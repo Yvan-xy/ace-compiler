@@ -264,12 +264,6 @@ public:
   //! been recorded, update the rescaling info to one with lower resulting scale
   //! degree.
   void Add_expr_rescale_info(EXPR_RESCALE_INFO rs_info) {
-    uint32_t mul_lev = _lower_ctx->Get_ctx_param().Get_mul_level();
-    // 0 means not yet configured (unit tests / early passes) — skip cap.
-    if (mul_lev > 0) {
-      uint32_t max_rescale_level = mul_lev - 1;
-      if (rs_info.Res_scale().Rescale_level() > max_rescale_level) return;
-    }
     std::pair<EXPR_RESCALE_INFO::ITER, bool> res =
         _rescale_expr.insert(rs_info);
     if (!res.second) {
@@ -1165,27 +1159,14 @@ RETV CKKS_SCALE_MANAGER::Handle_bootstrap(VISITOR* visitor, NODE_PTR node) {
 
 template <typename RETV, typename VISITOR>
 RETV CKKS_SCALE_MANAGER::Handle_rescale(VISITOR* visitor, NODE_PTR node) {
-  SCALE_MNG_CTX& ctx         = visitor->Context();
-  NODE_PTR       child       = node->Child(0);
-  RETV           res         = visitor->template Visit<RETV>(child);
-  uint32_t       scale_deg   = res.Scale();
-  uint32_t       rescale_lev = res.Rescale_level();
-  if (scale_deg <= 1) {
-    // Operand already at base scale (e.g. CKKS-only IR without prior scale
-    // analysis)
-    ctx.Set_node_scale_info(node, SCALE_INFO(1, rescale_lev));
-    return RETV{SCALE_INFO(1, rescale_lev), node};
-  }
-  // Cap rescales so we never exceed poly level budget (max rescale_level =
-  // mul_level - 1).  When mul_level is 0 (not configured), skip the cap.
-  uint32_t mul_lev_cfg = ctx.Lower_ctx()->Get_ctx_param().Get_mul_level();
-  if (mul_lev_cfg > 0) {
-    uint32_t max_rescale_level = mul_lev_cfg - 1;
-    if (rescale_lev + 1 > max_rescale_level) {
-      ctx.Set_node_scale_info(node, SCALE_INFO(1, rescale_lev));
-      return RETV{SCALE_INFO(1, rescale_lev), node};
-    }
-  }
+  SCALE_MNG_CTX& ctx = visitor->Context();
+  // handle child: reset scale of child to scale factor.
+  NODE_PTR child     = node->Child(0);
+  RETV     res       = visitor->template Visit<RETV>(child);
+  uint32_t scale_deg = res.Scale();
+  AIR_ASSERT_MSG(scale_deg > 1,
+                 "Scale degree of rescale operand must be larger than 1");
+  uint32_t   rescale_lev = res.Rescale_level();
   SCALE_INFO si(scale_deg - 1, rescale_lev + 1);
   ctx.Set_node_scale_info(node, si);
   return RETV{si, node};

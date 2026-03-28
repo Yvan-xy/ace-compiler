@@ -34,12 +34,7 @@ SCALE_INFO PARS::Handle(NODE_PTR node) {
 }
 
 void PARS::Rescale_ana(NODE_PTR node) {
-  SCALE_MNG_CTX* ctx     = Context();
-  uint32_t       mul_lev = ctx->Lower_ctx()->Get_ctx_param().Get_mul_level();
-  // When mul_level is 0 (not yet configured, e.g. during unit tests or early
-  // analysis passes), do not cap rescale insertion — use UINT32_MAX as
-  // sentinel.
-  uint32_t max_rescale_level = (mul_lev > 0) ? mul_lev - 1 : UINT32_MAX;
+  SCALE_MNG_CTX* ctx = Context();
   for (uint32_t id = 0; id < node->Num_child(); ++id) {
     NODE_PTR       child = node->Child(id);
     SCALE_MAP_ITER iter  = ctx->Node_scale_info_iter(child->Id());
@@ -48,22 +43,16 @@ void PARS::Rescale_ana(NODE_PTR node) {
     // rescale operands of which scale degree is larger than 2.
     SCALE_INFO si        = iter->second;
     uint32_t   scale_deg = iter->second.Scale_deg();
-    uint32_t   cur_lev   = iter->second.Rescale_level();
-    if (scale_deg > 2 && cur_lev < max_rescale_level) {
+    if (scale_deg > 2) {
       uint32_t rs_cnt = scale_deg - 2;
-      if (max_rescale_level != UINT32_MAX &&
-          cur_lev + rs_cnt > max_rescale_level)
-        rs_cnt = max_rescale_level - cur_lev;
-      uint32_t rs_lev = cur_lev + rs_cnt;
+      uint32_t rs_lev = iter->second.Rescale_level() + rs_cnt;
 
-      si = SCALE_INFO(scale_deg - rs_cnt, rs_lev);
-      if (rs_cnt > 0) {
-        EXPR_RESCALE_INFO rs_info(node, child, rs_cnt, si);
-        ctx->Add_expr_rescale_info(rs_info);
-        ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
-                   "Rescale opnd1 of node: ");
-        ctx->Trace_obj(TD_CKKS_SCALE_MGT, node);
-      }
+      si = SCALE_INFO(2, rs_lev);
+      EXPR_RESCALE_INFO rs_info(node, child, rs_cnt, si);
+      ctx->Add_expr_rescale_info(rs_info);
+      ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
+                 "Rescale opnd1 of node: ");
+      ctx->Trace_obj(TD_CKKS_SCALE_MGT, node);
     }
     ctx->Set_scale_info(child->Id(), si);
   }
@@ -616,13 +605,7 @@ void SCALE_MANAGER::Rescale_expr() {
     for (uint32_t id = 0; id < rs_info.Rescale_cnt(); ++id) {
       rescale = ckks_gen.Gen_rescale(rescale);
     }
-    // Set RESCALE node's scale to *input* (pre-rescale) scale so poly_ir_gen
-    // emits Init_ciph_down_scale (scale_deg > 1). Res_scale() is output scale.
-    uint32_t input_scale_deg =
-        rs_info.Res_scale().Scale_deg() + rs_info.Rescale_cnt();
-    SCALE_INFO input_scale(input_scale_deg,
-                           rs_info.Res_scale().Rescale_level());
-    Mng_ctx().Set_node_scale_info(rescale, input_scale);
+    Mng_ctx().Set_node_scale_info(rescale, rs_info.Res_scale());
 
     // 2. replace original node with rescale node
     NODE_PTR parent   = rs_info.Parent();

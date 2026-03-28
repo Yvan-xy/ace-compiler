@@ -134,10 +134,10 @@ void Init_ciph3_same_scale_ciph3(CIPHER3 res, CIPHER3 ciph1, CIPHER3 ciph2) {
   Set_is_ntt(Get_ciph3_c2(res), true);
   Set_ciph3_level(res, Get_ciph3_level(ciph));
   RTLIB_TM_END(RTM_INIT_CIPH_SM_SC, rtm);
-void Init_ciph3_same_scale(CIPHER3 res, CIPHER3 ciph1, CIPHER3 ciph2) {
-  Init_ciph3_same_scale_ciph3(res, ciph1, ciph2);
 }
 
+void Init_ciph3_same_scale(CIPHER3 res, CIPHER3 ciph1, CIPHER3 ciph2) {
+  Init_ciph3_same_scale_ciph3(res, ciph1, ciph2);
 }
 
 void Init_ciph3_up_scale(CIPHER3 res, CIPHER ciph1, CIPHER ciph2) {

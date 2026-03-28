@@ -407,17 +407,6 @@ STMT_PTR POLY_IR_GEN::New_init_ciph(CONST_VAR v_parent, NODE_PTR node) {
         CONST_VAR& v_opnd0 = Node_var(node->Child(0));
         NODE_PTR   n_res   = New_var_load(v_res, spos);
         NODE_PTR   n_opnd0 = New_var_load(v_opnd0, spos);
-        // When scale manager capped (rescale_level at budget), result scale_deg
-        // is 1; emit same_scale instead of down_scale.
-        const uint32_t* scale_ptr = node->Attr<uint32_t>(FHE_ATTR_KIND::SCALE);
-        uint32_t        scale_deg = (scale_ptr != nullptr) ? *scale_ptr : 2;
-        if (scale_deg <= 1) {
-          TYPE_PTR t_opnd1 = Glob_scope()->New_ptr_type(
-              Glob_scope()->Prim_type(PRIMITIVE_TYPE::INT_U64)->Id(),
-              POINTER_KIND::FLAT64);
-          NODE_PTR n_opnd1 = Container()->New_zero(t_opnd1, spos);
-          return New_init_ciph_same_scale(n_res, n_opnd0, n_opnd1, spos);
-        }
         return New_init_ciph_down_scale(n_res, n_opnd0, spos);
       }
       default:

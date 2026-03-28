@@ -661,26 +661,6 @@ POLY_LOWER_RETV CKKS2POLY::Handle_rescale(VISITOR*            visitor,
                    opnd0_pair.Kind() == RETV_KIND::RK_CIPH3_POLY,
                "invalid RETV kind");
 
-  // When scale manager capped (scale_deg 1), skip poly rescale to avoid "Level
-  // of rescale opnd is too small".
-  const uint32_t* scale_ptr =
-      node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::SCALE);
-  uint32_t scale_deg = (scale_ptr != nullptr) ? *scale_ptr : 2;
-  if (scale_deg <= 1) {
-    if (opnd0_pair.Kind() == RK_CIPH_POLY) {
-      return Post_handle_ckks_op(
-          visitor, node,
-          POLY_LOWER_RETV(RETV_KIND::RK_CIPH_POLY, opnd0_pair.Node1(),
-                          opnd0_pair.Node2()),
-          is_gen_rns_loop, core::RTM_FHE_RESCALE);
-    }
-    return Post_handle_ckks_op(
-        visitor, node,
-        POLY_LOWER_RETV(RETV_KIND::RK_CIPH3_POLY, opnd0_pair.Node1(),
-                        opnd0_pair.Node2(), opnd0_pair.Node3()),
-        is_gen_rns_loop, core::RTM_FHE_RESCALE);
-  }
-
   air::base::NODE_PTR n_rescale_c0 =
       ctx.Poly_gen().New_rescale(opnd0_pair.Node1(), node->Spos());
   air::base::NODE_PTR n_rescale_c1 =

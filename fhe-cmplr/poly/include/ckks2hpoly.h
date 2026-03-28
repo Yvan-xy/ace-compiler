@@ -357,20 +357,6 @@ POLY_LOWER_RETV CKKS2HPOLY::Handle_rescale(VISITOR*            visitor,
 
   POLY_LOWER_RETV opnd0_retv = visitor->template Visit<RETV>(opnd0);
 
-  // When scale manager capped (scale_deg 1), skip poly rescale to avoid "Level
-  // of rescale opnd is too small".
-  const uint32_t* scale_ptr =
-      node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::SCALE);
-  uint32_t scale_deg = (scale_ptr != nullptr) ? *scale_ptr : 2;
-  if (scale_deg <= 1) {
-    if (opnd0_retv.Kind() == RK_CIPH_POLY) {
-      return POLY_LOWER_RETV(RETV_KIND::RK_CIPH_POLY, opnd0_retv.Node1(),
-                             opnd0_retv.Node2());
-    }
-    return POLY_LOWER_RETV(RETV_KIND::RK_CIPH3_POLY, opnd0_retv.Node1(),
-                           opnd0_retv.Node2(), opnd0_retv.Node3());
-  }
-
   if (opnd0_retv.Kind() == RK_CIPH_POLY) {
     air::base::NODE_PTR n_c0 =
         ctx.Poly_gen().New_rescale(opnd0_retv.Node1(), node->Spos());
