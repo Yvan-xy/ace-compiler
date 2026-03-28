@@ -26,6 +26,7 @@ ACE_COMPILER_DIR="${SCRIPT_DIR}/.."
 BINDINGS_DIR="${ACE_COMPILER_DIR}/bindings"
 BINDINGS_BUILD_DIR="${BINDINGS_DIR}/build"
 ACE_BINDINGS_DIR="${ACE_COMPILER_DIR}/ace_bindings"
+ACE_INSTALL_DIR="${ACE_INSTALL_DIR:-}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -53,8 +54,27 @@ header() {
     echo -e "${BLUE}======================================================================${NC}"
 }
 
+detect_install_dir() {
+    if [ -n "${ACE_INSTALL_DIR}" ]; then
+        return
+    fi
+
+    local candidates=(
+        "/usr/local"
+    )
+
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if [ -f "${candidate}/lib/libAIRbase.a" ] && [ -f "${candidate}/rtlib/lib/libFHErt_ant.a" ]; then
+            ACE_INSTALL_DIR="${candidate}"
+            return
+        fi
+    done
+}
+
 check_prerequisites() {
     info "Checking prerequisites..."
+    detect_install_dir
     
     # Check Python
     if ! command -v python3 &> /dev/null; then
@@ -68,10 +88,17 @@ check_prerequisites() {
     fi
     
     # Check ACE libraries
-    if [ ! -f "${ACE_COMPILER_DIR}/ace_cmplr/lib/libAIRbase.a" ]; then
-        error "ACE libraries not found at ${ACE_COMPILER_DIR}/ace_cmplr/lib/\n" \
-              "Please build ACE first:\n" \
-              "  cd ${ACE_COMPILER_DIR} && ./build.sh release"
+    if [ -z "${ACE_INSTALL_DIR}" ]; then
+        error "ACE install prefix not detected.\n" \
+              "Set ACE_INSTALL_DIR to the installed compiler prefix (for example /usr/local)."
+    fi
+    if [ ! -f "${ACE_INSTALL_DIR}/lib/libAIRbase.a" ]; then
+        error "ACE libraries not found at ${ACE_INSTALL_DIR}/lib/\n" \
+              "Set ACE_INSTALL_DIR to the installed compiler prefix."
+    fi
+    if [ ! -f "${ACE_INSTALL_DIR}/rtlib/lib/libFHErt_ant.a" ]; then
+        error "ACE rtlib not found at ${ACE_INSTALL_DIR}/rtlib/lib/\n" \
+              "Set ACE_INSTALL_DIR to the installed compiler prefix."
     fi
     
     # Check shared bindings directory
@@ -85,6 +112,7 @@ check_prerequisites() {
 
 build_bindings() {
     info "Building shared bindings at ${BINDINGS_DIR}..."
+    info "Using ACE install prefix: ${ACE_INSTALL_DIR}"
     
     mkdir -p "${BINDINGS_BUILD_DIR}"
     cd "${BINDINGS_BUILD_DIR}"
@@ -94,7 +122,7 @@ build_bindings() {
     
     cmake .. \
         -DACE_COMPILER_DIR="${ACE_COMPILER_DIR}" \
-        -DACE_INSTALL_DIR="${ACE_COMPILER_DIR}/ace_cmplr" \
+        -DACE_INSTALL_DIR="${ACE_INSTALL_DIR}" \
         -Dpybind11_DIR="${PYBIND11_DIR}"
     
     make -j$(nproc)
@@ -239,6 +267,9 @@ show_usage() {
     echo "  ├── ace_bindings/    # Python package with .so files"
     echo "  ├── acepy/           # Also uses ace_bindings"
     echo "  └── ace_edsl/        # This directory"
+    echo ""
+    echo "Environment:"
+    echo "  ACE_INSTALL_DIR      Installed compiler prefix (auto-detected; e.g. /usr/local)"
 }
 
 # Main
@@ -254,6 +285,7 @@ case "${1:-}" in
         echo ""
         echo "To use:"
         echo "  export PYTHONPATH=\"${ACE_COMPILER_DIR}:\$PYTHONPATH\""
+        echo "  export ACE_INSTALL_DIR=\"${ACE_INSTALL_DIR}\""
         echo "  python3 -c 'from ace_bindings import air_builder; print(\"OK\")'"
         ;;
     "bindings")

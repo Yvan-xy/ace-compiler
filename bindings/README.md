@@ -16,7 +16,7 @@ Shared C++ Python bindings for the ACE compiler infrastructure via pybind11.
 - Python 3.8+
 - pybind11 (`pip install pybind11`)
 - CMake 3.14+
-- ACE compiler libraries built and installed in `ace_cmplr/`
+- ACE compiler libraries built and installed in an external prefix such as `/usr/local`
 
 ## Build
 
@@ -37,7 +37,7 @@ The `.so` files are automatically output to `../ace_bindings/`.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `ACE_COMPILER_DIR` | `..` | Path to ace-compiler source |
-| `ACE_INSTALL_DIR` | `${ACE_COMPILER_DIR}/ace_cmplr` | Path to ace_cmplr install |
+| `ACE_INSTALL_DIR` | `/usr/local` | Path to installed ACE compiler prefix |
 | `ACE_BINDINGS_OUTPUT_DIR` | `${ACE_COMPILER_DIR}/ace_bindings` | Output directory for .so files |
 | `ONNX_PROTO_DIR` | (auto-detected) | Path to generated ONNX proto files |
 

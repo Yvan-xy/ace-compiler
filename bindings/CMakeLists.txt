@@ -4,7 +4,7 @@
 # Usage:
 #   mkdir build && cd build
 #   cmake .. -DACE_COMPILER_DIR=/path/to/ace-compiler \
-#            -DACE_INSTALL_DIR=/path/to/ace_cmplr \
+#            -DACE_INSTALL_DIR=/usr/local \
 #            -Dpybind11_DIR=$(python -c "import pybind11; print(pybind11.get_cmake_dir())")
 #   make
 #
@@ -26,7 +26,17 @@ find_package(pybind11 REQUIRED)
 
 # ACE-compiler paths
 set(ACE_COMPILER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." CACHE PATH "Path to ace-compiler source")
-set(ACE_INSTALL_DIR "${ACE_COMPILER_DIR}/ace_cmplr" CACHE PATH "Path to ace_cmplr install")
+set(ACE_INSTALL_DIR "" CACHE PATH "Path to installed ACE compiler prefix")
+
+if(NOT ACE_INSTALL_DIR)
+    if(EXISTS "/usr/local/lib/libAIRbase.a" AND
+       EXISTS "/usr/local/rtlib/lib/libFHErt_ant.a")
+        set(_ACE_INSTALL_DIR_DEFAULT "/usr/local")
+    else()
+        set(_ACE_INSTALL_DIR_DEFAULT "")
+    endif()
+    set(ACE_INSTALL_DIR "${_ACE_INSTALL_DIR_DEFAULT}" CACHE PATH "Path to installed ACE compiler prefix" FORCE)
+endif()
 
 # Output directory for .so files - directly into ace_bindings package
 set(ACE_BINDINGS_OUTPUT_DIR "${ACE_COMPILER_DIR}/ace_bindings" CACHE PATH "Output directory for .so files")
@@ -209,4 +219,3 @@ message(STATUS "ACE_LIB_DIR:            ${ACE_LIB_DIR}")
 message(STATUS "ACE_BINDINGS_OUTPUT:    ${ACE_BINDINGS_OUTPUT_DIR}")
 message(STATUS "ACE_BINDINGS:           ${ACE_BINDINGS_ENABLED}")
 message(STATUS "")
-
