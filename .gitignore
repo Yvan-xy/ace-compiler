@@ -1,3 +1,8 @@
 build
 dataset
 third_parth
+*.log
+__pycache__
+resnet20_cifar10_pre.*
+bindings/build/
+*.so
