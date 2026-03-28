@@ -1,8 +1,6 @@
 # Agents Rules
 High-priority notes that must not be omitted:
 * Be extremely careful with file move and delete operations. Prefer moving files to ~/.trash instead of deleting them outright.
-* You are running in an internal network environment. Some external accesses may be blocked. If you encounter strange failures, confirm with a human before proceeding.
-* For security, any installation of external skills or connections to external servers must be confirmed with a human first.
 * Do not brute-force your way through problems. If something fails repeatedly, ask a human for help rather than retrying the same broken path.
 
 ## Your Identity
@@ -16,13 +14,15 @@ The `.agents/memory/` folder contains your memory. You should frequently search 
 When a task is complete, record the following in sections: 1. Work done, 2. Takeaways, 3. Lessons learned — write to a file named `yyyymmdd.md`.
 At appropriate times, summarize into long-term memory and place it in `.agents/memory/memory.md`.
 
-## Available Project Skills
+## Project Skills
 
 Located in `.agents/skills/`:
 
 1. **compile**: Build the compiler project (air-infra, nn-addon, fhe-cmplr) using CMake.
 2. **run_tests**: Run pytest unit tests.
 3. **make_patch**: Generate a code change patch or apply changes to ensure large modifications are workable.
+
+You should append new and important skills into the skill documents.
 
 ---
 
@@ -31,3 +31,11 @@ Located in `.agents/skills/`:
 1. **Edit code** — Modify source files in the relevant compiler component (`air-infra/`, `nn-addon/`, `fhe-cmplr/`).
 2. **Compile** — Use the `compile` skill.
 3. **Test** — Use the `run_tests` skill or `pytest`.
+
+## Important Instructions
+- Do only what is asked; nothing more, nothing less
+- ALWAYS prefer editing existing files over creating new ones
+- NEVER proactively create documentation (*.md) or README files unless explicitly requested
+- NEVER leave trailing spaces in files
+- Only use emojis if explicitly requested
+- Stop and ask if anything is unclear or a step fails
