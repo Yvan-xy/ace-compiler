@@ -33,3 +33,21 @@
 - Enabling rtlib unit tests exposed two missing standard-library includes:
   - `fhe-cmplr/rtlib/ant/unittest/ut_ckks_perf.cxx` needs `<iomanip>`
   - `fhe-cmplr/rtlib/ant/unittest/ut_ksw_opt.cxx` needs `<iomanip>`
+
+## Server Bring-up
+
+- Server host used: `yifan@10.28.27.58`
+- Server repo path: `/media/newhd/yifan/ace-compiler`
+- Prepared server-side `third_party/` with public clones for `jsoncpp`, `googletest`, `benchmark`, `uthash`, and `BLAKE2`.
+- Built the server Docker image successfully from the repo `Dockerfile` with tag `ace-compiler-dev:latest`.
+- Built inside the running server container `ace-compiler-dev`:
+  - build dir: `/app/build`
+  - generator: Ninja
+  - install prefix: default `/usr/local`
+  - main binary: `/usr/local/bin/fhe_cmplr`
+  - `ctest -N` count: 76
+- The older server checkout required extra compatibility fixes:
+  - `onnx2air.cxx` needed `ParseFromString` instead of `ParseFromIstream`
+  - `ut_ckks_perf.cxx` and `ut_ksw_opt.cxx` needed `<iomanip>`
+  - container needed `pybind11` and `nlohmann-json3-dev`
+- The newer local repo `Dockerfile` already had `pybind11`; it now also installs `nlohmann-json3-dev`.

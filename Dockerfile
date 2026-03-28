@@ -35,6 +35,7 @@ RUN apt-get update && \
         protobuf-compiler \
         libssl-dev \
         libgmp-dev \
+        nlohmann-json3-dev \
         libomp-dev \
         libomp5 \
         libntl-dev && \
