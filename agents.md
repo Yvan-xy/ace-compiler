@@ -19,7 +19,7 @@ At appropriate times, summarize into long-term memory and place it in `.agents/m
 
 Located in `.agents/skills/`:
 
-1. **compile**: Build the compiler project (air-infra, nn-addon, fhe-cmplr) using CMake.
+1. **compile**: Build the compiler project (air-infra, nn-addon, fhe-cmplr) using CMake, remember that you should build the release version by default. If you need the debug version, you can create a new build directory to build a debug version of ace-compiler.
 2. **run_tests**: Run pytest unit tests.
 3. **make_patch**: Generate a code change patch or apply changes to ensure large modifications are workable.
 
