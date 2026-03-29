@@ -694,6 +694,24 @@ finally:
         not IMPORTS_AVAILABLE,
         f"Imports not available: {IMPORT_ERROR if not IMPORTS_AVAILABLE else ''}",
     )
+    def test_primitive_raw_air_has_no_bootstrap_op(self):
+        """Primitive mode must not emit CKKS.bootstrap in raw AIR."""
+        if _is_rtlib_mode():
+            self.skipTest("rtlib mode intentionally emits runtime bootstrap op")
+        raw_air = os.path.join(BOOTSTRAP_OUTPUT_DIR, "bootstrap_full_raw.air")
+        self.assertTrue(os.path.isfile(raw_air), f"Missing raw AIR dump: {raw_air}")
+        with open(raw_air, "r", encoding="utf-8") as f:
+            raw_ir = f.read().lower()
+        self.assertNotIn(
+            "ckks.bootstrap",
+            raw_ir,
+            "primitive mode must keep the decomposition visible in raw AIR",
+        )
+
+    @unittest.skipIf(
+        not IMPORTS_AVAILABLE,
+        f"Imports not available: {IMPORT_ERROR if not IMPORTS_AVAILABLE else ''}",
+    )
     def test_generated_c_contains_bootstrap_ops(self):
         """Generated C code contains expected runtime calls for bootstrap.
 

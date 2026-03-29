@@ -12,16 +12,11 @@ ANT rtlib Eval_bootstrap (bootstrap.c / chebyshev_impl.c).
 Note on rescale/level management:
     The rtlib explicitly rescales at several points (Eval_linear_wsum,
     Apply_double_angle, conjugate split, recombine) and mod-switches
-    baby-step T_i to level-align with T_k.  In the EDSL pipeline, the
-    scale manager pass auto-inserts rescales after every multiplication
-    and manages levels.  Emitting explicit rescale/mod_switch nodes at
-    the EDSL level would conflict with auto scale management and trigger
-    assertion failures (scale_deg invariants, "Unexpected operator:
-    modswitch").  Therefore this module does NOT emit explicit rescale
-    or mod_switch nodes.  The structural match with the rtlib is still
-    present (same multiplications and additions in the same order),
-    and the pipeline's scale manager produces equivalent rescale
-    placement.
+    baby-step T_i to level-align with T_k. In the EDSL pipeline, the
+    scale manager auto-inserts rescales after multiplications, so this
+    module avoids emitting explicit rescale nodes. It does emit the same
+    baby-step mod-switch alignment used by the rtlib, because that level
+    normalization materially affects the downstream bootstrap levels.
 
 Usage (from AIRValue._bootstrap_*_primitive methods):
 
@@ -650,6 +645,14 @@ def _collapsed_fft_stage_plan(slots: int, encoding: bool, level_budget: int = 3)
     encode_stage_factor = _coeffs_to_slots_factor(slots) ** (1.0 / level_budget)
     stages = []
 
+    def encoding_plain_level(stage: int) -> int:
+        # Rotate_precomp computes enc_level = level + 1.
+        return enc_level + 1 + stage
+
+    def decoding_plain_level(stage: int) -> int:
+        # Rotate_precomp computes dec_level = level + level_budget.
+        return dec_level + level_budget - stage
+
     if encoding:
         start = 1 if params["flag_rem"] else 0
         end = level_budget
@@ -659,8 +662,7 @@ def _collapsed_fft_stage_plan(slots: int, encoding: bool, level_budget: int = 3)
                 "s": s,
                 "num_rot": params["num_rot"],
                 "shift": shift,
-                # Rotate_precomp computes enc_level = level + 1.
-                "plain_level": enc_level + 1 + s,
+                "plain_level": encoding_plain_level(s),
                 "diag_scale": encode_stage_factor,
             })
         if params["flag_rem"]:
@@ -668,7 +670,7 @@ def _collapsed_fft_stage_plan(slots: int, encoding: bool, level_budget: int = 3)
                 "s": 0,
                 "num_rot": params["num_rot_rem"],
                 "shift": 1,
-                "plain_level": enc_level + 1,
+                "plain_level": encoding_plain_level(0),
                 "diag_scale": encode_stage_factor,
             })
     else:
@@ -678,8 +680,7 @@ def _collapsed_fft_stage_plan(slots: int, encoding: bool, level_budget: int = 3)
                 "s": s,
                 "num_rot": params["num_rot"],
                 "shift": shift,
-                # Rotate_precomp computes dec_level = level + level_budget.
-                "plain_level": dec_level + level_budget - s,
+                "plain_level": decoding_plain_level(s),
                 "diag_scale": 1.0,
             })
         if params["flag_rem"]:
@@ -688,7 +689,7 @@ def _collapsed_fft_stage_plan(slots: int, encoding: bool, level_budget: int = 3)
                 "s": s,
                 "num_rot": params["num_rot_rem"],
                 "shift": 1 << (s * params["layers_coll"]),
-                "plain_level": dec_level + 1,
+                "plain_level": decoding_plain_level(level_budget - 1),
                 "diag_scale": 1.0,
             })
 
@@ -795,33 +796,6 @@ def get_bootstrap_precompute_summary(slots: int, level_budget: int = 3):
     }
 
 
-@lru_cache(maxsize=None)
-def _bootstrap_u0_matrices(slots: int):
-    """Build U0 and conj(U0^T) used by the runtime linear transform path."""
-    slots4 = 4 * slots
-    rot_group = []
-    five_pow = 1
-    for _ in range(slots):
-        rot_group.append(five_pow)
-        five_pow = (five_pow * 5) % slots4
-
-    u0 = []
-    for row in range(slots):
-        row_vals = []
-        rot = rot_group[row]
-        for col in range(slots):
-            angle = 2.0 * math.pi * ((col * rot) % slots4) / slots4
-            row_vals.append(complex(math.cos(angle), math.sin(angle)))
-        u0.append(tuple(row_vals))
-
-    u0 = tuple(u0)
-    u0hat_t = tuple(
-        tuple(complex(u0[col][row].real, -u0[col][row].imag) for col in range(slots))
-        for row in range(slots)
-    )
-    return u0, u0hat_t
-
-
 def _encode_plain_vector_like(x, values, scale_degree: int = 1, level: int = 0):
     """Encode a complex plaintext vector as a CKKS plaintext AIRValue."""
     if not hasattr(x, "container"):
@@ -869,37 +843,6 @@ def _mul_const_like(x, value):
     if not hasattr(x, "container"):
         return x * value
     return x * _encode_scalar_like(x, value, scale_degree=1, level=_bootstrap_const_level())
-
-
-def _matrix_diag(matrix, shift: int):
-    """Return the diagonal used with a positive left rotate by `shift`."""
-    slots = len(matrix)
-    return [matrix[row][(row + shift) % slots] for row in range(slots)]
-
-
-def _linear_transform_matrix(x, matrix, encode_level: int = 0):
-    """Apply a direct diagonal linear transform."""
-    slots = len(matrix)
-
-    # Cleartext fallback: use exact matrix-vector multiplication.
-    if not hasattr(x, "container"):
-        out = []
-        for row in range(slots):
-            acc = 0j
-            for col in range(slots):
-                acc += matrix[row][col] * x.vals[col]
-            out.append(acc)
-        return x.__class__(out)
-
-    result = None
-    for shift in range(slots):
-        rotated = x if shift == 0 else x.rotate(shift)
-        plain = _encode_plain_vector_like(
-            x, _matrix_diag(matrix, shift), scale_degree=1, level=encode_level
-        )
-        term = rotated * plain
-        result = term if result is None else result + term
-    return result
 
 
 def _mul_by_power_of_two(x, value: float):

@@ -13,6 +13,7 @@ RESNET_DATASET_SRC="${DATASET_DIR}/resnet20_cifar10.cxx"
 
 BOOTSTRAP_GEN_C="${ACE_EDSL_DIR}/examples/output/bootstrap_full.c"
 BOOTSTRAP_RAW_AIR="${ACE_EDSL_DIR}/examples/output/bootstrap_full_raw.air"
+BOOTSTRAP_UTILS_PY="${ACE_EDSL_DIR}/examples/resnet_bootstrap_utils.py"
 WORK_DIR="${APP_ROOT}/tmp_dsl_bts_resnet20"
 BOOTSTRAP_BODY_C="${WORK_DIR}/bootstrap_full_body.c"
 BOOTSTRAP_SHIM_C="${WORK_DIR}/dsl_bootstrap_shim.c"
@@ -29,18 +30,11 @@ fi
 
 (
   cd "${ACE_EDSL_DIR}/examples"
-  ACE_BOOTSTRAP_IMPL=primitive \
-  ACE_BOOTSTRAP_POLY_DEGREE=65536 \
-  ACE_BOOTSTRAP_MUL_LEVEL=30 \
   PYTHONPATH="${ACE_EDSL_DIR}:${APP_ROOT}" \
-  python3 - <<'PY'
-import importlib
-import bootstrap_full
-
-importlib.reload(bootstrap_full)
-ok = bootstrap_full.run_demo()
-raise SystemExit(0 if ok else 1)
-PY
+  python3 "${BOOTSTRAP_UTILS_PY}" generate-demo \
+    --impl primitive \
+    --poly-degree 65536 \
+    --mul-level 30
 )
 
 if [[ ! -f "${BOOTSTRAP_GEN_C}" ]]; then
@@ -76,125 +70,13 @@ trap cleanup EXIT
 
 cp "${RESNET_GEN_C}" "${RESNET_DATASET_INC}"
 
-# Extend the resnet runtime context with any additional rotation keys needed by
-# the generated DSL bootstrap body.
-python3 - "${BOOTSTRAP_GEN_C}" "${RESNET_DATASET_INC}" <<'PY'
-import re
-import sys
-from pathlib import Path
+python3 "${BOOTSTRAP_UTILS_PY}" patch-resnet-context \
+  --bootstrap-c "${BOOTSTRAP_GEN_C}" \
+  --resnet-inc "${RESNET_DATASET_INC}"
 
-bootstrap_path = Path(sys.argv[1])
-resnet_inc_path = Path(sys.argv[2])
-
-bootstrap_c = bootstrap_path.read_text(encoding="utf-8")
-resnet_inc = resnet_inc_path.read_text(encoding="utf-8")
-
-rot_idxs = set()
-for pattern in (
-    r"\bRotate\s*\([^,]+,\s*(-?\d+)\s*\)",
-    r"\bRotate_ciph\s*\([^,]+,\s*[^,]+,\s*(-?\d+)\s*\)",
-):
-    for m in re.finditer(pattern, bootstrap_c):
-        rot_idxs.add(int(m.group(1)))
-
-deg_match = re.search(
-    r"static\s+CKKS_PARAMS\s+parm\s*=\s*\{\s*LIB_ANT\s*,\s*(\d+)",
-    bootstrap_c,
-    re.S,
-)
-if deg_match:
-    ring_degree = int(deg_match.group(1))
-    if "Conjugate_ciph(" in bootstrap_c:
-        rot_idxs.add(2 * ring_degree - 1)
-
-ctx_pat = re.compile(
-    r"(static\s+CKKS_PARAMS\s+parm\s*=\s*\{\s*"
-    r"LIB_ANT\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*"
-    r"\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*)"
-    r"(\d+)\s*,\s*\n\s*\{\s*([^}]*)\s*\}",
-    re.S,
-)
-m = ctx_pat.search(resnet_inc)
-if not m:
-    raise SystemExit("failed to locate CKKS_PARAMS in resnet include")
-
-existing = []
-for tok in re.split(r"[,\s]+", m.group(3).strip()):
-    if tok:
-        existing.append(int(tok))
-
-all_rot_idxs = sorted({v for v in existing if v != 0} | {v for v in rot_idxs if v != 0})
-rot_list = ", ".join(str(v) for v in all_rot_idxs)
-patched = ctx_pat.sub(
-    lambda mm: f"{mm.group(1)}{len(all_rot_idxs)}, \n    {{ {rot_list} }}",
-    resnet_inc,
-    count=1,
-)
-
-rotate_init = "  Init_ciph_same_scale(&_pgen_rot_res_2, &ciph_0, 0);\n"
-rotate_fast_path = (
-    rotate_init
-    + "  if (rot_idx_1 == 0) {\n"
-    + "    Copy_ciphertext(&_pgen_rot_res_2, &ciph_0);\n"
-    + "    RTLIB_TM_END(20, rtm);\n"
-    + "    return _pgen_rot_res_2;\n"
-    + "  }\n"
-)
-patched = patched.replace(rotate_init, rotate_fast_path, 1)
-
-resnet_inc_path.write_text(patched, encoding="utf-8")
-PY
-
-# Strip the standalone wrapper globals from bootstrap_full.c so it can be
-# linked next to the resnet-generated translation unit, which already provides
-# Get_context_params()/Get_rt_data_info().
-python3 - "${BOOTSTRAP_GEN_C}" "${BOOTSTRAP_BODY_C}" <<'PY'
-import sys
-import re
-
-src, dst = sys.argv[1:3]
-skip = False
-brace_depth = 0
-out = []
-
-def starts_wrapper(line: str) -> bool:
-    return (
-        line.startswith("CKKS_PARAMS* Get_context_params()")
-        or line.startswith("RT_DATA_INFO* Get_rt_data_info()")
-    )
-
-with open(src, "r", encoding="utf-8") as f:
-    for line in f:
-        if not skip and starts_wrapper(line):
-            skip = True
-            brace_depth = line.count("{") - line.count("}")
-            continue
-        if skip:
-            brace_depth += line.count("{") - line.count("}")
-            if brace_depth <= 0:
-                skip = False
-            continue
-        line = re.sub(r"\bbootstrap_full\b", "dsl_bootstrap_full", line)
-        line = re.sub(r"\bRotate\b", "dsl_bts_Rotate", line)
-        line = re.sub(r"\bRelinearize\b", "dsl_bts_Relinearize", line)
-        line = re.sub(r"\b(_cst_\d+)\b", r"dsl_bts_\1", line)
-        out.append(line)
-
-body = "".join(out)
-rotate_init = "  Init_ciph_same_scale(&_pgen_rot_res_2, &ciph_0, 0);\n"
-rotate_fast_path = (
-    rotate_init
-    + "  if (rot_idx_1 == 0) {\n"
-    + "    Copy_ciphertext(&_pgen_rot_res_2, &ciph_0);\n"
-    + "    RTLIB_TM_END(20, rtm);\n"
-    + "    return _pgen_rot_res_2;\n"
-    + "  }\n"
-)
-body = body.replace(rotate_init, rotate_fast_path, 1)
-
-with open(dst, "w", encoding="utf-8") as f:
-    f.write(body)
-PY
+python3 "${BOOTSTRAP_UTILS_PY}" emit-body \
+  --bootstrap-c "${BOOTSTRAP_GEN_C}" \
+  --output "${BOOTSTRAP_BODY_C}"
 
 cat > "${BOOTSTRAP_SHIM_C}" <<'EOF'
 #include <stdlib.h>
