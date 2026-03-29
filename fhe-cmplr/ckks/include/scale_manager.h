@@ -231,6 +231,16 @@ public:
     return _lower_ctx->Get_ctx_param().Get_scaling_factor_bit_num();
   }
 
+  uint32_t Initial_rescale_level() const {
+    uint32_t input_level = _lower_ctx->Get_ctx_param().Get_input_level();
+    if (input_level == 0) {
+      return 0;
+    }
+    uint32_t q_cnt = _lower_ctx->Get_ctx_param().Get_mul_level() + 1;
+    AIR_ASSERT_MSG(input_level <= q_cnt, "input level exceeds q count");
+    return q_cnt - input_level;
+  }
+
   LOWER_CTX* Lower_ctx() const { return _lower_ctx; }
   uint32_t   Unfix_scale() const { return 0; }
   bool       Is_unfix_scale(uint32_t scale) const { return scale == 0; }
@@ -562,11 +572,12 @@ RETV CORE_SCALE_MANAGER::Handle_func_entry(VISITOR* visitor, NODE_PTR node) {
   ANALYZE_CTX::GUARD guard(visitor->Context(), node);
 
   SCALE_MNG_CTX& ctx = visitor->Context();
+  uint32_t       init_rescale_level = ctx.Initial_rescale_level();
   ctx.Trace(TD_CKKS_SCALE_MGT, std::string(ctx.Indent(), '+'),
-            "func_entry: s=", ctx.Formal_scale_deg(), " l=", INIT_RESCALE_LEVEL,
+            "func_entry: s=", ctx.Formal_scale_deg(), " l=", init_rescale_level,
             "\n");
 
-  ctx.Process_chi_res(node, ctx.Formal_scale_deg(), INIT_RESCALE_LEVEL);
+  ctx.Process_chi_res(node, ctx.Formal_scale_deg(), init_rescale_level);
 
   uint32_t child_num = node->Num_child();
   AIR_ASSERT(child_num > 1);
@@ -580,7 +591,7 @@ template <typename RETV, typename VISITOR>
 RETV CORE_SCALE_MANAGER::Handle_idname(VISITOR* visitor, NODE_PTR node) {
   SCALE_MNG_CTX&        ctx                  = visitor->Context();
   uint32_t              formal_scale_deg     = ctx.Formal_scale_deg();
-  uint32_t              formal_rescale_level = 0;
+  uint32_t              formal_rescale_level = ctx.Initial_rescale_level();
   air::opt::SSA_VER_PTR ssa_ver = ctx.Ssa_cntr()->Node_ver(node->Id());
   SCALE_INFO            si(formal_scale_deg, formal_rescale_level);
   ctx.Set_scale_info(ssa_ver->Id(), si);
@@ -903,6 +914,9 @@ public:
   RETV Handle_rescale(VISITOR* visitor, NODE_PTR node);
 
   template <typename RETV, typename VISITOR>
+  RETV Handle_modswitch(VISITOR* visitor, NODE_PTR node);
+
+  template <typename RETV, typename VISITOR>
   RETV Handle_raise_mod(VISITOR* visitor, NODE_PTR node);
 
   template <typename RETV, typename VISITOR>
@@ -1173,6 +1187,17 @@ RETV CKKS_SCALE_MANAGER::Handle_rescale(VISITOR* visitor, NODE_PTR node) {
 }
 
 template <typename RETV, typename VISITOR>
+RETV CKKS_SCALE_MANAGER::Handle_modswitch(VISITOR* visitor, NODE_PTR node) {
+  SCALE_MNG_CTX& ctx   = visitor->Context();
+  NODE_PTR       child = node->Child(0);
+  RETV           retv  = visitor->template Visit<RETV>(child);
+  SCALE_INFO     si    = retv.Scale_info();
+  si.Set_rescale_level(si.Rescale_level() + 1);
+  ctx.Set_node_scale_info(node, si);
+  return RETV{si, node};
+}
+
+template <typename RETV, typename VISITOR>
 RETV CKKS_SCALE_MANAGER::Handle_raise_mod(VISITOR* visitor, NODE_PTR node) {
   SCALE_MNG_CTX& ctx = visitor->Context();
   // child0: ciphertext operand
@@ -1180,8 +1205,15 @@ RETV CKKS_SCALE_MANAGER::Handle_raise_mod(VISITOR* visitor, NODE_PTR node) {
   SCALE_INFO si    = retv0.Scale_info();
   // child1: target level/mod size (constant/int expression)
   (void)visitor->template Visit<RETV>(node->Child(1));
-  // raise_mod changes modulus chain but should preserve scale degree in
-  // analysis.
+  // Raise_mod restores towers. Preserve scale degree but reset the rescale
+  // level according to the requested target modulus level.
+  NODE_PTR target = node->Child(1);
+  if (target->Opcode() == air::core::OPC_INTCONST) {
+    uint32_t q_cnt = ctx.Lower_ctx()->Get_ctx_param().Get_mul_level() + 1;
+    uint32_t raised_level = target->Intconst();
+    AIR_ASSERT_MSG(raised_level <= q_cnt, "raise_mod target exceeds q count");
+    si.Set_rescale_level(q_cnt - raised_level);
+  }
   ctx.Set_node_scale_info(node, si);
   return RETV{si, node};
 }

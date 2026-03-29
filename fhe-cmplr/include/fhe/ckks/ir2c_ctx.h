@@ -50,9 +50,20 @@ public:
   template <typename RETV, typename VISITOR>
   void Emit_encode(VISITOR* visitor, air::base::NODE_PTR dest,
                    air::base::NODE_PTR node) {
-    if (_rt_data_writer != nullptr &&
+    const uint32_t* complex_attr =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::ENCODE_DCMPLX);
+    const uint32_t* scale_attr =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::SCALE);
+    const uint32_t* level_attr =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
+    const uint32_t* num_p_attr =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::NUM_P);
+    bool encoding_dcmplx = (complex_attr != nullptr) && (*complex_attr != 0);
+    if (!encoding_dcmplx && _rt_data_writer != nullptr &&
         node->Child(0)->Opcode() == air::core::OPC_LDC &&
         node->Child(1)->Opcode() == air::core::OPC_INTCONST &&
+        node->Child(2)->Opcode() == air::core::OPC_INTCONST &&
+        node->Child(3)->Opcode() == air::core::OPC_INTCONST &&
         node->Child(0)->Const()->Kind() == air::base::CONSTANT_KIND::ARRAY) {
       // Offline encoding path: ldc of an ARRAY constant (not scalar FLOAT
       // from mask encoding — scalar constants fall through to runtime encode)
@@ -68,8 +79,8 @@ public:
       uint64_t     count = cst->Array_byte_len() / sizeof(float);
       AIR_ASSERT(count >= node->Child(1)->Intconst());
       // get level & scale from node
-      uint32_t sc  = node->Child(2)->Intconst();
-      uint32_t lv  = node->Child(3)->Intconst();
+      uint32_t sc  = (scale_attr != nullptr) ? *scale_attr : node->Child(2)->Intconst();
+      uint32_t lv  = (level_attr != nullptr) ? *level_attr : node->Child(3)->Intconst();
       uint64_t idx = _rt_data_writer->Append(name, data, count, sc, lv);
       // Pt_from_msg_validate(&dest, cst, index, len, scale, level)
       // Pt_from_msg(&dest, index, len, scale, level)
@@ -212,10 +223,29 @@ public:
     }
     _ir2c_util << ", ";
     visitor->template Visit<RETV>(node->Child(1));  // element count
-    _ir2c_util << ", ";
-    visitor->template Visit<RETV>(node->Child(2));  // scale
-    _ir2c_util << ", ";
-    visitor->template Visit<RETV>(node->Child(3));  // level
+    if (encoding_dcmplx && num_p_attr != nullptr && *num_p_attr != 0) {
+      // Encode_dcmplx_ext(plain, input, len, level, p_cnt)
+      _ir2c_util << ", ";
+      if (level_attr != nullptr) {
+        _ir2c_util << *level_attr;
+      } else {
+        visitor->template Visit<RETV>(node->Child(3));  // level
+      }
+      _ir2c_util << ", " << *num_p_attr;
+    } else {
+      _ir2c_util << ", ";
+      if (scale_attr != nullptr) {
+        _ir2c_util << *scale_attr;
+      } else {
+        visitor->template Visit<RETV>(node->Child(2));  // scale
+      }
+      _ir2c_util << ", ";
+      if (level_attr != nullptr) {
+        _ir2c_util << *level_attr;
+      } else {
+        visitor->template Visit<RETV>(node->Child(3));  // level
+      }
+    }
     _ir2c_util << ")";
   }
 
@@ -249,7 +279,11 @@ public:
     if (encoding_dcmplx) {
       AIR_ASSERT_MSG(!encoding_mask,
                      "Encode_dcmplx and mask-encoding are mutually exclusive");
-      _ir2c_util << "Encode_dcmplx(&";
+      const uint32_t* num_p_attr =
+          node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::NUM_P);
+      _ir2c_util << ((num_p_attr != nullptr && *num_p_attr != 0)
+                         ? "Encode_dcmplx_ext(&"
+                         : "Encode_dcmplx(&");
       Emit_st_var<RETV, VISITOR>(visitor, dest);
       _ir2c_util << ", (DCMPLX*)";
       Emit_buffer_address<RETV, VISITOR>(visitor, cst);

@@ -41,6 +41,7 @@ class FHEConfig:
     """FHE parameter configuration for CKKS/Poly lowering."""
     poly_degree: int = 0          # 0 = auto-determine
     mul_level: int = 0            # 0 = auto-determine
+    input_level: int = 0          # 0 = runtime default/full input level
     security_level: int = 0       # 0 = auto-determine
     scaling_factor_bits: int = 56
     first_prime_bits: int = 60
@@ -128,6 +129,7 @@ class AcePipeline:
         self,
         poly_degree: int = 0,
         mul_level: int = 0,
+        input_level: int = 0,
         security_level: int = 0,
         scaling_factor_bits: int = 56,
         first_prime_bits: int = 60,
@@ -143,6 +145,7 @@ class AcePipeline:
         Args:
             poly_degree: Polynomial degree (0 = auto)
             mul_level: Multiplication level (0 = auto)
+            input_level: CKKS input ciphertext level (0 = runtime default)
             security_level: Security level (0 = auto)
             scaling_factor_bits: CKKS scaling factor bits
             first_prime_bits: First prime bits (q0)
@@ -158,6 +161,7 @@ class AcePipeline:
         self.fhe_config = FHEConfig(
             poly_degree=poly_degree,
             mul_level=mul_level,
+            input_level=input_level,
             security_level=security_level,
             scaling_factor_bits=scaling_factor_bits,
             first_prime_bits=first_prime_bits,
@@ -246,6 +250,7 @@ class AcePipeline:
         self.glob_scope.configure_fhe_params(
             poly_degree=self.fhe_config.poly_degree,
             mul_level=self.fhe_config.mul_level,
+            input_level=self.fhe_config.input_level,
             security_level=self.fhe_config.security_level,
             scaling_factor_bits=self.fhe_config.scaling_factor_bits,
             first_prime_bits=self.fhe_config.first_prime_bits,
@@ -650,6 +655,7 @@ class Pipeline:
         self,
         poly_degree: int = 0,
         mul_level: int = 0,
+        input_level: int = 0,
         security_level: int = 0,
         scaling_factor_bits: int = 56,
         first_prime_bits: int = 60,
@@ -667,6 +673,7 @@ class Pipeline:
         Args:
             poly_degree: Polynomial degree (0 = auto)
             mul_level: Multiplication level (0 = auto)
+            input_level: CKKS input ciphertext level (0 = runtime default)
             security_level: Security level (0 = auto)
             scaling_factor_bits: CKKS scaling factor bits
             first_prime_bits: First prime bits
@@ -684,6 +691,7 @@ class Pipeline:
         self.config = FHEConfig(
             poly_degree=poly_degree,
             mul_level=mul_level,
+            input_level=input_level,
             security_level=security_level,
             scaling_factor_bits=scaling_factor_bits,
             first_prime_bits=first_prime_bits,
@@ -795,6 +803,7 @@ class Pipeline:
                 self.glob.configure_fhe_params(
                     poly_degree=self.config.poly_degree,
                     mul_level=self.config.mul_level,
+                    input_level=self.config.input_level,
                     security_level=self.config.security_level,
                     scaling_factor_bits=self.config.scaling_factor_bits,
                     first_prime_bits=self.config.first_prime_bits,

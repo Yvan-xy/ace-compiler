@@ -414,7 +414,32 @@ CIPHER Upscale_ciph(CIPHER res, CIPHER ciph, uint32_t mod_size) {
 }
 
 CIPHER Raise_mod(CIPHER res, CIPHER ciph, uint32_t mod_size) {
-  return Upscale_ciph(res, ciph, mod_size);
+  CKKS_EVALUATOR* eval       = (CKKS_EVALUATOR*)Eval();
+  CKKS_PARAMETER* params     = eval->_params;
+  size_t          ring_degree = params->_poly_degree;
+  uint32_t        raise_level = mod_size ? mod_size : (uint32_t)Get_q_cnt();
+
+  CIPHERTEXT* raised = Alloc_ciphertext();
+  Init_ciphertext_from_ciph(raised, ciph, ciph->_scaling_factor,
+                            ciph->_sf_degree);
+  Copy_ciphertext(raised, ciph);
+
+  while (Get_ciph_sf_degree(raised) > 1) {
+    Rescale_ciphertext(raised, raised, eval);
+  }
+
+  if (Is_ntt(Get_c0(raised))) Conv_ntt2poly_inplace(Get_c0(raised));
+  if (Is_ntt(Get_c1(raised))) Conv_ntt2poly_inplace(Get_c1(raised));
+
+  Init_ciphertext(res, ring_degree, raise_level, 0, raised->_scaling_factor,
+                  raised->_sf_degree, Get_ciph_slots(ciph));
+  Transform_values_from_level0(Get_c0(res), Get_c0(raised));
+  Transform_values_from_level0(Get_c1(res), Get_c1(raised));
+  Free_ciphertext(raised);
+
+  Conv_poly2ntt_inplace(Get_c0(res));
+  Conv_poly2ntt_inplace(Get_c1(res));
+  return res;
 }
 
 CIPHER Downscale_ciph(CIPHER res, CIPHER ciph, uint32_t waterline) {

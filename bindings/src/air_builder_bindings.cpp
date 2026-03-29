@@ -793,7 +793,10 @@ public:
     //   - Set nn::core::ATTR::MASK attribute
     // This causes the codegen to emit Encode_double_mask (scalar form)
     // instead of Encode_double (array pointer form).
-    std::shared_ptr<Node> new_ckks_encode(std::shared_ptr<Node> data) {
+    std::shared_ptr<Node> new_ckks_encode(std::shared_ptr<Node> data,
+                                          int32_t encode_len = -1,
+                                          uint32_t scale_degree = 1,
+                                          uint32_t level = 0) {
         if (container && data && data->has_node && data->node != air::base::Null_ptr) {
             // Use OPC_ENCODE from ckks_opcode.h so scale manager sees same opcode (plaintext promotion)
             air::base::OPCODE op = fhe::ckks::OPC_ENCODE;
@@ -870,24 +873,30 @@ public:
             // child 1: length
             // For constant arrays, use element count as encode length.
             // For scalar/masked encode, keep default 64 (slot count placeholder).
-            uint32_t encode_len = 64;
+            uint32_t inferred_encode_len = 64;
             NODE_PTR src_data = n->Child(0);
             if (src_data != air::base::Null_ptr &&
                 src_data->Opcode() == air::core::OPC_LDC &&
                 src_data->Rtype()->Is_array()) {
                 uint64_t elem_cnt = src_data->Rtype()->Cast_to_arr()->Elem_count();
                 if (elem_cnt > 0 && elem_cnt <= UINT32_MAX) {
-                    encode_len = static_cast<uint32_t>(elem_cnt);
+                    inferred_encode_len = static_cast<uint32_t>(elem_cnt);
                 }
             }
-            NODE_PTR len_node = container->New_intconst(u32_type, encode_len, spos);
+            uint32_t final_encode_len =
+                (encode_len > 0) ? static_cast<uint32_t>(encode_len) : inferred_encode_len;
+            NODE_PTR len_node = container->New_intconst(u32_type, final_encode_len, spos);
             n->Set_child(1, len_node);
-            // child 2: scale (use 1 as placeholder - will be set by scale manager)
-            NODE_PTR scale_node = container->New_intconst(u32_type, 1, spos);
+            NODE_PTR scale_node = container->New_intconst(u32_type, scale_degree, spos);
             n->Set_child(2, scale_node);
-            // child 3: level (use 0 as placeholder - will be set by scale manager)
-            NODE_PTR level_node = container->New_intconst(u32_type, 0, spos);
+            NODE_PTR level_node = container->New_intconst(u32_type, level, spos);
             n->Set_child(3, level_node);
+            if (scale_degree != 0) {
+                n->Set_attr(fhe::core::FHE_ATTR_KIND::SCALE, &scale_degree, 1);
+            }
+            if (level != 0) {
+                n->Set_attr(fhe::core::FHE_ATTR_KIND::LEVEL, &level, 1);
+            }
             
             auto node = wrap_node(n, "fhe::ckks::ENCODE");
             node->add_child(data);
@@ -904,8 +913,11 @@ public:
     // [r0, i0, r1, i1, ...]. Mark node with ENCODE_DCMPLX attr and set len to
     // number of complex slots.
     std::shared_ptr<Node> new_ckks_encode_complex(std::shared_ptr<Node> data,
-                                                  int32_t complex_len = -1) {
-        auto encoded = new_ckks_encode(data);
+                                                  int32_t complex_len = -1,
+                                                  uint32_t scale_degree = 1,
+                                                  uint32_t level = 0,
+                                                  uint32_t num_p = 0) {
+        auto encoded = new_ckks_encode(data, -1, scale_degree, level);
         if (!(container && encoded && encoded->has_node &&
               encoded->node != air::base::Null_ptr)) {
             return encoded;
@@ -930,6 +942,9 @@ public:
             TYPE_PTR u32_type = container->Glob_scope()->Prim_type(air::base::PRIMITIVE_TYPE::INT_U32);
             NODE_PTR len_node = container->New_intconst(u32_type, inferred_len, get_spos());
             encoded->node->Set_child(1, len_node);
+        }
+        if (num_p != 0) {
+            encoded->node->Set_attr(fhe::core::FHE_ATTR_KIND::NUM_P, &num_p, 1);
         }
         return encoded;
     }
@@ -3557,6 +3572,7 @@ private:
     // Made public for access by run_ckks_driver
     uint32_t fhe_poly_degree = 16384;
     uint32_t fhe_mul_level = 10;
+    uint32_t fhe_input_level = 0;
     uint32_t fhe_security_level = 128;
     uint32_t fhe_scaling_factor_bits = 40;
     uint32_t fhe_first_prime_bits = 60;
@@ -4022,13 +4038,15 @@ public:
     
     // Configure FHE parameters for the pipeline
     void configure_fhe_params(uint32_t poly_degree, uint32_t mul_level,
-                              uint32_t security_level, uint32_t scaling_factor_bits,
+                              uint32_t input_level, uint32_t security_level,
+                              uint32_t scaling_factor_bits,
                               uint32_t first_prime_bits, uint32_t hamming_weight) {
         // Store user-configured values for use in run_ckks_driver
         // NOTE: Don't set params in ctx_param or re-register types here - that causes
         // conflicts with passes. Just store values and apply them in run_ckks_driver.
         fhe_poly_degree = poly_degree;
         fhe_mul_level = mul_level;
+        fhe_input_level = input_level;
         fhe_security_level = security_level;
         fhe_scaling_factor_bits = scaling_factor_bits;
         fhe_first_prime_bits = first_prime_bits;
@@ -4043,6 +4061,7 @@ public:
             const auto& ctx_param = lower_ctx->Get_ctx_param();
             params["poly_degree"] = ctx_param.Get_poly_degree();
             params["mul_level"] = ctx_param.Get_mul_level();
+            params["input_level"] = ctx_param.Get_input_level();
             params["security_level"] = ctx_param.Get_security_level();
             params["scaling_factor_bits"] = ctx_param.Get_scaling_factor_bit_num();
             params["first_prime_bits"] = ctx_param.Get_first_prime_bit_num();
@@ -4424,21 +4443,22 @@ py::dict run_ckks_driver(std::shared_ptr<GlobScope> glob) {
     // Set FHE params - use user-configured values if available, otherwise use defaults
     auto& ctx_param = lower_ctx->Get_ctx_param();
     
-    if (glob->fhe_config_set) {
-        // Use user-configured values from configure_fhe_params()
-        // NOTE: 0 means "auto" - let compiler analysis determine the value
+        if (glob->fhe_config_set) {
+            // Use user-configured values from configure_fhe_params()
+            // NOTE: 0 means "auto" - let compiler analysis determine the value
         
         // Only set poly_degree/mul_level if user explicitly provided non-zero values
         // (Like native compiler: analysis determines these, user can only increase them)
         if (glob->fhe_poly_degree != 0) {
             ctx_param.Set_poly_degree(glob->fhe_poly_degree, false);
         }
-        if (glob->fhe_mul_level != 0) {
-            ctx_param.Set_mul_level(glob->fhe_mul_level, true);
-        }
+            if (glob->fhe_mul_level != 0) {
+                ctx_param.Set_mul_level(glob->fhe_mul_level, true);
+            }
+            ctx_param.Set_input_level(glob->fhe_input_level);
         
-        // Set security level from user config (0 = HE_STD_NOT_SET, skips rtlib validation)
-        ctx_param.Set_security_level(glob->fhe_security_level);
+            // Set security level from user config (0 = HE_STD_NOT_SET, skips rtlib validation)
+            ctx_param.Set_security_level(glob->fhe_security_level);
         ctx_param.Set_first_prime_bit_num(glob->fhe_first_prime_bits);
         ctx_param.Set_scaling_factor_bit_num(glob->fhe_scaling_factor_bits);
         ctx_param.Set_hamming_weight(glob->fhe_hamming_weight);
@@ -4970,6 +4990,7 @@ py::dict run_poly_driver(std::shared_ptr<GlobScope> glob) {
                 if (glob->fhe_mul_level != 0) {
                     ctx_param.Set_mul_level(glob->fhe_mul_level, true);
                 }
+                ctx_param.Set_input_level(glob->fhe_input_level);
                 ctx_param.Set_security_level(glob->fhe_security_level);
                 ctx_param.Set_first_prime_bit_num(glob->fhe_first_prime_bits);
                 ctx_param.Set_scaling_factor_bit_num(glob->fhe_scaling_factor_bits);
@@ -5071,9 +5092,15 @@ PYBIND11_MODULE(air_builder, m) {
              "CKKS rotation: rotate slots by given amount")
         .def("new_ckks_encode", &Container::new_ckks_encode,
              py::arg("data"),
+             py::arg("encode_len") = -1,
+             py::arg("scale_degree") = 1,
+             py::arg("level") = 0,
              "CKKS encode: encode scalar/constant into plaintext polynomial")
         .def("new_ckks_encode_complex", &Container::new_ckks_encode_complex,
              py::arg("data"), py::arg("complex_len") = -1,
+             py::arg("scale_degree") = 1,
+             py::arg("level") = 0,
+             py::arg("num_p") = 0,
              "CKKS encode (complex): input is interleaved [real, imag, ...] float64 array")
         .def("new_ckks_rescale", &Container::new_ckks_rescale,
              "CKKS rescale: reduce scale after multiplication")
@@ -5251,6 +5278,7 @@ PYBIND11_MODULE(air_builder, m) {
         .def("configure_fhe_params", &GlobScope::configure_fhe_params,
              py::arg("poly_degree") = 0,
              py::arg("mul_level") = 0,
+             py::arg("input_level") = 0,
              py::arg("security_level") = 0,
              py::arg("scaling_factor_bits") = 40,
              py::arg("first_prime_bits") = 60,
@@ -5258,6 +5286,7 @@ PYBIND11_MODULE(air_builder, m) {
              "Configure FHE/CKKS parameters.\n"
              "Equivalent to: -CKKS:sk_hw=<hamming_weight>:q0=<first_prime_bits>:sf=<scaling_factor_bits>\n"
              "Note: poly_degree=0 and mul_level=0 mean 'auto' (let compiler analysis determine).\n"
+             "      input_level=0 uses the runtime default/full input level.\n"
              "      Only set these if you need to INCREASE them beyond analysis requirements.")
         .def("get_fhe_params", &GlobScope::get_fhe_params,
              "Get current FHE parameters as a dict")

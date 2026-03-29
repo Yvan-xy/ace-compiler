@@ -72,6 +72,19 @@ void Encode_dcmplx(PLAIN plain, DCMPLX* input, size_t len, uint32_t sc_degree,
   RTLIB_TM_END(RTM_PT_ENCODE, rtm);
 }
 
+void Encode_dcmplx_ext(PLAIN plain, DCMPLX* input, size_t len, uint32_t level,
+                       uint32_t p_cnt) {
+  RTLIB_TM_START(RTM_PT_ENCODE, rtm);
+  VALUE_LIST* input_vec = Alloc_value_list(DCMPLX_TYPE, len);
+  FOR_ALL_ELEM(input_vec, idx) { DCMPLX_VALUE_AT(input_vec, idx) = input[idx]; }
+  Encode_ext_at_level(plain, (CKKS_ENCODER*)Context->_encoder, input_vec, level,
+                      0 /* default slots */, p_cnt);
+  Append_weight_plain((CKKS_ENCODER*)Context->_encoder,
+                      Get_plain_mem_size(plain));
+  Free_value_list(input_vec);
+  RTLIB_TM_END(RTM_PT_ENCODE, rtm);
+}
+
 void Encode_float_mask(PLAIN plain, float cst, size_t len, uint32_t sc_degree,
                        uint32_t level) {
   float* mask = malloc(len * sizeof(float));

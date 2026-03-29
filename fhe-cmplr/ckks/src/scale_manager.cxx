@@ -415,8 +415,20 @@ void CKKS_SCALE_MANAGER::Handle_encode_in_bin_arith_node(
 
   SPOS           spos           = bin_node->Spos();
   const uint32_t scale_child_id = 2;
+  const uint32_t level_child_id = 3;
   NODE_PTR       scale          = encode_node->Child(scale_child_id);
+  const uint32_t* explicit_level_attr =
+      encode_node->Attr<uint32_t>(core::FHE_ATTR_KIND::LEVEL);
+  bool preserve_explicit_level =
+      explicit_level_attr != nullptr && *explicit_level_attr != 0;
   CONTAINER*     cntr           = bin_node->Container();
+  NODE_PTR       child0         = bin_node->Child(0);
+  AIR_ASSERT(ana_ctx->Lower_ctx()->Is_cipher_type(child0->Rtype_id()));
+  CKKS_GEN ckks_gen(cntr, ana_ctx->Lower_ctx());
+  if (!preserve_explicit_level) {
+    NODE_PTR new_level = ckks_gen.Gen_get_level(child0);
+    encode_node->Set_child(level_child_id, new_level);
+  }
   if (ana_ctx->Enc_scl_cst()) {
     TYPE_PTR u32_type  = cntr->Glob_scope()->Prim_type(PRIMITIVE_TYPE::INT_U32);
     NODE_PTR new_scale = cntr->New_intconst(u32_type, child0_scale, spos);
@@ -432,8 +444,6 @@ void CKKS_SCALE_MANAGER::Handle_encode_in_bin_arith_node(
 
   // 2. handle scale get from child0
   AIR_ASSERT(scale->Opcode() == OPC_SCALE);
-  NODE_PTR child0 = bin_node->Child(0);
-  AIR_ASSERT(ana_ctx->Lower_ctx()->Is_cipher_type(child0->Rtype_id()));
   if (!child0->Is_ld() || !child0->Has_sym()) {
     PREG_PTR preg        = cntr->Parent_func_scope()->New_preg(child0->Rtype());
     STMT_PTR stp_child0  = cntr->New_stp(child0, preg, spos);
@@ -451,19 +461,22 @@ void CKKS_SCALE_MANAGER::Handle_encode_in_bin_arith_node(
   }
   // reset scale and level nodes of encode
   child0 = bin_node->Child(0);
-  CKKS_GEN       ckks_gen(cntr, ana_ctx->Lower_ctx());
-  const uint32_t level_child_id = 3;
   if (child0->Opcode() == air::core::OPC_LD) {
     ADDR_DATUM_PTR cipher_var = child0->Addr_datum();
     scale->Set_child(0, cntr->New_ld(cipher_var, spos));
-    NODE_PTR new_level = ckks_gen.Gen_get_level(cntr->New_ld(cipher_var, spos));
-    encode_node->Set_child(level_child_id, new_level);
+    if (!preserve_explicit_level) {
+      NODE_PTR new_level =
+          ckks_gen.Gen_get_level(cntr->New_ld(cipher_var, spos));
+      encode_node->Set_child(level_child_id, new_level);
+    }
   } else if (child0->Opcode() == air::core::OPC_LDP) {
     PREG_PTR cipher_var = child0->Preg();
     scale->Set_child(0, cntr->New_ldp(cipher_var, spos));
-    NODE_PTR new_level =
-        ckks_gen.Gen_get_level(cntr->New_ldp(cipher_var, spos));
-    encode_node->Set_child(level_child_id, new_level);
+    if (!preserve_explicit_level) {
+      NODE_PTR new_level =
+          ckks_gen.Gen_get_level(cntr->New_ldp(cipher_var, spos));
+      encode_node->Set_child(level_child_id, new_level);
+    }
   }
 }
 
