@@ -86,10 +86,69 @@ def _env_timeout_sec(name: str, default: int) -> int:
         return default
     return val if val > 0 else default
 
+
+def _gen_bootstrap_wrapper_code():
+    return """//-*-c-*-
+#include <stdio.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "rt_ant/rt_ant.h"
+#include "ckks/ciphertext.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern CIPHERTEXT bootstrap_full(CIPHERTEXT p0, CIPHERTEXT p1);
+
+DATA_SCHEME* Get_encode_scheme(int idx) {
+  static MAP_DESC desc_0[] = { {NORMAL, 0, 0, 0, 0} };
+  static MAP_DESC desc_1[] = { {NORMAL, 0, 0, 0, 0} };
+  static DATA_SCHEME scheme_0 = { "p0", {1, 1, 1, 8}, 1, desc_0 };
+  static DATA_SCHEME scheme_1 = { "p1", {1, 1, 1, 8}, 1, desc_1 };
+  static DATA_SCHEME* scheme[] = { &scheme_0, &scheme_1 };
+  if (idx < 0 || idx >= 2) {
+    return NULL;
+  }
+  return scheme[idx];
+}
+
+DATA_SCHEME* Get_decode_scheme(int idx) {
+  static MAP_DESC desc[] = { {NORMAL, 0, 0, 0, 0} };
+  static DATA_SCHEME scheme = { "output", {1, 1, 1, 8}, 1, desc };
+  (void)idx;
+  return &scheme;
+}
+
+int Get_input_count() {
+  return 2;
+}
+
+int Get_output_count() {
+  return 1;
+}
+
+bool Main_graph() {
+  CIPHERTEXT p0 = Get_input_data("p0", 0);
+  CIPHERTEXT p1 = Get_input_data("p1", 0);
+  CIPHERTEXT result;
+  memset(&result, 0, sizeof(result));
+  result = bootstrap_full(p0, p1);
+  Set_output_data("output", 0, &result);
+  return true;
+}
+
+#ifdef __cplusplus
+}
+#endif
+"""
+
 # ace_edsl and repo (ace-compiler) roots for finding rtlib
 ACE_EDSL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 REPO_ROOT = os.path.abspath(os.path.join(ACE_EDSL_DIR, ".."))
-ACE_CMPLR_DIR = os.path.join(REPO_ROOT, "ace_cmplr")
+ACE_CMPLR_DIR = os.environ.get("ACE_CMPLR_DIR", "/usr/local")
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -176,17 +235,6 @@ class TestBootstrapFull(unittest.TestCase):
         with open(BOOTSTRAP_C_FILE, "r") as f:
             gen_c = f.read()
         original_c = gen_c
-        if 'extern "C" CKKS_PARAMS* Get_context_params()' not in gen_c and "Get_context_params()" in gen_c:
-            gen_c = gen_c.replace(
-                "CKKS_PARAMS* Get_context_params() {",
-                'extern "C" CKKS_PARAMS* Get_context_params() {',
-                1,
-            )
-            gen_c = gen_c.replace(
-                "RT_DATA_INFO* Get_rt_data_info() {",
-                'extern "C" RT_DATA_INFO* Get_rt_data_info() {',
-                1,
-            )
         # Derive required rot idxs from generated Rotate calls instead of hardcoding.
         rot_idxs = set()
         for pattern in (
@@ -242,26 +290,38 @@ class TestBootstrapFull(unittest.TestCase):
         inc = ["-I", ace_cmplr_include, "-I", include_dir, "-I", ant_include_dir]
         src_to_compile = self._prepare_linkable_source(BOOTSTRAP_OUTPUT_DIR)
         ant_bootstrap_smoke_src = os.path.join(TESTS_DIR, "ant_bootstrap_smoke.cxx")
+        wrapper_src = os.path.join(BOOTSTRAP_OUTPUT_DIR, "bootstrap_full_wrapper_autogen.c")
+        with open(wrapper_src, "w") as f:
+            f.write(_gen_bootstrap_wrapper_code())
 
-        cxxflags = ["-std=gnu++17", "-O0", "-g", "-DNDEBUG", "-DRTLIB_SUPPORT_LINUX", "-fopenmp"]
-        link_cmd = (
-            ["g++", "-shared", "-fPIC"]
-            + cxxflags
-            + inc
-            + [
-                src_to_compile,
-                ant_bootstrap_smoke_src,
-                lib_ant,
-                lib_common,
-                lib_airutil,
-                "-lgmp",
-                "-lm",
-                "-lgomp",
-                "-o",
-                BOOTSTRAP_SHARED_LIB,
-            ]
-        )
+        cflags = ["-std=gnu11", "-O0", "-g", "-DNDEBUG", "-DRTLIB_SUPPORT_LINUX", "-fopenmp", "-fPIC"]
+        cxxflags = ["-std=gnu++17", "-O0", "-g", "-DNDEBUG", "-DRTLIB_SUPPORT_LINUX", "-fopenmp", "-fPIC"]
+        obj_gen = os.path.join(BOOTSTRAP_OUTPUT_DIR, "bootstrap_full_gen.o")
+        obj_wrap = os.path.join(BOOTSTRAP_OUTPUT_DIR, "bootstrap_full_wrap.o")
+        obj_smoke = os.path.join(BOOTSTRAP_OUTPUT_DIR, "ant_bootstrap_smoke.o")
+        compile_gen = ["gcc", "-c"] + cflags + inc + [src_to_compile, "-o", obj_gen]
+        compile_wrap = ["gcc", "-c"] + cflags + inc + [wrapper_src, "-o", obj_wrap]
+        compile_smoke = ["g++", "-c"] + cxxflags + inc + [ant_bootstrap_smoke_src, "-o", obj_smoke]
+        link_cmd = [
+            "g++",
+            "-shared",
+            "-fPIC",
+            obj_gen,
+            obj_wrap,
+            obj_smoke,
+            lib_ant,
+            lib_common,
+            lib_airutil,
+            "-lgmp",
+            "-lm",
+            "-lgomp",
+            "-o",
+            BOOTSTRAP_SHARED_LIB,
+        ]
         try:
+            subprocess.run(compile_gen, check=True, capture_output=True, cwd=REPO_ROOT)
+            subprocess.run(compile_wrap, check=True, capture_output=True, cwd=REPO_ROOT)
+            subprocess.run(compile_smoke, check=True, capture_output=True, cwd=REPO_ROOT)
             subprocess.run(link_cmd, check=True, capture_output=True, cwd=REPO_ROOT)
         except subprocess.CalledProcessError as e:
             self.skipTest(f"Build libbootstrap_full.so failed: {e.stderr.decode() if e.stderr else e}")
@@ -513,14 +573,19 @@ finally:
         out_dir = BOOTSTRAP_OUTPUT_DIR
         obj_gen = os.path.join(out_dir, "bootstrap_full.o")
         obj_main = os.path.join(out_dir, "bootstrap_test_main.o")
+        obj_wrap = os.path.join(out_dir, "bootstrap_full_harness_wrap.o")
         main_src = os.path.join(TESTS_DIR, "bootstrap_test_main.c")
+        wrapper_src = os.path.join(out_dir, "bootstrap_full_harness_wrapper.c")
+        with open(wrapper_src, "w") as f:
+            f.write(_gen_bootstrap_wrapper_code())
         cxxflags = ["-std=gnu++17", "-O0", "-g", "-DNDEBUG", "-DRTLIB_SUPPORT_LINUX", "-fopenmp"]
+        cflags = ["-std=gnu11", "-O0", "-g", "-DNDEBUG", "-DRTLIB_SUPPORT_LINUX", "-fopenmp"]
 
         src_to_compile = self._prepare_linkable_source(out_dir)
 
         try:
             subprocess.run(
-                ["g++", "-c"] + cxxflags + inc + [src_to_compile, "-o", obj_gen],
+                ["gcc", "-c"] + cflags + inc + [src_to_compile, "-o", obj_gen],
                 check=True,
                 capture_output=True,
                 cwd=REPO_ROOT,
@@ -536,10 +601,19 @@ finally:
             )
         except subprocess.CalledProcessError as e:
             self.skipTest(f"Compile bootstrap_test_main.c failed: {e.stderr.decode() if e.stderr else e}")
+        try:
+            subprocess.run(
+                ["gcc", "-c"] + cflags + inc + [wrapper_src, "-o", obj_wrap],
+                check=True,
+                capture_output=True,
+                cwd=REPO_ROOT,
+            )
+        except subprocess.CalledProcessError as e:
+            self.skipTest(f"Compile bootstrap harness wrapper failed: {e.stderr.decode() if e.stderr else e}")
 
         link_cmd = [
             "g++",
-            obj_gen, obj_main,
+            obj_gen, obj_main, obj_wrap,
             lib_ant, lib_common, lib_airutil,
             "-lgmp", "-lm", "-o", BOOTSTRAP_HARNESS_BIN,
             "-lgomp",
@@ -703,7 +777,7 @@ finally:
         so_path = self._build_shared_lib()
         nm_cmd = ["nm", "-D", "-C", so_path]
         nm_out = subprocess.run(nm_cmd, check=True, capture_output=True, text=True, cwd=REPO_ROOT).stdout
-        self.assertIn("bootstrap_full(", nm_out, "Expected bootstrap_full symbol in shared library")
+        self.assertRegex(nm_out, r"\bbootstrap_full\b", "Expected bootstrap_full symbol in shared library")
 
     @unittest.skipIf(
         not IMPORTS_AVAILABLE,

@@ -11,7 +11,7 @@ from typing import List, Sequence, Tuple
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 ACE_EDSL_DIR = os.path.abspath(os.path.join(TESTS_DIR, ".."))
 REPO_ROOT = os.path.abspath(os.path.join(ACE_EDSL_DIR, ".."))
-ACE_CMPLR_DIR = os.path.join(REPO_ROOT, "ace_cmplr")
+ACE_CMPLR_DIR = os.environ.get("ACE_CMPLR_DIR", "/usr/local")
 
 
 def find_rtlib_build():
