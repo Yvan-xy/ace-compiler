@@ -40,3 +40,4 @@ You should append new and important skills into the skill documents.
 - NEVER leave trailing spaces in files
 - Only use emojis if explicitly requested
 - Stop and ask if anything is unclear or a step fails
+- Your response should be clean, concise and clear
