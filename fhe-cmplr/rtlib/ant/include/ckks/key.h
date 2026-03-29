@@ -25,6 +25,9 @@ typedef PUBLIC_KEY* PUB_KEY;
 static inline uint32_t Auto_idx(int32_t rot_idx) {
   uint32_t auto_idx =
       Get_precomp_auto_idx((CKKS_KEY_GENERATOR*)Keygen(), rot_idx);
+  if (!auto_idx) {
+    fprintf(stderr, "missing automorphism index for rot_idx=%d\n", rot_idx);
+  }
   FMT_ASSERT(auto_idx, "cannot get precompute automorphism index");
   return auto_idx;
 }
