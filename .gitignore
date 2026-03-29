@@ -6,3 +6,6 @@ __pycache__
 resnet20_cifar10_pre.*
 bindings/build/
 *.so
+*.egg-info
+tmp_*/
+output/
