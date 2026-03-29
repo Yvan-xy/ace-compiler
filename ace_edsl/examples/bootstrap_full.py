@@ -81,9 +81,38 @@ LOG_SLOTS = 3  # 8 slots for demo
 NUM_SLOTS = 1 << LOG_SLOTS
 NUM_DOUBLE_ANGLE = R_UNIFORM_HW_192  # 3, matches ANT
 CHEB_COEFF_COUNT = UNIFORM_COEFF_SIZE_HW_192  # 55
-# Full-packed bootstrap branch constants for poly_degree=16384 (m=2N=32768).
-M_BY_4 = 8192
-THREE_M_BY_4 = 24576
+
+
+def _bootstrap_poly_degree() -> int:
+    """Return the poly degree used when generating bootstrap demo artifacts."""
+    raw = os.environ.get("ACE_BOOTSTRAP_POLY_DEGREE", "").strip()
+    if not raw:
+        return 16384
+    try:
+        degree = int(raw)
+    except ValueError:
+        return 16384
+    return degree if degree > 0 else 16384
+
+
+def _bootstrap_m_by_4() -> int:
+    return _bootstrap_poly_degree() // 2
+
+
+def _bootstrap_three_m_by_4() -> int:
+    return (_bootstrap_poly_degree() * 3) // 2
+
+
+def _skip_preprocessor(func):
+    """Mark a kernel to bypass AST preprocessing.
+
+    bootstrap_full contains ordinary Python mode-selection branches. The AST
+    preprocessor currently rewrites those branches in a way that collapses the
+    primitive path back to `ct.bootstrap()`. Skipping preprocessing for this
+    kernel preserves the real decomposition body during AIR tracing.
+    """
+    func._ace_skip_preprocessor = True
+    return func
 
 
 def _bootstrap_impl_mode() -> str:
@@ -115,6 +144,19 @@ def _bootstrap_mul_level() -> int:
     return 26
 
 
+def _bootstrap_input_level() -> int:
+    """Return the configured CKKS input ciphertext level for the demo."""
+    raw = os.environ.get("ACE_BOOTSTRAP_INPUT_LEVEL", "").strip()
+    if not raw:
+        # Bootstrap should consume a low-level ciphertext by default.
+        return 1
+    try:
+        lvl = int(raw)
+    except ValueError:
+        return 0
+    return lvl if lvl >= 0 else 0
+
+
 def _identity_bootstrap_cleartext_reference(values):
     """Cleartext model for message-preserving bootstrap paths (rtlib mode only)."""
     return [float(v) for v in values]
@@ -131,17 +173,27 @@ def bootstrap_full_python_reference(values):
     return [math.sin(8.0 * float(v)) for v in values]  # fallback
 
 
+def _coerce_numeric(value):
+    """Preserve complex values for cleartext bootstrap simulation."""
+    if isinstance(value, complex):
+        return value
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return complex(float(value[0]), float(value[1]))
+    return complex(float(value), 0.0)
+
+
 class _ClearSlots:
     """Minimal cleartext vector type to run the kernel body in pure Python."""
 
     def __init__(self, vals):
-        self.vals = [float(v) for v in vals]
+        self.vals = [_coerce_numeric(v) for v in vals]
 
     def _binary(self, other, op):
         if isinstance(other, _ClearSlots):
             assert len(self.vals) == len(other.vals)
             return _ClearSlots([op(a, b) for a, b in zip(self.vals, other.vals)])
-        return _ClearSlots([op(a, float(other)) for a in self.vals])
+        scalar = _coerce_numeric(other)
+        return _ClearSlots([op(a, scalar) for a in self.vals])
 
     def rotate(self, k):
         n = len(self.vals)
@@ -155,8 +207,7 @@ class _ClearSlots:
         return _ClearSlots(self.vals)
 
     def conjugate(self):
-        # Demo uses real-valued slots; conjugation is identity.
-        return _ClearSlots(self.vals)
+        return _ClearSlots([v.conjugate() for v in self.vals])
 
     def mul_mono(self, power):
         # Match current primitive rewrite surrogate in this demo.
@@ -214,7 +265,8 @@ class _ClearSlots:
     __rmul__ = __mul__
 
     def __rsub__(self, other):
-        return _ClearSlots([float(other) - a for a in self.vals])
+        scalar = _coerce_numeric(other)
+        return _ClearSlots([scalar - a for a in self.vals])
 
 
 def bootstrap_full_python_dsl_reference(values):
@@ -229,7 +281,13 @@ def bootstrap_full_python_dsl_reference(values):
     args = [ct, zero, 1.0] + coeffs + da_scalars + [float(BOOTSTRAP_POST_SCALE)]
     out = kernel_body(*args)
     if isinstance(out, _ClearSlots):
-        return out.vals
+        normalized = []
+        for v in out.vals:
+            if isinstance(v, complex) and abs(v.imag) < 1e-9:
+                normalized.append(float(v.real))
+            else:
+                normalized.append(v)
+        return normalized
     raise TypeError("bootstrap_full_python_dsl_reference expected _ClearSlots output")
 
 
@@ -249,6 +307,7 @@ def _bootstrap_extended_prelude(ct):
 # =============================================================================
 
 @ckks_kernel
+@_skip_preprocessor
 def bootstrap_full(
     ct: CkksCiphertext,
     zero: CkksCiphertext,
@@ -337,6 +396,7 @@ def bootstrap_full(
             from ace_edsl.edsl.core.bootstrap_decomposition import (
                 fullpacked_bootstrap_primitive,
             )
+            x_in = ct.raise_mod(_bootstrap_mul_level() + 1)
             # Convert post_scale to float for the decomposition.
             # During cleartext execution it's already a float;
             # during tracing, extract the compile-time constant.
@@ -345,9 +405,9 @@ def bootstrap_full(
             except (TypeError, ValueError):
                 ps_val = float(BOOTSTRAP_POST_SCALE)
             out = fullpacked_bootstrap_primitive(
-                ct,
-                m_by_4=M_BY_4,
-                three_m_by_4=THREE_M_BY_4,
+                x_in,
+                m_by_4=_bootstrap_m_by_4(),
+                three_m_by_4=_bootstrap_three_m_by_4(),
                 post_scale=ps_val,
             )
         else:
@@ -410,11 +470,11 @@ def run_demo():
 Bootstrap Algorithm:
 ┌─────────────────────────────────────────────────────────────────────┐
 │  primitive mode (full decomposition):                               │
-│    CoeffToSlot                 - DFT butterfly rotation pattern      │
+│    CoeffToSlot                 - U0hat diagonal linear transform     │
 │    Full-packed split           - conjugate + add/sub + mul_mono      │
 │    Dual EvalMod (PS)           - Chebyshev 55 (k=8,m=3) + 3 DA     │
 │    Recombine                   - mul_mono + add                      │
-│    SlotToCoeff                 - inverse DFT rotation pattern        │
+│    SlotToCoeff                 - U0 diagonal linear transform        │
 │    Post-scale                  - * 16 (q0/sf ratio)                  │
 │  evalmod mode:                                                      │
 │    Full-flow output            - CoeffToSlot + EvalMod + SlotToCoeff│
@@ -445,8 +505,9 @@ Key Difference from acepy:
     AceEDSL._get_dsl.cache_clear()
     
     # Execute the kernel - this triggers tracing
-    ct = CkksCiphertext(shape=(16384,), name="input_ct")
-    zero = CkksCiphertext(shape=(16384,), name="zero_ct")
+    poly_degree = _bootstrap_poly_degree()
+    ct = CkksCiphertext(shape=(poly_degree,), name="input_ct")
+    zero = CkksCiphertext(shape=(poly_degree,), name="zero_ct")
     coeffs = list(G_COEFFICIENTS_UNIFORM_HW_192)
     da_scalars = get_double_angle_scalars()
     kernel_args = [ct, zero, 1.0] + coeffs + da_scalars + [float(BOOTSTRAP_POST_SCALE)]
@@ -500,8 +561,9 @@ Key Difference from acepy:
     
     pipeline = AcePipeline(glob)
     pipeline.configure_fhe(
-        poly_degree=16384,  # N for CKKS
+        poly_degree=poly_degree,
         mul_level=_bootstrap_mul_level(),
+        input_level=_bootstrap_input_level(),
         security_level=0,  # 0 = skip validation (mul_depth=23 exceeds 128-bit limit at N=16384/32768)
         scaling_factor_bits=56,
         first_prime_bits=60,
@@ -565,11 +627,11 @@ Key Difference from acepy:
     elif impl_mode == "primitive":
         phase_summary = (
             "Bootstrap Phases (full-packed decomposition):\n"
-            f"  ├─ CoeffToSlot:  DFT butterfly ({LOG_SLOTS} layers)\n"
+            "  ├─ CoeffToSlot:  U0hat diagonal linear transform\n"
             "  ├─ Conjugate:    split real/imag + mul_mono\n"
             f"  ├─ Dual EvalMod: PS Chebyshev (k=8, m=3, deg=54) + {NUM_DOUBLE_ANGLE} DA\n"
             "  ├─ Recombine:    mul_mono + add\n"
-            f"  ├─ SlotToCoeff:  inverse DFT ({LOG_SLOTS} layers)\n"
+            "  ├─ SlotToCoeff:  U0 diagonal linear transform\n"
             f"  └─ Post-scale:   * {BOOTSTRAP_POST_SCALE}"
         )
     else:

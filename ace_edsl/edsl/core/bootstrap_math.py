@@ -14,6 +14,7 @@ from typing import List, Tuple
 # Chebyshev coefficients (UNIFORM_HW_UNDER_192, deg=54, K=32, R=3)
 # Source: fhe-cmplr/rtlib/ant/include/ckks/bootstrap.h
 # ---------------------------------------------------------------------------
+EVAL_SIN_UPPER_BOUND_K = 32
 UNIFORM_COEFF_SIZE = 55
 CHEBYSHEV_COEFFICIENTS: Tuple[float, ...] = (
     1.74551960283504837e-01, -3.43838095837535329e-02,

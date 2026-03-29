@@ -33,6 +33,9 @@ Usage (from AIRValue._bootstrap_*_primitive methods):
 """
 
 import math
+import os
+import struct
+from functools import lru_cache
 from typing import List, Optional
 
 from .bootstrap_math import (
@@ -41,6 +44,7 @@ from .bootstrap_math import (
     NUM_DOUBLE_ANGLE,
     BOOTSTRAP_POST_SCALE,
     BOOTSTRAP_POST_SCALE_DEG,
+    EVAL_SIN_UPPER_BOUND_K,
     compute_degree_ps,
     compute_chebyshev_depths,
     get_degree_from_coeffs,
@@ -96,7 +100,7 @@ def eval_chebyshev_ps(x, coeffs: Optional[List[float]] = None):
             half = t_list[i // 2 - 1]
             prod = half * half          # mul
             t_j = prod + prod           # double  (2 * T^2)
-            t_j = t_j + (-1.0)         # - 1
+            t_j = _add_const_like(t_j, -1.0)  # - 1
             t_list[j] = t_j
         elif i % 2 == 1:
             # odd, non-power-of-2
@@ -121,20 +125,25 @@ def eval_chebyshev_ps(x, coeffs: Optional[List[float]] = None):
             prod = h1 * h2
             t_j = prod + prod           # 2 * product
             if ihalf_1 == ihalf_2:
-                t_j = t_j + (-1.0)     # - 1
+                t_j = _add_const_like(t_j, -1.0)  # - 1
             else:
                 t_j = t_j - t_list[1]  # - T_2
             t_list[j] = t_j
 
     # Note (P1): Level alignment of baby-step T_i to T_k's level.
     # The rtlib (chebyshev_impl.c:611-630) mod-switches shallower T_i
-    # down to match T_k.  In the EDSL pipeline, mod_switch at the CKKS
-    # level is not supported by the scale manager (triggers "Unexpected
-    # operator: modswitch").  The pipeline's scale manager handles level
-    # differences automatically when the T_i are used in additions/
-    # multiplications during the giant-step phase.  The depth metadata
-    # is available via compute_chebyshev_depths() for future use if the
-    # pipeline adds explicit mod_switch support.
+    # down to match T_k before the giant-step phase. Without that
+    # alignment, the compiler path keeps the same values but tends to
+    # burn extra levels later when combining branches.
+    depths = compute_chebyshev_depths(k, even)
+    tk_depth = depths[k - 1]
+    for i in range(1, k):
+        if t_list[i] is None or depths[i] < 0:
+            continue
+        depth_diff = tk_depth - depths[i]
+        while depth_diff > 0:
+            t_list[i] = t_list[i].mod_switch()
+            depth_diff -= 1
 
     # ------------------------------------------------------------------
     # Step 2: doubling — T_{2k}, T_{4k}, …, T_{2^{m-1}·k}
@@ -145,7 +154,7 @@ def eval_chebyshev_ps(x, coeffs: Optional[List[float]] = None):
         prev = t2_list[i - 1]
         prod = prev * prev
         t2_i = prod + prod              # 2 * T^2
-        t2_i = t2_i + (-1.0)           # - 1
+        t2_i = _add_const_like(t2_i, -1.0)  # - 1
         t2_list[i] = t2_i
 
     # ------------------------------------------------------------------
@@ -166,13 +175,14 @@ def eval_chebyshev_ps(x, coeffs: Optional[List[float]] = None):
         f2.append(0.0)
     f2[target_len - 1] = 1.0
 
-    out = _inner_eval_chebyshev_ps(f2, k, m, t_list, t2_list, y, False)
+    out = _inner_eval_chebyshev_ps(f2, k, m, t_list, t2_list, y, False, depths)
     out = out - t2km1
 
     return out
 
 
-def _inner_eval_chebyshev_ps(coeffs, k, m, t_list, t2_list, y, in_recursion):
+def _inner_eval_chebyshev_ps(coeffs, k, m, t_list, t2_list, y, in_recursion,
+                             t_depths):
     """Recursive PS inner evaluation (mirrors Inner_eval_chebyshev_ps)."""
     k2m2k = k * (1 << (m - 1)) - k
 
@@ -206,30 +216,49 @@ def _inner_eval_chebyshev_ps(coeffs, k, m, t_list, t2_list, y, in_recursion):
     if dc >= 1:
         if dc == 1:
             q1 = divr2_q[1]
-            cu = t_list[0] * q1 if q1 != 1.0 else t_list[0]
+            cu = _mul_const_like(t_list[0], q1) if q1 != 1.0 else t_list[0]
         else:
             cu = _eval_linear_wsum(t_list, divr2_q[1: dc + 1])
-        cu = cu + (divr2_q[0] / 2.0)
+        cu = _add_const_like(cu, divr2_q[0] / 2.0)
         flag_c = True
 
     # Evaluate qu
     if get_degree_from_coeffs(div_q) > k:
-        qu = _inner_eval_chebyshev_ps(div_q, k, m - 1, t_list, t2_list, y, True)
+        qu = _inner_eval_chebyshev_ps(
+            div_q, k, m - 1, t_list, t2_list, y, True, t_depths
+        )
     else:
         qu = _eval_quot_or_rem(t_list, div_q, k, True, in_recursion)
 
     # Evaluate su
     if get_degree_from_coeffs(s2) > k:
-        su = _inner_eval_chebyshev_ps(s2, k, m - 1, t_list, t2_list, y, True)
+        su = _inner_eval_chebyshev_ps(
+            s2, k, m - 1, t_list, t2_list, y, True, t_depths
+        )
     else:
         su = _eval_quot_or_rem(t_list, s2, k, False, in_recursion)
 
     # Combine: (T_{2^{m-1}·k} + cu) * qu + su
     t2_m_1 = t2_list[m - 1]
     if flag_c:
+        target_depth = t_depths[k - 1] + (m - 1)
+        if dc == 1:
+            cu_depth = t_depths[0] + (1 if divr2_q[1] != 1.0 else 0)
+        else:
+            used_depths = [
+                t_depths[idx]
+                for idx, coeff in enumerate(divr2_q[1: dc + 1])
+                if coeff != 0.0 and idx < len(t_depths) and t_depths[idx] >= 0
+            ]
+            cu_depth = (max(used_depths) if used_depths else t_depths[0]) + 1
+        depth_diff = target_depth - cu_depth
+        while depth_diff > 0:
+            cu = cu.mod_switch()
+            depth_diff -= 1
+    if flag_c:
         combined = t2_m_1 + cu
     else:
-        combined = t2_m_1 + (divr2_q[0] / 2.0)
+        combined = _add_const_like(t2_m_1, divr2_q[0] / 2.0)
 
     out = combined * qu
     out = out + su
@@ -240,9 +269,9 @@ def _eval_linear_wsum(t_list, weights):
     """Weighted sum: sum weights[i] * t_list[i] (mul_const + accumulate).
 
     Note (P0a): The rtlib rescales the accumulated result here
-    (chebyshev_impl.c:309).  In the EDSL pipeline the scale manager
-    auto-inserts rescales after each mul_const, so no explicit rescale
-    is needed.
+    (chebyshev_impl.c:309). We leave the rescale placement to the CKKS
+    scale manager because forcing an explicit rescale here conflicts with
+    the current compiler pass ordering.
     """
     result = None
     for i, w in enumerate(weights):
@@ -250,7 +279,7 @@ def _eval_linear_wsum(t_list, weights):
             continue
         if i >= len(t_list) or t_list[i] is None:
             continue
-        term = t_list[i] * w if w != 1.0 else t_list[i]
+        term = _mul_const_like(t_list[i], w)
         if result is None:
             result = term
         else:
@@ -300,7 +329,7 @@ def _eval_quot_or_rem(t_list, quot_rem, k, is_quotient, in_recursion):
             out = t_k_1
 
     # free term (c0/2)
-    out = out + (qr[0] / 2.0)
+    out = _add_const_like(out, qr[0] / 2.0)
     return out
 
 
@@ -322,7 +351,7 @@ def apply_double_angle(x, num_iter: int = NUM_DOUBLE_ANGLE,
     for j in range(num_iter):
         x = x * x          # x^2
         x = x + x          # 2x^2
-        x = x + scalars[j] # + scalar_j
+        x = _add_const_like(x, scalars[j])  # + scalar_j
     return x
 
 
@@ -355,64 +384,547 @@ def eval_mod_primitive(x):
     return eval_approx_mod(x)
 
 
-def coeffs_to_slots_primitive(x, num_slots: int = 0):
-    """CoeffToSlot decomposition for _bootstrap_coeffs_to_slots_primitive.
-
-    Emits the baby-step/giant-step rotation pattern with symbolic
-    plaintext diagonal multiplications.  For the parameterized rotation
-    pattern approach, the diagonal values are resolved at C-code runtime
-    by the bootstrap precomputation (CKKS_BTS_PRECOM).
-
-    Current implementation: raise_mod + rotation/add butterfly structure
-    matching the DFT layer count for the given slot count.
-    The rotation indices match the rtlib's Coeff_slots_transform with
-    enc_budget=1 (single level, baby-step/giant-step).
-    """
-    try:
-        x = x.raise_mod(2)
-    except (NotImplementedError, AttributeError):
-        pass
-
-    # Determine number of DFT butterfly layers from slot count.
+def _default_demo_slots(num_slots: int) -> int:
+    """Return the slot count used by the primitive bootstrap demo."""
     if num_slots > 0:
-        log_n = max(1, int(math.log2(num_slots)))
+        return int(num_slots)
+    raw = os.environ.get("ACE_BOOTSTRAP_POLY_DEGREE", "").strip()
+    if raw:
+        try:
+            degree = int(raw)
+            if degree > 0:
+                return degree // 2
+        except ValueError:
+            pass
+    # Default to the full-packed slot count for the example's N=16384 context.
+    return 8192
+
+
+def _primitive_transform_levels():
+    """Return demo encode levels for CoeffToSlot and SlotToCoeff.
+
+    Mirror the current bootstrap demo configuration:
+      mul_level ~= ACE_BOOTSTRAP_MUL_LEVEL (default 26)
+      enc_budget = 3
+      dec_budget = 3
+      approx_mod_depth = 9  (UNIFORM_HW_192 path: PS depth 6 + 3 double-angle)
+    """
+    raw = os.environ.get("ACE_BOOTSTRAP_MUL_LEVEL", "").strip()
+    try:
+        mul_level = int(raw) if raw else 26
+    except ValueError:
+        mul_level = 26
+
+    level_0 = mul_level + 1
+    enc_budget = 3
+    dec_budget = 3
+    approx_mod_depth = 9
+    bts_depth = approx_mod_depth + enc_budget + dec_budget
+
+    enc_level = max(1, level_0 - enc_budget)
+    dec_level = max(1, level_0 - bts_depth)
+    return enc_level, dec_level
+
+
+def _bootstrap_const_level() -> int:
+    """Use the high bootstrap plaintext level for scalar constants too."""
+    enc_level, _ = _primitive_transform_levels()
+    return enc_level
+
+
+def _coeffs_to_slots_factor(slots: int) -> float:
+    """Return the full-packed normalization used by rtlib CoeffToSlot.
+
+    rtlib scales the full-packed CoeffToSlot matrices by:
+      1 / ring_degree / K / (q0 / sf)
+
+    For the full-packed path, slots = ring_degree / 2.
+    """
+    ring_degree = slots * 2
+    return 1.0 / ring_degree / EVAL_SIN_UPPER_BOUND_K / float(BOOTSTRAP_POST_SCALE)
+
+
+def _bootstrap_num_p(slots: int) -> int:
+    """Return the rtlib p-prime count for the current demo/bootstrap context."""
+    if slots >= 32768:
+        return 11
+    return 9
+
+
+def _reduce_rotation(index: int, slots: int) -> int:
+    """Match rtlib Reduce_rotation for power-of-two slot counts."""
+    return int(index) % int(slots)
+
+
+def _select_layers(log_slots: int, budget: int):
+    """Python port of rtlib Select_layers."""
+    layers = math.ceil(log_slots / budget)
+    rows = log_slots // layers
+    rem = log_slots % layers
+    dim = rows + (1 if rem != 0 else 0)
+
+    if dim < budget:
+        layers -= 1
+        rows = log_slots // layers
+        rem = log_slots - rows * layers
+        dim = rows + (1 if rem != 0 else 0)
+        while dim != budget:
+            rows -= 1
+            rem = log_slots - rows * layers
+            dim = rows + (1 if rem != 0 else 0)
+
+    return (layers, rows, rem)
+
+
+def _get_colls_fft_params(slots: int, level_budget: int = 3, dim1: int = 0):
+    """Python port of rtlib Get_colls_fft_params."""
+    log_slots = int(math.log2(slots))
+    layers_coll, _, rem_coll = _select_layers(log_slots, level_budget)
+    flag_rem = 0 if rem_coll == 0 else 1
+
+    num_rot = (1 << (layers_coll + 1)) - 1
+    num_rot_rem = (1 << (rem_coll + 1)) - 1
+
+    if dim1 == 0 or dim1 > num_rot:
+        if num_rot > 7:
+            g = 1 << (layers_coll // 2 + 2)
+        else:
+            g = 1 << (layers_coll // 2 + 1)
     else:
-        log_n = 3  # default demo: 8 slots
+        g = dim1
+    b = (num_rot + 1) // g
 
-    # Baby-step/giant-step rotation pattern.
-    # For each DFT layer i (0..log_n-1), emit rotation by 2^i and
-    # accumulate via plaintext diagonal multiplication.
-    # This is the structural skeleton; actual diagonal values come from
-    # the runtime precomputation of the DFT encoding matrix.
-    for i in range(log_n - 1, -1, -1):
-        rot_amount = 1 << i
-        rotated = x.rotate(rot_amount)
-        # In the rtlib, each rotation result is multiplied by a precomputed
-        # plaintext diagonal and accumulated.  In this decomposition we
-        # emit the rotation + add structure.  The plaintext diagonal
-        # multiplication is implicit (would be encoded into the rotated
-        # ciphertext via the key-switching mechanism).
-        x = x + rotated
+    b_rem = 0
+    g_rem = 0
+    if flag_rem:
+        if num_rot_rem > 7:
+            g_rem = 1 << (rem_coll // 2 + 2)
+        else:
+            g_rem = 1 << (rem_coll // 2 + 1)
+        b_rem = (num_rot_rem + 1) // g_rem
 
-    return x
+    return {
+        "level_budget": level_budget,
+        "layers_coll": layers_coll,
+        "rem_coll": rem_coll,
+        "flag_rem": flag_rem,
+        "num_rot": num_rot,
+        "b": b,
+        "g": g,
+        "num_rot_rem": num_rot_rem,
+        "b_rem": b_rem,
+        "g_rem": g_rem,
+    }
+
+
+@lru_cache(maxsize=None)
+def _bootstrap_rot_group(slots: int):
+    slots4 = 4 * slots
+    rot_group = []
+    five_pow = 1
+    for _ in range(slots):
+        rot_group.append(five_pow)
+        five_pow = (five_pow * 5) % slots4
+    return tuple(rot_group)
+
+
+@lru_cache(maxsize=None)
+def _bootstrap_ksi_pows(slots: int):
+    slots4 = 4 * slots
+    vals = []
+    for idx in range(slots4):
+        angle = 2.0 * math.pi * idx / slots4
+        vals.append(complex(math.cos(angle), math.sin(angle)))
+    vals.append(vals[0])
+    return tuple(vals)
+
+
+def _coeff_one_level(slots: int, encoding: bool):
+    """Port of rtlib Coeff_enc_one_level / Coeff_dec_one_level for full-packed mode."""
+    ksipows = _bootstrap_ksi_pows(slots)
+    rot_group = _bootstrap_rot_group(slots)
+    dim = len(ksipows) - 1
+    log_slots = int(math.log2(slots))
+    coeff = [[0j] * slots for _ in range(3 * log_slots)]
+
+    m = slots
+    while m > 1:
+        s = int(math.log2(m)) - 1
+        coeff_s = coeff[s]
+        coeff_logslots = coeff[s + log_slots]
+        coeff_2logslots = coeff[s + 2 * log_slots]
+        for k in range(0, slots, m):
+            lenh = m >> 1
+            lenq = m << 2
+            for j in range(lenh):
+                if encoding:
+                    j_twiddle = (lenq - rot_group[j] % lenq) * (dim // lenq)
+                    w = ksipows[j_twiddle]
+                    coeff_logslots[j + k] = 1
+                    coeff_2logslots[j + k] = 1
+                    coeff_logslots[j + k + lenh] = -w
+                    coeff_s[j + k + lenh] = w
+                else:
+                    j_twiddle = (rot_group[j] % lenq) * (dim // lenq)
+                    w = ksipows[j_twiddle]
+                    coeff_logslots[j + k] = 1
+                    coeff_2logslots[j + k] = w
+                    coeff_logslots[j + k + lenh] = -w
+                    coeff_s[j + k + lenh] = 1
+        m >>= 1
+
+    return coeff
+
+
+@lru_cache(maxsize=None)
+def _coeff_collapse(slots: int, level_budget: int, encoding: bool):
+    """Python port of rtlib Coeff_collapse for full-packed mode (flag=False)."""
+    params = _get_colls_fft_params(slots, level_budget)
+    layers_coll = params["layers_coll"]
+    rem_coll = params["rem_coll"]
+    flag_rem = params["flag_rem"]
+    num_rot = params["num_rot"]
+    num_rot_rem = params["num_rot_rem"]
+    dim_coll = level_budget
+    log_slots = int(math.log2(slots))
+    coeff1 = _coeff_one_level(slots, encoding)
+
+    coeff = []
+    for s in range(dim_coll):
+        if flag_rem:
+            after_remainder = (encoding and s >= 1) or ((not encoding) and s < level_budget - 1)
+            stage_num_rot = num_rot if after_remainder else num_rot_rem
+        else:
+            stage_num_rot = num_rot
+        coeff.append([[0j] * slots for _ in range(stage_num_rot)])
+
+    for s in range(dim_coll):
+        top = (
+            log_slots - (dim_coll - 1 - s) * layers_coll - 1
+            if encoding
+            else s * layers_coll
+        )
+        is_rem = flag_rem and ((encoding and s == 0) or ((not encoding) and s == dim_coll - 1))
+        end_l = rem_coll if is_rem else layers_coll
+
+        for l in range(end_l):
+            if l == 0:
+                coeff[s][0] = list(coeff1[top])
+                coeff[s][1] = list(coeff1[top + log_slots])
+                coeff[s][2] = list(coeff1[top + 2 * log_slots])
+                continue
+
+            coeff_temp = [[0j] * slots for _ in range(len(coeff[s]))]
+            if encoding:
+                t = 0
+                for u in range((1 << (l + 1)) - 1):
+                    temp_u = coeff[s][u]
+                    for k in range(slots):
+                        rot_idx = _reduce_rotation(k - (1 << (top - l)), slots)
+                        rot_idx2 = _reduce_rotation(k + (1 << (top - l)), slots)
+                        coeff_temp[u + t][k] += coeff1[top - l][k] * temp_u[rot_idx]
+                        coeff_temp[u + t + 1][k] += coeff1[top - l + log_slots][k] * temp_u[k]
+                        coeff_temp[u + t + 2][k] += coeff1[top - l + 2 * log_slots][k] * temp_u[rot_idx2]
+                    t += 1
+            else:
+                width = (1 << (l + 1)) - 1
+                for u in range(width):
+                    temp_u = coeff[s][u]
+                    for k in range(slots):
+                        coeff_temp[u][k] += coeff1[top + l][k] * temp_u[k]
+                        coeff_temp[u + (1 << l)][k] += coeff1[top + l + log_slots][k] * temp_u[k]
+                        coeff_temp[u + (1 << (l + 1))][k] += coeff1[top + l + 2 * log_slots][k] * temp_u[k]
+            coeff[s] = coeff_temp
+
+    return tuple(tuple(tuple(row) for row in stage) for stage in coeff)
+
+
+def _collapsed_fft_stage_plan(slots: int, encoding: bool, level_budget: int = 3):
+    """Return direct stage plans equivalent to rtlib Rotate_precomp for full-packed mode."""
+    params = _get_colls_fft_params(slots, level_budget)
+    coeff = _coeff_collapse(slots, level_budget, encoding)
+    enc_level, dec_level = _primitive_transform_levels()
+
+    # Distribute the CoeffToSlot factor across the collapsed stages exactly like
+    # rtlib Coeffs2slots_precomp.
+    encode_stage_factor = _coeffs_to_slots_factor(slots) ** (1.0 / level_budget)
+    stages = []
+
+    if encoding:
+        start = 1 if params["flag_rem"] else 0
+        end = level_budget
+        for s in range(end - 1, start - 1, -1):
+            shift = 1 << ((s - params["flag_rem"]) * params["layers_coll"] + params["rem_coll"])
+            stages.append({
+                "s": s,
+                "num_rot": params["num_rot"],
+                "shift": shift,
+                # Rotate_precomp computes enc_level = level + 1.
+                "plain_level": enc_level + 1 + s,
+                "diag_scale": encode_stage_factor,
+            })
+        if params["flag_rem"]:
+            stages.append({
+                "s": 0,
+                "num_rot": params["num_rot_rem"],
+                "shift": 1,
+                "plain_level": enc_level + 1,
+                "diag_scale": encode_stage_factor,
+            })
+    else:
+        for s in range(0, level_budget - params["flag_rem"]):
+            shift = 1 << (s * params["layers_coll"])
+            stages.append({
+                "s": s,
+                "num_rot": params["num_rot"],
+                "shift": shift,
+                # Rotate_precomp computes dec_level = level + level_budget.
+                "plain_level": dec_level + level_budget - s,
+                "diag_scale": 1.0,
+            })
+        if params["flag_rem"]:
+            s = level_budget - 1
+            stages.append({
+                "s": s,
+                "num_rot": params["num_rot_rem"],
+                "shift": 1 << (s * params["layers_coll"]),
+                "plain_level": dec_level + 1,
+                "diag_scale": 1.0,
+            })
+
+    return coeff, stages
+
+
+def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
+    """Apply the full-packed collapsed-FFT transform with CKKS ops."""
+    coeff, stages = _collapsed_fft_stage_plan(slots, encoding)
+
+    # Cleartext fallback: bootstrap is message-preserving, so use identity.
+    if not hasattr(x, "container"):
+        return x.__class__(x.vals)
+
+    result = x
+    for stage in stages:
+        s = stage["s"]
+        num_rot = stage["num_rot"]
+        shift = stage["shift"]
+        plain_level = stage["plain_level"]
+        diag_scale = stage["diag_scale"]
+        mid = (num_rot + 1) // 2
+        stage_acc = None
+        for dim2 in range(num_rot):
+            rot = _reduce_rotation((dim2 - mid + 1) * shift, slots)
+            rotated = result if rot == 0 else result.rotate(rot)
+            diag = coeff[s][dim2]
+            if diag_scale != 1.0:
+                diag = [val * diag_scale for val in diag]
+            plain = _encode_plain_vector_like(
+                x, diag, scale_degree=1, level=plain_level
+            )
+            term = rotated * plain
+            stage_acc = term if stage_acc is None else stage_acc + term
+        result = stage_acc
+    return result
+
+
+def _sample_indices(length: int):
+    candidates = [0, 1, 2, length // 2, length - 1]
+    seen = []
+    for idx in candidates:
+        if 0 <= idx < length and idx not in seen:
+            seen.append(idx)
+    return seen
+
+
+def _fnv1a64_bytes(data: bytes) -> int:
+    h = 0xCBF29CE484222325
+    for b in data:
+        h ^= b
+        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def _digest_complex_row(row) -> str:
+    payload = bytearray()
+    for val in row:
+        payload.extend(struct.pack("<dd", float(val.real), float(val.imag)))
+    return f"{_fnv1a64_bytes(payload):016x}"
+
+
+def _complex_pair(val):
+    return [float(val.real), float(val.imag)]
+
+
+def _summarize_coeff_collapse(coeff):
+    stage_summaries = []
+    for stage_idx, stage in enumerate(coeff):
+        rows = []
+        for row_idx, row in enumerate(stage):
+            sample_idxs = _sample_indices(len(row))
+            rows.append(
+                {
+                    "row": row_idx,
+                    "digest": _digest_complex_row(row),
+                    "samples": {
+                        str(idx): _complex_pair(row[idx]) for idx in sample_idxs
+                    },
+                }
+            )
+        stage_summaries.append(
+            {
+                "stage": stage_idx,
+                "rows": rows,
+            }
+        )
+    return stage_summaries
+
+
+def get_bootstrap_precompute_summary(slots: int, level_budget: int = 3):
+    """Return a compact summary of the full-packed collapsed-FFT precompute."""
+    enc_params = _get_colls_fft_params(slots, level_budget)
+    dec_params = _get_colls_fft_params(slots, level_budget)
+    enc_coeff = _coeff_collapse(slots, level_budget, True)
+    dec_coeff = _coeff_collapse(slots, level_budget, False)
+    return {
+        "slots": int(slots),
+        "level_budget": int(level_budget),
+        "encode_params": enc_params,
+        "decode_params": dec_params,
+        "encode_coeff_collapse": _summarize_coeff_collapse(enc_coeff),
+        "decode_coeff_collapse": _summarize_coeff_collapse(dec_coeff),
+    }
+
+
+@lru_cache(maxsize=None)
+def _bootstrap_u0_matrices(slots: int):
+    """Build U0 and conj(U0^T) used by the runtime linear transform path."""
+    slots4 = 4 * slots
+    rot_group = []
+    five_pow = 1
+    for _ in range(slots):
+        rot_group.append(five_pow)
+        five_pow = (five_pow * 5) % slots4
+
+    u0 = []
+    for row in range(slots):
+        row_vals = []
+        rot = rot_group[row]
+        for col in range(slots):
+            angle = 2.0 * math.pi * ((col * rot) % slots4) / slots4
+            row_vals.append(complex(math.cos(angle), math.sin(angle)))
+        u0.append(tuple(row_vals))
+
+    u0 = tuple(u0)
+    u0hat_t = tuple(
+        tuple(complex(u0[col][row].real, -u0[col][row].imag) for col in range(slots))
+        for row in range(slots)
+    )
+    return u0, u0hat_t
+
+
+def _encode_plain_vector_like(x, values, scale_degree: int = 1, level: int = 0):
+    """Encode a complex plaintext vector as a CKKS plaintext AIRValue."""
+    if not hasattr(x, "container"):
+        return x.__class__(values)
+
+    from .air_value import AIRValue
+
+    container = x.container
+    array_node = container.new_array_const(list(values))
+    num_p = _bootstrap_num_p(len(values))
+    if hasattr(container, "new_ckks_encode_complex"):
+        plain_node = container.new_ckks_encode_complex(
+            array_node, len(values), scale_degree, level, num_p
+        )
+    else:
+        plain_node = container.new_ckks_encode(
+            array_node, len(values), scale_degree, level
+        )
+    return AIRValue(plain_node, container, domain=getattr(x, "domain", None))
+
+
+def _encode_scalar_like(x, value, scale_degree: int = 1, level: int = 0):
+    """Encode a scalar as CKKS plaintext with explicit level/scale."""
+    if not hasattr(x, "container"):
+        return value
+
+    from .air_value import AIRValue
+
+    container = x.container
+    if isinstance(value, int):
+        const_node = container.new_intconst(int(value))
+    else:
+        const_node = container.new_floatconst(float(value))
+    plain_node = container.new_ckks_encode(const_node, 1, scale_degree, level)
+    return AIRValue(plain_node, container, domain=getattr(x, "domain", None))
+
+
+def _add_const_like(x, value):
+    if not hasattr(x, "container"):
+        return x + value
+    return x + _encode_scalar_like(x, value, scale_degree=1, level=_bootstrap_const_level())
+
+
+def _mul_const_like(x, value):
+    if not hasattr(x, "container"):
+        return x * value
+    return x * _encode_scalar_like(x, value, scale_degree=1, level=_bootstrap_const_level())
+
+
+def _matrix_diag(matrix, shift: int):
+    """Return the diagonal used with a positive left rotate by `shift`."""
+    slots = len(matrix)
+    return [matrix[row][(row + shift) % slots] for row in range(slots)]
+
+
+def _linear_transform_matrix(x, matrix, encode_level: int = 0):
+    """Apply a direct diagonal linear transform."""
+    slots = len(matrix)
+
+    # Cleartext fallback: use exact matrix-vector multiplication.
+    if not hasattr(x, "container"):
+        out = []
+        for row in range(slots):
+            acc = 0j
+            for col in range(slots):
+                acc += matrix[row][col] * x.vals[col]
+            out.append(acc)
+        return x.__class__(out)
+
+    result = None
+    for shift in range(slots):
+        rotated = x if shift == 0 else x.rotate(shift)
+        plain = _encode_plain_vector_like(
+            x, _matrix_diag(matrix, shift), scale_degree=1, level=encode_level
+        )
+        term = rotated * plain
+        result = term if result is None else result + term
+    return result
+
+
+def _mul_by_power_of_two(x, value: float):
+    """Multiply by an exact power of two using ciphertext doubling only."""
+    ivalue = int(round(float(value)))
+    if ivalue <= 0 or ivalue & (ivalue - 1):
+        return x * value
+
+    out = x
+    doublings = int(math.log2(ivalue))
+    for _ in range(doublings):
+        out = out + out
+    return out
+
+
+def coeffs_to_slots_primitive(x, num_slots: int = 0):
+    """CoeffToSlot decomposition using full-packed collapsed FFT semantics."""
+    slots = _default_demo_slots(num_slots)
+    return _apply_collapsed_fft_transform(x, slots, encoding=True)
 
 
 def slots_to_coeffs_primitive(x, num_slots: int = 0):
-    """SlotToCoeff decomposition for _bootstrap_slots_to_coeffs_primitive.
-
-    Inverse DFT butterfly structure (reversed rotation direction).
-    """
-    if num_slots > 0:
-        log_n = max(1, int(math.log2(num_slots)))
-    else:
-        log_n = 3
-
-    for i in range(log_n):
-        rot_amount = -(1 << i)
-        rotated = x.rotate(rot_amount)
-        x = x + rotated
-
-    return x
+    """SlotToCoeff decomposition using full-packed collapsed FFT semantics."""
+    slots = _default_demo_slots(num_slots)
+    return _apply_collapsed_fft_transform(x, slots, encoding=False)
 
 
 def fullpacked_bootstrap_primitive(ct, m_by_4: int = 8192,
@@ -448,12 +960,16 @@ def fullpacked_bootstrap_primitive(ct, m_by_4: int = 8192,
     Returns:
         AIRValue -- bootstrapped ciphertext.
     """
+    if not hasattr(ct, "container"):
+        # Cleartext fallback: bootstrap is message-preserving.
+        return ct.__class__(ct.vals)
+
     if post_scale is None:
         post_scale = float(BOOTSTRAP_POST_SCALE)
     deg = BOOTSTRAP_POST_SCALE_DEG
 
     # Step 1: CoeffToSlot
-    enc = coeffs_to_slots_primitive(ct, num_slots=0)
+    enc = coeffs_to_slots_primitive(ct, num_slots=m_by_4)
 
     # Step 2: Conjugate split (full-packed)
     conj = enc.conjugate()
@@ -470,7 +986,7 @@ def fullpacked_bootstrap_primitive(ct, m_by_4: int = 8192,
     combined = real_evmod + imag_evmod
 
     # Step 5: SlotToCoeff
-    out = slots_to_coeffs_primitive(combined, num_slots=0)
+    out = slots_to_coeffs_primitive(combined, num_slots=m_by_4)
 
     # Step 6: Post-processing (P2)
     if clear_imag and deg >= 1:
@@ -478,9 +994,9 @@ def fullpacked_bootstrap_primitive(ct, m_by_4: int = 8192,
         out_conj = out.conjugate()
         out = out + out_conj
         scale_val = float(2 ** (deg - 1))
-        out = out * scale_val
+        out = _mul_by_power_of_two(out, scale_val)
     else:
         # Standard post-scale: out = out * 2^deg
-        out = out * post_scale
+        out = _mul_by_power_of_two(out, post_scale)
 
     return out

@@ -52,7 +52,8 @@ def _make_kernel_decorator(domain: str):
                 dsl = _get_ace_edsl()
                 frame = inspect.currentframe().f_back.f_back  # Skip _make_kernel_decorator and decorator frames
                 dsl.frame = frame
-                if dsl.enable_preprocessor:
+                skip_preprocessor = getattr(f, "_ace_skip_preprocessor", False)
+                if dsl.enable_preprocessor and not skip_preprocessor:
                     import os
                     if os.environ.get('ACE_DEBUG_PREPROCESS'):
                         print(f"[DEBUG] Running preprocessor for {f.__name__}...")

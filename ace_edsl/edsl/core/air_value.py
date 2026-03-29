@@ -273,9 +273,12 @@ class AIRValue:
     
     def __mul__(self, other: Any) -> 'AIRValue':
         """Emit AIR multiply operation: a * b → container.new_mul()
-        
-        For CKKS domain, multiplication doubles the scale, so we insert
-        a rescale operation after the multiply to bring the scale back down.
+
+        For CKKS domain, emit only the multiply node. Rescale placement is
+        delegated to the CKKS scale manager unless the caller explicitly emits
+        `.rescale()`. Inserting `new_ckks_rescale()` here conflicts with the
+        primitive bootstrap decomposition, which relies on the pipeline to
+        manage scale and level transitions.
         """
         self._set_loc()
         other_node = self._get_other_node(other)
@@ -283,10 +286,6 @@ class AIRValue:
         self_node = self.value
         if self._domain == "fhe::ckks" and hasattr(self._container, 'new_ckks_mul'):
             result_node = self._container.new_ckks_mul(self_node, other_node)
-            # In CKKS, multiplication doubles the scale (scale × scale = scale²)
-            # Insert rescale to bring scale back to original level
-            if hasattr(self._container, 'new_ckks_rescale'):
-                result_node = self._container.new_ckks_rescale(result_node)
         elif self._domain == "fhe::sihe" and hasattr(self._container, 'new_sihe_mul'):
             result_node = self._container.new_sihe_mul(self_node, other_node)
         elif self._domain == "nn::core" and hasattr(self._container, 'new_nn_mul'):
