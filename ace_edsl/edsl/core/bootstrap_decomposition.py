@@ -402,7 +402,7 @@ def _primitive_transform_levels():
       mul_level ~= ACE_BOOTSTRAP_MUL_LEVEL (default 26)
       enc_budget = 3
       dec_budget = 3
-      approx_mod_depth = 9  (UNIFORM_HW_192 path: PS depth 6 + 3 double-angle)
+      approx_mod_depth = PS depth + NUM_DOUBLE_ANGLE
     """
     raw = os.environ.get("ACE_BOOTSTRAP_MUL_LEVEL", "").strip()
     try:
@@ -410,10 +410,14 @@ def _primitive_transform_levels():
     except ValueError:
         mul_level = 26
 
-    level_0 = mul_level
+    # The primitive path raises the ciphertext to the full available tower
+    # before CoeffToSlot, so the transform planning must use that raised level.
+    level_0 = mul_level + 1
     enc_budget = 3
     dec_budget = 3
-    approx_mod_depth = 9
+    chebyshev_degree = get_degree_from_coeffs(list(CHEBYSHEV_COEFFICIENTS))
+    ps_k, ps_m = compute_degree_ps(chebyshev_degree)
+    approx_mod_depth = int(math.ceil(math.log2(ps_k))) + ps_m + NUM_DOUBLE_ANGLE
     bts_depth = approx_mod_depth + enc_budget + dec_budget
 
     enc_level = max(1, level_0 - enc_budget)
@@ -1005,8 +1009,8 @@ def slots_to_coeffs_primitive(x, num_slots: int = 0):
     return _apply_collapsed_fft_transform(x, slots, encoding=False)
 
 
-def fullpacked_bootstrap_primitive(ct, m_by_4: int = 8192,
-                                   three_m_by_4: int = 24576,
+def fullpacked_bootstrap_primitive(ct, m_by_4: Optional[int] = None,
+                                   three_m_by_4: Optional[int] = None,
                                    post_scale: float = None,
                                    clear_imag: bool = False):
     """Full-packed bootstrap branch decomposition.
@@ -1030,8 +1034,9 @@ def fullpacked_bootstrap_primitive(ct, m_by_4: int = 8192,
 
     Args:
         ct: AIRValue ciphertext to bootstrap.
-        m_by_4: m/4 = ring_degree/2 (default 8192 for N=16384).
-        three_m_by_4: 3m/4 (default 24576).
+        m_by_4: m/4 = ring_degree/2. If omitted, derive from the active
+            bootstrap slot count.
+        three_m_by_4: 3m/4. If omitted, derive from `m_by_4`.
         post_scale: Post-scale value (default: BOOTSTRAP_POST_SCALE).
         clear_imag: If True, use conjugate-based imag clearing (P2).
 
@@ -1042,6 +1047,10 @@ def fullpacked_bootstrap_primitive(ct, m_by_4: int = 8192,
         # Cleartext fallback: bootstrap is message-preserving.
         return ct.__class__(ct.vals)
 
+    if m_by_4 is None:
+        m_by_4 = _default_demo_slots(0)
+    if three_m_by_4 is None:
+        three_m_by_4 = 3 * m_by_4
     if post_scale is None:
         post_scale = float(BOOTSTRAP_POST_SCALE)
     deg = BOOTSTRAP_POST_SCALE_DEG

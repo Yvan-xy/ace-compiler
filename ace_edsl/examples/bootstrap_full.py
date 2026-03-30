@@ -355,7 +355,8 @@ def bootstrap_full(
         from ace_edsl.edsl.core.bootstrap_decomposition import (
             fullpacked_bootstrap_primitive,
         )
-        x_in = ct.raise_mod(_bootstrap_mul_level())
+        # Raise to the full available tower before the staged bootstrap flow.
+        x_in = ct.raise_mod(_bootstrap_mul_level() + 1)
         try:
             ps_val = float(post_scale)
         except (TypeError, ValueError):
