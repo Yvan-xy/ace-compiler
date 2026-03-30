@@ -1119,20 +1119,22 @@ void Transform_value_to_rns_poly(POLY poly, VALUE_LIST* value,
                                  bool without_mod) {
   CRT_CONTEXT* crt   = Get_crt_context();
   size_t       q_cnt = Poly_level(poly);
+  size_t       p_cnt = Num_p(poly);
   IS_TRUE(LIST_LEN(value) == Get_rdgree(poly) && q_cnt <= Get_crt_num_q(crt),
           "length not match");
   Transform_to_dcrt(Get_poly_coeffs(poly), Get_poly_len(poly), value, q_cnt,
-                    Num_p(poly) ? true : false, without_mod, crt);
+                    p_cnt, without_mod, crt);
 }
 
 void Reconstruct_rns_poly_to_value(VALUE_LIST* res, POLY poly) {
   IS_TRUE(!Is_ntt(poly), "rns_poly should be intt-form");
   size_t       q_cnt = Poly_level(poly);
+  size_t       p_cnt = Num_p(poly);
   CRT_CONTEXT* crt   = Get_crt_context();
   IS_TRUE(LIST_LEN(res) == Get_rdgree(poly) && q_cnt <= Get_crt_num_q(crt),
           "length not match");
   Reconstruct_from_dcrt(res, Get_poly_coeffs(poly), Get_poly_len(poly), q_cnt,
-                        Num_p(poly) ? true : false, crt);
+                        p_cnt, crt);
 }
 
 void Sample_uniform_poly(POLY poly) {

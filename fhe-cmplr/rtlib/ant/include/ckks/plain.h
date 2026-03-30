@@ -45,6 +45,11 @@ void Encode_dcmplx(PLAIN plain, DCMPLX* input, size_t len, uint32_t sc_degree,
 void Encode_dcmplx_ext(PLAIN plain, DCMPLX* input, size_t len, uint32_t level,
                        uint32_t p_cnt);
 
+//! @brief Serialize an extended complex plaintext into a plain buffer.
+struct PLAINTEXT_BUFFER* Encode_dcmplx_ext_buffer(const void* input, size_t len,
+                                                  uint32_t level,
+                                                  uint32_t p_cnt);
+
 //! @brief Encode plaintext for mask with float value
 //! @param len length of non-zero values in mask vector
 //! @param level level of plaintext: num of q primes

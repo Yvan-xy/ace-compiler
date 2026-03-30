@@ -184,6 +184,15 @@ static inline uint64_t Get_plaintext_length(uint32_t level) {
   return sizeof(PLAINTEXT) + sizeof(uint64_t) * degree * num_primes;
 }
 
+static inline uint64_t Get_plaintext_length_ext(uint32_t level,
+                                                uint32_t p_cnt) {
+  CKKS_PARAMETER* param      = (CKKS_PARAMETER*)Param();
+  uint32_t        degree     = param->_poly_degree;
+  uint32_t        num_primes = (level > 0) ? level : param->_num_primes;
+  return sizeof(PLAINTEXT) +
+         sizeof(uint64_t) * degree * (num_primes + p_cnt);
+}
+
 struct PLAINTEXT_BUFFER* Encode_plain_buffer(const float* input, size_t len,
                                              uint32_t sc_degree,
                                              uint32_t level) {
@@ -203,6 +212,47 @@ struct PLAINTEXT_BUFFER* Encode_plain_buffer(const float* input, size_t len,
   pt->_poly._data = (int64_t*)((char*)buf + sizeof(struct PLAINTEXT_BUFFER) +
                                sizeof(PLAINTEXT));
   Encode_float(pt, (float*)input, len, sc_degree, level);
+  pt->_poly._data = NULL;
+  return buf;
+}
+
+struct PLAINTEXT_BUFFER* Encode_dcmplx_ext_buffer(const void* input, size_t len,
+                                                  uint32_t level,
+                                                  uint32_t p_cnt) {
+  uint32_t active_p_cnt = (uint32_t)Get_p_cnt();
+  FMT_ASSERT(
+      p_cnt == 0 || p_cnt <= active_p_cnt,
+      "Encode_dcmplx_ext_buffer p_cnt exceeds active encode-context p count");
+  size_t                   pt_len = Get_plaintext_length_ext(level, p_cnt);
+  struct PLAINTEXT_BUFFER* buf    = (struct PLAINTEXT_BUFFER*)malloc(
+      sizeof(struct PLAINTEXT_BUFFER) + pt_len);
+  IS_TRUE(buf != NULL, "Failed to malloc sizeofPLAINTEXT_BUFFER");
+  memcpy(buf->_magic, PT_BUFFER_MAGIC, sizeof(buf->_magic));
+  buf->_version = RT_VERSION_FULL;
+  buf->_size    = pt_len;
+  memset(buf->_data, 0, pt_len);
+
+  CKKS_PARAMETER* param = (CKKS_PARAMETER*)Param();
+  PLAINTEXT*      pt    = (PLAINTEXT*)buf->_data;
+  pt->_poly._ring_degree      = param->_poly_degree;
+  pt->_poly._num_primes       = (level > 0) ? level : param->_num_primes;
+  pt->_poly._num_primes_p     = p_cnt;
+  pt->_poly._num_alloc_primes = pt->_poly._num_primes + p_cnt;
+  pt->_poly._data = (int64_t*)((char*)buf + sizeof(struct PLAINTEXT_BUFFER) +
+                               sizeof(PLAINTEXT));
+
+  VALUE_LIST* input_vec = Alloc_value_list(DCMPLX_TYPE, len);
+  const double* vals = (const double*)input;
+  FOR_ALL_ELEM(input_vec, idx) {
+    double real = vals[idx * 2];
+    double imag = vals[idx * 2 + 1];
+    DCMPLX_VALUE_AT(input_vec, idx) = real + imag * I;
+  }
+  Encode_ext_at_level(pt, (CKKS_ENCODER*)Context->_encoder, input_vec, level,
+                      0 /* default slots */, p_cnt);
+  Append_weight_plain((CKKS_ENCODER*)Context->_encoder, Get_plain_mem_size(pt));
+  Free_value_list(input_vec);
+
   pt->_poly._data = NULL;
   return buf;
 }
@@ -269,7 +319,7 @@ bool Compare_plain_buffer(const struct PLAINTEXT_BUFFER* pb_x,
 }
 
 uint64_t Max_plain_buffer_length() {
-  return sizeof(struct PLAINTEXT_BUFFER) + Get_plaintext_length(0);
+  return sizeof(struct PLAINTEXT_BUFFER) + Get_plaintext_length_ext(0, Get_p_cnt());
 }
 
 L_POLY Lpoly_from_plain(PLAIN plain, size_t idx) {
