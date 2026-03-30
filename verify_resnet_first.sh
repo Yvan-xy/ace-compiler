@@ -31,11 +31,12 @@ fi
 
 (
   cd "${ACE_EDSL_DIR}/examples"
-  PYTHONPATH="${ACE_EDSL_DIR}:${APP_ROOT}" \
-  python3 "${BOOTSTRAP_UTILS_PY}" generate-demo \
-    --impl primitive \
-    --poly-degree 65536 \
-    --mul-level 30
+PYTHONPATH="${ACE_EDSL_DIR}:${APP_ROOT}" \
+ACE_CT_ENCODE_DEPTH=30 \
+python3 "${BOOTSTRAP_UTILS_PY}" generate-demo \
+  --impl primitive \
+  --poly-degree 65536 \
+  --mul-level 30
 )
 
 if [[ ! -f "${BOOTSTRAP_GEN_C}" ]]; then
@@ -200,94 +201,8 @@ python3 "${BOOTSTRAP_UTILS_PY}" emit-body \
   --bootstrap-c "${BOOTSTRAP_GEN_C}" \
   --output "${DSL_BOOTSTRAP_BODY_C}"
 
-cat > "${DSL_BOOTSTRAP_SHIM_C}" <<'EOF'
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <time.h>
-
-#include "ckks/cipher.h"
-#include "ckks/ciphertext.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-CIPHERTEXT dsl_bootstrap_full(CIPHERTEXT p0, CIPHERTEXT p1);
-
-static unsigned long g_dsl_bts_call_counter = 0;
-
-static double dsl_bts_now_sec(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
-
-static void dsl_bts_dump_first_output(CIPHER ciph) {
-  uint32_t dump_len = Get_ciph_slots(ciph);
-  if (dump_len > 8) {
-    dump_len = 8;
-  }
-  Print_cipher_msg_with_imag(stderr, "dsl_bts_round1", ciph, dump_len);
-  fflush(stderr);
-}
-
-static void dsl_bts_maybe_stop_after_first_dump(void) {
-  const char* flag = getenv("ACE_STOP_AFTER_FIRST_BTS");
-  if (flag != NULL && flag[0] != '\0' && strcmp(flag, "0") != 0) {
-    fprintf(stderr, "[dsl_bts] stopping after first bootstrap dump\n");
-    fflush(stderr);
-    _Exit(0);
-  }
-}
-
-CIPHER Eval_bootstrap_ciph_dsl(CIPHER res, CIPHER ciph,
-                               uint32_t level_after_bts,
-                               uint32_t num_slots) {
-  unsigned long call_id = __sync_add_and_fetch(&g_dsl_bts_call_counter, 1);
-  double t0 = dsl_bts_now_sec();
-  fprintf(stderr,
-          "[dsl_bts] begin call=%lu target_level=%u num_slots=%u "
-          "in_level=%zu in_sfdeg=%u in_slots=%u\n",
-          call_id, level_after_bts, num_slots, Level(ciph), Sc_degree(ciph),
-          Get_ciph_slots(ciph));
-
-  CIPHERTEXT in_copy;
-  memset(&in_copy, 0, sizeof(in_copy));
-  Copy_ciphertext(&in_copy, ciph);
-
-  CIPHERTEXT out = dsl_bootstrap_full(in_copy, in_copy);
-  if (level_after_bts != 0) {
-    while (Level(&out) > level_after_bts) {
-      Modswitch_ciph(&out);
-    }
-  }
-  fprintf(stderr,
-          "[dsl_bts] end   call=%lu out_level=%zu out_sfdeg=%u out_slots=%u "
-          "elapsed=%.3fs\n",
-          call_id, Level(&out), Sc_degree(&out), Get_ciph_slots(&out),
-          dsl_bts_now_sec() - t0);
-  if (call_id == 1) {
-    dsl_bts_dump_first_output(&out);
-    dsl_bts_maybe_stop_after_first_dump();
-  }
-
-  Free_poly_data(Get_c0(&in_copy));
-  Free_poly_data(Get_c1(&in_copy));
-
-  if (res == ciph) {
-    Free_poly_data(Get_c0(res));
-    Free_poly_data(Get_c1(res));
-  }
-
-  *res = out;
-  return res;
-}
-
-#ifdef __cplusplus
-}
-#endif
-EOF
+python3 "${BOOTSTRAP_UTILS_PY}" emit-shim \
+  --output "${DSL_BOOTSTRAP_SHIM_C}"
 
 COMMON_FLAGS=(
   -DRTLIB_SUPPORT_LINUX
@@ -336,7 +251,8 @@ BASE_LOG="${WORK_DIR}/baseline.log"
 DSL_LOG="${WORK_DIR}/dsl.log"
 
 "${BASE_BIN}" /app/dataset/test_batch.bin 0 > "${BASE_LOG}" 2>&1
-"${DSL_BIN}" /app/dataset/test_batch.bin 0 > "${DSL_LOG}" 2>&1
+env RTLIB_DISABLE_BOOTSTRAP_PRECOM=1 \
+  "${DSL_BIN}" /app/dataset/test_batch.bin 0 > "${DSL_LOG}" 2>&1
 
 echo "=== BASELINE FIRST BOOTSTRAP ==="
 grep -E '^\[base_bts\]|^\[base_bts_round1\]' "${BASE_LOG}" || true

@@ -8,6 +8,7 @@ import importlib
 import os
 import re
 import sys
+import textwrap
 from pathlib import Path
 
 
@@ -133,10 +134,7 @@ def emit_body(args: argparse.Namespace) -> int:
     out_lines: list[str] = []
 
     def starts_wrapper(line: str) -> bool:
-        return (
-            line.startswith("CKKS_PARAMS* Get_context_params()")
-            or line.startswith("RT_DATA_INFO* Get_rt_data_info()")
-        )
+        return line.startswith("CKKS_PARAMS* Get_context_params()")
 
     with src_path.open("r", encoding="utf-8") as source:
         for line in source:
@@ -150,13 +148,239 @@ def emit_body(args: argparse.Namespace) -> int:
                     skip = False
                 continue
             line = re.sub(r"\bbootstrap_full\b", args.entry_name, line)
+            line = re.sub(r"\bGet_rt_data_info\b", args.rtdata_name, line)
+            line = re.sub(r"\bPt_from_msg\b", args.pt_from_msg_name, line)
             line = re.sub(r"\bRotate\b", args.rotate_name, line)
             line = re.sub(r"\bRelinearize\b", args.relin_name, line)
             line = re.sub(r"\b(_cst_\d+)\b", rf"{args.const_prefix}\1", line)
             out_lines.append(line)
 
     body = _patch_zero_rotate_fast_path("".join(out_lines))
+    pt_decl = (
+        f'void* {args.pt_from_msg_name}(void* pt, uint32_t index, size_t len, '
+        f'uint32_t scale, uint32_t level);\n'
+    )
+    if pt_decl not in body:
+        include_line = '#include "rt_ant/rt_ant.h"\n'
+        body = body.replace(include_line, include_line + "\n" + pt_decl, 1)
+
     dst_path.write_text(body, encoding="utf-8")
+    return 0
+
+
+def emit_shim(args: argparse.Namespace) -> int:
+    dst_path = Path(args.output)
+    source = textwrap.dedent(
+        f"""\
+        #include <stdlib.h>
+        #include <stdio.h>
+        #include <string.h>
+        #include <time.h>
+        #include <fcntl.h>
+        #include <unistd.h>
+
+        #include "ckks/cipher.h"
+        #include "ckks/ciphertext.h"
+        #include "common/rt_api.h"
+        #include "fhe/core/rt_data_def.h"
+        #include "fhe/core/rt_encode_api.h"
+
+        #ifdef __cplusplus
+        extern "C" {{
+        #endif
+
+        CIPHERTEXT {args.entry_name}(CIPHERTEXT p0, CIPHERTEXT p1);
+        RT_DATA_INFO* {args.rtdata_name}(void);
+        PLAIN {args.pt_from_msg_name}(void* pt, uint32_t index, size_t len,
+                                      uint32_t scale, uint32_t level);
+
+        static unsigned long g_dsl_bts_call_counter = 0;
+
+        static double dsl_bts_now_sec(void) {{
+          struct timespec ts;
+          clock_gettime(CLOCK_MONOTONIC, &ts);
+          return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+        }}
+
+        static void dsl_bts_dump_first_output(CIPHER ciph) {{
+          uint32_t dump_len = Get_ciph_slots(ciph);
+          if (dump_len > 8) {{
+            dump_len = 8;
+          }}
+          Print_cipher_msg_with_imag(stderr, "{args.dump_label}", ciph, dump_len);
+          fflush(stderr);
+        }}
+
+        static void dsl_bts_maybe_stop_after_first_dump(void) {{
+          const char* flag = getenv("ACE_STOP_AFTER_FIRST_BTS");
+          if (flag != NULL && flag[0] != '\\0' && strcmp(flag, "0") != 0) {{
+            fprintf(stderr, "[{args.log_prefix}] stopping after first bootstrap dump\\n");
+            fflush(stderr);
+            _Exit(0);
+          }}
+        }}
+
+        typedef struct {{
+          int fd;
+          struct DATA_FILE_HDR hdr;
+          struct DATA_LUT_ENTRY* lut;
+          char* slot_buf;
+          uint64_t slot_size;
+          uint32_t slot_count;
+          int initialized;
+        }} DSL_BTS_PT_FILE;
+
+        static DSL_BTS_PT_FILE g_dsl_bts_pt = {{-1, {{0}}, NULL, NULL, 0, 0, 0}};
+
+        static void dsl_bts_pt_fini(void) {{
+          if (!g_dsl_bts_pt.initialized) {{
+            return;
+          }}
+          if (g_dsl_bts_pt.fd >= 0) {{
+            close(g_dsl_bts_pt.fd);
+          }}
+          free(g_dsl_bts_pt.lut);
+          free(g_dsl_bts_pt.slot_buf);
+          g_dsl_bts_pt.fd = -1;
+          g_dsl_bts_pt.lut = NULL;
+          g_dsl_bts_pt.slot_buf = NULL;
+          g_dsl_bts_pt.slot_size = 0;
+          g_dsl_bts_pt.slot_count = 0;
+          g_dsl_bts_pt.initialized = 0;
+        }}
+
+        static void dsl_bts_pt_init(void) {{
+          if (g_dsl_bts_pt.initialized) {{
+            return;
+          }}
+          RT_DATA_INFO* info = {args.rtdata_name}();
+          if (info == NULL || info->_file_name == NULL || info->_file_name[0] == '\\0') {{
+            fprintf(stderr, "[{args.log_prefix}] missing bootstrap rt data info\\n");
+            fflush(stderr);
+            abort();
+          }}
+          g_dsl_bts_pt.fd = open(info->_file_name, O_RDONLY);
+          if (g_dsl_bts_pt.fd < 0) {{
+            perror("[{args.log_prefix}] open bootstrap plaintext file");
+            abort();
+          }}
+          ssize_t ret = pread(g_dsl_bts_pt.fd, &g_dsl_bts_pt.hdr,
+                              sizeof(struct DATA_FILE_HDR), 0);
+          if (ret != (ssize_t)sizeof(struct DATA_FILE_HDR)) {{
+            fprintf(stderr, "[{args.log_prefix}] failed to read bootstrap plaintext header\\n");
+            fflush(stderr);
+            abort();
+          }}
+          uint64_t lut_size =
+              sizeof(struct DATA_LUT_ENTRY) * g_dsl_bts_pt.hdr._ent_count;
+          g_dsl_bts_pt.lut = (struct DATA_LUT_ENTRY*)malloc(lut_size);
+          if (g_dsl_bts_pt.lut == NULL) {{
+            fprintf(stderr, "[{args.log_prefix}] failed to allocate bootstrap LUT\\n");
+            fflush(stderr);
+            abort();
+          }}
+          ret = pread(g_dsl_bts_pt.fd, g_dsl_bts_pt.lut, lut_size,
+                      g_dsl_bts_pt.hdr._lut_ofst);
+          if (ret != (ssize_t)lut_size) {{
+            fprintf(stderr, "[{args.log_prefix}] failed to read bootstrap LUT\\n");
+            fflush(stderr);
+            abort();
+          }}
+          g_dsl_bts_pt.slot_count = (uint32_t)g_dsl_bts_pt.hdr._ent_count;
+          const char* env = getenv("PT_ENTRY_COUNT");
+          if (env != NULL && env[0] != '\\0') {{
+            unsigned long val = strtoul(env, NULL, 10);
+            if (val > 0) {{
+              g_dsl_bts_pt.slot_count = (uint32_t)val;
+            }}
+          }}
+          g_dsl_bts_pt.slot_size = Max_plain_buffer_length();
+          g_dsl_bts_pt.slot_buf =
+              (char*)malloc(g_dsl_bts_pt.slot_size * g_dsl_bts_pt.slot_count);
+          if (g_dsl_bts_pt.slot_buf == NULL) {{
+            fprintf(stderr, "[{args.log_prefix}] failed to allocate bootstrap plaintext cache\\n");
+            fflush(stderr);
+            abort();
+          }}
+          g_dsl_bts_pt.initialized = 1;
+          atexit(dsl_bts_pt_fini);
+        }}
+
+        PLAIN {args.pt_from_msg_name}(void* pt, uint32_t index, size_t len,
+                                      uint32_t scale, uint32_t level) {{
+          (void)pt;
+          (void)len;
+          (void)scale;
+          (void)level;
+          dsl_bts_pt_init();
+          if (index >= g_dsl_bts_pt.hdr._ent_count) {{
+            fprintf(stderr, "[{args.log_prefix}] bootstrap plaintext index out of range: %u\\n", index);
+            fflush(stderr);
+            abort();
+          }}
+          uint32_t slot = index % g_dsl_bts_pt.slot_count;
+          char* slot_ptr = g_dsl_bts_pt.slot_buf + slot * g_dsl_bts_pt.slot_size;
+          struct DATA_LUT_ENTRY* lut = &g_dsl_bts_pt.lut[index];
+          ssize_t ret = pread(g_dsl_bts_pt.fd, slot_ptr, lut->_size, lut->_ent_ofst);
+          if (ret != (ssize_t)lut->_size) {{
+            fprintf(stderr, "[{args.log_prefix}] failed to read bootstrap plaintext entry %u\\n", index);
+            fflush(stderr);
+            abort();
+          }}
+          return (PLAIN)Cast_buffer_to_plain((struct PLAINTEXT_BUFFER*)slot_ptr);
+        }}
+
+        CIPHER {args.bootstrap_call_name}(CIPHER res, CIPHER ciph,
+                                          uint32_t level_after_bts,
+                                          uint32_t num_slots) {{
+          unsigned long call_id = __sync_add_and_fetch(&g_dsl_bts_call_counter, 1);
+          size_t in_level = Level(ciph);
+          uint32_t in_sfdeg = Sc_degree(ciph);
+          uint32_t in_slots = Get_ciph_slots(ciph);
+          double t0 = dsl_bts_now_sec();
+          fprintf(stderr,
+                  "[{args.log_prefix}] begin call=%lu target_level=%u num_slots=%u "
+                  "in_level=%zu in_sfdeg=%u in_slots=%u\\n",
+                  call_id, level_after_bts, num_slots, in_level, in_sfdeg, in_slots);
+
+          CIPHERTEXT in_copy;
+          memset(&in_copy, 0, sizeof(in_copy));
+          Copy_ciphertext(&in_copy, ciph);
+
+          CIPHERTEXT out = {args.entry_name}(in_copy, in_copy);
+          if (level_after_bts != 0) {{
+            while (Level(&out) > level_after_bts) {{
+              Modswitch_ciph(&out);
+            }}
+          }}
+          double elapsed = dsl_bts_now_sec() - t0;
+          fprintf(stderr,
+                  "[{args.log_prefix}] end   call=%lu out_level=%zu out_sfdeg=%u out_slots=%u "
+                  "elapsed=%.3fs\\n",
+                  call_id, Level(&out), Sc_degree(&out), Get_ciph_slots(&out), elapsed);
+          if (call_id == 1) {{
+            dsl_bts_dump_first_output(&out);
+            dsl_bts_maybe_stop_after_first_dump();
+          }}
+
+          Free_poly_data(Get_c0(&in_copy));
+          Free_poly_data(Get_c1(&in_copy));
+
+          if (res == ciph) {{
+            Free_poly_data(Get_c0(res));
+            Free_poly_data(Get_c1(res));
+          }}
+
+          *res = out;
+          return res;
+        }}
+
+        #ifdef __cplusplus
+        }}
+        #endif
+        """
+    )
+    dst_path.write_text(source, encoding="utf-8")
     return 0
 
 
@@ -179,10 +403,22 @@ def build_parser() -> argparse.ArgumentParser:
     emit.add_argument("--bootstrap-c", required=True)
     emit.add_argument("--output", required=True)
     emit.add_argument("--entry-name", default="dsl_bootstrap_full")
+    emit.add_argument("--rtdata-name", default="dsl_bootstrap_get_rt_data_info")
+    emit.add_argument("--pt-from-msg-name", default="dsl_bts_Pt_from_msg")
     emit.add_argument("--rotate-name", default="dsl_bts_Rotate")
     emit.add_argument("--relin-name", default="dsl_bts_Relinearize")
     emit.add_argument("--const-prefix", default="dsl_bts")
     emit.set_defaults(func=emit_body)
+
+    shim = subparsers.add_parser("emit-shim")
+    shim.add_argument("--output", required=True)
+    shim.add_argument("--entry-name", default="dsl_bootstrap_full")
+    shim.add_argument("--rtdata-name", default="dsl_bootstrap_get_rt_data_info")
+    shim.add_argument("--pt-from-msg-name", default="dsl_bts_Pt_from_msg")
+    shim.add_argument("--bootstrap-call-name", default="Eval_bootstrap_ciph_dsl")
+    shim.add_argument("--log-prefix", default="dsl_bts")
+    shim.add_argument("--dump-label", default="dsl_bts_round1")
+    shim.set_defaults(func=emit_shim)
 
     return parser
 

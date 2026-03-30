@@ -75,9 +75,15 @@ void Prepare_context() {
   Context->_decryptor     = (PTR_TY)decryptor;
   Context->_evaluator     = (PTR_TY)evaluator;
 
-  // generate bootstrap precom for default slots
-  uint32_t default_slots = ctx_param->_poly_degree / 2;
-  Bootstrap_precom(default_slots);
+  // Skip runtime bootstrap precompute when the generated program does not use
+  // rtlib bootstrap entry points. This is useful for the decomposition-based
+  // DSL path, which has its own explicit bootstrap body.
+  const char* disable_bts_precom = getenv("RTLIB_DISABLE_BOOTSTRAP_PRECOM");
+  if (!(disable_bts_precom != NULL && disable_bts_precom[0] != '\0' &&
+        disable_bts_precom[0] != '0')) {
+    uint32_t default_slots = ctx_param->_poly_degree / 2;
+    Bootstrap_precom(default_slots);
+  }
 
   RT_DATA_INFO* data_info = Get_rt_data_info();
   if (data_info != NULL) {
