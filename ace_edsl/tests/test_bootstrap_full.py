@@ -408,10 +408,20 @@ finally:
     lib.Finalize_context()
 """
         capi_timeout = _env_timeout_sec("ACE_BOOTSTRAP_CAPI_TIMEOUT_SEC", 180)
+        child_env = os.environ.copy()
+        if child_env.get("ACE_BOOTSTRAP_CT_ENCODE", "").strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "off",
+            "no",
+        ):
+            child_env.setdefault("PT_ENTRY_COUNT", "512")
         try:
             result = subprocess.run(
                 [sys.executable, "-c", child_code],
                 cwd=REPO_ROOT,
+                env=child_env,
                 capture_output=True,
                 text=True,
                 timeout=capi_timeout,
