@@ -263,9 +263,9 @@ public:
     IR2C_CTX& ctx = visitor->Context();
     ctx << "Dot_prod(";
     air::base::NODE_PTR parent = ctx.Parent(1);
-    if (parent != air::base::Null_ptr && parent->Is_preg_op()) {
+    if (parent != air::base::Null_ptr) {
       ctx << "&";
-      ctx.Emit_preg_id(parent->Preg_id());
+      Emit_sym(ctx, parent);
       ctx << ", ";
     }
     visitor->template Visit<RETV>(node->Child(0));

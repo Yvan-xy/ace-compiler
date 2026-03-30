@@ -17,6 +17,9 @@ The optimization target is the generated primitive bootstrap used by:
 
 ## Current Performance Snapshot
 
+Unless noted otherwise, the numbers below refer to the current known-good
+optimized DSL path, not the earlier bring-up-era fully expanded 334 MB body.
+
 ### First-Bootstrap Timing
 
 Measured in `ace-compiler-dev` using the first-bootstrap-only path.
@@ -24,45 +27,72 @@ Measured in `ace-compiler-dev` using the first-bootstrap-only path.
 - Runtime rtlib bootstrap:
   - about `28.241s`
 - DSL primitive bootstrap:
-  - about `203.140s`
+  - non-`ct_encode`: about `92s` to `104s`
+  - `ct_encode`:
+    - previous validated baseline: `92.088s`
+    - current validated result after the latest collapsed-FFT BSGS retune:
+      `85.313s`
 
-So the first bootstrap alone is about `7.2x` slower than rtlib.
+So the first bootstrap is still about `3.3x` slower than rtlib even after the
+previous collapsed-FFT and offline-plaintext optimizations.
+
+### Warm Standalone Bootstrap Timing
+
+Measured with a standalone warm harness that calls the generated bootstrap
+directly multiple times in one process:
+
+- harness:
+  - [bootstrap_test_main.c](/home/dyf/code/ace-compiler/ace_edsl/tests/bootstrap_test_main.c)
+- preserved generated source used for the warm probe:
+  - [bootstrap_full_link.c.inlev1.c](/home/dyf/code/ace-compiler/ace_edsl/examples/output/bootstrap_full_link.c.inlev1.c)
+
+Observed timings:
+
+- warmup call:
+  - about `25.0s`
+- subsequent measured calls:
+  - about `24.2s` to `25.5s`
+
+Practical takeaway:
+
+- the first-bootstrap gap is now heavily contaminated by one-time keygen/setup
+- the steady-state DSL bootstrap cost is still materially above the rtlib
+  baseline, but the next DSL-only optimization target should be chosen from the
+  warmed profile, not the first-call profile
 
 ### End-to-End One-Image Resnet Run
 
-Measured in `ace-compiler-dev` on one image with the primitive DSL bootstrap integrated into `resnet20_cifar10`.
+Measured in `ace-compiler-dev` on one image with the primitive DSL bootstrap
+integrated into `resnet20_cifar10`.
 
-- successful run wall time:
-  - about `73m15s`
-- executed bootstrap count:
-  - `21`
-- observed per-bootstrap elapsed times:
-  - roughly `192s` to `203s` each
+- current first-bootstrap-only integrated probe:
+  - `ACE_BOOTSTRAP_CT_ENCODE=1 ACE_STOP_AFTER_FIRST_BTS=1 bash a_dsl_bts.sh`
+  - current validated result: `85.313s`
 
 ### Generated Bootstrap Size
 
-From [bootstrap_full.c](/home/dyf/code/ace-compiler/ace_edsl/examples/output/bootstrap_full.c):
+From the current validated generated body:
+
+- [bootstrap_full.c](/home/dyf/code/ace-compiler/ace_edsl/examples/output/bootstrap_full.c)
 
 - size:
-  - about `334,608,195` bytes
+  - about `1,769,046` bytes
 - line count:
-  - about `3,129,878`
+  - about `30,083`
 
-That size alone is a warning sign:
+That is no longer the primary problem. The current gap is mostly runtime cost,
+not code size blow-up.
 
-- compile time is high
-- instruction/cache locality will be poor
-- runtime overhead from fully expanded helper calls will be high
+Historical reference:
+
+- the older fully expanded primitive body was about `334 MB` / `3.13M` lines
+- that earlier body is not the right target for the current optimization pass
 
 ## Profiling Constraints
 
-The container now has `perf` installed, but it still cannot be used for real
-sampling here:
+The container now has `perf` installed.
 
-- `perf stat` / `perf record` fail with:
-  - `No permission to enable task-clock event`
-
-The usable profiler in this environment is `gprofng`.
+The usable profiler in this environment is `gprofng` and `perf`.
 
 ## Lightweight Profiling Findings
 
@@ -78,10 +108,11 @@ because the body is hundreds of MB. So the current profiling data is based on:
 
 ### Generated C Operation Counts
 
-From [bootstrap_full.c](/home/dyf/code/ace-compiler/ace_edsl/examples/output/bootstrap_full.c):
+From the known-good optimized generated body
+[bootstrap_full.c](/home/dyf/code/ace-compiler/ace_edsl/examples/output/bootstrap_full.c):
 
-- `Rotate(`: `374`
-- `Encode_dcmplx_ext(`: `378`
+- `Rotate(`: `90`
+- `Pt_from_msg(`: `378`
 - `Init_ciph_up_scale_plain(`: `474`
 - `Init_ciph_down_scale(`: `508`
 - `Init_ciph_same_scale(`: `538`
@@ -93,7 +124,7 @@ From [bootstrap_full.c](/home/dyf/code/ace-compiler/ace_edsl/examples/output/boo
 
 From [bootstrap_full_raw.air](/home/dyf/code/ace-compiler/ace_edsl/examples/output/bootstrap_full_raw.air):
 
-- `CKKS.rotate`: `372`
+- `CKKS.rotate`: `88`
 - `CKKS.mul`: `510`
 - `CKKS.add`: `546`
 - `CKKS.sub`: `13`
@@ -170,28 +201,64 @@ Practical takeaway:
 
 - the trustworthy profile data we have today is the full-process `gprofng`
   sample plus the direct first-bootstrap wall-clock runs
-- that profile is still enough to rule out `Copy_plain` as the main hotspot
-  and to show that NTT/polynomial kernels and first-run key generation are the
-  dominant costs
+- that profile is still enough to rule out plaintext ownership as the main
+  hotspot and to show that NTT/polynomial kernels and first-run key generation
+  are the dominant costs
+
+### Warm Standalone Profile
+
+Profiler:
+
+- `gprofng collect app`
+
+Harness:
+
+- [bootstrap_test_main.c](/home/dyf/code/ace-compiler/ace_edsl/tests/bootstrap_test_main.c)
+
+Experiment:
+
+- `/app/tmp_bootstrap_warm/warm_bootstrap.er`
+
+Important caveat:
+
+- this still contains one-time `Prepare_context()` setup in the same process
+- but the per-call wall times are already flat after the warmup call, so this
+  profile is much more representative of the steady-state bootstrap body than
+  the earlier first-call process profile
+
+Top functions by sampled CPU time:
+
+- `Forward_transform`: about `31.8%` exclusive
+- `Mul_poly`: about `16.9%` inclusive
+- `Sub_poly`: about `14.4%` inclusive
+- `Add_poly`: about `3.9%` inclusive
+- `Sample_uniform`: about `16.0%` inclusive
+- `Encode_impl`: about `9.0%` inclusive
+
+Most important bootstrap-body finding:
+
+- inside `bootstrap_full`, the largest steady-state helper is now `Rotate`
+  at about `10.7%` inclusive
+- next helper costs in the bootstrap body are:
+  - `Rescale`: about `2.6%`
+  - `Encode_dcmplx_ext`: about `1.3%`
+  - `Relinearize`: about `1.3%`
+
+Practical takeaway:
+
+- for DSL-only work, the next target is not the shared rtlib rotate helper
+  implementation
+- the next target is reducing the number of emitted high-level DSL helper calls,
+  especially `Rotate`, in the decomposition schedule itself
 
 ## Main Reasons The DSL Version Is Slow
 
-### 1. Repeated Plaintext Encoding Inside Each Bootstrap Call
+### 1. Too Many High-Level Rotations In The Decomposition Schedule
 
-This is the largest expected cost.
+The warmed profile says this is now the most actionable DSL-only cost.
 
-The generated DSL bootstrap currently performs about `378` `Encode_dcmplx_ext(...)` calls per bootstrap invocation.
-
-Rtlib does not do that per bootstrap call. Rtlib computes and stores those diagonal plaintexts once in bootstrap precompute and then reuses them.
-
-Practical consequence:
-
-- the DSL version repeatedly pays FFT/encoding/preparation cost for the same diagonal data
-- rtlib amortizes that cost across all bootstrap calls
-
-### 2. Hundreds of Standalone Rotations
-
-The generated DSL bootstrap issues about `374` `Rotate(...)` calls per bootstrap.
+The generated DSL bootstrap still emits about `112` `CKKS.rotate` ops in raw
+AIR and about `92` `Rotate(...)` calls in the optimized linked body.
 
 Each one is expensive:
 
@@ -199,9 +266,11 @@ Each one is expensive:
 - key-switch work
 - modulus handling / mod-down path
 
-Rtlib’s bootstrap uses structured precompute and hoisted scheduling inside the transform implementation instead of fully materializing every rotation/plain pair as a standalone high-level step.
+The rtlib helper implementation is not the right target here because it is part
+of the baseline too. The right target is the DSL collapsed-FFT / transform
+schedule that decides how many standalone rotations are emitted.
 
-### 3. Very Heavy Scale-Management Plumbing
+### 2. Very Heavy Scale-Management Plumbing
 
 Per bootstrap call, the DSL-generated code also emits:
 
@@ -211,22 +280,69 @@ Per bootstrap call, the DSL-generated code also emits:
 
 That means the decomposition is not only doing the math itself, it is also paying a large amount of helper/setup overhead around the math.
 
-### 4. Fully Expanded Code Instead of Structured Stage Code
+### 3. NTT / Polynomial Kernels Still Dominate Leaf Runtime
 
-The generated bootstrap body is fully expanded into millions of lines of helper calls.
+The hottest leaf kernels in both the first-call and warmed profiles are:
 
-This hurts:
+- `Forward_transform`
+- `Mul_poly`
+- `Sub_poly`
+- `Add_poly`
 
-- compile time
-- icache locality
-- branch predictor friendliness
-- ability to hoist common subexpressions / repeated runtime setup
-
-Rtlib is much more compact and structured.
+That means every reduction in emitted `Rotate`, `Rescale`, `Relinearize`, or
+plaintext-encode pressure matters mainly because it reduces how often those
+kernels get called.
 
 ## Concrete Optimization Plan
 
 The order below is intentional. Each step is listed in descending expected impact.
+
+### Current DSL-Only Work Item: Retune Collapsed-FFT BSGS For Fewer Rotates
+
+Status:
+
+- implemented
+- integrated `ct_encode` first-bootstrap path revalidated
+
+What changed:
+
+- the DSL collapsed-FFT planner now chooses the giant-step width `g` by
+  minimizing the emitted high-level rotation proxy `(g - 1) + (b - 1)` instead
+  of copying the rtlib `Rotate_precomp(...)` heuristic directly
+- for the active `65536` / `32768` full-packed case, that changes each stage
+  from:
+  - `g=16, b=4`
+  to:
+  - `g=8, b=8`
+
+Why this is DSL-only:
+
+- rtlib’s heuristic is reasonable for its own hoisted/internal rotate machinery
+- the DSL path materializes each `Rotate(...)` helper explicitly, so the right
+  local objective is to reduce the number of emitted standalone rotations
+  without changing the math
+
+Preliminary result:
+
+- collapsed-FFT stage rotation proxy:
+  - before: `108`
+  - after: `84`
+- traced raw AIR:
+  - `CKKS.rotate`: `112 -> 88`
+- current validated generated C:
+  - `Rotate(`: `114 -> 90`
+- integrated `ct_encode` first-bootstrap result:
+  - before: `92.088s`
+  - after: `85.313s`
+  - improvement: `6.775s` (`7.36%`)
+
+Required follow-up fix that was needed during bring-up:
+
+- the new low-level `Dot_prod(...)` emission initially produced malformed C for
+  store destinations
+- fixed in:
+  - [ir2c_handler.h](/home/dyf/code/ace-compiler/fhe-cmplr/include/fhe/poly/ir2c_handler.h)
+  so poly2c now emits the destination argument correctly for non-preg stores
 
 ### Phase 1: Cache Encoded Diagonal Plaintexts
 

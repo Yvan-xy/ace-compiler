@@ -496,23 +496,52 @@ def _get_colls_fft_params(slots: int, level_budget: int = 3, dim1: int = 0):
     num_rot = (1 << (layers_coll + 1)) - 1
     num_rot_rem = (1 << (rem_coll + 1)) - 1
 
+    def choose_dsl_g(num_rotations: int, default_g: int) -> int:
+        """Choose a power-of-two giant step that minimizes emitted rotates.
+
+        The rtlib helper picks `g` assuming hoisted/internal fast-rotate
+        machinery. The DSL path materializes each high-level `Rotate(...)`
+        helper call, so the relevant proxy is:
+
+            nonzero fast-rotates + nonzero outer baby-step rotates
+
+        which is `(g - 1) + (b - 1)` for `b = ceil((num_rot + 1) / g)`.
+        """
+        best_g = default_g
+        target = math.sqrt(num_rotations + 1)
+        best_score = (
+            (default_g - 1) + (((num_rotations + 1 + default_g - 1) // default_g) - 1),
+            abs(default_g - target),
+            default_g,
+        )
+        max_g = num_rotations + 1
+        g = 1
+        while g <= max_g:
+            b = (num_rotations + 1 + g - 1) // g
+            score = ((g - 1) + (b - 1), abs(g - target), g)
+            if score < best_score:
+                best_score = score
+                best_g = g
+            g <<= 1
+        return best_g
+
     if dim1 == 0 or dim1 > num_rot:
         if num_rot > 7:
-            g = 1 << (layers_coll // 2 + 2)
+            g = choose_dsl_g(num_rot, 1 << (layers_coll // 2 + 2))
         else:
-            g = 1 << (layers_coll // 2 + 1)
+            g = choose_dsl_g(num_rot, 1 << (layers_coll // 2 + 1))
     else:
         g = dim1
-    b = (num_rot + 1) // g
+    b = (num_rot + 1 + g - 1) // g
 
     b_rem = 0
     g_rem = 0
     if flag_rem:
         if num_rot_rem > 7:
-            g_rem = 1 << (rem_coll // 2 + 2)
+            g_rem = choose_dsl_g(num_rot_rem, 1 << (rem_coll // 2 + 2))
         else:
-            g_rem = 1 << (rem_coll // 2 + 1)
-        b_rem = (num_rot_rem + 1) // g_rem
+            g_rem = choose_dsl_g(num_rot_rem, 1 << (rem_coll // 2 + 1))
+        b_rem = (num_rot_rem + 1 + g_rem - 1) // g_rem
 
     return {
         "level_budget": level_budget,
