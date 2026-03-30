@@ -796,7 +796,8 @@ public:
     std::shared_ptr<Node> new_ckks_encode(std::shared_ptr<Node> data,
                                           int32_t encode_len = -1,
                                           uint32_t scale_degree = 1,
-                                          uint32_t level = 0) {
+                                          uint32_t level = 0,
+                                          bool precompute_cache = false) {
         if (container && data && data->has_node && data->node != air::base::Null_ptr) {
             // Use OPC_ENCODE from ckks_opcode.h so scale manager sees same opcode (plaintext promotion)
             air::base::OPCODE op = fhe::ckks::OPC_ENCODE;
@@ -897,6 +898,10 @@ public:
             if (level != 0) {
                 n->Set_attr(fhe::core::FHE_ATTR_KIND::LEVEL, &level, 1);
             }
+            if (precompute_cache) {
+                uint32_t flag = 1;
+                n->Set_attr(fhe::core::FHE_ATTR_KIND::ENCODE_CACHE, &flag, 1);
+            }
             
             auto node = wrap_node(n, "fhe::ckks::ENCODE");
             node->add_child(data);
@@ -916,8 +921,10 @@ public:
                                                   int32_t complex_len = -1,
                                                   uint32_t scale_degree = 1,
                                                   uint32_t level = 0,
-                                                  uint32_t num_p = 0) {
-        auto encoded = new_ckks_encode(data, -1, scale_degree, level);
+                                                  uint32_t num_p = 0,
+                                                  bool precompute_cache = false) {
+        auto encoded = new_ckks_encode(
+            data, -1, scale_degree, level, precompute_cache);
         if (!(container && encoded && encoded->has_node &&
               encoded->node != air::base::Null_ptr)) {
             return encoded;
@@ -3953,6 +3960,7 @@ public:
                 // Set input file for data file header
                 p2c_config.Set_ifile(data_file.c_str());
             }
+            p2c_config._ct_encode = ct_encode;
             
             // Enable free_poly for memory management (matches native compiler)
             p2c_config._free_poly = free_poly;
@@ -5095,12 +5103,14 @@ PYBIND11_MODULE(air_builder, m) {
              py::arg("encode_len") = -1,
              py::arg("scale_degree") = 1,
              py::arg("level") = 0,
+             py::arg("precompute_cache") = false,
              "CKKS encode: encode scalar/constant into plaintext polynomial")
         .def("new_ckks_encode_complex", &Container::new_ckks_encode_complex,
              py::arg("data"), py::arg("complex_len") = -1,
              py::arg("scale_degree") = 1,
              py::arg("level") = 0,
              py::arg("num_p") = 0,
+             py::arg("precompute_cache") = false,
              "CKKS encode (complex): input is interleaved [real, imag, ...] float64 array")
         .def("new_ckks_rescale", &Container::new_ckks_rescale,
              "CKKS rescale: reduce scale after multiplication")
