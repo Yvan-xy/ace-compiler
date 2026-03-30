@@ -140,7 +140,7 @@ def _bootstrap_mul_level() -> int:
                 return lvl
         except ValueError:
             pass
-    # Default headroom for primitive/bootstrap-stage demos.
+    # Demo default matches the full available Q-level count for N=16384.
     return 26
 
 
@@ -396,7 +396,7 @@ def bootstrap_full(
             from ace_edsl.edsl.core.bootstrap_decomposition import (
                 fullpacked_bootstrap_primitive,
             )
-            x_in = ct.raise_mod(_bootstrap_mul_level() + 1)
+            x_in = ct.raise_mod(_bootstrap_mul_level())
             # Convert post_scale to float for the decomposition.
             # During cleartext execution it's already a float;
             # during tracing, extract the compile-time constant.

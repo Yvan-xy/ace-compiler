@@ -41,12 +41,49 @@ class TestBootstrapStagePlanning(unittest.TestCase):
 
         self.assertEqual(
             [stage["plain_level"] for stage in enc_stages],
-            [31, 30, 29],
+            [30, 29, 28],
         )
         self.assertEqual(
             [stage["plain_level"] for stage in dec_stages],
-            [19, 18, 17],
+            [18, 17, 16],
         )
+
+    def test_collapsed_fft_grouping_reduces_duplicate_rotations(self):
+        coeff, enc_stages = bootstrap_decomposition._collapsed_fft_stage_plan(
+            32768, True
+        )
+        grouped = [
+            bootstrap_decomposition._group_collapsed_fft_stage_terms(
+                coeff, stage, 32768
+            )
+            for stage in enc_stages
+        ]
+
+        self.assertEqual(enc_stages[0]["num_rot"], 63)
+        self.assertEqual(len(grouped[0]), 32)
+        self.assertEqual(enc_stages[1]["num_rot"], 63)
+        self.assertEqual(len(grouped[1]), 63)
+        self.assertEqual(enc_stages[2]["num_rot"], 63)
+        self.assertEqual(len(grouped[2]), 63)
+
+    def test_no_cross_stage_duplicate_plain_diags_after_grouping(self):
+        for slots in (8192, 32768):
+            for encoding in (True, False):
+                coeff, stages = bootstrap_decomposition._collapsed_fft_stage_plan(
+                    slots, encoding
+                )
+                keys = []
+                for stage in stages:
+                    for _, diag in bootstrap_decomposition._group_collapsed_fft_stage_terms(
+                        coeff, stage, slots
+                    ):
+                        keys.append(
+                            (
+                                stage["plain_level"],
+                                tuple((float(v.real), float(v.imag)) for v in diag),
+                            )
+                        )
+                self.assertEqual(len(keys), len(set(keys)))
 
 
 class TestResnetBootstrapUtils(unittest.TestCase):

@@ -410,7 +410,7 @@ def _primitive_transform_levels():
     except ValueError:
         mul_level = 26
 
-    level_0 = mul_level + 1
+    level_0 = mul_level
     enc_budget = 3
     dec_budget = 3
     approx_mod_depth = 9
@@ -661,6 +661,9 @@ def _collapsed_fft_stage_plan(slots: int, encoding: bool, level_budget: int = 3)
             stages.append({
                 "s": s,
                 "num_rot": params["num_rot"],
+                "baby_step": params["b"],
+                "giant_step": params["g"],
+                "is_remainder": False,
                 "shift": shift,
                 "plain_level": encoding_plain_level(s),
                 "diag_scale": encode_stage_factor,
@@ -669,6 +672,9 @@ def _collapsed_fft_stage_plan(slots: int, encoding: bool, level_budget: int = 3)
             stages.append({
                 "s": 0,
                 "num_rot": params["num_rot_rem"],
+                "baby_step": params["b_rem"],
+                "giant_step": params["g_rem"],
+                "is_remainder": True,
                 "shift": 1,
                 "plain_level": encoding_plain_level(0),
                 "diag_scale": encode_stage_factor,
@@ -679,6 +685,9 @@ def _collapsed_fft_stage_plan(slots: int, encoding: bool, level_budget: int = 3)
             stages.append({
                 "s": s,
                 "num_rot": params["num_rot"],
+                "baby_step": params["b"],
+                "giant_step": params["g"],
+                "is_remainder": False,
                 "shift": shift,
                 "plain_level": decoding_plain_level(s),
                 "diag_scale": 1.0,
@@ -688,12 +697,45 @@ def _collapsed_fft_stage_plan(slots: int, encoding: bool, level_budget: int = 3)
             stages.append({
                 "s": s,
                 "num_rot": params["num_rot_rem"],
+                "baby_step": params["b_rem"],
+                "giant_step": params["g_rem"],
+                "is_remainder": True,
                 "shift": 1 << (s * params["layers_coll"]),
                 "plain_level": decoding_plain_level(level_budget - 1),
                 "diag_scale": 1.0,
             })
 
     return coeff, stages
+
+
+def _group_collapsed_fft_stage_terms(coeff, stage, slots: int):
+    """Group a collapsed-FFT stage by rotation and sum diagonals per rotation."""
+    s = stage["s"]
+    num_rot = stage["num_rot"]
+    shift = stage["shift"]
+    mid = (num_rot + 1) // 2
+    grouped = {}
+    order = []
+    for dim2 in range(num_rot):
+        rot = _reduce_rotation((dim2 - mid + 1) * shift, slots)
+        diag = coeff[s][dim2]
+        accum = grouped.get(rot)
+        if accum is None:
+            grouped[rot] = list(diag)
+            order.append(rot)
+        else:
+            for idx, val in enumerate(diag):
+                accum[idx] += val
+    return [(rot, grouped[rot]) for rot in order]
+
+
+def _rotate_plain_vector(values, rotation: int):
+    """Match rtlib Rotate_vector semantics for plaintext diagonals."""
+    length = len(values)
+    rot = int(rotation) % length
+    if rot == 0:
+        return list(values)
+    return [values[(idx + rot) % length] for idx in range(length)]
 
 
 def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
@@ -708,22 +750,50 @@ def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
     for stage in stages:
         s = stage["s"]
         num_rot = stage["num_rot"]
-        shift = stage["shift"]
+        baby_step = stage["baby_step"]
+        giant_step = stage["giant_step"]
         plain_level = stage["plain_level"]
         diag_scale = stage["diag_scale"]
-        mid = (num_rot + 1) // 2
+        shift = stage["shift"]
+        rot_in = []
+        for j in range(giant_step):
+            idx = (j - ((num_rot + 1) // 2) + 1) * shift
+            rot = _reduce_rotation(idx, slots)
+            rot_in.append(rot)
+
+        fast_rot = [
+            result if rot == 0 else result.rotate(rot)
+            for rot in rot_in
+        ]
+
         stage_acc = None
-        for dim2 in range(num_rot):
-            rot = _reduce_rotation((dim2 - mid + 1) * shift, slots)
-            rotated = result if rot == 0 else result.rotate(rot)
-            diag = coeff[s][dim2]
-            if diag_scale != 1.0:
-                diag = [val * diag_scale for val in diag]
-            plain = _encode_plain_vector_like(
-                x, diag, scale_degree=1, level=plain_level
-            )
-            term = rotated * plain
-            stage_acc = term if stage_acc is None else stage_acc + term
+        for i in range(baby_step):
+            giant = giant_step * i
+            giant_rot = giant * shift
+            diag_rotation = _reduce_rotation(-giant_rot, slots)
+            inner = None
+            for j in range(giant_step):
+                dim2 = giant + j
+                if dim2 == num_rot:
+                    continue
+                diag = coeff[s][dim2]
+                if diag_scale != 1.0:
+                    diag = [val * diag_scale for val in diag]
+                if diag_rotation != 0:
+                    diag = _rotate_plain_vector(diag, diag_rotation)
+                plain = _encode_plain_vector_like(
+                    x, diag, scale_degree=1, level=plain_level
+                )
+                term = fast_rot[j] * plain
+                inner = term if inner is None else inner + term
+            if inner is None:
+                continue
+            if i == 0:
+                stage_acc = inner
+            else:
+                rot = _reduce_rotation(giant_rot, slots)
+                moved = inner if rot == 0 else inner.rotate(rot)
+                stage_acc = moved if stage_acc is None else stage_acc + moved
         result = stage_acc
     return result
 
@@ -808,11 +878,16 @@ def _encode_plain_vector_like(x, values, scale_degree: int = 1, level: int = 0):
     num_p = _bootstrap_num_p(len(values))
     if hasattr(container, "new_ckks_encode_complex"):
         plain_node = container.new_ckks_encode_complex(
-            array_node, len(values), scale_degree, level, num_p
+            array_node,
+            len(values),
+            scale_degree,
+            level,
+            num_p,
+            True,
         )
     else:
         plain_node = container.new_ckks_encode(
-            array_node, len(values), scale_degree, level
+            array_node, len(values), scale_degree, level, True
         )
     return AIRValue(plain_node, container, domain=getattr(x, "domain", None))
 
