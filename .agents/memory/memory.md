@@ -222,6 +222,144 @@
     - total wall time about `73m15s`
   - `a_dsl_bts.sh` now writes future full logs to `/app/tmp_dsl_bts_resnet20/a_dsl_bts.log`
   - the latest successful PTY result was appended there as a reconstructed result block
+  - a new optimization note now exists at `/home/dyf/code/ace-compiler/docs/opt.md`
+  - current lightweight profiling picture recorded there:
+    - rtlib first bootstrap about `28.241s`
+    - DSL first bootstrap about `203.140s`
+    - generated bootstrap body about `334 MB` / `3.13M` lines
+    - helper counts dominated by:
+      - `Rotate(`: `374`
+      - `Encode_dcmplx_ext(`: `378`
+      - `Init_ciph_up_scale_plain(`: `474`
+      - `Init_ciph_down_scale(`: `508`
+      - `Init_ciph_same_scale(`: `538`
+  - main performance conclusion:
+    - the DSL path is slow because it fully materializes the bootstrap algorithm, repeatedly re-encodes diagonal plaintexts, executes hundreds of standalone rotations, and pays a lot of helper/setup overhead that rtlib amortizes through precompute and specialized runtime code
+  - recommended optimization order in `docs/opt.md`:
+    1. cache encoded diagonal plaintexts
+    2. hoist/reuse rotations inside collapsed-FFT stages
+    3. reduce fully expanded straight-line code into more structured stage code
+  - Phase 1 is now implemented:
+    - added `encode_cache` attr support in lowering/codegen
+    - primitive diagonal complex plaintext encodes now lower to lazy static cached plaintexts plus `Copy_plain(...)`
+    - added rtlib `Copy_plain(...)` to deep-copy cached plaintexts into generated local temporaries safely
+  - during Phase 1 validation, found a separate demo/shared-lib correctness issue:
+    - primitive demo `Raise_mod`/level planning had an off-by-one mismatch against the runtime Q chain
+    - fixed by making the demo path use:
+      - `raise_mod(_bootstrap_mul_level())`
+      - `level_0 = mul_level` in primitive collapsed-FFT planning
+  - after the Phase 1 fixes:
+    - targeted bootstrap tests passed again:
+      - `test_python_and_c_api_results_match`
+      - `test_z_inline_and_rtlib_results_match`
+    - first-bootstrap resnet probe via `ACE_STOP_AFTER_FIRST_BTS=1 bash a_dsl_bts.sh` still succeeded
+    - first bootstrap time improved from about `203.140s` to about `188.650s`
+    - that is about a `14.49s` / `7.1%` improvement on the first bootstrap
+  - follow-up ownership optimization:
+    - replaced deep `Copy_plain(...)` with borrowed/static plaintext aliasing in generated CKKS C
+    - patched the poly `MFREE_PASS` so cache-backed plaintext temps are not freed
+    - generated C now has:
+      - `Copy_plain(`: `0`
+      - direct `_pre_plain_*` alias assignments
+      - no `Free_data(&_pgen_tmp_..._poly)` for cache-backed plaintext temps
+    - correctness checks still pass
+    - but first-bootstrap resnet timing was about `192.475s`, so there was no additional meaningful speedup
+    - likely reason: many encoded diagonal plaintext nodes are still unique and only used once per bootstrap body
+  - profiling follow-up:
+    - `perf` is installed but still unusable in the container because perf events are blocked
+    - used `gprofng` instead
+    - full first-run sampled profile is dominated by setup:
+      - `Generate_rot_maps._omp_fn.0`
+      - `Generate_rot_key`
+      - `Generate_switching_key`
+    - hottest sampled functions in that profile include:
+      - `Forward_transform` (~35.6% exclusive)
+      - `Mul_poly` (~22.2% inclusive)
+      - `Sub_poly` (~20.1% inclusive)
+      - `Add_poly` (~4.75% exclusive)
+      - `Transform_values_to_dcrt.isra.0` (~4.38%)
+      - `Encode_impl` (~9.78% inclusive)
+      - `Sample_uniform` (~16.9% inclusive)
+      - `blake2b_compress` (~11.5% exclusive)
+    - attempted a signal-gated `gprofng` run to isolate only the first bootstrap window, but the resulting experiment had zero attributed CPU time
+    - current profiling conclusion:
+      - `Copy_plain` is not the main hotspot anymore
+      - the real costs are first-run key generation plus NTT/polynomial kernels and the fully expanded bootstrap structure
+  - Phase 2 optimization:
+    - implemented stage-level grouping by rotation index in collapsed-FFT transforms
+    - for duplicated rotations, diagonals are now summed before encoding so one unique rotation only pays one rotate/encode/mul chain
+    - codegen impact on the `65536` bootstrap body:
+      - raw AIR:
+        - `CKKS.rotate`: `372 -> 310`
+        - `CKKS.mul`: `510 -> 448`
+        - `CKKS.add`: `546 -> 484`
+      - generated C:
+        - `Rotate(`: `374 -> 240`
+        - `Encode_dcmplx_ext(`: `378 -> 244`
+        - `Init_ciph_up_scale_plain(`: `474 -> 340`
+        - `Init_ciph_down_scale(`: `508 -> 374`
+        - `Init_ciph_same_scale(`: `538 -> 404`
+      - body size: about `334.7 MB -> 321.3 MB`
+      - line count: about `3.13M -> 2.62M`
+    - correctness checks still pass
+    - first-bootstrap resnet timing improved from about `192.475s` to about `159.926s`
+    - that is about a `32.55s` / `16.9%` improvement relative to the previous borrowed-cache baseline
+  - deeper phase-2 follow-up:
+    - checked for cross-stage duplicate diagonal plaintexts after grouping and found none
+    - added a regression test to lock that in
+    - switched the collapsed-FFT stage evaluation to a true rtlib-style baby-step/giant-step form
+    - after BSGS:
+      - raw AIR `CKKS.rotate`: `372 -> 112`
+      - generated C `Rotate(`: `374 -> 92`
+      - generated C `Encode_dcmplx_ext(`: `378 -> 282`
+      - bootstrap correctness checks still pass
+      - first-bootstrap resnet timing dropped further to about `102.728s`
+    - compared with the earlier borrowed-cache baseline (`192.475s`), the current first-bootstrap path is about `46.6%` faster
+    - compared the generated DSL bootstrap rotation set directly against the
+      rtlib `Find_rot_indices(...)` formula for the same `32768`/`level_budget=3`
+      case
+    - result after BSGS:
+      - generated unique bootstrap rotations: `53`
+      - rtlib theoretical bootstrap rotations: `53`
+      - extra rotations: `0`
+      - missing rotations: `0`
+    - conclusion:
+      - there is no remaining bootstrap-rotation-key excess to trim at this layer
+      - remaining first-run setup cost now comes from unavoidable bootstrap
+        rotations, model rotations, and key generation cost itself
+  - runtime setup follow-up:
+    - ANT `Prepare_context()` was still calling `Bootstrap_precom(default_slots)`
+      even for the DSL-integrated resnet binary
+    - added env guard `RTLIB_DISABLE_BOOTSTRAP_PRECOM=1`
+    - wired that into `a_dsl_bts.sh` and `verify_resnet_first.sh` for the DSL path
+    - measured first-bootstrap result on the current BSGS path:
+      - before skip: about `102.728s`
+      - after skip: about `102.099s`
+    - conclusion:
+      - only about `0.63s` improvement
+      - so unused rtlib bootstrap precompute was not the dominant remaining cost
+  - attempted the next profiler-aligned optimization:
+    - emit cacheable complex bootstrap diagonals as `DE_PLAINTEXT` data-file
+      entries and load them via `Pt_from_msg(...)` instead of runtime
+      `Encode_dcmplx_ext(...)`
+  - this path is blocked for the `65536` resnet case:
+    - `generate-demo` segfaulted during offline plaintext generation
+    - standalone tests showed the same thing:
+      - `Encode_dcmplx_ext(...)` at `65536` segfaults in encode-only context
+      - `Encode_dcmplx_ext(...)` at `65536` also segfaults in a full ANT
+        runtime-context standalone test
+      - the same standalone encode path works at `16384`
+    - gdb backtrace goes through:
+      - `Forward_transform`
+      - `Ftt_fwd`
+      - `Conv_poly2ntt_inplace`
+      - `Encode_impl`
+      - `Encode_ext_at_level`
+  - conclusion:
+    - the offline-plaintext direction is still profiler-aligned, but currently
+      blocked by a runtime-side ANT encoder bug at `65536`
+    - default path is kept on the working BSGS runtime-encode route by leaving
+      `ACE_BOOTSTRAP_CT_ENCODE` disabled by default
 - Session-level skills currently available to Codex in this environment:
   - `imagegen`
   - `openai-docs`
@@ -235,3 +373,67 @@
     - `ACE_BOOTSTRAP_IMPL=primitive` must not emit `CKKS.bootstrap` in raw AIR
     - the final generated C for the real decomposition path must not just call `Eval_bootstrap_ciph(...)`
   - if that invariant is violated, tests or resnet correctness results do not validate the DSL implementation goal; they only validate the wrapper path
+
+
+- 2026-03-30 follow-up on ct_encode bootstrap integration:
+  - fixed the real compiler/runtime ownership issue for offline bootstrap plaintexts
+    at codegen/runtime level instead of relying on script-side free stripping
+  - root cause chain:
+    - invalid frees of borrowed plaintext temps loaded from `Pt_from_msg(...)`
+    - a regression reintroduced `Copy_plain(...)` and removed mfree suppression
+    - the correct compiler-side fix was to stop freeing cached encode temps again
+  - ct_encode integration debugging found multiple issues and fixes:
+    - compiler-side encode context / `num_p` alignment fixes for `Encode_dcmplx_ext`
+    - `Max_plain_buffer_length()` had to account for extended plaintexts
+    - CRT transform/reconstruct had a real bug: it used full active `P` count instead
+      of the polynomial's actual `p_cnt`; fixed in `crt.c` / `rns_poly.c`
+    - resnet integration could not reuse global `Pt_mgr` safely for bootstrap
+      plaintexts; added a dedicated bootstrap plaintext loader path in the DSL shim
+  - important ownership/runtime fixes:
+    - `bootstrap_full.c` no longer emits invalid `Free_data(&_pgen_tmp_..._poly)`
+      for borrowed bootstrap plaintext temps
+    - custom bootstrap plaintext loader now keeps all bootstrap plaintext entries
+      resident for the call so borrowed temps are not overwritten early
+  - cleanup pass:
+    - removed debug instrumentation again
+    - moved duplicated DSL shim emission out of shell scripts and into
+      `ace_edsl/examples/resnet_bootstrap_utils.py` (`emit-shim`)
+    - `a_dsl_bts.sh` and `verify_resnet_first.sh` now call the helper instead of
+      embedding duplicated large C blocks
+  - validated sequentially in `ace-compiler-dev`:
+    - `ACE_BOOTSTRAP_CT_ENCODE=1 python3 -m pytest -q tests/test_bootstrap_full.py -k "python_and_c_api_results_match or z_inline_and_rtlib_results_match"`
+      -> `2 passed`
+    - `ACE_BOOTSTRAP_CT_ENCODE=1 ACE_STOP_AFTER_FIRST_BTS=1 bash a_dsl_bts.sh`
+      -> succeeds
+      -> `out_level=15`, `out_sfdeg=1`
+      -> first-bootstrap elapsed about `92s`
+  - note: do not run the bootstrap pytest path and `a_dsl_bts.sh` concurrently,
+    because they both regenerate shared output files under `ace_edsl/examples/output/`
+
+
+- cleanup after ct_encode bootstrap fix:
+  - removed legacy `evalmod` mode from `ace_edsl/examples/bootstrap_full.py`
+    and simplified the example to the two maintained modes:
+    - `primitive`
+    - `rtlib`
+  - removed obsolete evalmod-only expectations from
+    `ace_edsl/tests/bootstrap_test_main.c`
+  - moved duplicated DSL shim C emission out of shell scripts and into
+    `ace_edsl/examples/resnet_bootstrap_utils.py` via `emit-shim`
+  - `a_dsl_bts.sh` and `verify_resnet_first.sh` now reuse the shared helper
+    instead of embedding large duplicated C blocks
+  - ct_encode ownership/runtime final shape:
+    - compiler/codegen no longer emits invalid frees for borrowed bootstrap
+      plaintext temps
+    - private bootstrap plaintext loader caches all bootstrap plaintext entries
+      for the call, avoiding overwrite of borrowed entries
+    - dedicated bootstrap plaintext loader is used only for the resnet shim path
+      and does not switch the global resnet `Pt_mgr`
+  - validated sequentially in `ace-compiler-dev` after cleanup:
+    - `python3 -m pytest -q tests/test_bootstrap_full.py -k "python_and_c_api_results_match or z_inline_and_rtlib_results_match"`
+      -> `2 passed`
+    - `ACE_BOOTSTRAP_CT_ENCODE=1 python3 -m pytest -q tests/test_bootstrap_full.py -k "python_and_c_api_results_match or z_inline_and_rtlib_results_match"`
+      -> `2 passed`
+    - `ACE_BOOTSTRAP_CT_ENCODE=1 ACE_STOP_AFTER_FIRST_BTS=1 bash a_dsl_bts.sh`
+      -> succeeds
+      -> first bootstrap remains correct at about `92s`
