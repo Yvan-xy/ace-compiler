@@ -40,6 +40,7 @@ RUN apt-get update && \
         libomp5 \
         gdb \
         linux-tools-$(uname -r) \
+        ripgrep \
         libntl-dev && \
     rm -rf /var/lib/apt/lists/*
 
