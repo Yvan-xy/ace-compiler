@@ -38,6 +38,8 @@ RUN apt-get update && \
         nlohmann-json3-dev \
         libomp-dev \
         libomp5 \
+        gdb \
+        linux-tools-$(uname -r) \
         libntl-dev && \
     rm -rf /var/lib/apt/lists/*
 
