@@ -71,10 +71,6 @@ trap cleanup EXIT
 
 cp "${RESNET_GEN_C}" "${RESNET_DATASET_INC}"
 
-python3 "${BOOTSTRAP_UTILS_PY}" patch-resnet-context \
-  --bootstrap-c "${BOOTSTRAP_GEN_C}" \
-  --resnet-inc "${RESNET_DATASET_INC}"
-
 python3 "${BOOTSTRAP_UTILS_PY}" emit-body \
   --bootstrap-c "${BOOTSTRAP_GEN_C}" \
   --output "${BOOTSTRAP_BODY_C}"

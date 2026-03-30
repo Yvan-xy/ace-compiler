@@ -12,24 +12,6 @@ import textwrap
 from pathlib import Path
 
 
-ROTATE_INIT = "  Init_ciph_same_scale(&_pgen_rot_res_2, &ciph_0, 0);\n"
-ROTATE_FAST_PATH = (
-    ROTATE_INIT
-    + "  if (rot_idx_1 == 0) {\n"
-    + "    Copy_ciphertext(&_pgen_rot_res_2, &ciph_0);\n"
-    + "    RTLIB_TM_END(20, rtm);\n"
-    + "    return _pgen_rot_res_2;\n"
-    + "  }\n"
-)
-CTX_PAT = re.compile(
-    r"(static\s+CKKS_PARAMS\s+parm\s*=\s*\{\s*"
-    r"LIB_ANT\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*"
-    r"\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*)"
-    r"(\d+)\s*,\s*\n\s*\{\s*([^}]*)\s*\}",
-    re.S,
-)
-
-
 def _script_dir() -> Path:
     return Path(__file__).resolve().parent
 
@@ -60,31 +42,6 @@ def _with_env(**updates):
     return _EnvCtx()
 
 
-def _extract_rotation_indices(bootstrap_c: str) -> list[int]:
-    rot_idxs: set[int] = set()
-    for pattern in (
-        r"\bRotate\s*\([^,]+,\s*(-?\d+)\s*\)",
-        r"\bRotate_ciph\s*\([^,]+,\s*[^,]+,\s*(-?\d+)\s*\)",
-    ):
-        for match in re.finditer(pattern, bootstrap_c):
-            rot_idxs.add(int(match.group(1)))
-
-    deg_match = re.search(
-        r"static\s+CKKS_PARAMS\s+parm\s*=\s*\{\s*LIB_ANT\s*,\s*(\d+)",
-        bootstrap_c,
-        re.S,
-    )
-    if deg_match and "Conjugate_ciph(" in bootstrap_c:
-        ring_degree = int(deg_match.group(1))
-        rot_idxs.add(2 * ring_degree - 1)
-
-    return sorted(v for v in rot_idxs if v != 0)
-
-
-def _patch_zero_rotate_fast_path(source: str) -> str:
-    return source.replace(ROTATE_INIT, ROTATE_FAST_PATH, 1)
-
-
 def generate_demo(args: argparse.Namespace) -> int:
     with _with_env(
         ACE_BOOTSTRAP_IMPL=args.impl,
@@ -97,56 +54,15 @@ def generate_demo(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-def patch_resnet_context(args: argparse.Namespace) -> int:
-    bootstrap_path = Path(args.bootstrap_c)
-    resnet_inc_path = Path(args.resnet_inc)
-
-    bootstrap_c = bootstrap_path.read_text(encoding="utf-8")
-    resnet_inc = resnet_inc_path.read_text(encoding="utf-8")
-
-    match = CTX_PAT.search(resnet_inc)
-    if match is None:
-        raise SystemExit("failed to locate CKKS_PARAMS in resnet include")
-
-    existing = []
-    for token in re.split(r"[,\s]+", match.group(3).strip()):
-        if token:
-            existing.append(int(token))
-
-    all_rot_idxs = sorted(set(existing) | set(_extract_rotation_indices(bootstrap_c)))
-    rot_list = ", ".join(str(v) for v in all_rot_idxs)
-    patched = CTX_PAT.sub(
-        lambda mm: f"{mm.group(1)}{len(all_rot_idxs)}, \n    {{ {rot_list} }}",
-        resnet_inc,
-        count=1,
-    )
-    patched = _patch_zero_rotate_fast_path(patched)
-    resnet_inc_path.write_text(patched, encoding="utf-8")
-    return 0
-
-
 def emit_body(args: argparse.Namespace) -> int:
     src_path = Path(args.bootstrap_c)
     dst_path = Path(args.output)
 
-    skip = False
-    brace_depth = 0
     out_lines: list[str] = []
-
-    def starts_wrapper(line: str) -> bool:
-        return line.startswith("CKKS_PARAMS* Get_context_params()")
 
     with src_path.open("r", encoding="utf-8") as source:
         for line in source:
-            if not skip and starts_wrapper(line):
-                skip = True
-                brace_depth = line.count("{") - line.count("}")
-                continue
-            if skip:
-                brace_depth += line.count("{") - line.count("}")
-                if brace_depth <= 0:
-                    skip = False
-                continue
+            line = re.sub(r"\bGet_context_params\b", args.ctxparams_name, line)
             line = re.sub(r"\bbootstrap_full\b", args.entry_name, line)
             line = re.sub(r"\bGet_rt_data_info\b", args.rtdata_name, line)
             line = re.sub(r"\bPt_from_msg\b", args.pt_from_msg_name, line)
@@ -155,7 +71,7 @@ def emit_body(args: argparse.Namespace) -> int:
             line = re.sub(r"\b(_cst_\d+)\b", rf"{args.const_prefix}\1", line)
             out_lines.append(line)
 
-    body = _patch_zero_rotate_fast_path("".join(out_lines))
+    body = "".join(out_lines)
     pt_decl = (
         f'void* {args.pt_from_msg_name}(void* pt, uint32_t index, size_t len, '
         f'uint32_t scale, uint32_t level);\n'
@@ -394,14 +310,10 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--mul-level", type=int, required=True)
     generate.set_defaults(func=generate_demo)
 
-    patch = subparsers.add_parser("patch-resnet-context")
-    patch.add_argument("--bootstrap-c", required=True)
-    patch.add_argument("--resnet-inc", required=True)
-    patch.set_defaults(func=patch_resnet_context)
-
     emit = subparsers.add_parser("emit-body")
     emit.add_argument("--bootstrap-c", required=True)
     emit.add_argument("--output", required=True)
+    emit.add_argument("--ctxparams-name", default="Get_extra_context_params")
     emit.add_argument("--entry-name", default="dsl_bootstrap_full")
     emit.add_argument("--rtdata-name", default="dsl_bootstrap_get_rt_data_info")
     emit.add_argument("--pt-from-msg-name", default="dsl_bts_Pt_from_msg")

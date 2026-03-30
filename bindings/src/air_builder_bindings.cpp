@@ -356,6 +356,10 @@ public:
         }
         return glob ? glob->Unknown_simple_spos() : SPOS(); 
     }
+
+    void set_rotation_attr(NODE_PTR node, int32_t rotation) {
+        node->Set_attr(nn::core::ATTR::RNUM, &rotation, 1);
+    }
     
     std::shared_ptr<Node> wrap_node(NODE_PTR n, const std::string& opcode) {
         auto node = std::make_shared<Node>(n, ++node_counter, opcode);
@@ -781,6 +785,7 @@ public:
             NODE_PTR n = container->New_cust_node(op, rtype, get_spos());
             n->Set_child(0, ct->node);
             n->Set_child(1, rot_const);
+            set_rotation_attr(n, rotation);
             auto node = wrap_node(n, "fhe::ckks::ROTATE");
             node->add_child(ct);
             return node;
@@ -1140,6 +1145,7 @@ public:
             NODE_PTR n = container->New_cust_node(op, rtype, get_spos());
             n->Set_child(0, ct->node);
             n->Set_child(1, power_const);
+            set_rotation_attr(n, power);
             auto node = wrap_node(n, "fhe::ckks::MUL_MONO");
             node->add_child(ct);
             return node;
@@ -3109,6 +3115,10 @@ public:
                 NODE_PTR repl = cntr.New_cust_node(rot_op, rtype, spos);
                 repl->Set_child(0, ct);
                 repl->Set_child(1, amount);
+                if (amount->Opcode() == air::core::OPC_INTCONST) {
+                    int32_t rot_idx = static_cast<int32_t>(amount->Intconst());
+                    this->set_rotation_attr(repl, rot_idx);
+                }
                 replaced++;
                 return repl;
             }
@@ -4687,17 +4697,24 @@ py::dict run_ckks_driver(std::shared_ptr<GlobScope> glob) {
                 for (auto fit = ckks_glob->Begin_func_scope();
                      fit != ckks_glob->End_func_scope(); ++fit) {
                     FUNC_SCOPE* fs = &(*fit);
+                    air::driver::DRIVER_CTX driver_ctx;
+                    fhe::ckks::CKKS_CONFIG ckks_cfg;
+                    // Use PARS scale management so rescales are inserted after muls
+                    // (ACE_SM only rescales when Rescale_node is true, which is false for CKKS-only IR).
+                    ckks_cfg._pars_rsc = true;
                     try {
-                        air::driver::DRIVER_CTX driver_ctx;
-                        fhe::ckks::CKKS_CONFIG ckks_cfg;
-                        // Use PARS scale management so rescales are inserted after muls
-                        // (ACE_SM only rescales when Rescale_node is true, which is false for CKKS-only IR).
-                        ckks_cfg._pars_rsc = true;
                         fhe::ckks::SCALE_MANAGER scale_mngr(&driver_ctx, &ckks_cfg, fs,
                                                             lower_ctx.get());
                         scale_mngr.Run();
                     } catch (const std::exception&) {
                         // scale_mngr may assert/throw when CKKS-only IR has no scale info
+                    } catch (...) {
+                    }
+                    try {
+                        fhe::core::CTX_PARAM_ANA ctx_param_ana(fs, lower_ctx.get(),
+                                                               &driver_ctx, &cfg);
+                        ctx_param_ana.Run();
+                    } catch (const std::exception&) {
                     } catch (...) {
                     }
                 }
@@ -4983,6 +5000,7 @@ py::dict run_poly_driver(std::shared_ptr<GlobScope> glob) {
     
     try {
         fhe::poly::POLY_CONFIG config;
+        const auto saved_rotate_keys = lower_ctx->Get_ctx_param().Get_rotate_index();
         // Default SPOLY path: ckks2poly lowering with poly2c flatten.
         // The flatten fix in poly2c_driver.cxx prevents HW_* ops from
         // being flattened into pregs, keeping them as direct children
@@ -4993,12 +5011,13 @@ py::dict run_poly_driver(std::shared_ptr<GlobScope> glob) {
             poly_driver.Run(config, glob->glob, *lower_ctx, &driver_ctx);
         if (new_glob) {
             glob->glob = new_glob;
+            auto& ctx_param = lower_ctx->Get_ctx_param();
             // poly_driver.Run() may reset lower_ctx's ctx_param to defaults
             // (e.g. scaling_factor_bit_num reverts to 40, security_level to
             // 128).  Re-apply user-configured values so that downstream
             // poly2c emits the correct CKKS_PARAMS.
+            ctx_param.Add_rotate_index(saved_rotate_keys);
             if (glob->fhe_config_set) {
-                auto& ctx_param = lower_ctx->Get_ctx_param();
                 if (glob->fhe_poly_degree != 0) {
                     ctx_param.Set_poly_degree(glob->fhe_poly_degree, false);
                 }

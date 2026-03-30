@@ -87,47 +87,6 @@ class TestBootstrapStagePlanning(unittest.TestCase):
 
 
 class TestResnetBootstrapUtils(unittest.TestCase):
-    def test_patch_resnet_context_adds_rotations_and_zero_fast_path(self):
-        bootstrap_c = """\
-static CKKS_PARAMS parm = {
-    LIB_ANT, 65536, 0, 29, 1, 60, 56, 3, 192, 0,
-    { }
-};
-CIPHERTEXT bootstrap_full(CIPHERTEXT p0, CIPHERTEXT p1) {
-  Rotate(p0, 1024);
-  Rotate(p0, 31744);
-  Conjugate_ciph(&p0, &p0);
-  return p0;
-}
-"""
-        resnet_inc = """\
-static CKKS_PARAMS parm = {
-    LIB_ANT, 65536, 0, 30, 17, 60, 56, 3, 192, 2,
-    { 7, 8 }
-};
-CIPHERTEXT Rotate(CIPHERTEXT ciph_0, int32_t rot_idx_1) {
-  Init_ciph_same_scale(&_pgen_rot_res_2, &ciph_0, 0);
-  return _pgen_rot_res_2;
-}
-"""
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            bootstrap_path = os.path.join(tmpdir, "bootstrap.c")
-            resnet_path = os.path.join(tmpdir, "resnet.inc")
-            with open(bootstrap_path, "w", encoding="utf-8") as f:
-                f.write(bootstrap_c)
-            with open(resnet_path, "w", encoding="utf-8") as f:
-                f.write(resnet_inc)
-
-            args = argparse.Namespace(bootstrap_c=bootstrap_path, resnet_inc=resnet_path)
-            self.assertEqual(resnet_bootstrap_utils.patch_resnet_context(args), 0)
-
-            patched = open(resnet_path, "r", encoding="utf-8").read()
-            self.assertIn("1024", patched)
-            self.assertIn("31744", patched)
-            self.assertIn(str(2 * 65536 - 1), patched)
-            self.assertIn("if (rot_idx_1 == 0)", patched)
-
     def test_emit_body_strips_wrappers_and_renames_symbols(self):
         bootstrap_c = """\
 CKKS_PARAMS* Get_context_params() {
@@ -138,6 +97,11 @@ RT_DATA_INFO* Get_rt_data_info() {
 }
 CIPHERTEXT Rotate(CIPHERTEXT ciph_0, int32_t rot_idx_1) {
   Init_ciph_same_scale(&_pgen_rot_res_2, &ciph_0, 0);
+  if (rot_idx_1 == 0) {
+    Copy_ciphertext(&_pgen_rot_res_2, &ciph_0);
+    RTLIB_TM_END(20, rtm);
+    return _pgen_rot_res_2;
+  }
   return _pgen_rot_res_2;
 }
 CIPHERTEXT bootstrap_full(CIPHERTEXT p0, CIPHERTEXT p1) {
@@ -157,7 +121,10 @@ CIPHERTEXT bootstrap_full(CIPHERTEXT p0, CIPHERTEXT p1) {
             args = argparse.Namespace(
                 bootstrap_c=src,
                 output=dst,
+                ctxparams_name="Get_extra_context_params",
                 entry_name="dsl_bootstrap_full",
+                rtdata_name="dsl_bootstrap_get_rt_data_info",
+                pt_from_msg_name="dsl_bts_Pt_from_msg",
                 rotate_name="dsl_bts_Rotate",
                 relin_name="dsl_bts_Relinearize",
                 const_prefix="dsl_bts",
@@ -167,6 +134,8 @@ CIPHERTEXT bootstrap_full(CIPHERTEXT p0, CIPHERTEXT p1) {
             body = open(dst, "r", encoding="utf-8").read()
             self.assertNotIn("Get_context_params()", body)
             self.assertNotIn("Get_rt_data_info()", body)
+            self.assertIn("Get_extra_context_params()", body)
+            self.assertIn("dsl_bootstrap_get_rt_data_info()", body)
             self.assertIn("dsl_bootstrap_full", body)
             self.assertIn("dsl_bts_Rotate", body)
             self.assertIn("dsl_bts_Relinearize", body)

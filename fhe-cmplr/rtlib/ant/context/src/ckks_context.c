@@ -26,6 +26,61 @@
 // global object for single side
 CKKS_CONTEXT* Context = NULL;
 
+static int Contains_rot_idx(const int32_t* rot_idxs, size_t num_rot_idx,
+                            int32_t rot_idx) {
+  for (size_t i = 0; i < num_rot_idx; ++i) {
+    if (rot_idxs[i] == rot_idx) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static CKKS_PARAMS* Merge_context_params(CKKS_PARAMS* base, CKKS_PARAMS* extra) {
+  if (extra == NULL || extra->_num_rot_idx == 0) {
+    return NULL;
+  }
+  if (base->_provider != extra->_provider ||
+      base->_poly_degree != extra->_poly_degree) {
+    fprintf(stderr,
+            "ERROR: extra context params mismatch: provider/degree differ\n");
+    abort();
+  }
+
+  size_t merged_rot_cnt = base->_num_rot_idx;
+  for (size_t i = 0; i < extra->_num_rot_idx; ++i) {
+    if (!Contains_rot_idx(base->_rot_idxs, base->_num_rot_idx,
+                          extra->_rot_idxs[i])) {
+      ++merged_rot_cnt;
+    }
+  }
+  if (merged_rot_cnt == base->_num_rot_idx) {
+    return NULL;
+  }
+
+  CKKS_PARAMS* merged =
+      (CKKS_PARAMS*)malloc(sizeof(CKKS_PARAMS) +
+                           merged_rot_cnt * sizeof(int32_t));
+  if (merged == NULL) {
+    fprintf(stderr, "ERROR: failed to allocate merged context params\n");
+    abort();
+  }
+
+  *merged               = *base;
+  merged->_num_rot_idx  = merged_rot_cnt;
+  size_t merged_rot_idx = 0;
+  for (size_t i = 0; i < base->_num_rot_idx; ++i) {
+    merged->_rot_idxs[merged_rot_idx++] = base->_rot_idxs[i];
+  }
+  for (size_t i = 0; i < extra->_num_rot_idx; ++i) {
+    int32_t rot_idx = extra->_rot_idxs[i];
+    if (!Contains_rot_idx(merged->_rot_idxs, merged_rot_idx, rot_idx)) {
+      merged->_rot_idxs[merged_rot_idx++] = rot_idx;
+    }
+  }
+  return merged;
+}
+
 void Prepare_context() {
   Init_rtlib_timing();
   Io_init();
@@ -34,7 +89,15 @@ void Prepare_context() {
 
   RTLIB_TM_START(RTM_PREPARE_CONTEXT, rtm);
   // get ctx params
-  CKKS_PARAMS* ctx_param = Get_context_params();
+  CKKS_PARAMS* base_ctx_param = Get_context_params();
+  CKKS_PARAMS* ctx_param      = base_ctx_param;
+  CKKS_PARAMS* merged_ctx_param =
+      (Get_extra_context_params != NULL)
+          ? Merge_context_params(base_ctx_param, Get_extra_context_params())
+          : NULL;
+  if (merged_ctx_param != NULL) {
+    ctx_param = merged_ctx_param;
+  }
 
   // generate CKKS Context
   Context = Alloc_ckks_context();
@@ -88,6 +151,9 @@ void Prepare_context() {
   RT_DATA_INFO* data_info = Get_rt_data_info();
   if (data_info != NULL) {
     Pt_mgr_init(data_info->_file_name);
+  }
+  if (merged_ctx_param != NULL) {
+    free(merged_ctx_param);
   }
   RTLIB_TM_END(RTM_PREPARE_CONTEXT, rtm);
 }
