@@ -58,7 +58,10 @@ public:
         node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
     const uint32_t* num_p_attr =
         node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::NUM_P);
+    const uint32_t* cache_attr =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::ENCODE_CACHE);
     bool encoding_dcmplx = (complex_attr != nullptr) && (*complex_attr != 0);
+    bool encode_cache = (cache_attr != nullptr) && (*cache_attr != 0);
     if (!encoding_dcmplx && _rt_data_writer != nullptr &&
         node->Child(0)->Opcode() == air::core::OPC_LDC &&
         node->Child(1)->Opcode() == air::core::OPC_INTCONST &&
@@ -219,7 +222,13 @@ public:
     } else {
       // runtime encoding with internal data embedded in C code
       // Encode_float(&dest, cst, len, scale, level);
-      Emit_runtime_encode<RETV, VISITOR>(visitor, dest, node);
+      if (encoding_dcmplx && encode_cache &&
+          node->Child(0)->Opcode() == air::core::OPC_LDC) {
+        Emit_cached_dcmplx_encode<RETV, VISITOR>(visitor, dest, node);
+        return;
+      } else {
+        Emit_runtime_encode<RETV, VISITOR>(visitor, dest, node);
+      }
     }
     _ir2c_util << ", ";
     visitor->template Visit<RETV>(node->Child(1));  // element count
@@ -247,6 +256,62 @@ public:
       }
     }
     _ir2c_util << ")";
+  }
+
+  template <typename RETV, typename VISITOR>
+  void Emit_cached_dcmplx_encode(VISITOR* visitor, air::base::NODE_PTR dest,
+                                 air::base::NODE_PTR node) {
+    air::base::NODE_PTR cst = node->Child(0);
+    AIR_ASSERT(cst->Opcode() == air::core::OPC_LDC);
+    air::base::CONSTANT_PTR cst_val = cst->Const();
+    AIR_ASSERT(cst_val != air::base::Null_ptr);
+
+    const uint32_t* num_p_attr =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::NUM_P);
+    const uint32_t* level_attr =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
+
+    uint32_t node_id = node->Id().Value();
+    _ir2c_util << "{ static PLAINTEXT _pre_plain_" << node_id
+               << "; static uint32_t _pre_plain_" << node_id
+               << "_init = 0; if (!_pre_plain_" << node_id << "_init) {\n";
+    _ir2c_util << "#pragma omp critical(_pre_plain_" << node_id << "_lock)\n";
+    _ir2c_util << "{ if (!_pre_plain_" << node_id << "_init) { ";
+    _ir2c_util << ((num_p_attr != nullptr && *num_p_attr != 0)
+                       ? "Encode_dcmplx_ext(&_pre_plain_"
+                       : "Encode_dcmplx(&_pre_plain_");
+    _ir2c_util << node_id << ", (DCMPLX*)";
+    Emit_buffer_address<RETV, VISITOR>(visitor, cst);
+    _ir2c_util << ", ";
+    visitor->template Visit<RETV>(node->Child(1));
+    if (num_p_attr != nullptr && *num_p_attr != 0) {
+      _ir2c_util << ", ";
+      if (level_attr != nullptr) {
+        _ir2c_util << *level_attr;
+      } else {
+        visitor->template Visit<RETV>(node->Child(3));
+      }
+      _ir2c_util << ", " << *num_p_attr;
+    } else {
+      const uint32_t* scale_attr =
+          node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::SCALE);
+      _ir2c_util << ", ";
+      if (scale_attr != nullptr) {
+        _ir2c_util << *scale_attr;
+      } else {
+        visitor->template Visit<RETV>(node->Child(2));
+      }
+      _ir2c_util << ", ";
+      if (level_attr != nullptr) {
+        _ir2c_util << *level_attr;
+      } else {
+        visitor->template Visit<RETV>(node->Child(3));
+      }
+    }
+    _ir2c_util << "); _pre_plain_" << node_id
+               << "_init = 1; } } } ";
+    Emit_st_var<RETV, VISITOR>(visitor, dest);
+    _ir2c_util << " = _pre_plain_" << node_id << "; }";
   }
 
   template <typename RETV, typename VISITOR>

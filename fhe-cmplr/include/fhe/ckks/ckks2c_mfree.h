@@ -153,6 +153,18 @@ public:
 
   template <typename RETV, typename VISITOR>
   RETV Handle_node(VISITOR* visitor, air::base::NODE_PTR node) {
+    if (node->Opcode() == air::core::OPC_ST && node->Num_child() >= 1) {
+      air::base::NODE_PTR rhs = node->Child(0);
+      if (rhs != air::base::Null_ptr &&
+          rhs->Domain() == fhe::ckks::CKKS_DOMAIN::ID &&
+          rhs->Operator() == fhe::ckks::CKKS_OPERATOR::ENCODE) {
+        const uint32_t* cache_attr =
+            rhs->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::ENCODE_CACHE);
+        if (cache_attr != nullptr && *cache_attr != 0) {
+          _pass.Mark_var_freed(node->Addr_datum());
+        }
+      }
+    }
     if (node->Opcode() == air::core::OPC_ST &&
         node->Child(0)->Opcode() == air::core::OPC_ILD &&
         node->Child(0)->Child(0)->Opcode() == air::core::OPC_ARRAY) {

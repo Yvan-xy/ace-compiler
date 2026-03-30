@@ -85,6 +85,8 @@ public:
   static constexpr const char* COEFF_MODE = "coeff_mode";
   // bool, annotate CKKS.encode input as complex vector (DCMPLX*)
   static constexpr const char* ENCODE_DCMPLX = "encode_dcmplx";
+  // bool, annotate CKKS.encode as reusable precomputed plaintext
+  static constexpr const char* ENCODE_CACHE = "encode_cache";
 };
 
 //! info of function gen in FHE phase

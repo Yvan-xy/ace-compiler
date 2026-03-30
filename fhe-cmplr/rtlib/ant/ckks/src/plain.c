@@ -164,6 +164,19 @@ DCMPLX* Get_dcmplx_msg_from_plain(PLAIN plain) {
   return data;
 }
 
+void Copy_plain(PLAIN res, PLAIN plain) {
+  POLYNOMIAL* poly = Get_plain_poly(plain);
+  Init_plaintext(
+      res,
+      Get_rdgree(poly),
+      Get_plain_slots(plain),
+      Poly_level(poly),
+      Num_p(poly),
+      Get_plain_scaling_factor(plain),
+      Get_plain_sf_degree(plain));
+  Copy_poly(Get_plain_poly(res), poly);
+}
+
 static inline uint64_t Get_plaintext_length(uint32_t level) {
   CKKS_PARAMETER* param      = (CKKS_PARAMETER*)Param();
   uint32_t        degree     = param->_poly_degree;

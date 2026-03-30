@@ -83,6 +83,9 @@ double* Get_msg_from_plain(PLAIN plain);
 //! plaintext
 DCMPLX* Get_dcmplx_msg_from_plain(PLAIN plain);
 
+//! @brief Deep-copy plaintext metadata and polynomial data.
+void Copy_plain(PLAIN res, PLAIN plain);
+
 //! @brief Get lpoly from PLAINTEXT at given idx
 //! need free data by Free_lpoly_data().
 L_POLY Lpoly_from_plain(PLAIN plain, size_t idx);

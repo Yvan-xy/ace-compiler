@@ -1102,9 +1102,12 @@ void Transform_values_from_level0(POLY res, POLY poly) {
   // fill up the rest data with proper moduli
   MODULUS* q_modulus = Q_modulus();
   int64_t  old_mod   = Get_mod_val(q_modulus);
+  FMT_ASSERT(old_mod != 0, "Transform_values_from_level0: old_mod is zero");
   for (size_t i = 1; i < Poly_level(res); i++) {
     q_modulus++;
     int64_t new_mod = Get_mod_val(q_modulus);
+    FMT_ASSERT(new_mod != 0,
+               "Transform_values_from_level0: new_mod is zero");
     for (size_t val_idx = 0; val_idx < degree; val_idx++) {
       *res_data = Switch_modulus(Get_coeff_at(poly, val_idx), old_mod, new_mod);
       res_data++;
