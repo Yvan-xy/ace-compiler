@@ -2,10 +2,9 @@
 Full CKKS Bootstrap Algorithm Implementation for ACE EDSL
 =========================================================
 
-This module supports three implementations selected by `ACE_BOOTSTRAP_IMPL`:
+This module supports two implementations selected by `ACE_BOOTSTRAP_IMPL`:
 - `primitive` (default; aliases: `inline`, `ops`, `dsl`, `mimic`): staged
   bootstrap ops in EDSL (`CoeffToSlot -> EvalMod -> SlotToCoeff`).
-- `evalmod` (legacy): explicit large EvalMod demo (Chebyshev + double-angle).
 - `rtlib`: mimic ANT rtlib bootstrap by emitting CKKS `Bootstrap` op directly.
 
 `rtlib` mode is the closest match to rtlib behavior in generated code because it
@@ -120,8 +119,6 @@ def _bootstrap_impl_mode() -> str:
     mode = os.environ.get("ACE_BOOTSTRAP_IMPL", "primitive").strip().lower()
     if mode in ("rtlib", "runtime", "native"):
         return "rtlib"
-    if mode in ("evalmod", "cheb", "legacy"):
-        return "evalmod"
     if mode in ("primitive", "inline", "ops", "dsl", "mimic"):
         return "primitive"
     return "primitive"
@@ -155,6 +152,14 @@ def _bootstrap_input_level() -> int:
     except ValueError:
         return 0
     return lvl if lvl >= 0 else 0
+
+
+def _bootstrap_ct_encode() -> bool:
+    """Whether to pre-encode bootstrap plaintext constants into the data file."""
+    raw = os.environ.get("ACE_BOOTSTRAP_CT_ENCODE", "").strip().lower()
+    if not raw:
+        return False
+    return raw not in ("0", "false", "off", "no")
 
 
 def _identity_bootstrap_cleartext_reference(values):
@@ -221,37 +226,6 @@ class _ClearSlots:
         # Cleartext model: mod_switch is value-preserving.
         return _ClearSlots(self.vals)
 
-    def bootstrap_coeffs_to_slots(self, _num_slots=0):
-        # Cleartext: CoeffToSlot is the DFT which converts coefficients
-        # to slots.  In cleartext slot-domain, this is approximately
-        # identity (DFT(IDFT(x)) = x).  Use rotation+add butterfly to
-        # match the homomorphic structure.
-        x = _ClearSlots(self.vals)
-        n = len(x.vals)
-        log_n = max(1, int(math.log2(n))) if n > 1 else 1
-        for i in range(log_n - 1, -1, -1):
-            r = x.rotate(1 << i)
-            x = x + r
-        return x
-
-    def bootstrap_eval_mod(self):
-        # Cleartext: apply the actual Chebyshev + double-angle per slot.
-        from ant_bootstrap_ref import (
-            eval_mod_cleartext as _eval_mod,
-        )
-        evaled = [_eval_mod(v) for v in self.vals]
-        return _ClearSlots(evaled)
-
-    def bootstrap_slots_to_coeffs(self, _num_slots=0):
-        # Cleartext: SlotToCoeff is the IDFT.
-        x = _ClearSlots(self.vals)
-        n = len(x.vals)
-        log_n = max(1, int(math.log2(n))) if n > 1 else 1
-        for i in range(log_n):
-            r = x.rotate(-(1 << i))
-            x = x + r
-        return x
-
     def __add__(self, other):
         return self._binary(other, lambda a, b: a + b)
 
@@ -289,17 +263,6 @@ def bootstrap_full_python_dsl_reference(values):
                 normalized.append(v)
         return normalized
     raise TypeError("bootstrap_full_python_dsl_reference expected _ClearSlots output")
-
-
-def _bootstrap_extended_prelude(ct):
-    """Materialize bootstrap-adjacent CKKS ops while keeping value stable."""
-    x0 = ct.raise_mod(2)
-    x1 = x0.conjugate()
-    # Keep x0 value while still exercising conjugate in IR.
-    x2 = x0 + x1 - x1
-    # Mul-by-monomial is rewritten to rotate in primitive mode.
-    mono = x2.mul_mono(4)
-    return x2 + mono - mono
 
 
 # =============================================================================
@@ -376,11 +339,9 @@ def bootstrap_full(
 
     `primitive`: emit bootstrap-stage ops in EDSL
                  (CoeffToSlot -> EvalMod -> SlotToCoeff).
-    `evalmod`: full EDSL flow output (CoeffToSlot + EvalMod + SlotToCoeff).
     `rtlib`: emit CKKS Bootstrap op directly (lowered by runtime bootstrap path).
     """
     out = ct
-    impl_mode = _bootstrap_impl_mode()
     if _use_rtlib_bootstrap():
         if hasattr(ct, "bootstrap"):
             out = ct.bootstrap()
@@ -391,66 +352,20 @@ def bootstrap_full(
             # Keep kernel preprocess-friendly: no early return branches.
             out = ct
     else:
-        if impl_mode == "primitive":
-            # Full-packed bootstrap decomposition via bootstrap_decomposition.
-            from ace_edsl.edsl.core.bootstrap_decomposition import (
-                fullpacked_bootstrap_primitive,
-            )
-            x_in = ct.raise_mod(_bootstrap_mul_level())
-            # Convert post_scale to float for the decomposition.
-            # During cleartext execution it's already a float;
-            # during tracing, extract the compile-time constant.
-            try:
-                ps_val = float(post_scale)
-            except (TypeError, ValueError):
-                ps_val = float(BOOTSTRAP_POST_SCALE)
-            out = fullpacked_bootstrap_primitive(
-                x_in,
-                m_by_4=_bootstrap_m_by_4(),
-                three_m_by_4=_bootstrap_three_m_by_4(),
-                post_scale=ps_val,
-            )
-        else:
-            # Shared explicit EDSL flow (legacy): prelude + staged transforms.
-            x_in = _bootstrap_extended_prelude(ct)
-            # Full EvalMod demo path (deep Chebyshev + double-angle).
-            rot4 = x_in.rotate(4)
-            dft0 = x_in + rot4
-            rot2 = dft0.rotate(2)
-            dft1 = dft0 + rot2
-            rot1 = dft1.rotate(1)
-            x = dft1 + rot1
-            T_prev2 = zero + one
-            T_prev1 = x
-            out = T_prev2 * g0 + T_prev1 * g1
-            cheb_coeffs = (
-                g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15,
-                g16, g17, g18, g19, g20, g21, g22, g23, g24, g25, g26, g27,
-                g28, g29, g30, g31, g32, g33, g34, g35, g36, g37, g38, g39,
-                g40, g41, g42, g43, g44, g45, g46, g47, g48, g49, g50, g51,
-                g52, g53, g54,
-            )
-            for gk in cheb_coeffs:
-                t_curr = 2 * x * T_prev1 - T_prev2
-                out = out + t_curr * gk
-                T_prev2, T_prev1 = T_prev1, t_curr
-            da = out
-            da = da * da
-            da = da + da
-            da = da + da1
-            da = da * da
-            da = da + da
-            da = da + da2
-            da = da * da
-            da = da + da
-            da = da + da3
-            evalmod_result = da * post_scale
-            rot1b = evalmod_result.rotate(1)
-            idft0 = evalmod_result - rot1b
-            rot2b = idft0.rotate(2)
-            idft1 = idft0 - rot2b
-            rot4b = idft1.rotate(4)
-            out = idft1 - rot4b
+        from ace_edsl.edsl.core.bootstrap_decomposition import (
+            fullpacked_bootstrap_primitive,
+        )
+        x_in = ct.raise_mod(_bootstrap_mul_level())
+        try:
+            ps_val = float(post_scale)
+        except (TypeError, ValueError):
+            ps_val = float(BOOTSTRAP_POST_SCALE)
+        out = fullpacked_bootstrap_primitive(
+            x_in,
+            m_by_4=_bootstrap_m_by_4(),
+            three_m_by_4=_bootstrap_three_m_by_4(),
+            post_scale=ps_val,
+        )
     return out
 
 
@@ -476,10 +391,6 @@ Bootstrap Algorithm:
 │    Recombine                   - mul_mono + add                      │
 │    SlotToCoeff                 - U0 diagonal linear transform        │
 │    Post-scale                  - * 16 (q0/sf ratio)                  │
-│  evalmod mode:                                                      │
-│    Full-flow output            - CoeffToSlot + EvalMod + SlotToCoeff│
-│    EvalMod (ANT)               - Chebyshev 55 + 3 double-angles     │
-│                                + post scale 16                       │
 │  rtlib mode:                                                        │
 │    Direct CKKS Bootstrap op   - lowers to rtlib bootstrap path      │
 └─────────────────────────────────────────────────────────────────────┘
@@ -569,6 +480,7 @@ Key Difference from acepy:
         first_prime_bits=60,
         hamming_weight=192,
         data_file=data_file_path,
+        ct_encode=_bootstrap_ct_encode(),
         enable_poly=True,   # Poly-level C (Hw_modadd, Rotate, etc.) for ANT rtlib; scale handled in pipeline
     )
     # Keep CKKS extended-op semantics intact for staged bootstrap flow.
@@ -624,7 +536,7 @@ Key Difference from acepy:
             "Bootstrap Phases:\n"
             "  └─ Direct CKKS.bootstrap lowering to rtlib bootstrap path"
         )
-    elif impl_mode == "primitive":
+    else:
         phase_summary = (
             "Bootstrap Phases (full-packed decomposition):\n"
             "  ├─ CoeffToSlot:  U0hat diagonal linear transform\n"
@@ -634,14 +546,6 @@ Key Difference from acepy:
             "  ├─ SlotToCoeff:  U0 diagonal linear transform\n"
             f"  └─ Post-scale:   * {BOOTSTRAP_POST_SCALE}"
         )
-    else:
-        phase_summary = (
-            "Bootstrap Phases:\n"
-            f"  ├─ Phase 1:      {LOG_SLOTS} CoeffToSlot butterfly layers\n"
-            f"  ├─ EvalMod:      Chebyshev {CHEB_COEFF_COUNT} coeffs + {NUM_DOUBLE_ANGLE} double-angles + post scale {BOOTSTRAP_POST_SCALE}\n"
-            f"  └─ Phase 3:      {LOG_SLOTS} SlotToCoeff butterfly layers"
-        )
-
     print(f"""
 ✓ Full bootstrap compiled to C code!
 

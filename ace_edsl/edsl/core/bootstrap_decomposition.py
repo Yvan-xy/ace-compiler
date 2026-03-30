@@ -440,10 +440,26 @@ def _coeffs_to_slots_factor(slots: int) -> float:
 
 
 def _bootstrap_num_p(slots: int) -> int:
-    """Return the rtlib p-prime count for the current demo/bootstrap context."""
-    if slots >= 32768:
-        return 11
-    return 9
+    """Return the exact rtlib p-prime count for the active bootstrap context."""
+
+    def _env_int(name: str, default: int) -> int:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
+    del slots  # p-prime count is derived from context parameters, not slot size.
+    mul_level = max(1, _env_int("ACE_BOOTSTRAP_MUL_LEVEL", 26))
+    q_parts = max(1, _env_int("ACE_BOOTSTRAP_Q_PARTS", 3))
+    first_mod_size = max(1, _env_int("ACE_BOOTSTRAP_FIRST_MOD_SIZE", 60))
+    scaling_mod_size = max(1, _env_int("ACE_BOOTSTRAP_SCALING_MOD_SIZE", 56))
+
+    num_per_part = math.ceil(float(mul_level) / float(q_parts))
+    bit_num = first_mod_size + (num_per_part - 1) * scaling_mod_size
+    return int(math.ceil(float(bit_num) / 60.0))
 
 
 def _reduce_rotation(index: int, slots: int) -> int:

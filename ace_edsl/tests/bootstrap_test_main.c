@@ -17,9 +17,6 @@
 
 static double Input_p0[] = {0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8};
 static double Input_p1[] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-// evalmod mode computes an EvalMod-style transform (sin(8*x) surrogate)
-static double Expected_evalmod[] = {0.717356, -0.999574, 0.675463, 0.058374, -0.756802, 0.996165, -0.631267, -0.116549};
-// inline/primitive/rtlib modes are message-preserving in this test.
 static double Expected_identity[] = {0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8};
 
 static TENSOR* Generate_input_data(size_t n, size_t c, size_t h, size_t w,
@@ -46,14 +43,6 @@ static void Print_output_data(double* result, int len) {
   printf("\n");
 }
 
-static bool Is_evalmod_mode(void) {
-  const char* mode = getenv("ACE_BOOTSTRAP_IMPL");
-  if (mode == NULL) {
-    return false;
-  }
-  return strcmp(mode, "evalmod") == 0 || strcmp(mode, "cheb") == 0 || strcmp(mode, "legacy") == 0;
-}
-
 int main(int argc, char* argv[]) {
   Prepare_context();
 
@@ -70,8 +59,7 @@ int main(int argc, char* argv[]) {
   Print_output_data(result, NUM_SLOTS);
   Finalize_context();
 
-  double* expected = Is_evalmod_mode() ? Expected_evalmod : Expected_identity;
-  bool res = Validate_output_data(result, expected, NUM_SLOTS);
+  bool res = Validate_output_data(result, Expected_identity, NUM_SLOTS);
   free(result);
   if (res) {
     printf("SUCCESS\n");
