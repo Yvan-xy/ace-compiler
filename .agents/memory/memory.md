@@ -235,9 +235,34 @@
       - `Init_ciph_same_scale(`: `538`
   - main performance conclusion:
     - the DSL path is slow because it fully materializes the bootstrap algorithm, repeatedly re-encodes diagonal plaintexts, executes hundreds of standalone rotations, and pays a lot of helper/setup overhead that rtlib amortizes through precompute and specialized runtime code
-  - recommended optimization order in `docs/opt.md`:
-    1. cache encoded diagonal plaintexts
-    2. hoist/reuse rotations inside collapsed-FFT stages
+- recommended optimization order in `docs/opt.md`:
+  1. cache encoded diagonal plaintexts
+  2. hoist/reuse rotations inside collapsed-FFT stages
+- Later March 30, 2026 cleanup / integration work:
+  - removed the remaining `resnet_bootstrap_utils.py` text-patching path used
+    for resnet bootstrap integration
+  - the generated bootstrap body now keeps its own context provider and
+    `emit-body` renames it to `Get_extra_context_params()`
+  - ANT runtime `Prepare_context()` now optionally merges
+    `Get_extra_context_params()` with the program's main `Get_context_params()`
+    before key generation
+  - zero-rotate fast path moved into poly2c-generated `Rotate` helper code
+    instead of Python source rewriting
+  - the cleaner rotate-key fix is in compiler IR metadata / analysis:
+    - `bindings/src/air_builder_bindings.cpp` now attaches `nn::core::ATTR::RNUM`
+      to CKKS rotate nodes and preserves it when rewriting `mul_mono`
+    - `fhe-cmplr/include/fhe/core/ctx_param_ana.h` now analyzes rotate keys for
+      `rotate`, `mul_mono`, and `conjugate`
+    - CKKS-only traced bootstrap flow now runs `CTX_PARAM_ANA`
+  - the temporary IR2C-side rotate-key workaround was removed after the cleaner
+    metadata/analyzer path worked
+  - validation after the clean fix:
+    - `python3 -m pytest -q ace_edsl/tests/test_resnet_bootstrap_utils.py`
+      passes in `ace-compiler-dev`
+    - generated bootstrap `Get_context_params()` now emits `42` bootstrap rotate
+      keys directly
+    - integrated `ACE_BOOTSTRAP_CT_ENCODE=1 ACE_STOP_AFTER_FIRST_BTS=1 bash a_dsl_bts.sh`
+      passes with first bootstrap about `65.243s`
     3. reduce fully expanded straight-line code into more structured stage code
   - Phase 1 is now implemented:
     - added `encode_cache` attr support in lowering/codegen
@@ -437,3 +462,158 @@
     - `ACE_BOOTSTRAP_CT_ENCODE=1 ACE_STOP_AFTER_FIRST_BTS=1 bash a_dsl_bts.sh`
       -> succeeds
       -> first bootstrap remains correct at about `92s`
+
+
+- 2026-03-30 follow-up on rotate-lowering optimization direction:
+  - reverted a temporary `CKKS2POLY::Expand_rotate` experiment because that
+    helper path is shared with the rtlib bootstrap baseline and should not be
+    changed for DSL-only optimization work
+  - inspected the saved known-good first-bootstrap `gprofng` capture for the
+    optimized DSL path:
+    - `tmp_profile_dsl_first_bsgs.er`
+  - dominant first-call hotspot remains shared setup, not DSL helper bodies:
+    - `Generate_rot_maps._omp_fn.0`
+    - `Generate_rot_key`
+    - `Generate_switching_key`
+  - within that capture, the generated DSL helper bodies are comparatively
+    small:
+    - `dsl_bts_Rotate`
+    - `dsl_bts_Relinearize`
+    - `Encode_dcmplx_ext`
+    - `Rescale`
+  - conclusion:
+    - do not optimize `Expand_rotate` for the current first-bootstrap metric
+    - the next useful DSL-only target requires a warmed second-call profile that
+      excludes first-run key generation noise
+- 2026-03-30 warm standalone bootstrap profiling:
+  - extended `ace_edsl/tests/bootstrap_test_main.c` with env-controlled warm
+    runs:
+    - `ACE_BOOTSTRAP_WARMUP_RUNS`
+    - `ACE_BOOTSTRAP_MEASURE_RUNS`
+    - `ACE_BOOTSTRAP_SKIP_VALIDATE`
+  - built a warm standalone harness in `ace-compiler-dev` against the preserved
+    runtime-encode primitive bootstrap source
+    `ace_edsl/examples/output/bootstrap_full_link.c.inlev1.c`
+  - observed steady-state timings:
+    - warmup call about `25.0s`
+    - subsequent measured calls about `24.2s` to `25.5s`
+  - captured `gprofng` experiment:
+    - `/app/tmp_bootstrap_warm/warm_bootstrap.er`
+  - warm profile still shows heavy NTT/poly kernels:
+    - `Forward_transform`
+    - `Mul_poly`
+    - `Sub_poly`
+    - `Add_poly`
+  - within `bootstrap_full`, the largest steady-state helper cost is still
+    `Rotate`, followed by `Rescale`, `Encode_dcmplx_ext`, and `Relinearize`
+  - implication:
+    - do not optimize the shared rotate helper implementation
+    - the next DSL-only optimization target should be reducing the number of
+      emitted `Rotate` / `Rescale` / `Relinearize` calls in the decomposition
+      schedule, with `Rotate` pressure the first thing to investigate
+- 2026-03-30 collapsed-FFT BSGS retune:
+  - updated `docs/opt.md` to reflect the current known-good performance picture
+    and the warmed-profile findings
+  - changed the DSL collapsed-FFT stage planner in
+    `ace_edsl/edsl/core/bootstrap_decomposition.py` to choose `g` by
+    minimizing emitted high-level rotation count instead of copying the rtlib
+    `Rotate_precomp(...)` heuristic directly
+  - for the active `65536` / `32768` full-packed case, each stage now uses:
+    - before: `g=16, b=4`
+    - after: `g=8, b=8`
+  - preliminary effect:
+    - collapsed-FFT stage rotation proxy `108 -> 84`
+    - traced raw AIR `CKKS.rotate: 112 -> 88`
+    - locally generated C `Rotate(: 114 -> 90`
+  - initial bring-up exposed a poly2c bug:
+    - `Handle_dot_prod()` emitted malformed `Dot_prod(...)` calls for store
+      destinations because it only handled preg results correctly
+    - fixed in `fhe-cmplr/include/fhe/poly/ir2c_handler.h`
+  - after that fix:
+    - `generate-demo` completed successfully again in `ace-compiler-dev`
+    - integrated `ct_encode` probe
+      `ACE_BOOTSTRAP_CT_ENCODE=1 ACE_STOP_AFTER_FIRST_BTS=1 bash a_dsl_bts.sh`
+      succeeded
+    - output contract remained correct:
+      - `out_level=15`
+      - `out_sfdeg=1`
+      - `out_slots=32768`
+    - first-bootstrap elapsed improved from the prior validated `ct_encode`
+      baseline:
+      - before: `92.088s`
+      - after: `85.313s`
+      - delta: `6.775s` / `7.36%`
+- 2026-03-30 fresh post-retune profile and follow-up:
+  - captured a new current-path `gprofng` experiment after the BSGS retune/fix:
+    - `/app/tmp_profile_dsl_first_current.er`
+  - first-call process time was still dominated by shared setup:
+    - `Generate_rot_maps._omp_fn.0`
+    - `Generate_rot_key`
+    - `Generate_switching_key`
+  - inside `dsl_bootstrap_full`, helper ordering had shifted to:
+    - `Rescale`
+    - `dsl_bts_Rotate`
+    - `dsl_bts_Relinearize`
+  - current generated artifact counts matched that diagnosis:
+    - `CKKS.rescale`: `508`
+    - `Rotate(`: `90`
+    - `Pt_from_msg(`: `378`
+  - checked collapsed-FFT term structure:
+    - `189` encode terms and `189` decode terms
+    - zero all-zero terms
+    - only `3` trivial `+/-1` diagonal terms per direction
+  - implication at that point:
+    - trivial diagonal skipping alone would not move the needle
+    - the next DSL-only target should be reducing scale-management and
+      plaintext-multiply pressure in `_apply_collapsed_fft_transform()`
+- 2026-03-30 lazy-rescale transform accumulation:
+  - added a DSL-only `skip_auto_rescale` attribute for selected `CKKS.mul`
+    nodes via:
+    - `fhe-cmplr/include/fhe/core/lower_ctx.h`
+    - `bindings/src/air_builder_bindings.cpp`
+    - `fhe-cmplr/ckks/include/scale_manager.h`
+    - `fhe-cmplr/ckks/src/scale_manager.cxx`
+  - changed
+    `ace_edsl/edsl/core/bootstrap_decomposition.py::_apply_collapsed_fft_transform`
+    to accumulate ct-plain products across each inner sum and issue one explicit
+    `rescale()` afterward
+  - integrated validation:
+    - `ACE_BOOTSTRAP_CT_ENCODE=1 ACE_STOP_AFTER_FIRST_BTS=1 bash a_dsl_bts.sh`
+      succeeded
+    - output contract remained correct:
+      - `out_level=15`
+      - `out_sfdeg=1`
+      - `out_slots=32768`
+    - first-bootstrap elapsed improved:
+      - before: `85.313s`
+      - after: `68.232s`
+      - delta: `17.081s` / `20.02%`
+  - generated artifact effect:
+    - `CKKS.rescale: 508 -> 178`
+    - generated C `Rescale(: 1016 -> 356`
+    - generated C `Init_ciph_down_scale(: 508 -> 178`
+  - fresh profile after that change:
+    - `/app/tmp_profile_dsl_first_current2.er`
+    - one-call bootstrap in that run: `66.771s`
+    - inside `dsl_bootstrap_full`, helper ordering is now:
+      - `dsl_bts_Rotate` first
+      - `Rescale` second
+      - `dsl_bts_Relinearize` third
+  - implication:
+    - after the scale-management win, the next remaining DSL-only target
+      shifted back to `dsl_bts_Rotate`
+- 2026-03-30 failed rotate-precomp follow-up:
+  - tried a DSL-only alternate rotate lowering/helper path for bootstrap
+    transform rotates, aiming to use a separate `Precomp + Dot_prod` route only
+    for annotated bootstrap rotations
+  - result was a severe regression:
+    - raw AIR `CKKS.rotate: 88 -> 418`
+    - integrated one-call `ct_encode` bootstrap regressed to `180.067s`
+  - reverted that entire attempt immediately
+  - rebuilt compiler/bindings and revalidated the restored path:
+    - integrated one-call `ct_encode` bootstrap returned to a fast working
+      state at `66.045s` on the latest rerun
+  - takeaway:
+    - a useful rotate optimization likely needs an explicit bootstrap-local
+      hoisting/cache design; a naive alternate rotate lowering can easily
+      increase IR/helper pressure and lose badly
