@@ -87,6 +87,8 @@ public:
   static constexpr const char* ENCODE_DCMPLX = "encode_dcmplx";
   // bool, annotate CKKS.encode as reusable precomputed plaintext
   static constexpr const char* ENCODE_CACHE = "encode_cache";
+  // bool, annotate CKKS.mul so the scale manager defers auto-rescale
+  static constexpr const char* SKIP_AUTO_RESCALE = "skip_auto_rescale";
 };
 
 //! info of function gen in FHE phase

@@ -946,6 +946,10 @@ template <typename RETV, typename VISITOR>
 RETV CKKS_SCALE_MANAGER::Handle_mul(VISITOR* visitor, NODE_PTR node) {
   SCALE_MNG_CTX& ctx       = visitor->Context();
   LOWER_CTX*     lower_ctx = ctx.Lower_ctx();
+  const uint32_t* lazy_rescale_attr =
+      node->Attr<uint32_t>(core::FHE_ATTR_KIND::SKIP_AUTO_RESCALE);
+  bool lazy_rescale =
+      (lazy_rescale_attr != nullptr) && (*lazy_rescale_attr != 0);
 
   // handle child0: dec scale of child0 to sf
   NODE_PTR child0 = node->Child(0);
@@ -981,13 +985,17 @@ RETV CKKS_SCALE_MANAGER::Handle_mul(VISITOR* visitor, NODE_PTR node) {
   ctx.Set_node_scale_info(node, scale_info);
 
   if (ctx.Req_eva()) {
-    AIR_ASSERT(scale_deg == 2);
-    NODE_PTR parent = ctx.Parent(1);
-    scale_info      = SCALE_INFO(1, rescale_level + 1);
-    EXPR_RESCALE_INFO rs_info(parent, node, scale_deg - 1, scale_info);
-    ctx.Add_expr_rescale_info(rs_info);
+    if (!lazy_rescale) {
+      AIR_ASSERT(scale_deg == 2);
+      NODE_PTR parent = ctx.Parent(1);
+      scale_info      = SCALE_INFO(1, rescale_level + 1);
+      EXPR_RESCALE_INFO rs_info(parent, node, scale_deg - 1, scale_info);
+      ctx.Add_expr_rescale_info(rs_info);
+    }
   } else if (ctx.Req_pars()) {
-    scale_info = PARS(&ctx).Handle(node);
+    if (!lazy_rescale) {
+      scale_info = PARS(&ctx).Handle(node);
+    }
   } else if (ctx.Req_ace_sm()) {
     scale_info = ACE_SM(&ctx).Handle_mul(node, si0, si1);
   }

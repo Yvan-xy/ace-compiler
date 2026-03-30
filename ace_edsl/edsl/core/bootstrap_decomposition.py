@@ -829,10 +829,11 @@ def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
                 plain = _encode_plain_vector_like(
                     x, diag, scale_degree=1, level=plain_level
                 )
-                term = fast_rot[j] * plain
+                term = _mul_plain_lazy_rescale(fast_rot[j], plain)
                 inner = term if inner is None else inner + term
             if inner is None:
                 continue
+            inner = inner.rescale()
             if i == 0:
                 stage_acc = inner
             else:
@@ -935,6 +936,20 @@ def _encode_plain_vector_like(x, values, scale_degree: int = 1, level: int = 0):
             array_node, len(values), scale_degree, level, True
         )
     return AIRValue(plain_node, container, domain=getattr(x, "domain", None))
+
+
+def _mul_plain_lazy_rescale(ct, plain):
+    """Multiply ct*plain and defer compiler auto-rescale for this node."""
+    if not hasattr(ct, "container"):
+        return ct * plain
+
+    from .air_value import AIRValue
+
+    container = ct.container
+    mul_node = container.new_ckks_mul(ct.value, plain.value)
+    if hasattr(mul_node, "set_u32_attr"):
+        mul_node.set_u32_attr("skip_auto_rescale", 1)
+    return AIRValue(mul_node, container, domain=getattr(ct, "domain", None))
 
 
 def _encode_scalar_like(x, value, scale_degree: int = 1, level: int = 0):

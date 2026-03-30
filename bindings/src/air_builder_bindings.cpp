@@ -290,6 +290,13 @@ public:
         s += ")";
         return s;
     }
+
+    void set_u32_attr(const std::string& attr_name, uint32_t value) {
+        if (!has_node || node == NODE_PTR()) {
+            throw std::runtime_error("set_u32_attr requires a real AIR node");
+        }
+        node->Set_attr(attr_name.c_str(), &value, 1);
+    }
 };
 
 // Container - creates real AIR nodes
@@ -5059,6 +5066,8 @@ PYBIND11_MODULE(air_builder, m) {
         .def("name", &Node::name)
         .def("opcode_name", &Node::opcode_name)
         .def("to_string", &Node::to_string)
+        .def("set_u32_attr", &Node::set_u32_attr,
+             py::arg("attr_name"), py::arg("value"))
         .def("__repr__", &Node::to_string);
     
     py::class_<Container>(m, "Container")

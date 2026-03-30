@@ -178,6 +178,10 @@ SCALE_INFO PARS::Downscale_analysis(NODE_PTR node) {
 
 SCALE_INFO ACE_SM::Handle_mul(NODE_PTR node, SCALE_INFO si0, SCALE_INFO si1) {
   SCALE_MNG_CTX* ctx = Context();
+  const uint32_t* lazy_rescale_attr =
+      node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::SKIP_AUTO_RESCALE);
+  bool lazy_rescale =
+      (lazy_rescale_attr != nullptr) && (*lazy_rescale_attr != 0);
   if (si0.Scale_deg() >= 2) {
     si0 = Rescale_res(node->Child(0), si0);
   }
@@ -187,6 +191,7 @@ SCALE_INFO ACE_SM::Handle_mul(NODE_PTR node, SCALE_INFO si0, SCALE_INFO si1) {
   uint32_t   scale_deg = si0.Scale_deg() + si1.Scale_deg();
   uint32_t   rs_level  = std::max(si0.Rescale_level(), si1.Rescale_level());
   SCALE_INFO si(scale_deg, rs_level);
+  if (lazy_rescale) return si;
   if (!ctx->Rescale_node(node, ctx->Parent_stmt(), scale_deg)) return si;
 
   si                       = SCALE_INFO(1, rs_level + 1);

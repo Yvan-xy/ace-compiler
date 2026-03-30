@@ -30,11 +30,12 @@ Measured in `ace-compiler-dev` using the first-bootstrap-only path.
   - non-`ct_encode`: about `92s` to `104s`
   - `ct_encode`:
     - previous validated baseline: `92.088s`
-    - current validated result after the latest collapsed-FFT BSGS retune:
-      `85.313s`
+    - after collapsed-FFT BSGS retune: `85.313s`
+    - current validated result after the lazy-rescale transform rewrite:
+      `68.232s`
 
-So the first bootstrap is still about `3.3x` slower than rtlib even after the
-previous collapsed-FFT and offline-plaintext optimizations.
+So the first bootstrap is now about `2.42x` slower than rtlib on the validated
+`ct_encode` path.
 
 ### Warm Standalone Bootstrap Timing
 
@@ -67,7 +68,7 @@ integrated into `resnet20_cifar10`.
 
 - current first-bootstrap-only integrated probe:
   - `ACE_BOOTSTRAP_CT_ENCODE=1 ACE_STOP_AFTER_FIRST_BTS=1 bash a_dsl_bts.sh`
-  - current validated result: `85.313s`
+  - current validated result: `68.232s`
 
 ### Generated Bootstrap Size
 
@@ -76,9 +77,9 @@ From the current validated generated body:
 - [bootstrap_full.c](/home/dyf/code/ace-compiler/ace_edsl/examples/output/bootstrap_full.c)
 
 - size:
-  - about `1,769,046` bytes
+  - about `1,550,581` bytes
 - line count:
-  - about `30,083`
+  - about `25,884`
 
 That is no longer the primary problem. The current gap is mostly runtime cost,
 not code size blow-up.
@@ -114,11 +115,12 @@ From the known-good optimized generated body
 - `Rotate(`: `90`
 - `Pt_from_msg(`: `378`
 - `Init_ciph_up_scale_plain(`: `474`
-- `Init_ciph_down_scale(`: `508`
+- `Init_ciph_down_scale(`: `178`
 - `Init_ciph_same_scale(`: `538`
 - `Relinearize(`: `36`
 - `Hw_modmul(`: `1092`
 - `Hw_modadd(`: `1105`
+- `Rescale(`: `356`
 
 ### Raw AIR Operation Counts
 
@@ -128,6 +130,7 @@ From [bootstrap_full_raw.air](/home/dyf/code/ace-compiler/ace_edsl/examples/outp
 - `CKKS.mul`: `510`
 - `CKKS.add`: `546`
 - `CKKS.sub`: `13`
+- `CKKS.rescale`: `178`
 - `CKKS.modswitch`: `10`
 - `CKKS.raise_mod`: `1`
 - `CKKS.mul_mono`: `2`
@@ -297,7 +300,7 @@ kernels get called.
 
 The order below is intentional. Each step is listed in descending expected impact.
 
-### Current DSL-Only Work Item: Retune Collapsed-FFT BSGS For Fewer Rotates
+### Current DSL-Only Work Item: Lazy-Rescale Stage Accumulation
 
 Status:
 
@@ -306,35 +309,38 @@ Status:
 
 What changed:
 
-- the DSL collapsed-FFT planner now chooses the giant-step width `g` by
-  minimizing the emitted high-level rotation proxy `(g - 1) + (b - 1)` instead
-  of copying the rtlib `Rotate_precomp(...)` heuristic directly
-- for the active `65536` / `32768` full-packed case, that changes each stage
-  from:
-  - `g=16, b=4`
-  to:
-  - `g=8, b=8`
+- introduced a DSL-only `skip_auto_rescale` CKKS.mul attribute
+- tagged collapsed-FFT ct-plain multiplies with that attribute
+- changed `_apply_collapsed_fft_transform()` to:
+  - accumulate ct-plain products within each baby-step inner sum first
+  - call one explicit `rescale()` per inner sum afterward
+  instead of letting the generic CKKS scale manager rescale every individual
+  ct-plain multiply
 
 Why this is DSL-only:
 
-- rtlib’s heuristic is reasonable for its own hoisted/internal rotate machinery
-- the DSL path materializes each `Rotate(...)` helper explicitly, so the right
-  local objective is to reduce the number of emitted standalone rotations
-  without changing the math
+- rtlib already has a specialized transform schedule and stage-local rescale
+  placement
+- the DSL path was still using the generic CKKS scale manager, which inserted
+  far more rescale plumbing than the rtlib stage structure needs
 
-Preliminary result:
+Validated result:
 
-- collapsed-FFT stage rotation proxy:
-  - before: `108`
-  - after: `84`
-- traced raw AIR:
-  - `CKKS.rotate`: `112 -> 88`
-- current validated generated C:
-  - `Rotate(`: `114 -> 90`
+- raw AIR:
+  - `CKKS.rescale`: `508 -> 178`
+- generated C:
+  - `Rescale(`: `1016 -> 356`
+  - `Init_ciph_down_scale(`: `508 -> 178`
 - integrated `ct_encode` first-bootstrap result:
-  - before: `92.088s`
-  - after: `85.313s`
-  - improvement: `6.775s` (`7.36%`)
+  - before: `85.313s`
+  - after: `68.232s`
+  - improvement: `17.081s` (`20.02%`)
+
+Compared with the older validated `ct_encode` baseline:
+
+- `92.088s -> 68.232s`
+- `23.856s` faster
+- about `25.91%`
 
 Required follow-up fix that was needed during bring-up:
 
@@ -343,6 +349,22 @@ Required follow-up fix that was needed during bring-up:
 - fixed in:
   - [ir2c_handler.h](/home/dyf/code/ace-compiler/fhe-cmplr/include/fhe/poly/ir2c_handler.h)
   so poly2c now emits the destination argument correctly for non-preg stores
+
+Fresh post-change profile:
+
+- experiment:
+  - `tmp_profile_dsl_first_current2.er`
+- one-call probe in that run:
+  - `66.771s`
+- inside `dsl_bootstrap_full`, helper ordering is now:
+  - `dsl_bts_Rotate`: about `2.512s` inclusive
+  - `Rescale`: about `1.061s`
+  - `dsl_bts_Relinearize`: about `0.991s`
+
+Current implication:
+
+- after cutting scale-management pressure hard, the next DSL-only target shifts
+  back to the remaining `Rotate` helper cost inside the bootstrap body
 
 ### Phase 1: Cache Encoded Diagonal Plaintexts
 
