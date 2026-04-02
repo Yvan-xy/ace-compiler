@@ -175,6 +175,10 @@ struct SourceLoc {
     bool is_valid() const { return line > 0; }
 };
 
+static void Set_rotation_attr(NODE_PTR node, int32_t rotation) {
+    node->Set_attr(nn::core::ATTR::RNUM, &rotation, 1);
+}
+
 // Type wrapper
 class Type {
 public:
@@ -357,10 +361,6 @@ public:
         return glob ? glob->Unknown_simple_spos() : SPOS(); 
     }
 
-    void set_rotation_attr(NODE_PTR node, int32_t rotation) {
-        node->Set_attr(nn::core::ATTR::RNUM, &rotation, 1);
-    }
-    
     std::shared_ptr<Node> wrap_node(NODE_PTR n, const std::string& opcode) {
         auto node = std::make_shared<Node>(n, ++node_counter, opcode);
         nodes.push_back(node);
@@ -785,7 +785,7 @@ public:
             NODE_PTR n = container->New_cust_node(op, rtype, get_spos());
             n->Set_child(0, ct->node);
             n->Set_child(1, rot_const);
-            set_rotation_attr(n, rotation);
+            Set_rotation_attr(n, rotation);
             auto node = wrap_node(n, "fhe::ckks::ROTATE");
             node->add_child(ct);
             return node;
@@ -1145,7 +1145,7 @@ public:
             NODE_PTR n = container->New_cust_node(op, rtype, get_spos());
             n->Set_child(0, ct->node);
             n->Set_child(1, power_const);
-            set_rotation_attr(n, power);
+            Set_rotation_attr(n, power);
             auto node = wrap_node(n, "fhe::ckks::MUL_MONO");
             node->add_child(ct);
             return node;
@@ -3117,7 +3117,7 @@ public:
                 repl->Set_child(1, amount);
                 if (amount->Opcode() == air::core::OPC_INTCONST) {
                     int32_t rot_idx = static_cast<int32_t>(amount->Intconst());
-                    this->set_rotation_attr(repl, rot_idx);
+                    Set_rotation_attr(repl, rot_idx);
                 }
                 replaced++;
                 return repl;
