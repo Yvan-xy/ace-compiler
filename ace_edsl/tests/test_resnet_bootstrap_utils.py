@@ -41,11 +41,11 @@ class TestBootstrapStagePlanning(unittest.TestCase):
 
         self.assertEqual(
             [stage["plain_level"] for stage in enc_stages],
-            [30, 29, 28],
+            [31, 30, 29],
         )
         self.assertEqual(
             [stage["plain_level"] for stage in dec_stages],
-            [18, 17, 16],
+            [19, 18, 17],
         )
 
     def test_collapsed_fft_grouping_reduces_duplicate_rotations(self):
@@ -106,6 +106,7 @@ CIPHERTEXT Rotate(CIPHERTEXT ciph_0, int32_t rot_idx_1) {
 }
 CIPHERTEXT bootstrap_full(CIPHERTEXT p0, CIPHERTEXT p1) {
   _cst_7 = 0;
+  Raise_mod(&p0, &p1, 31);
   Rotate(p0, 1);
   Relinearize(&p0, &p1);
   return p0;
@@ -127,6 +128,7 @@ CIPHERTEXT bootstrap_full(CIPHERTEXT p0, CIPHERTEXT p1) {
                 pt_from_msg_name="dsl_bts_Pt_from_msg",
                 rotate_name="dsl_bts_Rotate",
                 relin_name="dsl_bts_Relinearize",
+                raise_level_name="dsl_bts_raise_level",
                 const_prefix="dsl_bts",
             )
             self.assertEqual(resnet_bootstrap_utils.emit_body(args), 0)
@@ -139,6 +141,7 @@ CIPHERTEXT bootstrap_full(CIPHERTEXT p0, CIPHERTEXT p1) {
             self.assertIn("dsl_bootstrap_full", body)
             self.assertIn("dsl_bts_Rotate", body)
             self.assertIn("dsl_bts_Relinearize", body)
+            self.assertIn("dsl_bts_raise_level()", body)
             self.assertIn("dsl_bts_cst_7", body)
             self.assertIn("if (rot_idx_1 == 0)", body)
 

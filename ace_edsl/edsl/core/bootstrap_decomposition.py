@@ -410,25 +410,35 @@ def _primitive_transform_levels():
     except ValueError:
         mul_level = 26
 
-    # The primitive path raises the ciphertext to the full available tower
-    # before CoeffToSlot, so the transform planning must use that raised level.
-    level_0 = mul_level + 1
     enc_budget = 3
     dec_budget = 3
-    chebyshev_degree = get_degree_from_coeffs(list(CHEBYSHEV_COEFFICIENTS))
-    ps_k, ps_m = compute_degree_ps(chebyshev_degree)
-    approx_mod_depth = int(math.ceil(math.log2(ps_k))) + ps_m + NUM_DOUBLE_ANGLE
-    bts_depth = approx_mod_depth + enc_budget + dec_budget
+    level_0 = max(1, mul_level) + 1
+    bts_depth = _primitive_bootstrap_depth(enc_budget, dec_budget)
 
     enc_level = max(1, level_0 - enc_budget)
     dec_level = max(1, level_0 - bts_depth)
     return enc_level, dec_level
 
 
+def _primitive_bootstrap_depth(enc_budget: int = 3, dec_budget: int = 3) -> int:
+    """Return the rtlib-equivalent bootstrap depth for the primitive path."""
+    chebyshev_degree = get_degree_from_coeffs(list(CHEBYSHEV_COEFFICIENTS))
+    ps_k, ps_m = compute_degree_ps(chebyshev_degree)
+    approx_mod_depth = int(math.ceil(math.log2(ps_k))) + ps_m + NUM_DOUBLE_ANGLE
+    return approx_mod_depth + enc_budget + dec_budget
+
+
 def _bootstrap_const_level() -> int:
     """Use the high bootstrap plaintext level for scalar constants too."""
     enc_level, _ = _primitive_transform_levels()
     return enc_level
+
+
+def _bootstrap_ct_encode_enabled() -> bool:
+    raw = os.environ.get("ACE_BOOTSTRAP_CT_ENCODE", "").strip().lower()
+    if not raw:
+        return False
+    return raw not in ("0", "false", "off", "no")
 
 
 def _coeffs_to_slots_factor(slots: int) -> float:
@@ -778,6 +788,26 @@ def _group_collapsed_fft_stage_terms(coeff, stage, slots: int):
     return [(rot, grouped[rot]) for rot in order]
 
 
+def _compact_grouped_stage_terms(coeff, stage, slots: int):
+    """Return grouped stage terms when they form a contiguous rotation run."""
+    if not _bootstrap_ct_encode_enabled():
+        return None
+
+    grouped_terms = _group_collapsed_fft_stage_terms(coeff, stage, slots)
+    if len(grouped_terms) >= stage["num_rot"]:
+        return None
+
+    grouped_terms = sorted(grouped_terms, key=lambda item: item[0])
+    expected = [
+        _reduce_rotation(idx * stage["shift"], slots)
+        for idx in range(len(grouped_terms))
+    ]
+    actual = [rot for rot, _ in grouped_terms]
+    if actual != expected:
+        return None
+    return grouped_terms
+
+
 def _rotate_plain_vector(values, rotation: int):
     """Match rtlib Rotate_vector semantics for plaintext diagonals."""
     length = len(values)
@@ -810,6 +840,18 @@ def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
             rot = _reduce_rotation(idx, slots)
             rot_in.append(rot)
 
+        compact_terms = _compact_grouped_stage_terms(coeff, stage, slots)
+        if compact_terms is None:
+            term_count = num_rot
+            stage_giant_step = giant_step
+        else:
+            term_count = len(compact_terms)
+            stage_giant_step = max(1, (term_count + baby_step - 1) // baby_step)
+            rot_in = [
+                _reduce_rotation(j * shift, slots)
+                for j in range(min(stage_giant_step, term_count))
+            ]
+
         fast_rot = [
             result if rot == 0 else result.rotate(rot)
             for rot in rot_in
@@ -817,15 +859,18 @@ def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
 
         stage_acc = None
         for i in range(baby_step):
-            giant = giant_step * i
+            giant = stage_giant_step * i
             giant_rot = giant * shift
             diag_rotation = _reduce_rotation(-giant_rot, slots)
             inner = None
-            for j in range(giant_step):
+            for j in range(len(rot_in)):
                 dim2 = giant + j
-                if dim2 == num_rot:
+                if dim2 >= term_count:
                     continue
-                diag = coeff[s][dim2]
+                if compact_terms is None:
+                    diag = coeff[s][dim2]
+                else:
+                    _, diag = compact_terms[dim2]
                 if diag_scale != 1.0:
                     diag = [val * diag_scale for val in diag]
                 if diag_rotation != 0:
@@ -837,14 +882,16 @@ def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
                 inner = term if inner is None else inner + term
             if inner is None:
                 continue
-            inner = inner.rescale()
             if i == 0:
                 stage_acc = inner
             else:
                 rot = _reduce_rotation(giant_rot, slots)
                 moved = inner if rot == 0 else inner.rotate(rot)
                 stage_acc = moved if stage_acc is None else stage_acc + moved
-        result = stage_acc
+        # Match the rtlib transform structure more closely: accumulate each
+        # stage at the multiplied scale and only rescale when a following stage
+        # still needs to consume this result.
+        result = stage_acc.rescale()
     return result
 
 

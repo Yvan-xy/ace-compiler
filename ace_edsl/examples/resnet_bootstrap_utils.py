@@ -80,8 +80,152 @@ def emit_body(args: argparse.Namespace) -> int:
         include_line = '#include "rt_ant/rt_ant.h"\n'
         body = body.replace(include_line, include_line + "\n" + pt_decl, 1)
 
+    raise_decl = f"uint32_t {args.raise_level_name}(void);\n"
+    if raise_decl not in body:
+        include_line = '#include "rt_ant/rt_ant.h"\n'
+        body = body.replace(include_line, include_line + raise_decl, 1)
+
+    body = re.sub(
+        r"Raise_mod\(\s*(&[^,]+)\s*,\s*(&[^,]+)\s*,\s*\d+\s*\);",
+        rf"Raise_mod(\1, \2, {args.raise_level_name}());",
+        body,
+    )
+
+    raw_stage_probe = os.environ.get("ACE_BOOTSTRAP_STAGE_PROBE", "").strip().lower()
+    if raw_stage_probe and raw_stage_probe not in ("0", "false", "off", "no"):
+        body = _inject_stage_probes(body)
+
     dst_path.write_text(body, encoding="utf-8")
     return 0
+
+
+def _inject_stage_probes(body: str) -> str:
+    support = textwrap.dedent(
+        """\
+        #include <time.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        static int dsl_bts_stage_probe_enabled(void) {
+          static int initialized = 0;
+          static int enabled = 0;
+          if (!initialized) {
+            const char* flag = getenv("ACE_BOOTSTRAP_STAGE_PROBE");
+            enabled = (flag != NULL && flag[0] != '\\0' && strcmp(flag, "0") != 0);
+            initialized = 1;
+          }
+          return enabled;
+        }
+
+        static double dsl_bts_stage_now_sec(void) {
+          struct timespec ts;
+          clock_gettime(CLOCK_MONOTONIC, &ts);
+          return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+        }
+
+        static void dsl_bts_stage_mark(const char* stage, double* last) {
+          if (!dsl_bts_stage_probe_enabled()) {
+            return;
+          }
+          double now = dsl_bts_stage_now_sec();
+          fprintf(stderr, "[dsl_bts_stage] %s elapsed=%.3fs\\n", stage, now - *last);
+          fflush(stderr);
+          *last = now;
+        }
+        """
+    )
+
+    include_anchor = 'void* dsl_bts_Pt_from_msg'
+    if support not in body and include_anchor in body:
+        body = body.replace(include_anchor, support + "\n" + include_anchor, 1)
+
+    fn_anchor = "CIPHERTEXT dsl_bootstrap_full(CIPHERTEXT p0_0, CIPHERTEXT p1_1) {\n"
+    if fn_anchor not in body:
+        raise RuntimeError("stage probe injection failed: bootstrap entry anchor missing")
+    body = body.replace(
+        fn_anchor,
+        fn_anchor +
+        "  double _dsl_bts_stage_last = 0.0;\n"
+        "  if (dsl_bts_stage_probe_enabled()) {\n"
+        "    _dsl_bts_stage_last = dsl_bts_stage_now_sec();\n"
+        "  }\n",
+        1,
+    )
+
+    def insert_before_once(text: str, needle: str, snippet: str) -> str:
+        idx = text.find(needle)
+        if idx < 0:
+            raise RuntimeError(f"stage probe injection failed: missing anchor {needle!r}")
+        return text[:idx] + snippet + text[idx:]
+
+    # Step 1 done: first full-packed CoeffToSlot result is ready before conjugate split.
+    body = insert_before_once(
+        body,
+        "  Conjugate_ciph(",
+        '  dsl_bts_stage_mark("coeff_to_slots", &_dsl_bts_stage_last);\n',
+    )
+
+    mul_mono_matches = list(re.finditer(r"^  Mul_mono_ciph\(", body, flags=re.M))
+    if len(mul_mono_matches) < 2:
+        raise RuntimeError("stage probe injection failed: expected two Mul_mono_ciph anchors")
+
+    first_mul = mul_mono_matches[0].start()
+    second_mul = mul_mono_matches[1].start()
+    body = (
+        body[:first_mul]
+        + '  dsl_bts_stage_mark("split", &_dsl_bts_stage_last);\n'
+        + body[first_mul:]
+    )
+    second_mul += len('  dsl_bts_stage_mark("split", &_dsl_bts_stage_last);\n')
+    body = (
+        body[:second_mul]
+        + '  dsl_bts_stage_mark("dual_evalmod", &_dsl_bts_stage_last);\n'
+        + body[second_mul:]
+    )
+
+    rotate_after_recombine = re.search(r"^  _preg_\d+ = dsl_bts_Rotate\(", body[second_mul:], flags=re.M)
+    if rotate_after_recombine is None:
+        raise RuntimeError("stage probe injection failed: missing SlotToCoeff rotate anchor")
+    rotate_pos = second_mul + rotate_after_recombine.start()
+    body = (
+        body[:rotate_pos]
+        + '  dsl_bts_stage_mark("recombine", &_dsl_bts_stage_last);\n'
+        + body[rotate_pos:]
+    )
+
+    post_scale_pos = -1
+    scan_pos = rotate_pos
+    while True:
+        line_end = body.find("\n", scan_pos)
+        if line_end < 0:
+            line_end = len(body)
+        line = body[scan_pos:line_end]
+        if line.startswith("  Init_ciph_same_scale("):
+            args = line[len("  Init_ciph_same_scale("):-2]
+            parts = [part.strip() for part in args.split(",")]
+            if len(parts) == 3 and parts[1] == parts[2]:
+                post_scale_pos = scan_pos
+                break
+        if line_end >= len(body):
+            break
+        scan_pos = line_end + 1
+    if post_scale_pos < 0:
+        raise RuntimeError("stage probe injection failed: missing post-scale doubling anchor")
+    body = (
+        body[:post_scale_pos]
+        + '  dsl_bts_stage_mark("slots_to_coeffs", &_dsl_bts_stage_last);\n'
+        + body[post_scale_pos:]
+    )
+
+    ret_pos = body.rfind("  return __ret_tmp_")
+    if ret_pos < 0:
+        raise RuntimeError("stage probe injection failed: missing bootstrap return anchor")
+    body = (
+        body[:ret_pos]
+        + '  dsl_bts_stage_mark("post_scale", &_dsl_bts_stage_last);\n'
+        + body[ret_pos:]
+    )
+    return body
 
 
 def emit_shim(args: argparse.Namespace) -> int:
@@ -94,7 +238,6 @@ def emit_shim(args: argparse.Namespace) -> int:
         #include <time.h>
         #include <fcntl.h>
         #include <unistd.h>
-
         #include "ckks/cipher.h"
         #include "ckks/ciphertext.h"
         #include "common/rt_api.h"
@@ -105,17 +248,46 @@ def emit_shim(args: argparse.Namespace) -> int:
         extern "C" {{
         #endif
 
+        CKKS_PARAMS* Get_context_params(void);
         CIPHERTEXT {args.entry_name}(CIPHERTEXT p0, CIPHERTEXT p1);
         RT_DATA_INFO* {args.rtdata_name}(void);
+        CKKS_PARAMS* {args.ctxparams_name}(void);
         PLAIN {args.pt_from_msg_name}(void* pt, uint32_t index, size_t len,
                                       uint32_t scale, uint32_t level);
 
         static unsigned long g_dsl_bts_call_counter = 0;
+        static __thread uint32_t g_dsl_bts_target_level_after_bts = 0;
 
         static double dsl_bts_now_sec(void) {{
           struct timespec ts;
           clock_gettime(CLOCK_MONOTONIC, &ts);
           return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+        }}
+
+        uint32_t {args.raise_level_name}(void) {{
+          CKKS_PARAMS* ctx = Get_context_params();
+          if (ctx == NULL) {{
+            ctx = {args.ctxparams_name}();
+          }}
+          if (ctx == NULL) {{
+            fprintf(stderr, "[{args.log_prefix}] missing bootstrap context params\\n");
+            fflush(stderr);
+            abort();
+          }}
+          uint32_t q_cnt = (uint32_t)(ctx->_mul_depth + 1);
+          uint32_t target_level = g_dsl_bts_target_level_after_bts;
+          uint32_t bts_depth = {args.bootstrap_depth};
+          if (target_level == 0) {{
+            return q_cnt;
+          }}
+          if (target_level > q_cnt - bts_depth) {{
+            fprintf(stderr,
+                    "[{args.log_prefix}] target level %u exceeds max %u for bootstrap depth %u\\n",
+                    target_level, q_cnt - bts_depth, bts_depth);
+            fflush(stderr);
+            abort();
+          }}
+          return target_level + bts_depth;
         }}
 
         static void dsl_bts_dump_first_output(CIPHER ciph) {{
@@ -140,13 +312,12 @@ def emit_shim(args: argparse.Namespace) -> int:
           int fd;
           struct DATA_FILE_HDR hdr;
           struct DATA_LUT_ENTRY* lut;
-          char* slot_buf;
-          uint64_t slot_size;
-          uint32_t slot_count;
           int initialized;
         }} DSL_BTS_PT_FILE;
 
-        static DSL_BTS_PT_FILE g_dsl_bts_pt = {{-1, {{0}}, NULL, NULL, 0, 0, 0}};
+        static DSL_BTS_PT_FILE g_dsl_bts_pt = {{-1, {{0}}, NULL, 0}};
+        static __thread char* g_dsl_bts_pt_tls_buf = NULL;
+        static __thread uint64_t g_dsl_bts_pt_tls_size = 0;
 
         static void dsl_bts_pt_fini(void) {{
           if (!g_dsl_bts_pt.initialized) {{
@@ -156,13 +327,24 @@ def emit_shim(args: argparse.Namespace) -> int:
             close(g_dsl_bts_pt.fd);
           }}
           free(g_dsl_bts_pt.lut);
-          free(g_dsl_bts_pt.slot_buf);
           g_dsl_bts_pt.fd = -1;
           g_dsl_bts_pt.lut = NULL;
-          g_dsl_bts_pt.slot_buf = NULL;
-          g_dsl_bts_pt.slot_size = 0;
-          g_dsl_bts_pt.slot_count = 0;
           g_dsl_bts_pt.initialized = 0;
+        }}
+
+        static char* dsl_bts_pt_thread_buf(uint64_t min_size) {{
+          if (g_dsl_bts_pt_tls_size >= min_size && g_dsl_bts_pt_tls_buf != NULL) {{
+            return g_dsl_bts_pt_tls_buf;
+          }}
+          char* new_buf = (char*)realloc(g_dsl_bts_pt_tls_buf, min_size);
+          if (new_buf == NULL) {{
+            fprintf(stderr, "[{args.log_prefix}] failed to grow bootstrap plaintext scratch buffer\\n");
+            fflush(stderr);
+            abort();
+          }}
+          g_dsl_bts_pt_tls_buf = new_buf;
+          g_dsl_bts_pt_tls_size = min_size;
+          return g_dsl_bts_pt_tls_buf;
         }}
 
         static void dsl_bts_pt_init(void) {{
@@ -202,22 +384,6 @@ def emit_shim(args: argparse.Namespace) -> int:
             fflush(stderr);
             abort();
           }}
-          g_dsl_bts_pt.slot_count = (uint32_t)g_dsl_bts_pt.hdr._ent_count;
-          const char* env = getenv("PT_ENTRY_COUNT");
-          if (env != NULL && env[0] != '\\0') {{
-            unsigned long val = strtoul(env, NULL, 10);
-            if (val > 0) {{
-              g_dsl_bts_pt.slot_count = (uint32_t)val;
-            }}
-          }}
-          g_dsl_bts_pt.slot_size = Max_plain_buffer_length();
-          g_dsl_bts_pt.slot_buf =
-              (char*)malloc(g_dsl_bts_pt.slot_size * g_dsl_bts_pt.slot_count);
-          if (g_dsl_bts_pt.slot_buf == NULL) {{
-            fprintf(stderr, "[{args.log_prefix}] failed to allocate bootstrap plaintext cache\\n");
-            fflush(stderr);
-            abort();
-          }}
           g_dsl_bts_pt.initialized = 1;
           atexit(dsl_bts_pt_fini);
         }}
@@ -229,14 +395,16 @@ def emit_shim(args: argparse.Namespace) -> int:
           (void)scale;
           (void)level;
           dsl_bts_pt_init();
+          // The generated primitive bootstrap body immediately Copy_plain(...)
+          // from each Pt_from_msg(...) result, so a thread-local scratch buffer
+          // is sufficient and avoids keeping every bootstrap plaintext resident.
           if (index >= g_dsl_bts_pt.hdr._ent_count) {{
             fprintf(stderr, "[{args.log_prefix}] bootstrap plaintext index out of range: %u\\n", index);
             fflush(stderr);
             abort();
           }}
-          uint32_t slot = index % g_dsl_bts_pt.slot_count;
-          char* slot_ptr = g_dsl_bts_pt.slot_buf + slot * g_dsl_bts_pt.slot_size;
           struct DATA_LUT_ENTRY* lut = &g_dsl_bts_pt.lut[index];
+          char* slot_ptr = dsl_bts_pt_thread_buf(lut->_size);
           ssize_t ret = pread(g_dsl_bts_pt.fd, slot_ptr, lut->_size, lut->_ent_ofst);
           if (ret != (ssize_t)lut->_size) {{
             fprintf(stderr, "[{args.log_prefix}] failed to read bootstrap plaintext entry %u\\n", index);
@@ -263,7 +431,10 @@ def emit_shim(args: argparse.Namespace) -> int:
           memset(&in_copy, 0, sizeof(in_copy));
           Copy_ciphertext(&in_copy, ciph);
 
+          uint32_t prev_target_level = g_dsl_bts_target_level_after_bts;
+          g_dsl_bts_target_level_after_bts = level_after_bts;
           CIPHERTEXT out = {args.entry_name}(in_copy, in_copy);
+          g_dsl_bts_target_level_after_bts = prev_target_level;
           if (level_after_bts != 0) {{
             while (Level(&out) > level_after_bts) {{
               Modswitch_ciph(&out);
@@ -319,14 +490,18 @@ def build_parser() -> argparse.ArgumentParser:
     emit.add_argument("--pt-from-msg-name", default="dsl_bts_Pt_from_msg")
     emit.add_argument("--rotate-name", default="dsl_bts_Rotate")
     emit.add_argument("--relin-name", default="dsl_bts_Relinearize")
+    emit.add_argument("--raise-level-name", default="dsl_bts_raise_level")
     emit.add_argument("--const-prefix", default="dsl_bts")
     emit.set_defaults(func=emit_body)
 
     shim = subparsers.add_parser("emit-shim")
     shim.add_argument("--output", required=True)
     shim.add_argument("--entry-name", default="dsl_bootstrap_full")
+    shim.add_argument("--ctxparams-name", default="Get_extra_context_params")
     shim.add_argument("--rtdata-name", default="dsl_bootstrap_get_rt_data_info")
     shim.add_argument("--pt-from-msg-name", default="dsl_bts_Pt_from_msg")
+    shim.add_argument("--raise-level-name", default="dsl_bts_raise_level")
+    shim.add_argument("--bootstrap-depth", type=int, default=15)
     shim.add_argument("--bootstrap-call-name", default="Eval_bootstrap_ciph_dsl")
     shim.add_argument("--log-prefix", default="dsl_bts")
     shim.add_argument("--dump-label", default="dsl_bts_round1")
