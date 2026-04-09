@@ -793,6 +793,8 @@ public:
   template <typename RETV, typename VISITOR>
   RETV Handle_rotate(VISITOR* visitor, NODE_PTR rot_node);
   template <typename RETV, typename VISITOR>
+  RETV Handle_rotate_batch(VISITOR* visitor, NODE_PTR rot_node);
+  template <typename RETV, typename VISITOR>
   RETV Handle_mul_mono(VISITOR* visitor, NODE_PTR mul_mono_node);
   template <typename RETV, typename VISITOR>
   RETV Handle_conjugate(VISITOR* visitor, NODE_PTR conjugate_node);
@@ -904,6 +906,31 @@ RETV CKKS_ANA_IMPL::Handle_rotate(VISITOR* visitor, NODE_PTR rot_node) {
   AIR_ASSERT(rot_idx != nullptr && rot_idx_count > 0);
   for (uint32_t i = 0; i < rot_idx_count; ++i) {
     visitor->Context().Add_rotate_index(rot_idx[i]);
+  }
+
+  return child0_res;
+}
+
+template <typename RETV, typename VISITOR>
+RETV CKKS_ANA_IMPL::Handle_rotate_batch(VISITOR* visitor, NODE_PTR rot_node) {
+  CTX_PARAM_ANA_CTX& ana_ctx   = visitor->Context();
+  uint32_t           mul_level = ana_ctx.Top_mul_level();
+  ana_ctx.Set_node_mul_level(rot_node, mul_level);
+
+  ana_ctx.Push_mul_level(mul_level);
+  RETV child0_res = visitor->template Visit<RETV>(rot_node->Child(0));
+  AIR_ASSERT_MSG(mul_level == ana_ctx.Top_mul_level(),
+                 "mul level inconsistent");
+  ana_ctx.Pop_mul_level();
+
+  const char* rot_idx_key   = nn::core::ATTR::RNUM;
+  uint32_t    rot_idx_count = 0;
+  const int*  rot_idx       = rot_node->Attr<int>(rot_idx_key, &rot_idx_count);
+  AIR_ASSERT(rot_idx != nullptr && rot_idx_count > 0);
+  for (uint32_t i = 0; i < rot_idx_count; ++i) {
+    if (rot_idx[i] != 0) {
+      visitor->Context().Add_rotate_index(rot_idx[i]);
+    }
   }
 
   return child0_res;

@@ -548,6 +548,47 @@ class AIRValue:
             raise NotImplementedError("Container does not support rotate operation")
         
         return self._flatten_result(result_node)
+
+    def rotate_batch(self, amounts: list[int]) -> 'AIRValue':
+        """
+        Emit a grouped CKKS rotate batch over one source ciphertext.
+
+        Returns an array of ciphertexts that can be indexed with ``[i]`` to
+        access the rotated outputs.
+        """
+        self._set_loc()
+        if not amounts:
+            raise ValueError("rotate_batch requires at least one rotation")
+
+        norm_amounts = []
+        for amount in amounts:
+            if hasattr(amount, 'value'):
+                amount = amount.value
+            norm_amounts.append(int(amount))
+
+        self_node = self.value
+        if not hasattr(self._container, 'new_ckks_rotate_batch'):
+            raise NotImplementedError("Container does not support rotate_batch")
+
+        result_node = self._container.new_ckks_rotate_batch(self_node, norm_amounts)
+
+        if not AIRValue.FLAT_IR_MODE or not hasattr(self._container, 'new_stid'):
+            return AIRValue(
+                result_node,
+                self._container,
+                shape=(len(norm_amounts),),
+                domain=self._domain,
+            )
+
+        temp_name = AIRValue._next_temp_name()
+        self._container.new_stid(temp_name, result_node)
+        return AIRValue(
+            node=None,
+            container=self._container,
+            shape=(len(norm_amounts),),
+            domain=self._domain,
+            temp_name=temp_name,
+        )
     
     def rescale(self) -> 'AIRValue':
         """

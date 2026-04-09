@@ -207,15 +207,12 @@ public:
     if (stmt_node != air::base::Null_ptr && stmt_node->Opcode() == air::core::OPC_ST &&
         stmt_node->Child(0)->Opcode() == air::core::OPC_ILD &&
         stmt_node->Child(0)->Child(0)->Opcode() == air::core::OPC_ARRAY) {
-      // we have loop to free whole array, so won't free individual
-      _pass.Mark_var_freed(stmt_node->Addr_datum());
-      // if the st-ild is in top-level, ignore mfree so far
-      // a possible solution is to post-pone mfree to PRAGMA END
+      // `st x = ild(array(a, i))` is a move-like extraction for mfreeable
+      // element types. Keep the extracted value on the normal last-use path
+      // and suppress container frees on the backing array to avoid double-free.
       air::base::NODE_PTR rhs = stmt_node->Child(0)->Child(0)->Child(0);
-      if (Parent(2) == air::base::Null_ptr &&
-          rhs->Opcode() == air::core::OPC_LDA) {
-        CMPLR_DEV_WARN("TODO: find right place to free %s.\n",
-                       rhs->Addr_datum()->Name()->Char_str());
+      if (rhs->Opcode() == air::core::OPC_LDA &&
+          _pass.Type_need_mfree(stmt_node->Addr_datum()->Type())) {
         _pass.Mark_var_freed(rhs->Addr_datum());
       }
     } else if (stmt_node != air::base::Null_ptr && stmt_node->Opcode() == air::core::OPC_CALL &&

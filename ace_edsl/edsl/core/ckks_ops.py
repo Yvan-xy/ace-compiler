@@ -127,6 +127,18 @@ def ckks_rotate(ct: AIRValue, rotation: int) -> AIRValue:
     return AIRValue(result_node, container)
 
 
+def ckks_rotate_batch(ct: AIRValue, rotations: list[int]) -> AIRValue:
+    """
+    CKKS grouped rotation batch over one source ciphertext.
+    """
+    container = ct.container
+    if hasattr(container, 'new_ckks_rotate_batch'):
+        result_node = container.new_ckks_rotate_batch(ct.value, rotations)
+    else:
+        return ct
+    return AIRValue(result_node, container, shape=(len(rotations),))
+
+
 def ckks_mod_switch(ct: AIRValue) -> AIRValue:
     """
     CKKS modulus switch operation.

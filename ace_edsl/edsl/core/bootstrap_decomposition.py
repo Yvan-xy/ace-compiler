@@ -852,10 +852,8 @@ def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
                 for j in range(min(stage_giant_step, term_count))
             ]
 
-        fast_rot = [
-            result if rot == 0 else result.rotate(rot)
-            for rot in rot_in
-        ]
+        fast_rot_batch = result.rotate_batch(rot_in)
+        fast_rot = [fast_rot_batch[j] for j in range(len(rot_in))]
 
         stage_acc = None
         for i in range(baby_step):

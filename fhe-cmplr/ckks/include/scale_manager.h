@@ -900,6 +900,8 @@ public:
 
   template <typename RETV, typename VISITOR>
   RETV Handle_rotate(VISITOR* visitor, NODE_PTR node);
+  template <typename RETV, typename VISITOR>
+  RETV Handle_rotate_batch(VISITOR* visitor, NODE_PTR node);
 
   template <typename RETV, typename VISITOR>
   RETV Handle_relin(VISITOR* visitor, NODE_PTR node);
@@ -1122,6 +1124,16 @@ RETV CKKS_SCALE_MANAGER::Handle_rotate(VISITOR* visitor, NODE_PTR node) {
   } else if (ctx.Req_ace_sm()) {
     si = ACE_SM(&ctx).Handle_rotate(node, si);
   }
+  ctx.Set_node_scale_info(node, si);
+  return RETV{si, node};
+}
+
+template <typename RETV, typename VISITOR>
+RETV CKKS_SCALE_MANAGER::Handle_rotate_batch(VISITOR* visitor, NODE_PTR node) {
+  SCALE_MNG_CTX& ctx   = visitor->Context();
+  NODE_PTR       child = node->Child(0);
+  RETV           retv0 = visitor->template Visit<RETV>(child);
+  SCALE_INFO     si    = retv0.Scale_info();
   ctx.Set_node_scale_info(node, si);
   return RETV{si, node};
 }

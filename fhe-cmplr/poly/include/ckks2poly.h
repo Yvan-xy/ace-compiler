@@ -137,6 +137,7 @@ public:
         case fhe::ckks::CKKS_OPERATOR::RAISE_MOD:
         case fhe::ckks::CKKS_OPERATOR::CONJUGATE:
         case fhe::ckks::CKKS_OPERATOR::MUL_MONO:
+        case fhe::ckks::CKKS_OPERATOR::ROTATE_BATCH:
         case fhe::ckks::CKKS_OPERATOR::BOOTSTRAP_COEFFS_TO_SLOTS:
         case fhe::ckks::CKKS_OPERATOR::BOOTSTRAP_EVAL_MOD:
         case fhe::ckks::CKKS_OPERATOR::BOOTSTRAP_SLOTS_TO_COEFFS:

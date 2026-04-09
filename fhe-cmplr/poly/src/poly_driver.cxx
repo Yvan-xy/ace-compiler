@@ -185,6 +185,7 @@ GLOB_SCOPE* POLY_DRIVER::Run_flatten(GLOB_SCOPE* glob, POLY_LAYER tgt_layer) {
             opcode == fhe::ckks::OPC_ENCODE ||
             opcode == fhe::ckks::OPC_RESCALE ||
             opcode == fhe::ckks::OPC_ROTATE ||
+            opcode == fhe::ckks::OPC_ROTATE_BATCH ||
             opcode == fhe::ckks::OPC_UPSCALE ||
             opcode == fhe::ckks::OPC_MODSWITCH ||
             opcode == fhe::ckks::OPC_RELIN ||

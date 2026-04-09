@@ -617,3 +617,239 @@
     - a useful rotate optimization likely needs an explicit bootstrap-local
       hoisting/cache design; a naive alternate rotate lowering can easily
       increase IR/helper pressure and lose badly
+- 2026-04-08 current DSL bootstrap profiling summary:
+  - compared [1.log](/home/dyf/code/ace-compiler/1.log) vs
+    [origin.log](/home/dyf/code/ace-compiler/origin.log)
+  - current integrated gap:
+    - DSL `MAIN_GRAPH`: `1458.887598s`
+    - rtlib `MAIN_GRAPH`: `899.852733s`
+    - non-bootstrap residuals are effectively equal, so the gap is almost
+      entirely bootstrap itself
+  - added an optional stage probe in
+    `ace_edsl/examples/resnet_bootstrap_utils.py` behind
+    `ACE_BOOTSTRAP_STAGE_PROBE=1`
+  - current first-bootstrap stage breakdown on the real `ct_encode` path:
+    - `coeff_to_slots`: `25.263s`
+    - `split`: `0.430s`
+    - `dual_evalmod`: `23.151s`
+    - `recombine`: `0.028s`
+    - `slots_to_coeffs`: `13.531s`
+    - `post_scale`: `0.011s`
+    - total: `62.416s`
+  - next optimization order is now clear:
+    1. make raise target-level-aware
+    2. optimize the transform path
+    3. optimize dual `EvalMod`
+    4. ignore split/recombine/post-scale
+- 2026-04-08 dynamic raise-level follow-up:
+  - the earlier "max target level" shortcut was ineffective because the graph's
+    maximum requested `level_after_bts` was already the maximum legal output
+    level, so it still implied a full raise
+  - implemented the useful version in the integrated `dsl-bts` path instead:
+    - rewrote emitted `Raise_mod(..., const)` in the generated bootstrap body
+      to call a shim helper for the raise level
+    - shim computes `raise_level = level_after_bts + bts_depth` at runtime
+  - important constraint learned:
+    - for the integrated path, derive the active Q-chain from the main
+      program's `Get_context_params()`
+    - do not use the bootstrap module's `Get_extra_context_params()` for this
+      because that extra context is primarily for additional rotate metadata
+  - validation:
+    - `python3 -m pytest -q ace_edsl/tests/test_resnet_bootstrap_utils.py`
+      passes
+    - first-bootstrap probe improved:
+      - about `62.766s -> 59.461s`
+    - full one-image integrated run improved:
+      - bootstrap-call sum: about `1275.737s -> 1102.668s`
+      - bootstrap-call average: about `60.749s -> 52.508s`
+      - wall time: about `24m40.078s -> 21m48.061s`
+    - largest wins are on lower target levels:
+      - `14` calls now about `52`–`54s`
+      - `13` calls about `50`–`51s`
+      - `6` calls about `31s`
+  - conclusion:
+    - keep the dynamic raise integration as the new baseline
+    - next target remains the transform path, then dual `EvalMod`
+- 2026-04-08 transform follow-up after dynamic raise:
+  - optimized `_apply_collapsed_fft_transform()` by moving from one
+    `rescale()` per baby-step inner sum to one `rescale()` per transform stage
+  - validation:
+    - `python3 -m pytest -q ace_edsl/tests/test_resnet_bootstrap_utils.py`
+      passes
+    - first-bootstrap stage probe improved:
+      - `coeff_to_slots`: `25.263s -> 22.972s`
+      - `dual_evalmod`: `23.151s -> 22.114s`
+      - `slots_to_coeffs`: `13.531s -> 12.067s`
+      - total: `62.416s -> 57.606s`
+    - full one-image integrated run improved:
+      - bootstrap-call sum: `1102.668s -> 1078.293s`
+      - bootstrap-call average: `52.508s -> 51.347s`
+      - wall time: `21m48.061s -> 21m24.185s`
+  - conclusion:
+    - keep the stage-boundary rescale change
+    - the remaining biggest target is still the transform path, especially
+      bootstrap-local rotate cost, followed by dual `EvalMod`
+- 2026-04-08 transform/OMP follow-up:
+  - reverted the framework-level OMP `parallel sections` experiment
+  - root cause:
+    - the integrated resnet harness already runs `Run_main_graph()` inside an
+      outer `#pragma omp parallel for`
+    - inner bootstrap `parallel sections` became nested OpenMP and effectively
+      serialized under libgomp defaults (`OMP_NESTED=FALSE`,
+      `OMP_MAX_ACTIVE_LEVELS=1`)
+  - revalidated the revert:
+    - helper tests still pass
+    - integrated first bootstrap returned to the non-OMP baseline path with no
+      emitted `#pragma omp parallel sections` in `bootstrap_full_body.c`
+- 2026-04-08 collapsed-FFT planner ablations:
+  - current non-OMP baseline first-bootstrap probe:
+    - `coeff_to_slots`: `22.450s`
+    - `dual_evalmod`: `21.390s`
+    - `slots_to_coeffs`: `11.862s`
+    - total: `56.140s`
+  - forcing rtlib default BSGS (`ACE_BOOTSTRAP_FORCE_RTLIB_BSGS=1`) regressed:
+    - `coeff_to_slots`: `26.629s`
+    - `dual_evalmod`: `21.537s`
+    - `slots_to_coeffs`: `13.831s`
+    - total: `62.432s`
+  - disabling stage compaction (`ACE_BOOTSTRAP_DISABLE_STAGE_COMPACTION=1`)
+    also regressed:
+    - `coeff_to_slots`: `26.012s`
+    - `dual_evalmod`: `22.715s`
+    - `slots_to_coeffs`: `13.817s`
+    - total: `63.019s`
+  - conclusion:
+    - the current DSL planner differences are not the main reason the DSL path
+      is slower than rtlib
+    - `g=8, b=8` and limited compaction are compensating for the heavier
+      generic rotate lowering
+    - the next meaningful optimization must happen in the framework/codegen
+      path for grouped/hoisted rotate+decomp reuse, not by reverting these
+      planner choices toward rtlib defaults
+- 2026-04-09 lower-level helper substitution follow-up:
+  - tried replacing generated rotate/relin helper bodies with direct runtime
+    wrappers around `Rotate_ciph` / `Relin`
+  - full rotate+relin runtime-wrapper path regressed the real first-bootstrap
+    probe:
+    - `coeff_to_slots`: `22.450s -> 22.792s`
+    - `dual_evalmod`: `21.390s -> 22.175s`
+    - `slots_to_coeffs`: `11.862s -> 12.676s`
+    - total: `56.140s -> 58.092s`
+  - isolating runtime `Relin` alone also regressed:
+    - `coeff_to_slots`: `22.817s`
+    - `dual_evalmod`: `21.764s`
+    - `slots_to_coeffs`: `12.406s`
+    - total: `57.444s`
+  - both experiments were reverted
+  - conclusion:
+    - one-for-one replacement of the generated helper body with a runtime
+      helper is still not enough
+    - the real missing win is stage-level grouped rotate reuse, like rtlib's
+      `Rotate_iteration(...)` hoisting, not isolated helper substitution
+- 2026-04-09 grouped rotate batch follow-up:
+  - implemented a first-class `CKKS.rotate_batch` path for the collapsed-FFT
+    `fast_rot` construction
+  - representation:
+    - one ciphertext child
+    - array-of-ciphertext result type
+    - rotation list carried in `nn::core::ATTR::RNUM`
+  - runtime/codegen path:
+    - new generic runtime helper `Rotate_batch_ciph(...)`
+    - helper shares one `Alloc_precomp(Get_c1(ciph))` across the whole batch
+      and then runs repeated `Fast_rotate(...)`
+    - poly IR2C emits this helper directly for array-of-cipher stores of the
+      new op
+  - integration validation:
+    - `python3 -m pytest -q ace_edsl/tests/test_resnet_bootstrap_utils.py`
+      passes
+    - first-bootstrap stage probe improved from the previous clean baseline:
+      - `coeff_to_slots`: `22.450s -> 20.274s`
+      - `dual_evalmod`: `21.390s -> 21.792s`
+      - `slots_to_coeffs`: `11.862s -> 9.398s`
+      - total: `56.140s -> 53.334s`
+    - non-probed integrated early calls also improved:
+      - call 1 (`target_level=15`): `55.308s`
+      - call 2 (`14`): `48.368s`
+      - call 3 (`16`): `53.658s`
+      - call 4 (`14`): `47.172s`
+      - call 5 (`16`): `54.994s`
+      - call 6 (`13`): `46.163s`
+      - call 7 (`6`): `29.153s`
+    - first 7-call average in the integrated run was about `47.83s`, better
+      than the earlier full-run baseline average `51.35s`
+  - generated helper shape also improved:
+    - `dsl_bts_Rotate(...)` call sites in the emitted bootstrap body dropped
+      from `82` to `44`
+    - `Rotate_batch_ciph(...)` sites added: `6`
+  - conclusion:
+    - grouped rotate reuse is the first lower-level strategy that produced a
+      real integrated speedup
+    - the next likely target is extending the same idea beyond `fast_rot`
+      to the later stage-local moved rotates, or tackling the still-large
+      `dual_evalmod` bucket
+2026-04-16
+- investigated why multi-image `dsl-bts` (`0..9`) was getting killed
+- confirmed a real compiler ownership bug in the grouped `rotate_batch` path:
+  - `poly2c_mfree` treated `st x = ild(array(batch, i))` as already freed
+  - generated bootstrap body therefore missed `Free_data(...)` calls for the
+    extracted ciphertext temporaries
+  - patch in `fhe-cmplr/include/fhe/poly/poly2c_mfree.h`:
+    - keep extracted ciphertext values on the normal last-use mfree path
+    - suppress only the backing batch-array container free
+  - regenerated body now frees extracted values such as `_t46_48`, `_t47_49`,
+    `_t53_55`, `_t125_127`, `_t132_134`
+- validated helper regression safety:
+  - `python3 -m pytest -q ace_edsl/tests/test_resnet_bootstrap_utils.py`
+    still passes (`4 passed`)
+- root cause of the `0..9` kill is larger than the missing-frees bug:
+  - direct runtime sampling on the rebuilt binary shows one active DSL
+    bootstrap image is already around `15 GB RSS` at about `20s` and around
+    `30 GB RSS` at about `40s`
+  - the old image-level `#pragma omp parallel for` in
+    `fhe-cmplr/rtlib/ant/dataset/resnet_cifar.main.inc` therefore oversubscribes
+    memory badly for DSL bootstrap multi-image runs
+ - clean fix:
+  - `resnet_cifar.main.inc` now supports `ACE_IMAGE_PARALLELISM`
+  - serial path when `ACE_IMAGE_PARALLELISM <= 1`
+  - explicit `num_threads(image_parallelism)` parallel path otherwise
+  - `a_dsl_bts.sh` now defaults multi-image runs to
+    `ACE_IMAGE_PARALLELISM=1` via `ACE_DSL_BTS_IMAGE_PARALLELISM`
+    unless the user overrides it
+2026-04-19
+- investigated the current `fhe_cmplr ... -CKKS:...:sbm ...` compile crash
+  entirely in `ace-compiler-dev`
+- reproduced the crash on both:
+  - `resnet20_cifar10_pre.onnx`
+  - `resnet20_cifar10_random/resnet20_cifar10.onnx`
+- the crash is specific to the `sbm` / `RESBM` path:
+  - `-CKKS:hw=192:q0=60:sf=56:sbm` crashed before the fix
+  - `-CKKS:hw=192:q0=60:sf=56` succeeded
+  - `-CKKS:hw=192:q0=60:sf=56:mbc=2` succeeded
+- `gdb` backtrace showed the fault in:
+  - `fhe::ckks::Operation_cost(...)`
+  - called from `MIN_CUT_REGION::Scc_cut_op_cost(...)`
+  - through `RESBM::Cal_min_laten_plan()`
+- completed a container-local `git bisect`:
+  - oldest good anchor: `2891247 add compiler source`
+  - first bad commit: `4ad8997 Optimize DSL bootstrap transform with grouped rotate batches`
+- concrete regression cause:
+  - `4ad8997` inserted `CKKS.ROTATE_BATCH` into
+    `fhe-cmplr/include/fhe/ckks/opcode_def.inc`
+  - `fhe-cmplr/ckks/src/ckks_cost_model.cxx` uses opcode-indexed vectors
+    keyed by `opc.Operator()`
+  - those vectors were not updated for the new opcode, so all following CKKS
+    operator indices became misaligned in the `sbm` path
+- fix applied in `fhe-cmplr/ckks/src/ckks_cost_model.cxx`:
+  - added `ROTATE_BATCH` entries to both:
+    - `Fhe_op_cost_deg65536`
+    - `Fhe_op_cost_deg131072`
+  - currently reuses single-`ROTATE` latency so the enum-indexed table stays
+    aligned
+- validation after the fix in `ace-compiler-dev`:
+  - both old crash reproducers now exit `0` and emit full generated C:
+    - `resnet20_cifar10_pre.onnx`
+    - `resnet20_cifar10_random/resnet20_cifar10.onnx`
+- nuance:
+  - non-fatal `Unexpected PRAGMA` / `Unexpected COMMENT` assertions still print
+  - those also occurred on the oldest good commit, so they are not the crash
+    regression fixed here

@@ -179,6 +179,13 @@ static void Set_rotation_attr(NODE_PTR node, int32_t rotation) {
     node->Set_attr(nn::core::ATTR::RNUM, &rotation, 1);
 }
 
+static void Set_rotation_list_attr(NODE_PTR node,
+                                   const std::vector<int32_t>& rotations) {
+    if (!rotations.empty()) {
+        node->Set_attr(nn::core::ATTR::RNUM, rotations.data(), rotations.size());
+    }
+}
+
 // Type wrapper
 class Type {
 public:
@@ -793,6 +800,41 @@ public:
         auto node = std::make_shared<Node>(++node_counter, "fhe::ckks::ROTATE");
         node->add_child(ct);
         nodes.push_back(node);
+        return node;
+    }
+
+    std::shared_ptr<Node> new_ckks_rotate_batch(std::shared_ptr<Node> ct,
+                                                py::list rotations) {
+        if (!(container && ct->has_node)) {
+            auto node =
+                std::make_shared<Node>(++node_counter, "fhe::ckks::ROTATE_BATCH");
+            node->add_child(ct);
+            nodes.push_back(node);
+            return node;
+        }
+        if (rotations.empty()) {
+            throw std::runtime_error("new_ckks_rotate_batch requires non-empty rotations");
+        }
+
+        std::vector<int32_t> rot_vals;
+        rot_vals.reserve(rotations.size());
+        for (py::handle item : rotations) {
+            rot_vals.push_back(item.cast<int32_t>());
+        }
+
+        TYPE_PTR elem_type = get_compatible_type(ct->node->Rtype());
+        std::vector<int64_t> dims = {static_cast<int64_t>(rot_vals.size())};
+        std::string arr_name = "cipher_batch_" + std::to_string(rot_vals.size());
+        TYPE_PTR arr_type =
+            glob->New_arr_type(glob->New_str(arr_name.c_str()), elem_type, dims, get_spos());
+
+        OPCODE op(fhe::ckks::CKKS_DOMAIN::ID,
+                  fhe::ckks::CKKS_OPERATOR::ROTATE_BATCH);
+        NODE_PTR n = container->New_cust_node(op, arr_type, get_spos());
+        n->Set_child(0, ct->node);
+        Set_rotation_list_attr(n, rot_vals);
+        auto node = wrap_node(n, "fhe::ckks::ROTATE_BATCH");
+        node->add_child(ct);
         return node;
     }
     
@@ -1483,8 +1525,11 @@ public:
             if (!(idx && idx->has_node)) {
                 throw std::runtime_error("new_ild requires real index node");
             }
-            // Build ARRAY(base, idx) then ILD(array)
-            NODE_PTR array = container->New_array(base_node, 1, get_spos());
+            // Build ARRAY(LDA(base_var), idx) then ILD(array). The SSA builder
+            // expects array loads/stores to use an address base rather than LD.
+            NODE_PTR base_addr = container->New_lda(
+                base_node->Addr_datum(), air::base::POINTER_KIND::FLAT64, get_spos());
+            NODE_PTR array = container->New_array(base_addr, 1, get_spos());
             container->Set_array_idx(array, 0, idx->node);
             NODE_PTR ild = container->New_ild(array, get_spos());
             auto node = wrap_node(ild, "air::core::ILD");
@@ -5126,6 +5171,9 @@ PYBIND11_MODULE(air_builder, m) {
         .def("new_ckks_rotate", &Container::new_ckks_rotate,
              py::arg("ct"), py::arg("rotation"),
              "CKKS rotation: rotate slots by given amount")
+        .def("new_ckks_rotate_batch", &Container::new_ckks_rotate_batch,
+             py::arg("ct"), py::arg("rotations"),
+             "CKKS grouped rotation batch: rotate one ciphertext by many amounts")
         .def("new_ckks_encode", &Container::new_ckks_encode,
              py::arg("data"),
              py::arg("encode_len") = -1,

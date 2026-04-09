@@ -456,6 +456,28 @@ CIPHER Rotate_ciph(CIPHER res, CIPHER ciph, int32_t rot_idx) {
   return res;
 }
 
+void Rotate_batch_ciph(CIPHER res_arr, CIPHER ciph, const int32_t* rot_idx,
+                       uint32_t count) {
+  CKKS_EVALUATOR* eval = (CKKS_EVALUATOR*)Eval();
+  if (count == 0) {
+    return;
+  }
+
+  VALUE_LIST* precomputed = Alloc_precomp(Get_c1(ciph));
+  for (uint32_t idx = 0; idx < count; ++idx) {
+    CIPHERTEXT* out = &res_arr[idx];
+    int32_t     rot = rot_idx[idx];
+    if (rot == 0) {
+      Init_ciphertext_from_ciph(out, ciph, ciph->_scaling_factor,
+                                ciph->_sf_degree);
+      Copy_ciphertext(out, ciph);
+    } else {
+      Fast_rotate(out, ciph, rot, eval, precomputed);
+    }
+  }
+  Free_precomp(precomputed);
+}
+
 CIPHER Conjugate_ciph(CIPHER res, CIPHER ciph) {
   Conjugate(res, ciph, (CKKS_EVALUATOR*)Eval());
   return res;

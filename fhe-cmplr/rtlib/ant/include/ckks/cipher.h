@@ -167,6 +167,11 @@ void Modswitch_ciph(CIPHER ciph);
 //! @brief Rotate a ciphertext with given rotation idx
 CIPHER Rotate_ciph(CIPHER res, CIPHER ciph, int32_t rot_idx);
 
+//! @brief Rotate one ciphertext by many rotation indices while sharing the
+//! expensive rotate precompute across the batch.
+void Rotate_batch_ciph(CIPHER res_arr, CIPHER ciph, const int32_t* rot_idx,
+                       uint32_t count);
+
 //! @brief Conjugate ciphertext using current evaluator context.
 CIPHER Conjugate_ciph(CIPHER res, CIPHER ciph);
 

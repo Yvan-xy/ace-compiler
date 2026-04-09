@@ -197,6 +197,30 @@ public:
       ctx << "))";
       return;
     }
+    if (node->Addr_datum()->Type()->Is_array() &&
+        val->Opcode() == fhe::ckks::OPC_ROTATE_BATCH) {
+      air::base::TYPE_PTR elem_type =
+          node->Addr_datum()->Type()->Cast_to_arr()->Elem_type();
+      AIR_ASSERT(ctx.Is_cipher_type(elem_type->Id()));
+      uint32_t   rot_cnt = 0;
+      const int* rot_idx = val->Attr<int>(nn::core::ATTR::RNUM, &rot_cnt);
+      AIR_ASSERT(rot_idx != nullptr && rot_cnt > 0);
+      ctx << "{ static const int32_t _rot_batch_" << node->Id().Value()
+          << "[] = {";
+      for (uint32_t i = 0; i < rot_cnt; ++i) {
+        if (i > 0) {
+          ctx << ", ";
+        }
+        ctx << rot_idx[i];
+      }
+      ctx << "}; Rotate_batch_ciph(";
+      ctx.Emit_var(node);
+      ctx << ", ";
+      visitor->template Visit<RETV>(val->Child(0));
+      ctx << ", _rot_batch_" << node->Id().Value() << ", " << rot_cnt
+          << "); }";
+      return;
+    }
     if (ctx.Is_cipher_type(node->Addr_datum()->Type_id())) {
       air::base::OPCODE opc = val->Opcode();
       switch (opc) {
