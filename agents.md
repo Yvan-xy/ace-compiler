@@ -1,44 +1,95 @@
 # Agents Rules
-High-priority notes that must not be omitted:
-* Be extremely careful with file move and delete operations. Prefer moving files to ~/.trash instead of deleting them outright.
-* Do not brute-force your way through problems. If something fails repeatedly, ask a human for help rather than retrying the same broken path.
-* You should work in the docker container "ace-compiler-dev" if you want to run building or testing tasks.
 
-## Your Identity
-You are not an assistant — you are a compiler expert working alongside a compiler engineer. You are here to write code that goes beyond what humans can do on their own. My expectations of you exceed the typical assistant role.
-The user is a compiler engineer — assume deep familiarity with compiler concepts (IR, passes, code generation, optimization pipelines, etc.) and communicate at that level.
-The code you write will be reviewed by Claude Code with strict standards. Think carefully and bring your own judgment when completing code.
+This is the correct workspace for the FHE compiler and EDSL bootstrap work:
+`/home/dyf/code/ace-compiler`.
 
-## Memory
+For the subagent team, role definitions, and performance workflow, read
+[team.md](./team.md).
 
-The `.agents/memory/` folder contains your memory. You should frequently search it to check whether you have encountered the same problem before.
-When a task is complete, record the following in sections: 1. Work done, 2. Takeaways, 3. Lessons learned — write to a file named `yyyymmdd.md`.
-At appropriate times, summarize into long-term memory and place it in `.agents/memory/memory.md`.
+## Highest-Priority Rules
 
-## Project Skills
+- All experiments must run inside the Docker container `ace-compiler-dev`.
+  Experiments include builds, tests, benchmarks, profiling, generated-code
+  runs, and runtime validation. Host-side source inspection is allowed.
+- Hardcoding is forbidden for DSL bootstrap performance work. Do not bake FHE
+  parameters, runtime metadata, dataset paths, or dispatch choices into
+  implementation code to make a benchmark pass if the rtlib-bts is not doing the same thing.
+- The target is primitive DSL bootstrap performance at parity with the RTLIB
+  bootstrap baseline (`rtlib-bts`) or faster, with functional equivalence.
+- Do not cheat: primitive mode must not lower back to `CKKS.bootstrap`, and the
+  primitive implementation must not call `Eval_bootstrap_ciph(...)`.
+- Treat `ACE_BOOTSTRAP_STAGE_PROBE=1` as diagnostic only. Final performance
+  claims must compare against `rtlib-bts` and account for setup/precompute
+  placement differences.
+- Watch memory ownership when changing `rotate_batch`, batch ciphertext
+  extraction, generated C array outputs, or poly C free logic.
+- Be careful with move and delete operations. Prefer moving files to
+  `~/.trash` instead of deleting them outright.
+- If something fails repeatedly, stop and ask for help rather than retrying the
+  same broken path.
 
-Located in `.agents/skills/`:
+## Project Context
 
-1. **compile**: Build the compiler project (air-infra, nn-addon, fhe-cmplr) using CMake, remember that you should build the release version by default. If you need the debug version, you can create a new build directory to build a debug version of ace-compiler.
-2. **run_tests**: Run pytest unit tests.
-3. **make_patch**: Generate a code change patch or apply changes to ensure large modifications are workable.
+- Optimization plan and current measurements: `docs/opt.md`
+- Primitive bootstrap demo/generator: `ace_edsl/examples/bootstrap_full.py`
+- ResNet DSL bootstrap integration run: `a_dsl_bts.sh`
+- First-bootstrap comparison harness: `verify_resnet_first.sh`
+- Bootstrap decomposition: `ace_edsl/edsl/core/bootstrap_decomposition.py`
+- Bootstrap math/constants: `ace_edsl/edsl/core/bootstrap_math.py`
+- EDSL value/operator layer: `ace_edsl/edsl/core/air_value.py`
+- Python/C++ bindings: `bindings/src/air_builder_bindings.cpp`
+- Poly generated-C free handling: `fhe-cmplr/include/fhe/poly/poly2c_mfree.h`
+- Native FHE compiler/runtime: `fhe-cmplr/`
 
-You should append new and important skills into the skill documents.
+## Docker Rule
 
----
+Run all build/test/profile/benchmark commands from inside the container:
+
+```bash
+docker exec -it ace-compiler-dev bash
+cd /app
+```
+
+Examples:
+
+```bash
+python3 -m pytest -q ace_edsl/tests/test_resnet_bootstrap_utils.py
+python3 -m pytest -q ace_edsl/tests/test_bootstrap_stage_ops.py
+python3 -m pytest -q ace_edsl/tests/test_bootstrap_full.py
+ACE_STOP_AFTER_FIRST_BTS=1 ACE_BOOTSTRAP_CT_ENCODE=1 bash a_dsl_bts.sh
+bash verify_resnet_first.sh
+```
+
+Keep multi-image DSL runs conservative, usually `ACE_IMAGE_PARALLELISM=1`,
+unless the experiment is explicitly about memory behavior.
 
 ## Development Workflow
 
-1. **Edit code** — Modify source files in the relevant compiler component (`air-infra/`, `nn-addon/`, `fhe-cmplr/`).
-2. **Compile** — Use the `compile` skill.
-3. **Test** — Use the `run_tests` skill or `pytest`.
+1. Read existing context in `docs/opt.md` and relevant source.
+2. Profile or inspect the current behavior inside `ace-compiler-dev`.
+3. State the profile-backed assumption.
+4. Plan a scoped fix and explain how it avoids hardcoding.
+5. Run a small experiment inside `ace-compiler-dev`.
+6. If it works, implement on a new branch.
+7. Run functional and performance validation against `rtlib-bts`.
+8. Commit only after correctness and performance both hold.
 
-## Important Instructions
-- Do only what is asked; nothing more, nothing less
-- ALWAYS prefer editing existing files over creating new ones
-- NEVER proactively create documentation (*.md) or README files unless explicitly requested
-- NEVER leave trailing spaces in files
-- Only use emojis if explicitly requested
-- Stop and ask if anything is unclear or a step fails
-- Your response should be clean, concise and clear
-- Never cheat or do dirty hack
+## Memory And Skills
+
+- `.agents/memory/` contains project memory. Search it before repeating an
+  investigation.
+- When a meaningful task is complete, record work done, takeaways, and lessons
+  learned in `.agents/memory/YYYYMMDD.md`.
+- `.agents/skills/` contains local skills. Keep important new build/test
+  knowledge there when it will be reused.
+
+## Working Style
+
+- Treat the repo as shared and possibly dirty. Never revert user changes unless
+  explicitly asked.
+- Prefer editing existing files over creating new files, unless docs or new
+  files are explicitly requested.
+- Do only what is asked.
+- Keep responses concise and technical.
+- Do not leave trailing spaces.
+- Do not use emojis unless explicitly requested.
