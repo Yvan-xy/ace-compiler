@@ -24,6 +24,8 @@ RUN_ALL_IMAGES="${ACE_DSL_BTS_ALL_IMAGES:-0}"
 START_IDX="${ACE_DSL_BTS_START_IDX:-0}"
 END_IDX="${ACE_DSL_BTS_END_IDX:-}"
 IMAGE_PARALLELISM="${ACE_DSL_BTS_IMAGE_PARALLELISM:-}"
+BOOTSTRAP_CT_ENCODE="${ACE_BOOTSTRAP_CT_ENCODE:-1}"
+BOOTSTRAP_CT_ENCODE_DEPTH="${ACE_CT_ENCODE_DEPTH:-30}"
 
 mkdir -p "${WORK_DIR}"
 exec > >(tee "${LOG_FILE}") 2>&1
@@ -57,7 +59,8 @@ fi
 (
   cd "${ACE_EDSL_DIR}/examples"
 PYTHONPATH="${ACE_EDSL_DIR}:${APP_ROOT}" \
-ACE_CT_ENCODE_DEPTH=30 \
+ACE_BOOTSTRAP_CT_ENCODE="${BOOTSTRAP_CT_ENCODE}" \
+ACE_CT_ENCODE_DEPTH="${BOOTSTRAP_CT_ENCODE_DEPTH}" \
 python3 "${BOOTSTRAP_UTILS_PY}" generate-demo \
   --impl primitive \
   --poly-degree 65536 \
@@ -81,6 +84,15 @@ fi
 
 if [[ -f "${BOOTSTRAP_RAW_AIR}" ]] && grep -q 'CKKS.bootstrap' "${BOOTSTRAP_RAW_AIR}"; then
   echo "bootstrap_full_raw.air still contains CKKS.bootstrap; expected primitive decomposition" >&2
+  exit 1
+fi
+
+if [[ "${BOOTSTRAP_CT_ENCODE}" != "0" ]] &&
+   [[ "${BOOTSTRAP_CT_ENCODE,,}" != "false" ]] &&
+   [[ "${BOOTSTRAP_CT_ENCODE,,}" != "off" ]] &&
+   [[ "${BOOTSTRAP_CT_ENCODE,,}" != "no" ]] &&
+   grep -q 'Encode_dcmplx_ext(' "${BOOTSTRAP_GEN_C}"; then
+  echo "bootstrap_full.c still performs lazy dcmplx encoding; expected ct-encoded plaintext data" >&2
   exit 1
 fi
 
