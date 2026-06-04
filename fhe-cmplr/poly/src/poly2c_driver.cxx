@@ -70,7 +70,9 @@ void POLY2C_DRIVER::Emit_get_context_params() {
   const core::CTX_PARAM&   param    = _ctx.Lower_ctx().Get_ctx_param();
   const std::set<int32_t>& rot_keys = param.Get_rotate_index();
   // CKKS_PARAMS Get_context_params()
-  _ctx << "CKKS_PARAMS* Get_context_params() {\n";
+  _ctx << "CKKS_PARAMS* ";
+  _ctx.Emit_identifier(_ctx.Function_name_prefix());
+  _ctx << "Get_context_params() {\n";
   _ctx << "  static CKKS_PARAMS parm = {\n";
   _ctx << "    ";
   _ctx << fhe::core::Provider_name(_ctx.Provider());
@@ -107,7 +109,9 @@ void POLY2C_DRIVER::Emit_get_context_params() {
 
   _ctx << "// In offline encoding scenery, data file type will be changed. "
           "Below impl need to be changed also? \n";
-  _ctx << "RT_DATA_INFO* Get_rt_data_info() {\n";
+  _ctx << "RT_DATA_INFO* ";
+  _ctx.Emit_identifier(_ctx.Function_name_prefix());
+  _ctx << "Get_rt_data_info() {\n";
   if (_ctx.Emit_data_file()) {
     _ctx << "  static RT_DATA_INFO info = {\n";
     _ctx << "    \"" << _ctx.Data_file() << "\",\n";

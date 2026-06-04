@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <limits>
 #include <ostream>
+#include <string>
 #include <unordered_set>
 
 #include "air/base/st.h"
@@ -30,6 +31,14 @@ public:
   //! @brief Construct a new ir2c util object
   //! @param os output stream
   IR2C_UTIL(std::ostream& os) : _os(os), _level(0) {}
+
+  void Set_function_name_prefix(const std::string& prefix) {
+    _function_name_prefix = prefix;
+  }
+
+  void Set_constant_name_prefix(const std::string& prefix) {
+    _constant_name_prefix = prefix;
+  }
 
   //! @brief Level of current node in nested block structures
   //! @return int Current Level
@@ -98,7 +107,10 @@ public:
   }
 
   //! @brief Emit a constant id as the name of the constant
-  void Emit_constant_id(CONSTANT_ID cst) { _os << "_cst_" << cst.Value(); }
+  void Emit_constant_id(CONSTANT_ID cst) {
+    Emit_identifier(_constant_name_prefix.c_str());
+    _os << "_cst_" << cst.Value();
+  }
 
   //! @brief Emit a constant and mark constant used
   void Emit_constant_name(CONSTANT_ID cst) {
@@ -292,7 +304,9 @@ public:
     Emit_param(*it, -1);
     ++it;
 
-    _os << " " << func->Name()->Char_str() << "(";
+    _os << " ";
+    Emit_function_identifier(func->Name()->Char_str());
+    _os << "(";
     int idx = 0;
     while (it != sig->End_param()) {
       if (idx > 0) {
@@ -316,7 +330,9 @@ public:
     AIR_ASSERT(it != sig->End_param());
     Emit_type((*it)->Type(), true);
 
-    _os << " " << func->Name()->Char_str() << "(";
+    _os << " ";
+    Emit_function_identifier(func->Name()->Char_str());
+    _os << "(";
     for (int i = 0; i < fscope->Formal_cnt(); ++i) {
       if (i > 0) {
         _os << ", ";
@@ -379,6 +395,16 @@ public:
   //! @brief Emit a symbol name from SYM_PTR
   void Emit_sym(SYM_PTR sym) { Emit_name(sym->Name()); }
 
+  //! @brief Emit a function/global symbol name from SYM_PTR
+  void Emit_function_sym(SYM_PTR sym) {
+    Emit_function_identifier(sym->Name()->Char_str());
+  }
+
+  void Emit_function_identifier(const char* str) {
+    Emit_identifier(_function_name_prefix.c_str());
+    Emit_identifier(str);
+  }
+
   //! @brief Emit a name from STR_PTR
   void Emit_name(STR_PTR name) { Emit_identifier(name->Char_str()); }
 
@@ -428,6 +454,8 @@ protected:
   std::ostream&                _os;
   std::unordered_set<uint32_t> _cst_used;
   int                          _level;
+  std::string                  _function_name_prefix;
+  std::string                  _constant_name_prefix;
 };  // IR2C_UTIL
 
 }  // namespace base

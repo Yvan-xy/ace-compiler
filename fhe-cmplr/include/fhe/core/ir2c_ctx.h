@@ -30,7 +30,10 @@ public:
    */
   IR2C_CTX(std::ostream& os, const LOWER_CTX& lower_ctx,
            const fhe::poly::POLY2C_CONFIG& cfg)
-      : air::core::IR2C_CTX(os), _lower_ctx(lower_ctx), _config(cfg) {}
+      : air::core::IR2C_CTX(os), _lower_ctx(lower_ctx), _config(cfg) {
+    Set_function_name_prefix(cfg.Function_name_prefix());
+    Set_constant_name_prefix(cfg.Constant_name_prefix());
+  }
 
   bool Is_poly_type(air::base::TYPE_ID type) {
     return _lower_ctx.Is_poly_type(type);

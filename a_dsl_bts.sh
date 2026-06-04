@@ -19,9 +19,35 @@ BOOTSTRAP_BODY_C="${WORK_DIR}/bootstrap_full_body.c"
 BOOTSTRAP_SHIM_C="${WORK_DIR}/dsl_bootstrap_shim.c"
 OUTPUT_BIN="${APP_ROOT}/resnet20_cifar10_pre.dsl_bts.ace"
 BACKUP_RESNET_INC="${WORK_DIR}/resnet20_cifar10_pre.onnx.inc.orig"
+DATASET_BIN="${ACE_DSL_BTS_DATASET:-${APP_ROOT}/dataset/test_batch.bin}"
+RUN_ALL_IMAGES="${ACE_DSL_BTS_ALL_IMAGES:-0}"
+START_IDX="${ACE_DSL_BTS_START_IDX:-0}"
+END_IDX="${ACE_DSL_BTS_END_IDX:-}"
+IMAGE_PARALLELISM="${ACE_DSL_BTS_IMAGE_PARALLELISM:-}"
 
 mkdir -p "${WORK_DIR}"
 exec > >(tee "${LOG_FILE}") 2>&1
+
+if [[ -n "${END_IDX}" && "${RUN_ALL_IMAGES}" != "0" ]]; then
+  echo "ACE_DSL_BTS_ALL_IMAGES conflicts with ACE_DSL_BTS_END_IDX" >&2
+  exit 1
+fi
+
+RUN_ARGS=("${DATASET_BIN}")
+if [[ "${RUN_ALL_IMAGES}" == "0" ]]; then
+  if [[ -z "${END_IDX}" ]]; then
+    END_IDX="${START_IDX}"
+  fi
+  RUN_ARGS+=("${START_IDX}" "${END_IDX}")
+fi
+
+if [[ -z "${IMAGE_PARALLELISM}" ]]; then
+  if [[ "${RUN_ALL_IMAGES}" != "0" ]]; then
+    IMAGE_PARALLELISM=1
+  elif [[ "${END_IDX}" != "${START_IDX}" ]]; then
+    IMAGE_PARALLELISM=1
+  fi
+fi
 
 if [[ ! -f "${RESNET_GEN_C}" ]]; then
   echo "missing generated resnet source: ${RESNET_GEN_C}" >&2
@@ -71,9 +97,7 @@ trap cleanup EXIT
 
 cp "${RESNET_GEN_C}" "${RESNET_DATASET_INC}"
 
-python3 "${BOOTSTRAP_UTILS_PY}" emit-body \
-  --bootstrap-c "${BOOTSTRAP_GEN_C}" \
-  --output "${BOOTSTRAP_BODY_C}"
+cp "${BOOTSTRAP_GEN_C}" "${BOOTSTRAP_BODY_C}"
 
 python3 "${BOOTSTRAP_UTILS_PY}" emit-shim \
   --output "${BOOTSTRAP_SHIM_C}"
@@ -123,5 +147,11 @@ c++ \
   /usr/local/lib/libAIRutil.a \
   -lgmp -lm -o "${OUTPUT_BIN}" -lgomp
 
+echo "dsl-bts run args: ${RUN_ARGS[*]}"
+if [[ -n "${IMAGE_PARALLELISM}" ]]; then
+  echo "dsl-bts image parallelism: ${IMAGE_PARALLELISM}"
+fi
+
 time env RTLIB_DISABLE_BOOTSTRAP_PRECOM=1 \
-  "${OUTPUT_BIN}" /app/dataset/test_batch.bin 0 0
+  ${IMAGE_PARALLELISM:+ACE_IMAGE_PARALLELISM=${IMAGE_PARALLELISM}} \
+  "${OUTPUT_BIN}" "${RUN_ARGS[@]}"

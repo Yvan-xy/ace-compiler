@@ -72,10 +72,6 @@ trap cleanup EXIT
 
 cp "${RESNET_GEN_C}" "${RESNET_DATASET_INC}"
 
-python3 "${BOOTSTRAP_UTILS_PY}" patch-resnet-context \
-  --bootstrap-c "${BOOTSTRAP_GEN_C}" \
-  --resnet-inc "${RESNET_DATASET_INC}"
-
 cat > "${BASE_DRIVER_CXX}" <<'EOF'
 #include <cstdio>
 #include <cstdlib>
@@ -197,9 +193,7 @@ CIPHER Eval_bootstrap_ciph_baseline_probe(CIPHER res, CIPHER ciph,
 #endif
 EOF
 
-python3 "${BOOTSTRAP_UTILS_PY}" emit-body \
-  --bootstrap-c "${BOOTSTRAP_GEN_C}" \
-  --output "${DSL_BOOTSTRAP_BODY_C}"
+cp "${BOOTSTRAP_GEN_C}" "${DSL_BOOTSTRAP_BODY_C}"
 
 python3 "${BOOTSTRAP_UTILS_PY}" emit-shim \
   --output "${DSL_BOOTSTRAP_SHIM_C}"

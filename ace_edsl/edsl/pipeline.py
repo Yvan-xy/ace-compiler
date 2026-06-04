@@ -56,6 +56,10 @@ class FHEConfig:
     ct_encode: bool = False
     free_poly: bool = True
     enable_poly: bool = True      # False = CKKS-level C code (for debugging)
+    function_name_prefix: str = ""
+    constant_name_prefix: str = ""
+    pt_from_msg_name: str = "Pt_from_msg"
+    raise_mod_level_func: str = ""
 
 
 @dataclass
@@ -138,6 +142,10 @@ class AcePipeline:
         ct_encode: bool = False,
         free_poly: bool = True,
         enable_poly: bool = True,
+        function_name_prefix: str = "",
+        constant_name_prefix: str = "",
+        pt_from_msg_name: str = "Pt_from_msg",
+        raise_mod_level_func: str = "",
     ) -> "AcePipeline":
         """
         Configure FHE parameters.
@@ -154,6 +162,10 @@ class AcePipeline:
             ct_encode: Enable ciphertext encoding
             free_poly: Free polynomial after use
             enable_poly: Enable poly lowering (False = CKKS-level C for debugging)
+            function_name_prefix: Prefix for generated C function symbols
+            constant_name_prefix: Prefix for generated C constant symbols
+            pt_from_msg_name: Plaintext data loader function name
+            raise_mod_level_func: Runtime helper name for attributed raise_mod
             
         Returns:
             self (for method chaining)
@@ -170,6 +182,10 @@ class AcePipeline:
             ct_encode=ct_encode,
             free_poly=free_poly,
             enable_poly=enable_poly,
+            function_name_prefix=function_name_prefix,
+            constant_name_prefix=constant_name_prefix,
+            pt_from_msg_name=pt_from_msg_name,
+            raise_mod_level_func=raise_mod_level_func,
         )
         return self
     
@@ -294,6 +310,10 @@ class AcePipeline:
             ct_encode=self.fhe_config.ct_encode,
             free_poly=self.fhe_config.free_poly,
             enable_poly=self.fhe_config.enable_poly,
+            function_name_prefix=self.fhe_config.function_name_prefix,
+            constant_name_prefix=self.fhe_config.constant_name_prefix,
+            pt_from_msg_name=self.fhe_config.pt_from_msg_name,
+            raise_mod_level_func=self.fhe_config.raise_mod_level_func,
         )
         
         if ok and hasattr(self.glob_scope, "get_c_code"):

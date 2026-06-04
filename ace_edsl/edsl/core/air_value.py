@@ -815,12 +815,17 @@ class AIRValue:
 
         return self._flatten_result(result_node)
 
-    def raise_mod(self, mod_size: int) -> 'AIRValue':
+    def raise_mod(
+        self, mod_size: int, runtime_raise_level: bool = False
+    ) -> 'AIRValue':
         """
         Emit CKKS raise_mod operation.
 
         Args:
-            mod_size: Target modulus size/level parameter
+            mod_size: Target modulus size/level parameter used by compiler
+                analysis
+            runtime_raise_level: Emit the C raise target through the configured
+                runtime helper while preserving mod_size in AIR metadata
 
         Returns:
             AIRValue representing raised ciphertext
@@ -830,7 +835,9 @@ class AIRValue:
         mod_size = int(mod_size)
 
         if hasattr(self._container, 'new_ckks_raise_mod'):
-            result_node = self._container.new_ckks_raise_mod(self_node, mod_size)
+            result_node = self._container.new_ckks_raise_mod(
+                self_node, mod_size, runtime_raise_level
+            )
         else:
             raise NotImplementedError("Container does not support raise_mod operation")
 

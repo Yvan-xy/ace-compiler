@@ -9,6 +9,8 @@
 #ifndef AIR_BASE_IR2C_CTX_H
 #define AIR_BASE_IR2C_CTX_H
 
+#include <string>
+
 #include "air/base/analyze_ctx.h"
 #include "air/base/ir2c_util.h"
 #include "air/base/meta_info.h"
@@ -156,6 +158,14 @@ public:
   //! @brief Emit function definition
   void Emit_func_def(FUNC_SCOPE* fscope) { _ir2c_util.Emit_func_def(fscope); }
 
+  void Set_function_name_prefix(const std::string& prefix) {
+    _ir2c_util.Set_function_name_prefix(prefix);
+  }
+
+  void Set_constant_name_prefix(const std::string& prefix) {
+    _ir2c_util.Set_constant_name_prefix(prefix);
+  }
+
   //! @brief Emit preg id
   void Emit_preg_id(PREG_ID id) { _ir2c_util.Emit_preg_id(id); }
 
@@ -240,7 +250,7 @@ public:
   }
 
   //! @brief Emit a symbol name from SYM_PTR
-  void Emit_sym(SYM_PTR sym) { Emit_name(sym->Name()); }
+  void Emit_sym(SYM_PTR sym) { _ir2c_util.Emit_function_sym(sym); }
 
   //! @brief Emit a name from STR_PTR
   void Emit_name(STR_PTR name) { _ir2c_util.Emit_identifier(name->Char_str()); }

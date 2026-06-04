@@ -47,6 +47,13 @@ def generate_demo(args: argparse.Namespace) -> int:
         ACE_BOOTSTRAP_IMPL=args.impl,
         ACE_BOOTSTRAP_POLY_DEGREE=args.poly_degree,
         ACE_BOOTSTRAP_MUL_LEVEL=args.mul_level,
+        ACE_BOOTSTRAP_FUNCTION_NAME_PREFIX=args.function_name_prefix,
+        ACE_BOOTSTRAP_CONSTANT_NAME_PREFIX=args.const_prefix,
+        ACE_BOOTSTRAP_PT_FROM_MSG_NAME=args.pt_from_msg_name,
+        ACE_BOOTSTRAP_RAISE_LEVEL_NAME=args.raise_level_name,
+        ACE_BOOTSTRAP_RUNTIME_RAISE_LEVEL=(
+            "1" if args.runtime_raise_level else "0"
+        ),
     ):
         bootstrap_full = _bootstrap_module()
         importlib.reload(bootstrap_full)
@@ -58,44 +65,14 @@ def emit_body(args: argparse.Namespace) -> int:
     src_path = Path(args.bootstrap_c)
     dst_path = Path(args.output)
 
-    out_lines: list[str] = []
-
-    with src_path.open("r", encoding="utf-8") as source:
-        for line in source:
-            line = re.sub(r"\bGet_context_params\b", args.ctxparams_name, line)
-            line = re.sub(r"\bbootstrap_full\b", args.entry_name, line)
-            line = re.sub(r"\bGet_rt_data_info\b", args.rtdata_name, line)
-            line = re.sub(r"\bPt_from_msg\b", args.pt_from_msg_name, line)
-            line = re.sub(r"\bRotate\b", args.rotate_name, line)
-            line = re.sub(r"\bRelinearize\b", args.relin_name, line)
-            line = re.sub(r"\b(_cst_\d+)\b", rf"{args.const_prefix}\1", line)
-            out_lines.append(line)
-
-    body = "".join(out_lines)
-    pt_decl = (
-        f'void* {args.pt_from_msg_name}(void* pt, uint32_t index, size_t len, '
-        f'uint32_t scale, uint32_t level);\n'
-    )
-    if pt_decl not in body:
-        include_line = '#include "rt_ant/rt_ant.h"\n'
-        body = body.replace(include_line, include_line + "\n" + pt_decl, 1)
-
-    raise_decl = f"uint32_t {args.raise_level_name}(void);\n"
-    if raise_decl not in body:
-        include_line = '#include "rt_ant/rt_ant.h"\n'
-        body = body.replace(include_line, include_line + raise_decl, 1)
-
-    body = re.sub(
-        r"Raise_mod\(\s*(&[^,]+)\s*,\s*(&[^,]+)\s*,\s*\d+\s*\);",
-        rf"Raise_mod(\1, \2, {args.raise_level_name}());",
-        body,
-    )
-
     raw_stage_probe = os.environ.get("ACE_BOOTSTRAP_STAGE_PROBE", "").strip().lower()
     if raw_stage_probe and raw_stage_probe not in ("0", "false", "off", "no"):
-        body = _inject_stage_probes(body)
+        raise RuntimeError(
+            "ACE_BOOTSTRAP_STAGE_PROBE text injection is disabled for direct "
+            "bootstrap codegen"
+        )
 
-    dst_path.write_text(body, encoding="utf-8")
+    dst_path.write_text(src_path.read_text(encoding="utf-8"), encoding="utf-8")
     return 0
 
 
@@ -257,6 +234,10 @@ def emit_shim(args: argparse.Namespace) -> int:
 
         static unsigned long g_dsl_bts_call_counter = 0;
         static __thread uint32_t g_dsl_bts_target_level_after_bts = 0;
+
+        CKKS_PARAMS* Get_extra_context_params(void) {{
+          return {args.ctxparams_name}();
+        }}
 
         static double dsl_bts_now_sec(void) {{
           struct timespec ts;
@@ -479,14 +460,23 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--impl", default="primitive")
     generate.add_argument("--poly-degree", type=int, required=True)
     generate.add_argument("--mul-level", type=int, required=True)
+    generate.add_argument("--function-name-prefix", default="dsl_bts_")
+    generate.add_argument("--const-prefix", default="dsl_bts")
+    generate.add_argument("--pt-from-msg-name", default="dsl_bts_Pt_from_msg")
+    generate.add_argument("--raise-level-name", default="dsl_bts_raise_level")
+    generate.add_argument(
+        "--runtime-raise-level",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     generate.set_defaults(func=generate_demo)
 
     emit = subparsers.add_parser("emit-body")
     emit.add_argument("--bootstrap-c", required=True)
     emit.add_argument("--output", required=True)
-    emit.add_argument("--ctxparams-name", default="Get_extra_context_params")
-    emit.add_argument("--entry-name", default="dsl_bootstrap_full")
-    emit.add_argument("--rtdata-name", default="dsl_bootstrap_get_rt_data_info")
+    emit.add_argument("--ctxparams-name", default="dsl_bts_Get_context_params")
+    emit.add_argument("--entry-name", default="dsl_bts_bootstrap_full")
+    emit.add_argument("--rtdata-name", default="dsl_bts_Get_rt_data_info")
     emit.add_argument("--pt-from-msg-name", default="dsl_bts_Pt_from_msg")
     emit.add_argument("--rotate-name", default="dsl_bts_Rotate")
     emit.add_argument("--relin-name", default="dsl_bts_Relinearize")
@@ -496,9 +486,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     shim = subparsers.add_parser("emit-shim")
     shim.add_argument("--output", required=True)
-    shim.add_argument("--entry-name", default="dsl_bootstrap_full")
-    shim.add_argument("--ctxparams-name", default="Get_extra_context_params")
-    shim.add_argument("--rtdata-name", default="dsl_bootstrap_get_rt_data_info")
+    shim.add_argument("--entry-name", default="dsl_bts_bootstrap_full")
+    shim.add_argument("--ctxparams-name", default="dsl_bts_Get_context_params")
+    shim.add_argument("--rtdata-name", default="dsl_bts_Get_rt_data_info")
     shim.add_argument("--pt-from-msg-name", default="dsl_bts_Pt_from_msg")
     shim.add_argument("--raise-level-name", default="dsl_bts_raise_level")
     shim.add_argument("--bootstrap-depth", type=int, default=15)

@@ -162,6 +162,31 @@ def _bootstrap_ct_encode() -> bool:
     return raw not in ("0", "false", "off", "no")
 
 
+def _env_flag(name: str) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    return bool(raw) and raw not in ("0", "false", "off", "no")
+
+
+def _bootstrap_runtime_raise_level() -> bool:
+    return _env_flag("ACE_BOOTSTRAP_RUNTIME_RAISE_LEVEL")
+
+
+def _bootstrap_function_name_prefix() -> str:
+    return os.environ.get("ACE_BOOTSTRAP_FUNCTION_NAME_PREFIX", "")
+
+
+def _bootstrap_constant_name_prefix() -> str:
+    return os.environ.get("ACE_BOOTSTRAP_CONSTANT_NAME_PREFIX", "")
+
+
+def _bootstrap_pt_from_msg_name() -> str:
+    return os.environ.get("ACE_BOOTSTRAP_PT_FROM_MSG_NAME", "Pt_from_msg")
+
+
+def _bootstrap_raise_level_name() -> str:
+    return os.environ.get("ACE_BOOTSTRAP_RAISE_LEVEL_NAME", "")
+
+
 def _identity_bootstrap_cleartext_reference(values):
     """Cleartext model for message-preserving bootstrap paths (rtlib mode only)."""
     return [float(v) for v in values]
@@ -356,7 +381,10 @@ def bootstrap_full(
             fullpacked_bootstrap_primitive,
         )
         # Raise to the full available tower before the staged bootstrap flow.
-        x_in = ct.raise_mod(_bootstrap_mul_level() + 1)
+        x_in = ct.raise_mod(
+            _bootstrap_mul_level() + 1,
+            runtime_raise_level=_bootstrap_runtime_raise_level(),
+        )
         try:
             ps_val = float(post_scale)
         except (TypeError, ValueError):
@@ -483,6 +511,10 @@ Key Difference from acepy:
         data_file=data_file_path,
         ct_encode=_bootstrap_ct_encode(),
         enable_poly=True,   # Poly-level C (Hw_modadd, Rotate, etc.) for ANT rtlib; scale handled in pipeline
+        function_name_prefix=_bootstrap_function_name_prefix(),
+        constant_name_prefix=_bootstrap_constant_name_prefix(),
+        pt_from_msg_name=_bootstrap_pt_from_msg_name(),
+        raise_mod_level_func=_bootstrap_raise_level_name(),
     )
     # Keep CKKS extended-op semantics intact for staged bootstrap flow.
     # The current generic rewrite maps conjugate -> identity, which breaks

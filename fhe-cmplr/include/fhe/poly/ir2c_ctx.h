@@ -9,6 +9,8 @@
 #ifndef FHE_POLY_IR2C_CTX_H
 #define FHE_POLY_IR2C_CTX_H
 
+#include <string>
+
 #include "fhe/ckks/ir2c_ctx.h"
 
 namespace fhe {
@@ -35,6 +37,22 @@ public:
     // LEVEL_T and SCALE_T are used for level/scale metadata
     _ir2c_util << "typedef size_t LEVEL_T;" << std::endl;
     _ir2c_util << "typedef double SCALE_T;" << std::endl << std::endl;
+    if (std::string(Pt_from_msg_name()) != "Pt_from_msg") {
+      _ir2c_util << "void* ";
+      _ir2c_util.Emit_identifier(Pt_from_msg_name());
+      _ir2c_util << "(void* pt, uint32_t index, size_t len, "
+                    "uint32_t scale, uint32_t level);"
+                 << std::endl;
+    }
+    if (Raise_mod_level_func()[0] != '\0') {
+      _ir2c_util << "uint32_t ";
+      _ir2c_util.Emit_identifier(Raise_mod_level_func());
+      _ir2c_util << "(void);" << std::endl;
+    }
+    if (std::string(Pt_from_msg_name()) != "Pt_from_msg" ||
+        Raise_mod_level_func()[0] != '\0') {
+      _ir2c_util << std::endl;
+    }
   }
 
   //! @brief Emit fhe server function definition

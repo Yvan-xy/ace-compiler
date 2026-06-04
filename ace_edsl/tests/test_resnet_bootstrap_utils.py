@@ -87,7 +87,7 @@ class TestBootstrapStagePlanning(unittest.TestCase):
 
 
 class TestResnetBootstrapUtils(unittest.TestCase):
-    def test_emit_body_strips_wrappers_and_renames_symbols(self):
+    def test_emit_body_copies_direct_codegen_output(self):
         bootstrap_c = """\
 CKKS_PARAMS* Get_context_params() {
   return 0;
@@ -134,16 +134,35 @@ CIPHERTEXT bootstrap_full(CIPHERTEXT p0, CIPHERTEXT p1) {
             self.assertEqual(resnet_bootstrap_utils.emit_body(args), 0)
 
             body = open(dst, "r", encoding="utf-8").read()
-            self.assertNotIn("Get_context_params()", body)
-            self.assertNotIn("Get_rt_data_info()", body)
-            self.assertIn("Get_extra_context_params()", body)
-            self.assertIn("dsl_bootstrap_get_rt_data_info()", body)
-            self.assertIn("dsl_bootstrap_full", body)
-            self.assertIn("dsl_bts_Rotate", body)
-            self.assertIn("dsl_bts_Relinearize", body)
-            self.assertIn("dsl_bts_raise_level()", body)
-            self.assertIn("dsl_bts_cst_7", body)
+            self.assertEqual(body, bootstrap_c)
+            self.assertIn("Get_context_params()", body)
+            self.assertIn("Get_rt_data_info()", body)
+            self.assertIn("bootstrap_full", body)
+            self.assertIn("Raise_mod(&p0, &p1, 31)", body)
             self.assertIn("if (rot_idx_1 == 0)", body)
+
+    def test_emit_shim_exposes_extra_context_bridge(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dst = os.path.join(tmpdir, "shim.c")
+            args = argparse.Namespace(
+                output=dst,
+                entry_name="dsl_bts_bootstrap_full",
+                ctxparams_name="dsl_bts_Get_context_params",
+                rtdata_name="dsl_bts_Get_rt_data_info",
+                pt_from_msg_name="dsl_bts_Pt_from_msg",
+                raise_level_name="dsl_bts_raise_level",
+                bootstrap_depth=15,
+                bootstrap_call_name="Eval_bootstrap_ciph_dsl",
+                log_prefix="dsl_bts",
+                dump_label="dsl_bts_round1",
+            )
+            self.assertEqual(resnet_bootstrap_utils.emit_shim(args), 0)
+
+            shim = open(dst, "r", encoding="utf-8").read()
+            self.assertIn("CKKS_PARAMS* Get_extra_context_params(void)", shim)
+            self.assertIn("return dsl_bts_Get_context_params();", shim)
+            self.assertIn("dsl_bts_raise_level(void)", shim)
+            self.assertIn("dsl_bts_bootstrap_full(in_copy, in_copy)", shim)
 
 
 if __name__ == "__main__":

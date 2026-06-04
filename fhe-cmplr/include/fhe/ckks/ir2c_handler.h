@@ -163,7 +163,14 @@ public:
     ctx << ", ";
     visitor->template Visit<RETV>(node->Child(0));
     ctx << ", ";
-    visitor->template Visit<RETV>(node->Child(1));
+    const uint32_t* runtime_raise =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::RUNTIME_RAISE_LEVEL);
+    if (runtime_raise != nullptr && *runtime_raise != 0 &&
+        ctx.Raise_mod_level_func()[0] != '\0') {
+      ctx << ctx.Raise_mod_level_func() << "()";
+    } else {
+      visitor->template Visit<RETV>(node->Child(1));
+    }
     ctx << ")";
   }
 

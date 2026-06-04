@@ -92,6 +92,7 @@ namespace ace_bindings {
 using namespace air::base;
 
 static bool s_air_initialized = false;
+static GLOB_SCOPE* s_active_binding_glob = nullptr;
 
 void ensure_air_initialized() {
     if (!s_air_initialized) {
@@ -105,6 +106,14 @@ void ensure_air_initialized() {
         fhe::poly::Register_polynomial();
         s_air_initialized = true;
     }
+}
+
+GLOB_SCOPE* active_binding_glob() {
+    ensure_air_initialized();
+    if (!s_active_binding_glob) {
+        s_active_binding_glob = GLOB_SCOPE::Get();
+    }
+    return s_active_binding_glob;
 }
 
 // Sanitize string for UTF-8 compatibility
@@ -208,7 +217,7 @@ public:
     
     static Type make_int(int bits) { 
         ensure_air_initialized();
-        GLOB_SCOPE* glob = GLOB_SCOPE::Get();
+        GLOB_SCOPE* glob = active_binding_glob();
         TYPE_PTR t;
         if (bits == 32) t = glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
         else if (bits == 64) t = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
@@ -218,7 +227,7 @@ public:
     
     static Type make_float(int bits) { 
         ensure_air_initialized();
-        GLOB_SCOPE* glob = GLOB_SCOPE::Get();
+        GLOB_SCOPE* glob = active_binding_glob();
         TYPE_PTR t;
         if (bits == 32) t = glob->Prim_type(PRIMITIVE_TYPE::FLOAT_32);
         else if (bits == 64) t = glob->Prim_type(PRIMITIVE_TYPE::FLOAT_64);
@@ -228,7 +237,7 @@ public:
     
     static Type make_array(const std::vector<int>& shape, Type elem) {
         ensure_air_initialized();
-        GLOB_SCOPE* glob = GLOB_SCOPE::Get();
+        GLOB_SCOPE* glob = active_binding_glob();
         SPOS spos = glob->Unknown_simple_spos();
         std::vector<int64_t> dims;
         for (int s : shape) dims.push_back(static_cast<int64_t>(s));
@@ -257,7 +266,7 @@ public:
     
     static Type make_polynomial(int degree = 4096) {
         ensure_air_initialized();
-        GLOB_SCOPE* glob = GLOB_SCOPE::Get();
+        GLOB_SCOPE* glob = active_binding_glob();
         SPOS spos = glob->Unknown_simple_spos();
         TYPE_PTR elem_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
         std::vector<int64_t> dims = {static_cast<int64_t>(degree)};
@@ -1140,7 +1149,9 @@ public:
     }
 
     // CKKS raise_mod - raise ciphertext modulus with a target level/mod_size
-    std::shared_ptr<Node> new_ckks_raise_mod(std::shared_ptr<Node> ct, int32_t mod_size) {
+    std::shared_ptr<Node> new_ckks_raise_mod(
+        std::shared_ptr<Node> ct, int32_t mod_size,
+        bool runtime_raise_level = false) {
         if (container && ct->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::RAISE_MOD);
             TYPE_PTR u32_type = glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
@@ -1150,6 +1161,11 @@ public:
             NODE_PTR n = container->New_cust_node(op, rtype, get_spos());
             n->Set_child(0, ct->node);
             n->Set_child(1, mod_const);
+            if (runtime_raise_level) {
+                uint32_t attr = 1;
+                n->Set_attr(fhe::core::FHE_ATTR_KIND::RUNTIME_RAISE_LEVEL,
+                            &attr, 1);
+            }
             auto node = wrap_node(n, "fhe::ckks::RAISE_MOD");
             node->add_child(ct);
             return node;
@@ -2016,7 +2032,8 @@ public:
     
     GlobScope() {
         ensure_air_initialized();
-        glob = GLOB_SCOPE::Get();
+        glob = new GLOB_SCOPE(0, true);
+        s_active_binding_glob = glob;
         types["void"] = Type::make_void();
         types["i32"] = Type::make_int(32);
         types["i64"] = Type::make_int(64);
@@ -2948,6 +2965,7 @@ public:
         // Step 4: Update glob to point to new transformed glob
         // ═══════════════════════════════════════════════════════════════════
         glob = new_glob;
+        s_active_binding_glob = glob;
         
         return replaced;
     }
@@ -3619,6 +3637,7 @@ private:
             
             if (new_glob) {
                 glob = new_glob;
+                s_active_binding_glob = glob;
                 return true;
             }
         } catch (const std::exception& e) {
@@ -3678,6 +3697,7 @@ private:
             GLOB_SCOPE* new_glob = fhe::sihe::Sihe_driver(glob, lower_ctx.get(), nullptr, cfg);
             if (new_glob && new_glob != glob) {
                 glob = new_glob;
+                s_active_binding_glob = glob;
                 
                 // After lowering, find the existing CIPHERTEXT/PLAINTEXT types in the cloned glob
                 // and update lower_ctx to use their IDs (don't create new types!)
@@ -3749,6 +3769,7 @@ private:
             GLOB_SCOPE* ckks_glob = fhe::ckks::Ckks_driver(glob, lower_ctx.get(), &driver_ctx, &cfg);
             if (ckks_glob) {
                 glob = ckks_glob;
+                s_active_binding_glob = glob;
                 return true;
             }
             // Driver may return null if scale analysis fails
@@ -4002,9 +4023,13 @@ public:
     // ct_encode: if true, encode constants at compile time
     // free_poly: if true, insert Free_poly_data calls for memory management (native default)
     // enable_poly: if true, use POLY2C_VISITOR (poly-level); if false, use CKKS2C_VISITOR (CKKS-level for debugging)
-    bool run_poly2c_pass_with_config(const std::string& output_file, const std::string& data_file, 
-                                     bool ct_encode, bool free_poly = true,
-                                     bool enable_poly = true) {
+    bool run_poly2c_pass_with_config(
+        const std::string& output_file, const std::string& data_file,
+        bool ct_encode, bool free_poly = true, bool enable_poly = true,
+        const std::string& function_name_prefix = "",
+        const std::string& constant_name_prefix = "",
+        const std::string& pt_from_msg_name = "Pt_from_msg",
+        const std::string& raise_mod_level_func = "") {
         if (!glob) {
             return false;
         }
@@ -4015,6 +4040,13 @@ public:
             // Use native POLY2C_DRIVER for proper C code generation
             std::ostringstream output;
             fhe::poly::POLY2C_CONFIG p2c_config;
+            auto& ctx_param = lower_ctx->Get_ctx_param();
+            if (ctx_param.Get_poly_degree() == 0) {
+                ctx_param.Set_poly_degree(16384, false);
+            }
+            if (ctx_param.Get_mul_level() == 0) {
+                ctx_param.Set_mul_level(1, true);
+            }
             
             // Configure P2C options
             if (!data_file.empty()) {
@@ -4023,6 +4055,10 @@ public:
                 p2c_config.Set_ifile(data_file.c_str());
             }
             p2c_config._ct_encode = ct_encode;
+            p2c_config._function_name_prefix = function_name_prefix;
+            p2c_config._constant_name_prefix = constant_name_prefix;
+            p2c_config._pt_from_msg_name = pt_from_msg_name;
+            p2c_config._raise_mod_level_func = raise_mod_level_func;
             
             // Enable free_poly for memory management (matches native compiler)
             p2c_config._free_poly = free_poly;
@@ -4968,6 +5004,7 @@ py::dict run_ckks_driver(std::shared_ptr<GlobScope> glob) {
             // so retv always has a load (domain=0) as its child, not a CKKS operation.
             
             glob->glob = ckks_glob;
+            s_active_binding_glob = ckks_glob;
             result["success"] = true;
             result["message"] = "CKKS lowering successful";
             
@@ -5006,6 +5043,7 @@ py::dict load_onnx_model(const std::string& onnx_path) {
             // Create a Python GlobScope wrapper
             auto py_glob = std::make_shared<GlobScope>();
             py_glob->glob = load_result.glob;
+            s_active_binding_glob = load_result.glob;
             
             result["success"] = true;
             result["message"] = load_result.message;
@@ -5056,6 +5094,7 @@ py::dict run_poly_driver(std::shared_ptr<GlobScope> glob) {
             poly_driver.Run(config, glob->glob, *lower_ctx, &driver_ctx);
         if (new_glob) {
             glob->glob = new_glob;
+            s_active_binding_glob = new_glob;
             auto& ctx_param = lower_ctx->Get_ctx_param();
             // poly_driver.Run() may reset lower_ctx's ctx_param to defaults
             // (e.g. scaling_factor_bit_num reverts to 40, security_level to
@@ -5209,6 +5248,7 @@ PYBIND11_MODULE(air_builder, m) {
              "CKKS bootstrap stage: slots-to-coeffs via runtime context/precom")
         .def("new_ckks_raise_mod", &Container::new_ckks_raise_mod,
              py::arg("ct"), py::arg("mod_size"),
+             py::arg("runtime_raise_level") = false,
              "CKKS raise_mod: raise ciphertext modulus with a target mod size/level")
         .def("new_ckks_conjugate", &Container::new_ckks_conjugate,
              "CKKS conjugate: complex conjugation over slots")
@@ -5339,12 +5379,17 @@ PYBIND11_MODULE(air_builder, m) {
              py::arg("ct_encode") = false,
              py::arg("free_poly") = true,
              py::arg("enable_poly") = true,
+             py::arg("function_name_prefix") = "",
+             py::arg("constant_name_prefix") = "",
+             py::arg("pt_from_msg_name") = "Pt_from_msg",
+             py::arg("raise_mod_level_func") = "",
              "Run poly2c pass with configuration.\n"
              "  output_file: if non-empty, write C code to this file\n"
              "  data_file: if non-empty, write constants to this file (makes C code MUCH smaller)\n"
              "  ct_encode: if true, encode constants at compile time\n"
              "  free_poly: if true, insert Free_poly_data calls (matches native compiler)\n"
-             "  enable_poly: if true, use POLY2C_VISITOR (poly-level); if false, use CKKS2C_VISITOR (CKKS-level)")
+             "  enable_poly: if true, use POLY2C_VISITOR (poly-level); if false, use CKKS2C_VISITOR (CKKS-level)\n"
+             "  function_name_prefix/constant_name_prefix: prefix generated symbols for embedding")
         .def("list_available_passes", &GlobScope::list_available_passes,
              "List available C++ passes")
         // Python lowering integration

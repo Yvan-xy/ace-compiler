@@ -22,6 +22,7 @@ public:
       : _prov_str("ant"),
         _ct_encode(false),
         _free_poly(false),
+        _pt_from_msg_name("Pt_from_msg"),
         _provider(fhe::core::PROVIDER::ANT),
         _ifile(nullptr) {}
 
@@ -38,12 +39,26 @@ public:
   bool           Emit_data_file() const { return !_data_file.empty(); }
   bool           Ct_encode() const { return _ct_encode; }
   bool           Free_poly() const { return _free_poly; }
+  const char*    Function_name_prefix() const {
+    return _function_name_prefix.c_str();
+  }
+  const char* Constant_name_prefix() const {
+    return _constant_name_prefix.c_str();
+  }
+  const char* Pt_from_msg_name() const { return _pt_from_msg_name.c_str(); }
+  const char* Raise_mod_level_func() const {
+    return _raise_mod_level_func.c_str();
+  }
 
   // leave this member public so that OPTION_DESC can access it
   std::string _prov_str;
   std::string _data_file;  // place data in a seperated file
   bool        _ct_encode;  // encode constants to plaintext at compile time
   bool        _free_poly;  // insert free_poly
+  std::string _function_name_prefix;
+  std::string _constant_name_prefix;
+  std::string _pt_from_msg_name;
+  std::string _raise_mod_level_func;
 
   fhe::core::PROVIDER _provider;  // parsed from _prov_str
   const char*         _ifile;     // set ifile if data_file is set
@@ -56,6 +71,16 @@ public:
   bool           Emit_data_file() const { return cfg.Emit_data_file(); } \
   bool           Ct_encode() const { return cfg.Ct_encode(); }           \
   bool           Free_poly() const { return cfg.Free_poly(); }           \
+  const char*    Function_name_prefix() const {                          \
+    return cfg.Function_name_prefix();                                    \
+  }                                                                       \
+  const char* Constant_name_prefix() const {                              \
+    return cfg.Constant_name_prefix();                                    \
+  }                                                                       \
+  const char* Pt_from_msg_name() const { return cfg.Pt_from_msg_name(); } \
+  const char* Raise_mod_level_func() const {                              \
+    return cfg.Raise_mod_level_func();                                    \
+  }                                                                       \
   DECLARE_COMMON_CONFIG_ACCESS_API(cfg)
 
 }  // namespace poly

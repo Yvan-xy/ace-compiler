@@ -122,7 +122,7 @@ public:
         Emit_buffer_address<RETV, VISITOR>(visitor, node->Child(0));
       } else {
         Emit_st_var<RETV, VISITOR>(visitor, dest);
-        _ir2c_util << " = *(PLAIN)Pt_from_msg(&";
+        _ir2c_util << " = *(PLAIN)" << Pt_from_msg_name() << "(&";
         Emit_st_var<RETV, VISITOR>(visitor, dest);
       }
       _ir2c_util << ", " << idx << " /* " << name << " */";
@@ -237,7 +237,7 @@ public:
             Emit_buffer_address<RETV, VISITOR>(visitor, node->Child(0));
           } else {
             Emit_st_var<RETV, VISITOR>(visitor, dest);
-            _ir2c_util << " = *(PLAIN)Pt_from_msg(&";
+            _ir2c_util << " = *(PLAIN)" << Pt_from_msg_name() << "(&";
             Emit_st_var<RETV, VISITOR>(visitor, dest);
           }
           _ir2c_util << ", ";
@@ -340,8 +340,9 @@ public:
                << "; static uint32_t _pre_plain_" << node_id
                << "_init = 0; if (!_pre_plain_" << node_id << "_init) {\n";
     _ir2c_util << "#pragma omp critical(_pre_plain_" << node_id << "_lock)\n";
-    _ir2c_util << "{ if (!_pre_plain_" << node_id << "_init) { Copy_plain(&_pre_plain_"
-               << node_id << ", (PLAIN)Pt_from_msg(&_pre_plain_" << node_id;
+    _ir2c_util << "{ if (!_pre_plain_" << node_id
+               << "_init) { Copy_plain(&_pre_plain_" << node_id << ", (PLAIN)"
+               << Pt_from_msg_name() << "(&_pre_plain_" << node_id;
     _ir2c_util << ", " << idx << " /* " << name << " */";
     _ir2c_util << ", ";
     visitor->template Visit<RETV>(node->Child(1));

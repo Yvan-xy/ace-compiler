@@ -89,6 +89,8 @@ public:
   static constexpr const char* ENCODE_CACHE = "encode_cache";
   // bool, annotate CKKS.mul so the scale manager defers auto-rescale
   static constexpr const char* SKIP_AUTO_RESCALE = "skip_auto_rescale";
+  // bool, emit CKKS.raise_mod level via configured runtime helper in IR2C
+  static constexpr const char* RUNTIME_RAISE_LEVEL = "runtime_raise_level";
 };
 
 //! info of function gen in FHE phase
