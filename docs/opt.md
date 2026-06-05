@@ -15,6 +15,213 @@ The optimization target is the generated primitive bootstrap used by:
 - [bootstrap_full.py](/home/dyf/code/ace-compiler/ace_edsl/examples/bootstrap_full.py)
 - [a_dsl_bts.sh](/home/dyf/code/ace-compiler/a_dsl_bts.sh)
 
+## 2026-06-05 Current Snapshot
+
+This section supersedes the older "current" sections below for active tuning.
+The April notes are still useful as history, but some diagnostic assumptions
+changed after direct bootstrap C codegen and ct-encoded plaintext data became
+the default `dsl-bts` path.
+
+### Commands Run
+
+All commands were run inside `ace-compiler-dev` from `/app`.
+
+- first-bootstrap diagnostic attempt:
+  - `/usr/bin/time -p env ACE_BOOTSTRAP_STAGE_PROBE=1 ACE_STOP_AFTER_FIRST_BTS=1 ./a_dsl_bts.sh`
+- first-bootstrap full-process sample:
+  - `gprofng collect app -p hi -o tmp_dsl_bts_resnet20/first_bts_20260605.er -- env RTLIB_DISABLE_BOOTSTRAP_PRECOM=1 ACE_STOP_AFTER_FIRST_BTS=1 ./resnet20_cifar10_pre.dsl_bts.ace /app/dataset/test_batch.bin 0 0`
+- full one-image integrated validation:
+  - `/usr/bin/time -p env RTLIB_TIMING_OUTPUT=/app/tmp_dsl_bts_resnet20/rt_timing_20260605.txt ./a_dsl_bts.sh`
+
+Important diagnostic caveats:
+
+- `ACE_BOOTSTRAP_STAGE_PROBE=1` no longer produced stage timing lines on the
+  direct-codegen path. The previous stage probe used text injection, and direct
+  codegen now rejects that style of body modification.
+- `gprofng` works for whole-process sampling, but the first-bootstrap process
+  profile is dominated by setup and rotation-key generation. It is not a good
+  fine-grained bootstrap-body profile.
+- `perf` is not currently usable in this container/kernel pairing. `perf stat`
+  reports missing tools for kernel `6.8.0-117`.
+
+### Current Integrated Result
+
+Fresh full one-image `dsl-bts` run:
+
+- log:
+  - `/app/tmp_dsl_bts_resnet20/a_dsl_bts.log`
+- runtime timing report:
+  - `/app/tmp_dsl_bts_resnet20/rt_timing_20260605.txt`
+- result:
+  - `1 / 1` image passed
+- inner binary wall time:
+  - `19m49.129s`
+- outer script wall time, including generate/compile/run:
+  - `1232.40s`
+
+Bootstrap timing from the `dsl_bts` call log:
+
+- calls: `21`
+- summed bootstrap time: `980.903s`
+- average bootstrap time: `46.710s/call`
+- min / max: `28.045s / 54.585s`
+
+Target-level averages:
+
+- level `6`: `3` calls, `28.788s/call`
+- level `13`: `3` calls, `45.333s/call`
+- level `14`: `6` calls, `47.674s/call`
+- level `15`: `3` calls, `50.844s/call`
+- level `16`: `6` calls, `53.327s/call`
+
+Runtime counters from `RTLIB_TIMING_OUTPUT`:
+
+- `MAIN_GRAPH`: `1167.687662s`
+- `FHE_BOOTSTRAP`: `980.959156s` across `21` calls
+- non-bootstrap residual:
+  - about `186.729s`
+
+Compared with the rtlib baseline in
+[origin.log](/home/dyf/code/ace-compiler/origin.log):
+
+- rtlib `MAIN_GRAPH`: `899.852733s`
+- rtlib `BS_EVAL`: `712.991312s` across `21` calls
+- rtlib bootstrap average:
+  - about `33.952s/call`
+- rtlib non-bootstrap residual:
+  - about `186.861s`
+
+Direct implication:
+
+- the non-bootstrap residual still matches rtlib closely
+- the remaining integrated gap is still almost entirely bootstrap body cost
+- current DSL bootstrap average is about `1.38x` the rtlib bootstrap average
+
+Historical multi-image reference:
+
+- `/app/1.log` remains useful as a 10-image run:
+  - `210` bootstrap calls
+  - summed bootstrap time `9674.250s`
+  - average `46.068s/call`
+  - `10 / 10` images passed
+- treat it as historical evidence, not the fresh validation run.
+
+### Current First-Bootstrap Measurements
+
+Fresh first-bootstrap-only measurements:
+
+- `ACE_BOOTSTRAP_STAGE_PROBE=1 ACE_STOP_AFTER_FIRST_BTS=1 ./a_dsl_bts.sh`
+  - first bootstrap: `54.942s`
+  - stage lines were not emitted
+- direct binary with `ACE_STOP_AFTER_FIRST_BTS=1`
+  - first bootstrap: `54.202s`
+- `gprofng` full-process run:
+  - first bootstrap: `54.318s`
+
+The whole-process `gprofng` profile had total CPU `246.760s`. The top samples
+were:
+
+- `Forward_transform`: `87.224s` exclusive
+- libc static frames: `50.043s` exclusive
+- `blake2b_compress`: `32.162s` exclusive
+- `Mul_poly`: `62.575s` inclusive
+- `Sub_poly`: `57.467s` inclusive
+- `Sample_uniform`: `47.237s` inclusive
+
+The call tree is the important part:
+
+- about `244s` of CPU is under `Generate_rot_maps._omp_fn.0`
+- that flows through `Generate_rot_key` and `Generate_switching_key`
+- only about `0.49s` is attributed under `dsl_bts_bootstrap_full`
+
+So this profile mainly confirms that first-run setup/key generation is large.
+It should not be used to choose fine-grained body-level optimizations.
+
+### Generated Shape
+
+Fresh generated artifacts:
+
+- `ace_edsl/examples/output/bootstrap_full.c`
+  - `1,370,889` bytes
+  - `22,819` lines
+- `ace_edsl/examples/output/bootstrap_full_raw.air`
+  - `596,539` bytes
+  - `12,311` lines
+- `ace_edsl/examples/output/bootstrap_full_data.msg`
+  - `5,634,258,816` bytes
+
+Generated C operation census:
+
+- `Rotate_batch_ciph(`: `6`
+- scalar `dsl_bts_Rotate(`: `44`
+- `Pt_from_msg(`: `317`
+- `Copy_plain(`: `316`
+- `Encode_double_mask(`: `128`
+- `Relinearize(`: `36`
+- `Rescale(`: `272`
+- forbidden lazy `Encode_dcmplx_ext(`: `0`
+- forbidden `Eval_bootstrap_ciph(`: `0`
+
+Raw AIR census:
+
+- `CKKS.rotate_batch`: `6`
+- `CKKS.rotate`: `48`
+- `CKKS.encode`: `444`
+- `CKKS.mul`: `448`
+- `CKKS.add`: `484`
+- `CKKS.sub`: `13`
+- `CKKS.rescale`: `6`
+- `CKKS.modswitch`: `10`
+- `CKKS.raise_mod`: `1`
+- forbidden `CKKS.bootstrap`: `0`
+
+Current interpretation:
+
+- code size is not the primary current problem
+- plaintext loading/copying is not the hot path; ct-encoded plaintext data
+  removed lazy `Encode_dcmplx_ext`
+- remaining scalar moved rotations and `dual_evalmod` are better optimization
+  targets than `Pt_from_msg` / `Copy_plain`
+
+### Next Optimization Order
+
+1. Restore stage-level timing for direct codegen without text replacement.
+   Use first-class timing hooks or generated direct-codegen markers so
+   `coeff_to_slots`, `dual_evalmod`, and `slots_to_coeffs` can be measured
+   again.
+2. Generalize grouped moved-rotate lowering in
+   `_apply_collapsed_fft_transform()`. The current `rotate_batch` win applies
+   to the `fast_rot` construction, but the later moved rotations still lower as
+   scalar `inner.rotate(rot)` calls. The target shape is a parameter-general
+   collapsed-FFT stage op or rotate-accumulate lowering, not a ResNet-specific
+   helper.
+3. Work on `dual_evalmod` after moved rotations. The older valid stage probes
+   and current native review both point to it as the next major cost bucket.
+4. Continue replacing env/default-driven metadata with explicit bootstrap
+   metadata or context-derived values:
+   - poly degree
+   - multiplication level
+   - bootstrap depth
+   - hamming weight
+   - q/p partitioning
+   - scale/post-scale details
+5. Update planning diagnostics so `ROTATE_BATCH` cost/stat accounting reflects
+   the number of nonzero rotations in the batch rather than counting every
+   batch as one rotate.
+
+Regression guardrails for the current path:
+
+- fail if raw AIR contains `CKKS.bootstrap`
+- fail if generated primitive C calls `Eval_bootstrap_ciph(`
+- fail on the ct-encoded path if generated C contains lazy
+  `Encode_dcmplx_ext(`
+- warn if generated C grows beyond about `1.6 MB` or `25k` lines
+- warn if `bootstrap_full_data.msg` grows beyond about `6.2 GB`
+- treat first-bootstrap times above `58s` as suspicious and above `60.5s` as a
+  likely regression
+- treat full one-image bootstrap average above about `50.7s/call` as a likely
+  current-path regression
+
 ## Current Performance Snapshot
 
 Unless noted otherwise, the numbers below refer to the current known-good
@@ -91,9 +298,10 @@ Historical reference:
 
 ## Profiling Constraints
 
-The container now has `perf` installed.
-
-The usable profiler in this environment is `gprofng` and `perf`.
+As of 2026-06-05, the usable profiler in this environment is `gprofng`.
+Earlier notes treated `perf` as available, but the current container reports
+missing host kernel tools for `6.8.0-117`, so do not rely on `perf` until that
+tooling is fixed.
 
 ## Lightweight Profiling Findings
 
