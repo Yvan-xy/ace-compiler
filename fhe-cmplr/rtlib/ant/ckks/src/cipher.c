@@ -766,6 +766,22 @@ CIPHER Eval_bootstrap_slots_to_coeffs_ciph(CIPHER res, CIPHER ciph,
   return res;
 }
 
+CIPHER Eval_bootstrap_fft_stage_ciph(CIPHER res, CIPHER ciph,
+                                     uint32_t num_slots, uint32_t step,
+                                     uint32_t encoding, uint32_t is_rem) {
+  CKKS_BTS_CTX*    bts_ctx = NULL;
+  CKKS_BTS_PRECOM* precom  = Ensure_bts_precom(ciph, num_slots, &bts_ctx);
+  FMT_ASSERT(!Is_lt_bootstrap(precom),
+             "bootstrap FFT stage is unavailable for linear-transform bootstrap");
+
+  VL_VL_PLAIN* conj_pre =
+      encoding ? Get_u0hatt_pre_fft(precom) : Get_u0_pre_fft(precom);
+  FMT_ASSERT(conj_pre != NULL, "bootstrap FFT precom is unavailable");
+  Bootstrap_fft_stage(res, ciph, conj_pre, bts_ctx, step, encoding != 0,
+                      is_rem != 0);
+  return res;
+}
+
 CIPHER Encrypt(CIPHER res, PLAIN plain) {
   Encrypt_msg(res, (CKKS_ENCRYPTOR*)Context->_encryptor, plain);
   return res;

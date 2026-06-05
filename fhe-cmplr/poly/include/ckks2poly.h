@@ -141,6 +141,7 @@ public:
         case fhe::ckks::CKKS_OPERATOR::BOOTSTRAP_COEFFS_TO_SLOTS:
         case fhe::ckks::CKKS_OPERATOR::BOOTSTRAP_EVAL_MOD:
         case fhe::ckks::CKKS_OPERATOR::BOOTSTRAP_SLOTS_TO_COEFFS:
+        case fhe::ckks::CKKS_OPERATOR::BOOTSTRAP_FFT_STAGE:
           CMPLR_ASSERT(Lower_ctx()->Is_cipher_type(tid_child),
                        "child should be ciphertext");
           return retv_cand[0];  // CIPH

@@ -65,6 +65,9 @@ class AIRValue:
     @staticmethod
     def _bootstrap_stage_primitive_enabled() -> bool:
         """Enable experimental stage-op lowering to explicit CKKS primitives."""
+        impl = os.environ.get("ACE_BOOTSTRAP_IMPL", "").strip().lower()
+        if impl in ("stage", "stages", "stage_op", "stage_ops", "stage-op", "stage-ops"):
+            return False
         raw = os.environ.get("ACE_BOOTSTRAP_STAGE_PRIMITIVE_LOWERING")
         if raw is None:
             # Default to primitive lowering; set env to 0/false/off to disable.
@@ -589,6 +592,30 @@ class AIRValue:
             domain=self._domain,
             temp_name=temp_name,
         )
+
+    def bootstrap_fft_stage(
+        self,
+        num_slots: int,
+        step: int,
+        encoding: bool,
+        is_remainder: bool,
+        rotations: list[int],
+    ) -> 'AIRValue':
+        """Emit one collapsed FFT bootstrap stage."""
+        self._set_loc()
+        if not hasattr(self._container, "new_ckks_bootstrap_fft_stage"):
+            raise NotImplementedError(
+                "Container does not support bootstrap_fft_stage operation"
+            )
+        result_node = self._container.new_ckks_bootstrap_fft_stage(
+            self.value,
+            int(num_slots),
+            int(step),
+            bool(encoding),
+            bool(is_remainder),
+            [int(rot) for rot in rotations],
+        )
+        return self._flatten_result(result_node)
     
     def rescale(self) -> 'AIRValue':
         """

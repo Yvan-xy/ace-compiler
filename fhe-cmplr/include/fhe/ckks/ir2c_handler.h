@@ -312,6 +312,40 @@ public:
   }
 
   template <typename RETV, typename VISITOR>
+  void Handle_bootstrap_fft_stage(VISITOR* visitor, air::base::NODE_PTR node) {
+    IR2C_CTX&           ctx    = visitor->Context();
+    air::base::NODE_PTR parent = ctx.Parent(1);
+
+    AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
+    const uint32_t* slot = node->Attr<uint32_t>(nn::core::ATTR::SLOT);
+    const uint32_t* stage =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::BOOTSTRAP_STAGE);
+    const uint32_t* encoding =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::BOOTSTRAP_ENCODING);
+    const uint32_t* remainder =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::BOOTSTRAP_REMAINDER);
+    if (ctx.Provider() == core::PROVIDER::ANT) {
+      ctx << "Eval_bootstrap_fft_stage_ciph(&";
+      ctx.Emit_st_var(parent);
+      ctx << ", ";
+      visitor->template Visit<RETV>(node->Child(0));
+      ctx << ", " << (slot == nullptr ? 0 : *slot);
+      ctx << ", " << (stage == nullptr ? 0 : *stage);
+      ctx << ", " << (encoding == nullptr ? 0 : *encoding);
+      ctx << ", " << (remainder == nullptr ? 0 : *remainder) << ")";
+    } else {
+      ctx << "Bootstrap(&";
+      ctx.Emit_st_var(parent);
+      ctx << ", ";
+      visitor->template Visit<RETV>(node->Child(0));
+      ctx << ", 0)";
+    }
+    if (!ctx._need_bts) {
+      ctx._need_bts = true;
+    }
+  }
+
+  template <typename RETV, typename VISITOR>
   void Handle_free(VISITOR* visitor, air::base::NODE_PTR node) {
     IR2C_CTX& ctx      = visitor->Context();
     uint64_t  elem_cnt = 0;

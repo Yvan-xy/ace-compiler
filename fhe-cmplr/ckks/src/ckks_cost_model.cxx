@@ -90,6 +90,7 @@ const static CKKS_OP_COST Modswitch = CKKS_OP_COST(OPC_MODSWITCH, 0., 31);
 const static CKKS_OP_COST Sub     = CKKS_OP_COST(OPC_SUB, {});
 const static CKKS_OP_COST Neg     = CKKS_OP_COST(OPC_NEG, {});
 const static CKKS_OP_COST Upscale = CKKS_OP_COST(OPC_UPSCALE, {});
+const static CKKS_OP_COST Metadata = CKKS_OP_COST(OPC_SCALE, {});
 
 //! @brief Fhe_op_cost_deg65536 provides a summary of the cost of FHE operations
 //! at polynomial degree N= 2^16.
@@ -108,6 +109,17 @@ const static std::vector<const CKKS_OP_COST*> Fhe_op_cost_deg65536 = {
     &Modswitch,
     &Relin_deg65536,
     &Bootstrap_deg65536,
+    &Metadata,
+    &Metadata,
+    &Metadata,
+    &Modswitch,
+    &Rotate_deg65536,
+    &Rotate_deg65536,
+    &Bootstrap_deg65536,
+    &Bootstrap_deg65536,
+    &Bootstrap_deg65536,
+    &Rotate_deg65536,
+    &Metadata,
 };
 
 // latency(ms) of rotation at poly_degree= 2^17 and level [0, 31]
@@ -198,6 +210,17 @@ const static std::vector<const CKKS_OP_COST*> Fhe_op_cost_deg131072 = {
     &Modswitch,
     &Relin_deg131072,
     &Bootstrap_deg131072,
+    &Metadata,
+    &Metadata,
+    &Metadata,
+    &Modswitch,
+    &Rotate_deg131072,
+    &Rotate_deg131072,
+    &Bootstrap_deg131072,
+    &Bootstrap_deg131072,
+    &Bootstrap_deg131072,
+    &Rotate_deg131072,
+    &Metadata,
 };
 
 double Operation_cost(air::base::OPCODE opc, uint32_t level,

@@ -1148,6 +1148,47 @@ public:
         return node;
     }
 
+    // CKKS bootstrap collapsed FFT stage op.
+    std::shared_ptr<Node> new_ckks_bootstrap_fft_stage(
+        std::shared_ptr<Node> ct, int32_t num_slots, int32_t step,
+        bool encoding, bool is_remainder, py::list rotations) {
+        if (container && ct->has_node) {
+            OPCODE op(
+                fhe::ckks::CKKS_DOMAIN::ID,
+                fhe::ckks::CKKS_OPERATOR::BOOTSTRAP_FFT_STAGE);
+            TYPE_PTR rtype = get_compatible_type(ct->node->Rtype());
+            NODE_PTR n = container->New_cust_node(op, rtype, get_spos());
+            n->Set_child(0, ct->node);
+
+            uint32_t slots = static_cast<uint32_t>(num_slots > 0 ? num_slots : 0);
+            uint32_t stage = static_cast<uint32_t>(step >= 0 ? step : 0);
+            uint32_t enc = encoding ? 1U : 0U;
+            uint32_t rem = is_remainder ? 1U : 0U;
+            n->Set_attr(nn::core::ATTR::SLOT, &slots, 1);
+            n->Set_attr(fhe::core::FHE_ATTR_KIND::BOOTSTRAP_STAGE, &stage, 1);
+            n->Set_attr(fhe::core::FHE_ATTR_KIND::BOOTSTRAP_ENCODING, &enc, 1);
+            n->Set_attr(fhe::core::FHE_ATTR_KIND::BOOTSTRAP_REMAINDER, &rem, 1);
+
+            std::vector<int32_t> rot_vals;
+            rot_vals.reserve(rotations.size());
+            for (py::handle item : rotations) {
+                rot_vals.push_back(item.cast<int32_t>());
+            }
+            if (!rot_vals.empty()) {
+                Set_rotation_list_attr(n, rot_vals);
+            }
+
+            auto node = wrap_node(n, "fhe::ckks::BOOTSTRAP_FFT_STAGE");
+            node->add_child(ct);
+            return node;
+        }
+        auto node = std::make_shared<Node>(
+            ++node_counter, "fhe::ckks::BOOTSTRAP_FFT_STAGE");
+        node->add_child(ct);
+        nodes.push_back(node);
+        return node;
+    }
+
     // CKKS raise_mod - raise ciphertext modulus with a target level/mod_size
     std::shared_ptr<Node> new_ckks_raise_mod(
         std::shared_ptr<Node> ct, int32_t mod_size,
@@ -5246,6 +5287,12 @@ PYBIND11_MODULE(air_builder, m) {
              &Container::new_ckks_bootstrap_slots_to_coeffs,
              py::arg("ct"), py::arg("num_slots") = 0,
              "CKKS bootstrap stage: slots-to-coeffs via runtime context/precom")
+        .def("new_ckks_bootstrap_fft_stage",
+             &Container::new_ckks_bootstrap_fft_stage,
+             py::arg("ct"), py::arg("num_slots"), py::arg("step"),
+             py::arg("encoding"), py::arg("is_remainder"),
+             py::arg("rotations"),
+             "CKKS bootstrap collapsed FFT stage via runtime context/precom")
         .def("new_ckks_raise_mod", &Container::new_ckks_raise_mod,
              py::arg("ct"), py::arg("mod_size"),
              py::arg("runtime_raise_level") = false,

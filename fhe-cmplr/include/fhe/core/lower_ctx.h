@@ -91,6 +91,12 @@ public:
   static constexpr const char* SKIP_AUTO_RESCALE = "skip_auto_rescale";
   // bool, emit CKKS.raise_mod level via configured runtime helper in IR2C
   static constexpr const char* RUNTIME_RAISE_LEVEL = "runtime_raise_level";
+  // integer, collapsed FFT bootstrap stage index
+  static constexpr const char* BOOTSTRAP_STAGE = "bootstrap_stage";
+  // bool, collapsed FFT bootstrap stage direction: 1 coeffs-to-slots, 0 slots-to-coeffs
+  static constexpr const char* BOOTSTRAP_ENCODING = "bootstrap_encoding";
+  // bool, collapsed FFT bootstrap remainder stage
+  static constexpr const char* BOOTSTRAP_REMAINDER = "bootstrap_remainder";
 };
 
 //! info of function gen in FHE phase

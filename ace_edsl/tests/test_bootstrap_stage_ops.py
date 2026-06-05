@@ -132,6 +132,64 @@ class TestBootstrapStageOps(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, msg=f"{proc.stdout}\n{proc.stderr}")
         self.assertIn("STAGE_OP_PRIMITIVE_LOWERING_OK", proc.stdout)
 
+    def test_primitive_transform_can_lower_to_fft_stage_op(self):
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        parent_root = os.path.abspath(os.path.join(repo_root, ".."))
+        script = textwrap.dedent(
+            f"""
+            import os
+            import sys
+            sys.path.insert(0, {repo_root!r})
+            sys.path.insert(0, {parent_root!r})
+            from ace_edsl.edsl import AceEDSL, AcePipeline, CkksCiphertext, ckks_kernel
+
+            os.environ["ACE_BOOTSTRAP_STAGE_PRIMITIVE_LOWERING"] = "1"
+            os.environ["ACE_BOOTSTRAP_FFT_STAGE_OP"] = "1"
+            os.environ["ACE_BOOTSTRAP_POLY_DEGREE"] = "16384"
+            os.environ["ACE_BOOTSTRAP_MUL_LEVEL"] = "8"
+
+            @ckks_kernel
+            def _bootstrap_fft_stage_kernel(ct: CkksCiphertext) -> CkksCiphertext:
+                return ct.bootstrap_coeffs_to_slots()
+
+            AceEDSL._get_dsl.cache_clear()
+            inp = CkksCiphertext(shape=(8192,), name="input")
+            _bootstrap_fft_stage_kernel(inp)
+            dsl = AceEDSL._get_dsl()
+            before_ir = dsl.current_air_module.dump().lower()
+            assert "ckks.bootstrap_fft_stage" in before_ir
+            assert "ckks.bootstrap_coeffs_to_slots" not in before_ir
+
+            pipeline = AcePipeline(dsl.current_air_module)
+            pipeline.configure_fhe(
+                poly_degree=16384,
+                mul_level=8,
+                security_level=0,
+                scaling_factor_bits=56,
+                first_prime_bits=60,
+                hamming_weight=192,
+                data_file="/tmp/test_bootstrap_fft_stage.msg",
+                enable_poly=True,
+            )
+            result = pipeline.run(start_domain="fhe::ckks", dump_stages=True, verbose=False)
+            assert result.success, result.error
+            c_code = result.c_code or ""
+            assert "Eval_bootstrap_fft_stage_ciph(" in c_code
+            assert "Eval_bootstrap_coeffs_to_slots_ciph(" not in c_code
+            assert "Eval_bootstrap_ciph(" not in c_code
+            print("FFT_STAGE_PRIMITIVE_LOWERING_OK")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("FFT_STAGE_PRIMITIVE_LOWERING_OK", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

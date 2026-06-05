@@ -195,7 +195,8 @@ GLOB_SCOPE* POLY_DRIVER::Run_flatten(GLOB_SCOPE* glob, POLY_LAYER tgt_layer) {
             opcode == fhe::ckks::OPC_MUL_MONO ||
             opcode == fhe::ckks::OPC_BOOTSTRAP_COEFFS_TO_SLOTS ||
             opcode == fhe::ckks::OPC_BOOTSTRAP_EVAL_MOD ||
-            opcode == fhe::ckks::OPC_BOOTSTRAP_SLOTS_TO_COEFFS) {
+            opcode == fhe::ckks::OPC_BOOTSTRAP_SLOTS_TO_COEFFS ||
+            opcode == fhe::ckks::OPC_BOOTSTRAP_FFT_STAGE) {
           return true;
         }
         return false;

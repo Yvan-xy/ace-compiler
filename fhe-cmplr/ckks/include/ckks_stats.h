@@ -81,6 +81,7 @@ public:
         break;
       case OPC_ROTATE:
       case OPC_ROTATE_BATCH:
+      case OPC_BOOTSTRAP_FFT_STAGE:
         kind = ROTATE;
         break;
       case OPC_RESCALE:

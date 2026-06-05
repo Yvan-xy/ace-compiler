@@ -2,15 +2,18 @@
 Full CKKS Bootstrap Algorithm Implementation for ACE EDSL
 =========================================================
 
-This module supports two implementations selected by `ACE_BOOTSTRAP_IMPL`:
-- `primitive` (default; aliases: `inline`, `ops`, `dsl`, `mimic`): staged
-  bootstrap ops in EDSL (`CoeffToSlot -> EvalMod -> SlotToCoeff`).
+This module supports three implementations selected by `ACE_BOOTSTRAP_IMPL`:
+- `primitive` (default; aliases: `inline`, `ops`, `dsl`, `mimic`): explicit
+  primitive CKKS decomposition in EDSL.
+- `stage_ops` (aliases: `stage`, `stages`): first-class bootstrap stage ops
+  (`CoeffToSlot -> EvalMod -> SlotToCoeff`) without a full bootstrap op.
 - `rtlib`: mimic ANT rtlib bootstrap by emitting CKKS `Bootstrap` op directly.
 
 `rtlib` mode is the closest match to rtlib behavior in generated code because it
 lowers to the runtime bootstrap path (`Eval_bootstrap_ciph(...)` on ANT).
-`primitive` mode emits first-class bootstrap stage ops in EDSL, providing a
-full bootstrap semantic path without direct `Bootstrap(...)` call emission.
+`primitive` and `stage_ops` both avoid direct `Bootstrap(...)` call emission.
+`stage_ops` is useful for measuring parameter-general runtime stage lowering
+against the fully expanded primitive decomposition.
 
 **EvalMod:** The kernel mirrors ANT's EvalMod core (bootstrap.c): Chebyshev
 series (55 coeffs from G_coefficients_uniform_hw_192), double-angle iterations
@@ -119,6 +122,8 @@ def _bootstrap_impl_mode() -> str:
     mode = os.environ.get("ACE_BOOTSTRAP_IMPL", "primitive").strip().lower()
     if mode in ("rtlib", "runtime", "native"):
         return "rtlib"
+    if mode in ("stage", "stages", "stage_op", "stage_ops", "stage-op", "stage-ops"):
+        return "stage_ops"
     if mode in ("primitive", "inline", "ops", "dsl", "mimic"):
         return "primitive"
     return "primitive"
@@ -126,6 +131,10 @@ def _bootstrap_impl_mode() -> str:
 
 def _use_rtlib_bootstrap() -> bool:
     return _bootstrap_impl_mode() == "rtlib"
+
+
+def _use_stage_ops_bootstrap() -> bool:
+    return _bootstrap_impl_mode() == "stage_ops"
 
 def _bootstrap_mul_level() -> int:
     """Return CKKS mul level budget for bootstrap demo pipeline."""
@@ -197,7 +206,7 @@ def bootstrap_full_python_reference(values):
     impl_mode = _bootstrap_impl_mode()
     if impl_mode == "rtlib":
         return _identity_bootstrap_cleartext_reference(values)
-    # primitive mode now does real EvalMod math; use ANT reference.
+    # primitive and stage-op modes do real EvalMod math; use ANT reference.
     if ant_bootstrap_full_reference is not None:
         return ant_bootstrap_full_reference(values)
     return [math.sin(8.0 * float(v)) for v in values]  # fallback
@@ -362,8 +371,8 @@ def bootstrap_full(
 ) -> CkksCiphertext:
     """Bootstrap kernel with selectable implementation mode.
 
-    `primitive`: emit bootstrap-stage ops in EDSL
-                 (CoeffToSlot -> EvalMod -> SlotToCoeff).
+    `primitive`: emit explicit primitive CKKS decomposition in EDSL.
+    `stage_ops`: emit first-class bootstrap stage ops in EDSL.
     `rtlib`: emit CKKS Bootstrap op directly (lowered by runtime bootstrap path).
     """
     out = ct
@@ -375,6 +384,16 @@ def bootstrap_full(
             out = _ClearSlots(_identity_bootstrap_cleartext_reference(ct.vals))
         else:
             # Keep kernel preprocess-friendly: no early return branches.
+            out = ct
+    elif _use_stage_ops_bootstrap():
+        if hasattr(ct, "bootstrap_coeffs_to_slots"):
+            slots = _bootstrap_m_by_4()
+            out = ct.bootstrap_coeffs_to_slots(slots)
+            out = out.bootstrap_eval_mod()
+            out = out.bootstrap_slots_to_coeffs(slots)
+        elif isinstance(ct, _ClearSlots):
+            out = _ClearSlots(bootstrap_full_python_reference(ct.vals))
+        else:
             out = ct
     else:
         from ace_edsl.edsl.core.bootstrap_decomposition import (

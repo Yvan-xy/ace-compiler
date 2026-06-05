@@ -208,6 +208,12 @@ CIPHER Eval_bootstrap_eval_mod_ciph(CIPHER res, CIPHER ciph,
 CIPHER Eval_bootstrap_slots_to_coeffs_ciph(CIPHER res, CIPHER ciph,
                                            uint32_t num_slots);
 
+//! @brief Bootstrap collapsed FFT stage op.
+//! Applies one coeffs-to-slots or slots-to-coeffs collapsed stage.
+CIPHER Eval_bootstrap_fft_stage_ciph(CIPHER res, CIPHER ciph,
+                                     uint32_t num_slots, uint32_t step,
+                                     uint32_t encoding, uint32_t is_rem);
+
 //! @brief TO BEREMOVE just for bootstrap example
 CIPHER Encrypt(CIPHER res, PLAIN plain);
 

@@ -441,6 +441,13 @@ def _bootstrap_ct_encode_enabled() -> bool:
     return raw not in ("0", "false", "off", "no")
 
 
+def _bootstrap_fft_stage_op_enabled() -> bool:
+    raw = os.environ.get("ACE_BOOTSTRAP_FFT_STAGE_OP", "").strip().lower()
+    if not raw:
+        return False
+    return raw not in ("0", "false", "off", "no")
+
+
 def _coeffs_to_slots_factor(slots: int) -> float:
     """Return the full-packed normalization used by rtlib CoeffToSlot.
 
@@ -817,6 +824,27 @@ def _rotate_plain_vector(values, rotation: int):
     return [values[(idx + rot) % length] for idx in range(length)]
 
 
+def _collapsed_fft_stage_rotation_keys(stage, slots: int):
+    """Return rotation keys used by one collapsed FFT stage plan."""
+    keys = []
+    seen = set()
+
+    def add(rot):
+        rot = _reduce_rotation(rot, slots)
+        if rot != 0 and rot not in seen:
+            seen.add(rot)
+            keys.append(rot)
+
+    num_rot = stage["num_rot"]
+    shift = stage["shift"]
+    mid = (num_rot + 1) // 2
+    for j in range(stage["giant_step"]):
+        add((j - mid + 1) * shift)
+    for i in range(stage["baby_step"]):
+        add(stage["giant_step"] * i * shift)
+    return keys
+
+
 def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
     """Apply the full-packed collapsed-FFT transform with CKKS ops."""
     coeff, stages = _collapsed_fft_stage_plan(slots, encoding)
@@ -824,6 +852,18 @@ def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
     # Cleartext fallback: bootstrap is message-preserving, so use identity.
     if not hasattr(x, "container"):
         return x.__class__(x.vals)
+
+    if _bootstrap_fft_stage_op_enabled() and hasattr(x, "bootstrap_fft_stage"):
+        result = x
+        for stage in stages:
+            result = result.bootstrap_fft_stage(
+                slots,
+                stage["s"],
+                encoding,
+                stage["is_remainder"],
+                _collapsed_fft_stage_rotation_keys(stage, slots),
+            ).rescale()
+        return result
 
     result = x
     for stage in stages:

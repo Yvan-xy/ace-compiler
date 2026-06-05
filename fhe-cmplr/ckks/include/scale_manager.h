@@ -932,6 +932,8 @@ public:
   RETV Handle_bootstrap_eval_mod(VISITOR* visitor, NODE_PTR node);
   template <typename RETV, typename VISITOR>
   RETV Handle_bootstrap_slots_to_coeffs(VISITOR* visitor, NODE_PTR node);
+  template <typename RETV, typename VISITOR>
+  RETV Handle_bootstrap_fft_stage(VISITOR* visitor, NODE_PTR node);
 
 private:
   //! gen CKKS.rescale(node) to dec scale of node.
@@ -1134,6 +1136,18 @@ RETV CKKS_SCALE_MANAGER::Handle_rotate_batch(VISITOR* visitor, NODE_PTR node) {
   NODE_PTR       child = node->Child(0);
   RETV           retv0 = visitor->template Visit<RETV>(child);
   SCALE_INFO     si    = retv0.Scale_info();
+  ctx.Set_node_scale_info(node, si);
+  return RETV{si, node};
+}
+
+template <typename RETV, typename VISITOR>
+RETV CKKS_SCALE_MANAGER::Handle_bootstrap_fft_stage(VISITOR* visitor,
+                                                    NODE_PTR node) {
+  SCALE_MNG_CTX& ctx   = visitor->Context();
+  NODE_PTR       child = node->Child(0);
+  RETV           retv0 = visitor->template Visit<RETV>(child);
+  SCALE_INFO     child_si = retv0.Scale_info();
+  SCALE_INFO     si(child_si.Scale_deg() + 1, child_si.Rescale_level());
   ctx.Set_node_scale_info(node, si);
   return RETV{si, node};
 }

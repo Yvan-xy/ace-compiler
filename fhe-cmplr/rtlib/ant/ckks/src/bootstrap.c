@@ -1233,7 +1233,7 @@ void Bootstrap_keygen(CKKS_BTS_CTX* bts_ctx, uint32_t slots) {
 CIPHERTEXT* Rotate_iteration(CIPHERTEXT* result, CKKS_BTS_CTX* bts_ctx,
                              VL_VL_PLAIN* conj_pre, VL_VL_I32* rot_in,
                              VL_VL_I32* rot_out, int32_t step, bool encoding,
-                             bool is_rem) {
+                             bool is_rem, bool rescale_before) {
   CKKS_PARAMETER*  ckks_params = Get_bts_params(bts_ctx);
   CKKS_EVALUATOR*  eval        = Get_bts_eval(bts_ctx);
   size_t           degree      = ckks_params->_poly_degree;
@@ -1262,7 +1262,7 @@ CIPHERTEXT* Rotate_iteration(CIPHERTEXT* result, CKKS_BTS_CTX* bts_ctx,
   int32_t num_rot    = is_rem ? num_rots_rem : num_rots;
   int32_t level_idx  = encoding ? level_budget - 1 : 0;
 
-  if (is_rem || step != level_idx) {
+  if (rescale_before && (is_rem || step != level_idx)) {
     Rescale_ciphertext(result, result, eval);
   }
 
@@ -1463,23 +1463,118 @@ CIPHERTEXT* Coeff_slots_transform(CIPHERTEXT* result, CIPHERTEXT* ciph,
   if (encoding) {
     for (int32_t s = end - 1; s > start - 1; s--) {
       Rotate_iteration(result, bts_ctx, conj_pre, rot_in, rot_out, s, encoding,
-                       FALSE);
+                       FALSE, TRUE);
     }
   } else {
     for (int32_t s = start; s < end; s++) {
       Rotate_iteration(result, bts_ctx, conj_pre, rot_in, rot_out, s, encoding,
-                       FALSE);
+                       FALSE, TRUE);
     }
   }
   if (flag_rem) {
     int32_t s = encoding ? stop : level_budget - flag_rem;
     Rotate_iteration(result, bts_ctx, conj_pre, rot_in, rot_out, s, encoding,
-                     TRUE);
+                     TRUE, TRUE);
   }
 
   Free_value_list(rot_in);
   Free_value_list(rot_out);
 
+  return result;
+}
+
+CIPHERTEXT* Bootstrap_fft_stage(CIPHERTEXT* result, CIPHERTEXT* ciph,
+                                VL_VL_PLAIN* conj_pre,
+                                CKKS_BTS_CTX* bts_ctx, uint32_t step,
+                                bool encoding, bool is_rem) {
+  CKKS_PARAMETER*  ckks_params = Get_bts_params(bts_ctx);
+  size_t           degree      = ckks_params->_poly_degree;
+  size_t           order       = degree * 2;
+  size_t           slots       = Get_ciph_slots(ciph);
+  CKKS_BTS_PRECOM* precom      = Get_bts_precom(bts_ctx, slots);
+  IS_TRUE(precom,
+          "Precomputations were not generated, Please call Bootstrap_setup");
+
+  VL_I32* param =
+      encoding ? Get_encode_params(precom) : Get_decode_params(precom);
+  IS_TRUE(param->_length == TOTAL_PARAMS, "invalid length of param");
+  int32_t level_budget    = Get_i32_value_at(param, LEVEL_BUDGET);
+  int32_t layers_collapse = Get_i32_value_at(param, LAYERS_COLL);
+  int32_t rem_collapse    = Get_i32_value_at(param, LAYERS_REM);
+  int32_t num_rots        = Get_i32_value_at(param, NUM_ROTATIONS);
+  int32_t g               = Get_i32_value_at(param, GIANT_STEP);
+  int32_t b               = Get_i32_value_at(param, BABY_STEP);
+  int32_t num_rots_rem    = Get_i32_value_at(param, NUM_ROTATIONS_REM);
+  int32_t g_rem           = Get_i32_value_at(param, GIANT_STEP_REM);
+  int32_t b_rem           = Get_i32_value_at(param, BABY_STEP_REM);
+
+  IS_TRUE(step < (uint32_t)level_budget, "invalid bootstrap FFT stage");
+
+  int32_t stop     = -1;
+  int32_t flag_rem = 0;
+  if (rem_collapse) {
+    stop     = 0;
+    flag_rem = 1;
+  }
+
+  int32_t start       = encoding ? stop + 1 : 0;
+  int32_t end         = encoding ? level_budget : level_budget - flag_rem;
+  int32_t slots_value = encoding ? slots : order / 4;
+
+  VL_VL_I32* rot_in    = Alloc_value_list(VL_PTR_TYPE, level_budget);
+  uint32_t   rem_index = encoding ? 0 : level_budget - 1;
+  for (uint32_t i = 0; i < (uint32_t)level_budget; i++) {
+    if (flag_rem == 1 && i == rem_index) {
+      VL_VALUE_AT(rot_in, i) = Alloc_value_list(I32_TYPE, num_rots_rem + 1);
+    } else {
+      VL_VALUE_AT(rot_in, i) = Alloc_value_list(I32_TYPE, num_rots + 1);
+    }
+  }
+
+  VL_VL_I32* rot_out = Alloc_value_list(VL_PTR_TYPE, level_budget);
+  for (size_t i = 0; i < (size_t)level_budget; i++) {
+    VL_VALUE_AT(rot_out, i) = Alloc_value_list(I32_TYPE, b + b_rem);
+  }
+
+  for (int32_t s = start; s < end; s++) {
+    VALUE_LIST* vl_rot_in = Get_vl_value_at(rot_in, s);
+    int32_t     shift_value =
+        encoding ? ((s - flag_rem) * layers_collapse + rem_collapse)
+                 : (s * layers_collapse);
+    for (int32_t j = 0; j < g; j++) {
+      I32_VALUE_AT(vl_rot_in, j) = Reduce_rotation(
+          (j - ((num_rots + 1) / 2) + 1) * (1 << shift_value), slots_value);
+    }
+    VALUE_LIST* vl_rot_out = Get_vl_value_at(rot_out, s);
+    for (int32_t i = 0; i < b; i++) {
+      I32_VALUE_AT(vl_rot_out, i) =
+          Reduce_rotation((g * i) * (1 << shift_value), order / 4);
+    }
+  }
+
+  if (flag_rem) {
+    int32_t     s           = encoding ? stop : level_budget - flag_rem;
+    int32_t     shift_value = encoding ? 1 : (1 << (s * layers_collapse));
+    VALUE_LIST* vl_rot_in   = Get_vl_value_at(rot_in, s);
+    for (int32_t j = 0; j < g_rem; j++) {
+      I32_VALUE_AT(vl_rot_in, j) = Reduce_rotation(
+          (j - ((num_rots_rem + 1) / 2) + 1) * shift_value, slots_value);
+    }
+    VALUE_LIST* vl_rot_out = Get_vl_value_at(rot_out, s);
+    for (int32_t i = 0; i < b_rem; i++) {
+      I32_VALUE_AT(vl_rot_out, i) =
+          Reduce_rotation((g_rem * i) * shift_value, order / 4);
+    }
+  }
+
+  Init_ciphertext_from_ciph(result, ciph, ciph->_scaling_factor,
+                            ciph->_sf_degree);
+  Copy_ciphertext(result, ciph);
+  Rotate_iteration(result, bts_ctx, conj_pre, rot_in, rot_out, (int32_t)step,
+                   encoding, is_rem, FALSE);
+
+  Free_value_list(rot_in);
+  Free_value_list(rot_out);
   return result;
 }
 

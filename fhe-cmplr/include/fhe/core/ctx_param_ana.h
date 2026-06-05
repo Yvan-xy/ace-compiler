@@ -813,6 +813,8 @@ public:
   template <typename RETV, typename VISITOR>
   RETV Handle_bootstrap_slots_to_coeffs(VISITOR* visitor, NODE_PTR node);
   template <typename RETV, typename VISITOR>
+  RETV Handle_bootstrap_fft_stage(VISITOR* visitor, NODE_PTR node);
+  template <typename RETV, typename VISITOR>
   RETV Handle_encode(VISITOR* visitor, NODE_PTR encode);
 };
 
@@ -1181,6 +1183,31 @@ RETV CKKS_ANA_IMPL::Handle_bootstrap_slots_to_coeffs(VISITOR* visitor,
   AIR_ASSERT_MSG(mul_level == ana_ctx.Top_mul_level(),
                  "mul level inconsistent");
   ana_ctx.Pop_mul_level();
+  return RETV(false, mul_level);
+}
+
+template <typename RETV, typename VISITOR>
+RETV CKKS_ANA_IMPL::Handle_bootstrap_fft_stage(VISITOR* visitor,
+                                               NODE_PTR node) {
+  CTX_PARAM_ANA_CTX& ana_ctx   = visitor->Context();
+  uint32_t           mul_level = ana_ctx.Top_mul_level();
+  ana_ctx.Set_node_mul_level(node, mul_level);
+  ana_ctx.Push_mul_level(mul_level);
+  (void)visitor->template Visit<RETV>(node->Child(0));
+  AIR_ASSERT_MSG(mul_level == ana_ctx.Top_mul_level(),
+                 "mul level inconsistent");
+  ana_ctx.Pop_mul_level();
+
+  uint32_t   rot_idx_count = 0;
+  const int* rot_idx       = node->Attr<int>(nn::core::ATTR::RNUM, &rot_idx_count);
+  if (rot_idx != nullptr) {
+    for (uint32_t i = 0; i < rot_idx_count; ++i) {
+      if (rot_idx[i] != 0) {
+        visitor->Context().Add_rotate_index(rot_idx[i]);
+      }
+    }
+  }
+
   return RETV(false, mul_level);
 }
 

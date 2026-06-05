@@ -23,6 +23,8 @@ DSL_BOOTSTRAP_SHIM_C="${WORK_DIR}/dsl_bootstrap_shim.c"
 DSL_BIN="${WORK_DIR}/verify_resnet_first.dsl.ace"
 BOOTSTRAP_CT_ENCODE="${ACE_BOOTSTRAP_CT_ENCODE:-1}"
 BOOTSTRAP_CT_ENCODE_DEPTH="${ACE_CT_ENCODE_DEPTH:-30}"
+BOOTSTRAP_IMPL="${ACE_BOOTSTRAP_IMPL:-primitive}"
+BOOTSTRAP_FFT_STAGE_OP="${ACE_BOOTSTRAP_FFT_STAGE_OP:-1}"
 
 mkdir -p "${WORK_DIR}"
 
@@ -34,10 +36,12 @@ fi
 (
   cd "${ACE_EDSL_DIR}/examples"
 PYTHONPATH="${ACE_EDSL_DIR}:${APP_ROOT}" \
+ACE_BOOTSTRAP_IMPL="${BOOTSTRAP_IMPL}" \
 ACE_BOOTSTRAP_CT_ENCODE="${BOOTSTRAP_CT_ENCODE}" \
 ACE_CT_ENCODE_DEPTH="${BOOTSTRAP_CT_ENCODE_DEPTH}" \
+ACE_BOOTSTRAP_FFT_STAGE_OP="${BOOTSTRAP_FFT_STAGE_OP}" \
 python3 "${BOOTSTRAP_UTILS_PY}" generate-demo \
-  --impl primitive \
+  --impl "${BOOTSTRAP_IMPL}" \
   --poly-degree 65536 \
   --mul-level 30
 )
@@ -57,7 +61,8 @@ if grep -q 'Eval_bootstrap_ciph(' "${BOOTSTRAP_GEN_C}"; then
   exit 1
 fi
 
-if [[ -f "${BOOTSTRAP_RAW_AIR}" ]] && grep -q 'CKKS.bootstrap' "${BOOTSTRAP_RAW_AIR}"; then
+if [[ -f "${BOOTSTRAP_RAW_AIR}" ]] &&
+   grep -Eq 'CKKS\.bootstrap([[:space:]\(]|$)' "${BOOTSTRAP_RAW_AIR}"; then
   echo "bootstrap_full_raw.air still contains CKKS.bootstrap; expected primitive decomposition" >&2
   exit 1
 fi

@@ -553,6 +553,12 @@ CIPHERTEXT* Coeffs_to_slots(CIPHERTEXT* result, CIPHERTEXT* ciph,
 CIPHERTEXT* Slots_to_coeffs(CIPHERTEXT* result, CIPHERTEXT* ciph,
                             VL_VL_PLAIN* conj_pre, CKKS_BTS_CTX* bts_ctx);
 
+//! @brief Apply one collapsed FFT bootstrap stage.
+CIPHERTEXT* Bootstrap_fft_stage(CIPHERTEXT* result, CIPHERTEXT* ciph,
+                                VL_VL_PLAIN* conj_pre,
+                                CKKS_BTS_CTX* bts_ctx, uint32_t step,
+                                bool encoding, bool is_rem);
+
 //! @brief Evaluate linear transformations
 CIPHERTEXT* Linear_transform(CIPHERTEXT* result, CIPHERTEXT* ciph,
                              VL_PLAIN* conj_pre, CKKS_BTS_CTX* bts_ctx);

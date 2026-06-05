@@ -311,6 +311,32 @@ public:
           }
           return;
         }
+        case ckks::OPC_BOOTSTRAP_FFT_STAGE: {
+          const uint32_t* slot = val->Attr<uint32_t>(nn::core::ATTR::SLOT);
+          const uint32_t* stage =
+              val->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::BOOTSTRAP_STAGE);
+          const uint32_t* encoding =
+              val->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::BOOTSTRAP_ENCODING);
+          const uint32_t* remainder =
+              val->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::BOOTSTRAP_REMAINDER);
+          if (ctx.Provider() == core::PROVIDER::ANT) {
+            ctx << "Eval_bootstrap_fft_stage_ciph(&";
+            ctx.Emit_var(node);
+            ctx << ", ";
+            visitor->template Visit<RETV>(val->Child(0));
+            ctx << ", " << (slot == nullptr ? 0 : *slot);
+            ctx << ", " << (stage == nullptr ? 0 : *stage);
+            ctx << ", " << (encoding == nullptr ? 0 : *encoding);
+            ctx << ", " << (remainder == nullptr ? 0 : *remainder) << ")";
+          } else {
+            ctx << "Bootstrap(&";
+            ctx.Emit_var(node);
+            ctx << ", ";
+            visitor->template Visit<RETV>(val->Child(0));
+            ctx << ", 0)";
+          }
+          return;
+        }
         default:
           break;
       }
@@ -390,6 +416,30 @@ public:
           ctx << ", ";
           visitor->template Visit<RETV>(val->Child(0));
           ctx << ", " << (slot == nullptr ? 0 : *slot);
+        } else {
+          ctx << "Bootstrap(&";
+          ctx.Emit_preg_id(node->Preg_id());
+          ctx << ", ";
+          visitor->template Visit<RETV>(val->Child(0));
+          ctx << ", 0";
+        }
+      } else if (val->Opcode() == fhe::ckks::OPC_BOOTSTRAP_FFT_STAGE) {
+        const uint32_t* slot = val->Attr<uint32_t>(nn::core::ATTR::SLOT);
+        const uint32_t* stage =
+            val->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::BOOTSTRAP_STAGE);
+        const uint32_t* encoding =
+            val->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::BOOTSTRAP_ENCODING);
+        const uint32_t* remainder =
+            val->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::BOOTSTRAP_REMAINDER);
+        if (ctx.Provider() == core::PROVIDER::ANT) {
+          ctx << "Eval_bootstrap_fft_stage_ciph(&";
+          ctx.Emit_preg_id(node->Preg_id());
+          ctx << ", ";
+          visitor->template Visit<RETV>(val->Child(0));
+          ctx << ", " << (slot == nullptr ? 0 : *slot);
+          ctx << ", " << (stage == nullptr ? 0 : *stage);
+          ctx << ", " << (encoding == nullptr ? 0 : *encoding);
+          ctx << ", " << (remainder == nullptr ? 0 : *remainder);
         } else {
           ctx << "Bootstrap(&";
           ctx.Emit_preg_id(node->Preg_id());

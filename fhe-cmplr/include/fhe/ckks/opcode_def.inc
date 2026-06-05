@@ -40,6 +40,8 @@ CKKS_OPCODE(BOOTSTRAP_EVAL_MOD, bootstrap_eval_mod, 1, 0,
             PROP_EXPR | PROP_TYPE | PROP_ATTR | PROP_LIB_CALL)
 CKKS_OPCODE(BOOTSTRAP_SLOTS_TO_COEFFS, bootstrap_slots_to_coeffs, 1, 0,
             PROP_EXPR | PROP_TYPE | PROP_ATTR | PROP_LIB_CALL)
+CKKS_OPCODE(BOOTSTRAP_FFT_STAGE, bootstrap_fft_stage, 1, 0,
+            PROP_EXPR | PROP_TYPE | PROP_ATTR | PROP_LIB_CALL)
 
 // free opcode to free ciphertext
 CKKS_OPCODE(FREE,       free,       1, 0, PROP_STMT | PROP_TYPE | PROP_LIB_CALL)
