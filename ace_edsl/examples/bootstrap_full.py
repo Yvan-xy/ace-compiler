@@ -65,6 +65,8 @@ from bootstrap_ant_constants import (
     UNIFORM_COEFF_SIZE_HW_192,
     R_UNIFORM_HW_192,
 )
+from ace_edsl.edsl.core.bootstrap_decomposition import BootstrapConfig
+from ace_edsl.edsl.core.bootstrap_math import EVAL_SIN_UPPER_BOUND_K
 
 # ANT full bootstrap reference (Python port of Eval_bootstrap); see plan ant_full_bootstrap_python_port
 try:
@@ -82,24 +84,26 @@ NUM_DOUBLE_ANGLE = R_UNIFORM_HW_192  # 3, matches ANT
 CHEB_COEFF_COUNT = UNIFORM_COEFF_SIZE_HW_192  # 55
 
 
+def _env_int(names, default: int, min_value: int = 1) -> int:
+    """Parse the first valid integer from one or more env var names."""
+    if isinstance(names, str):
+        names = (names,)
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if value >= min_value:
+            return value
+    return default
+
+
 def _bootstrap_poly_degree() -> int:
     """Return the poly degree used when generating bootstrap demo artifacts."""
-    raw = os.environ.get("ACE_BOOTSTRAP_POLY_DEGREE", "").strip()
-    if not raw:
-        return 16384
-    try:
-        degree = int(raw)
-    except ValueError:
-        return 16384
-    return degree if degree > 0 else 16384
-
-
-def _bootstrap_m_by_4() -> int:
-    return _bootstrap_poly_degree() // 2
-
-
-def _bootstrap_three_m_by_4() -> int:
-    return (_bootstrap_poly_degree() * 3) // 2
+    return _env_int("ACE_BOOTSTRAP_POLY_DEGREE", 16384)
 
 
 def _skip_preprocessor(func):
@@ -127,31 +131,51 @@ def _bootstrap_impl_mode() -> str:
 def _use_rtlib_bootstrap() -> bool:
     return _bootstrap_impl_mode() == "rtlib"
 
+
 def _bootstrap_mul_level() -> int:
     """Return CKKS mul level budget for bootstrap demo pipeline."""
-    raw = os.environ.get("ACE_BOOTSTRAP_MUL_LEVEL", "").strip()
-    if raw:
-        try:
-            lvl = int(raw)
-            if lvl > 0:
-                return lvl
-        except ValueError:
-            pass
     # Demo default matches the full available Q-level count for N=16384.
-    return 26
+    return _env_int("ACE_BOOTSTRAP_MUL_LEVEL", 26)
 
 
 def _bootstrap_input_level() -> int:
     """Return the configured CKKS input ciphertext level for the demo."""
-    raw = os.environ.get("ACE_BOOTSTRAP_INPUT_LEVEL", "").strip()
-    if not raw:
-        # Bootstrap should consume a low-level ciphertext by default.
-        return 1
-    try:
-        lvl = int(raw)
-    except ValueError:
-        return 0
-    return lvl if lvl >= 0 else 0
+    # Bootstrap should consume a low-level ciphertext by default.
+    return _env_int("ACE_BOOTSTRAP_INPUT_LEVEL", 1, min_value=0)
+
+
+def _bootstrap_first_prime_bits() -> int:
+    return _env_int(
+        ("ACE_BOOTSTRAP_FIRST_PRIME_BITS", "ACE_BOOTSTRAP_FIRST_MOD_SIZE"),
+        60,
+    )
+
+
+def _bootstrap_scaling_factor_bits() -> int:
+    return _env_int(
+        ("ACE_BOOTSTRAP_SCALING_FACTOR_BITS", "ACE_BOOTSTRAP_SCALING_MOD_SIZE"),
+        56,
+    )
+
+
+def _bootstrap_hamming_weight() -> int:
+    return _env_int("ACE_BOOTSTRAP_HAMMING_WEIGHT", 192)
+
+
+def _bootstrap_q_parts() -> int:
+    return _env_int("ACE_BOOTSTRAP_Q_PARTS", 3)
+
+
+def _bootstrap_transform_level_budget() -> int:
+    return _env_int("ACE_BOOTSTRAP_TRANSFORM_LEVEL_BUDGET", 3)
+
+
+def _bootstrap_enc_budget() -> int:
+    return _env_int("ACE_BOOTSTRAP_ENC_BUDGET", _bootstrap_transform_level_budget())
+
+
+def _bootstrap_dec_budget() -> int:
+    return _env_int("ACE_BOOTSTRAP_DEC_BUDGET", _bootstrap_transform_level_budget())
 
 
 def _bootstrap_ct_encode() -> bool:
@@ -171,6 +195,10 @@ def _bootstrap_runtime_raise_level() -> bool:
     return _env_flag("ACE_BOOTSTRAP_RUNTIME_RAISE_LEVEL")
 
 
+def _bootstrap_stage_probe_enabled() -> bool:
+    return _env_flag("ACE_BOOTSTRAP_STAGE_PROBE")
+
+
 def _bootstrap_function_name_prefix() -> str:
     return os.environ.get("ACE_BOOTSTRAP_FUNCTION_NAME_PREFIX", "")
 
@@ -185,6 +213,74 @@ def _bootstrap_pt_from_msg_name() -> str:
 
 def _bootstrap_raise_level_name() -> str:
     return os.environ.get("ACE_BOOTSTRAP_RAISE_LEVEL_NAME", "")
+
+
+def _stage_probe_c_prologue() -> str:
+    """Return direct-codegen probe redirects emitted before generated code.
+
+    The ResNet shim provides strong timing wrappers for these symbols. Weak
+    fallbacks keep standalone generated bootstrap experiments linkable.
+    """
+    return """
+#ifndef ACE_DSL_BTS_STAGE_PROBE_WEAK
+#if defined(__GNUC__) || defined(__clang__)
+#define ACE_DSL_BTS_STAGE_PROBE_WEAK __attribute__((weak))
+#else
+#define ACE_DSL_BTS_STAGE_PROBE_WEAK
+#endif
+#endif
+
+ACE_DSL_BTS_STAGE_PROBE_WEAK CIPHER dsl_bts_probe_Conjugate_ciph(CIPHER res, CIPHER ciph) {
+  return Conjugate_ciph(res, ciph);
+}
+
+ACE_DSL_BTS_STAGE_PROBE_WEAK CIPHER dsl_bts_probe_Mul_mono_ciph(CIPHER res, CIPHER ciph,
+                                                                 uint32_t power) {
+  return Mul_mono_ciph(res, ciph, power);
+}
+
+ACE_DSL_BTS_STAGE_PROBE_WEAK void dsl_bts_probe_Init_ciph_same_scale(CIPHER res,
+                                                                      CIPHER ciph1,
+                                                                      CIPHER ciph2) {
+  Init_ciph_same_scale(res, ciph1, ciph2);
+}
+
+#define Conjugate_ciph dsl_bts_probe_Conjugate_ciph
+#define Mul_mono_ciph dsl_bts_probe_Mul_mono_ciph
+#define Init_ciph_same_scale dsl_bts_probe_Init_ciph_same_scale
+
+"""
+
+
+def _with_stage_probe_prologue(c_code: str) -> str:
+    """Add structured helper redirects for direct-codegen stage timing."""
+    if not _bootstrap_stage_probe_enabled():
+        return c_code
+    if "dsl_bts_probe_Conjugate_ciph" in c_code:
+        return c_code
+    include_anchor = '#include "rt_ant/rt_ant.h"\n'
+    prologue = _stage_probe_c_prologue()
+    if include_anchor in c_code:
+        return c_code.replace(include_anchor, include_anchor + prologue, 1)
+    return prologue + c_code
+
+
+def _bootstrap_trace_config() -> BootstrapConfig:
+    """Build explicit trace-time bootstrap/FHE metadata for primitive lowering."""
+    return BootstrapConfig(
+        poly_degree=_bootstrap_poly_degree(),
+        mul_level=_bootstrap_mul_level(),
+        first_prime_bits=_bootstrap_first_prime_bits(),
+        scaling_factor_bits=_bootstrap_scaling_factor_bits(),
+        hamming_weight=_bootstrap_hamming_weight(),
+        q_parts=_bootstrap_q_parts(),
+        enc_budget=_bootstrap_enc_budget(),
+        dec_budget=_bootstrap_dec_budget(),
+        ct_encode=_bootstrap_ct_encode(),
+        eval_sin_upper_bound_k=EVAL_SIN_UPPER_BOUND_K,
+        chebyshev_coefficients=tuple(G_COEFFICIENTS_UNIFORM_HW_192),
+        double_angle_scalars=tuple(get_double_angle_scalars(NUM_DOUBLE_ANGLE)),
+    )
 
 
 def _identity_bootstrap_cleartext_reference(values):
@@ -232,7 +328,8 @@ class _ClearSlots:
             return _ClearSlots(self.vals)
         return _ClearSlots(self.vals[-r:] + self.vals[:-r])
 
-    def raise_mod(self, _mod_size):
+    def raise_mod(self, _mod_size, runtime_raise_level=False):
+        del runtime_raise_level
         # Cleartext model: modulus raising is value-preserving.
         return _ClearSlots(self.vals)
 
@@ -275,9 +372,10 @@ def bootstrap_full_python_dsl_reference(values):
     kernel_body = getattr(bootstrap_full, "__wrapped__", bootstrap_full)
     ct = _ClearSlots(values)
     zero = _ClearSlots([0.0] * len(values))
+    bootstrap_config = _bootstrap_trace_config()
     coeffs = list(G_COEFFICIENTS_UNIFORM_HW_192)
-    da_scalars = get_double_angle_scalars()
-    args = [ct, zero, 1.0] + coeffs + da_scalars + [float(BOOTSTRAP_POST_SCALE)]
+    da_scalars = get_double_angle_scalars(NUM_DOUBLE_ANGLE)
+    args = [ct, zero, 1.0] + coeffs + da_scalars + [bootstrap_config.post_scale]
     out = kernel_body(*args)
     if isinstance(out, _ClearSlots):
         normalized = []
@@ -380,20 +478,15 @@ def bootstrap_full(
         from ace_edsl.edsl.core.bootstrap_decomposition import (
             fullpacked_bootstrap_primitive,
         )
+        bootstrap_config = _bootstrap_trace_config()
         # Raise to the full available tower before the staged bootstrap flow.
         x_in = ct.raise_mod(
-            _bootstrap_mul_level() + 1,
+            bootstrap_config.raise_level,
             runtime_raise_level=_bootstrap_runtime_raise_level(),
         )
-        try:
-            ps_val = float(post_scale)
-        except (TypeError, ValueError):
-            ps_val = float(BOOTSTRAP_POST_SCALE)
         out = fullpacked_bootstrap_primitive(
             x_in,
-            m_by_4=_bootstrap_m_by_4(),
-            three_m_by_4=_bootstrap_three_m_by_4(),
-            post_scale=ps_val,
+            config=bootstrap_config,
         )
     return out
 
@@ -405,21 +498,22 @@ def bootstrap_full(
 def run_demo():
     """Run bootstrap_full as a standalone demo, compiling to C code."""
     impl_mode = _bootstrap_impl_mode()
+    bootstrap_config = _bootstrap_trace_config()
     print("=" * 70)
     print("Full CKKS Bootstrap Algorithm - ACE EDSL")
     print("=" * 70)
     print(f"Implementation mode: {impl_mode}")
     
-    print("""
+    print(f"""
 Bootstrap Algorithm:
 ┌─────────────────────────────────────────────────────────────────────┐
 │  primitive mode (full decomposition):                               │
 │    CoeffToSlot                 - U0hat diagonal linear transform     │
 │    Full-packed split           - conjugate + add/sub + mul_mono      │
-│    Dual EvalMod (PS)           - Chebyshev 55 (k=8,m=3) + 3 DA     │
+│    Dual EvalMod (PS)           - Chebyshev 55 (k=8,m=3) + {len(bootstrap_config.double_angle_scalars)} DA     │
 │    Recombine                   - mul_mono + add                      │
 │    SlotToCoeff                 - U0 diagonal linear transform        │
-│    Post-scale                  - * 16 (q0/sf ratio)                  │
+│    Post-scale                  - * {bootstrap_config.post_scale:g} (q0/sf ratio)                  │
 │  rtlib mode:                                                        │
 │    Direct CKKS Bootstrap op   - lowers to rtlib bootstrap path      │
 └─────────────────────────────────────────────────────────────────────┘
@@ -445,12 +539,12 @@ Key Difference from acepy:
     AceEDSL._get_dsl.cache_clear()
     
     # Execute the kernel - this triggers tracing
-    poly_degree = _bootstrap_poly_degree()
+    poly_degree = bootstrap_config.poly_degree
     ct = CkksCiphertext(shape=(poly_degree,), name="input_ct")
     zero = CkksCiphertext(shape=(poly_degree,), name="zero_ct")
     coeffs = list(G_COEFFICIENTS_UNIFORM_HW_192)
-    da_scalars = get_double_angle_scalars()
-    kernel_args = [ct, zero, 1.0] + coeffs + da_scalars + [float(BOOTSTRAP_POST_SCALE)]
+    da_scalars = list(bootstrap_config.double_angle_scalars)
+    kernel_args = [ct, zero, 1.0] + coeffs + da_scalars + [bootstrap_config.post_scale]
     bootstrap_full(*kernel_args)
     
     dsl = AceEDSL._get_dsl()
@@ -501,15 +595,15 @@ Key Difference from acepy:
     
     pipeline = AcePipeline(glob)
     pipeline.configure_fhe(
-        poly_degree=poly_degree,
-        mul_level=_bootstrap_mul_level(),
+        poly_degree=bootstrap_config.poly_degree,
+        mul_level=bootstrap_config.mul_level,
         input_level=_bootstrap_input_level(),
         security_level=0,  # 0 = skip validation (mul_depth=23 exceeds 128-bit limit at N=16384/32768)
-        scaling_factor_bits=56,
-        first_prime_bits=60,
-        hamming_weight=192,
+        scaling_factor_bits=bootstrap_config.scaling_factor_bits,
+        first_prime_bits=bootstrap_config.first_prime_bits,
+        hamming_weight=bootstrap_config.hamming_weight,
         data_file=data_file_path,
-        ct_encode=_bootstrap_ct_encode(),
+        ct_encode=bootstrap_config.ct_encode,
         enable_poly=True,   # Poly-level C (Hw_modadd, Rotate, etc.) for ANT rtlib; scale handled in pipeline
         function_name_prefix=_bootstrap_function_name_prefix(),
         constant_name_prefix=_bootstrap_constant_name_prefix(),
@@ -543,12 +637,13 @@ Key Difference from acepy:
     if os.path.isfile(wrapper_path):
         with open(wrapper_path) as wf:
             wrapper_code = wf.read()
+    c_code = _with_stage_probe_prologue(result.c_code)
     with open(c_file, 'w') as f:
-        f.write(result.c_code)
+        f.write(c_code)
         if wrapper_code:
             f.write("\n// --- Wrapper (Main_graph, encode/decode schemes) ---\n")
             f.write(wrapper_code)
-    total_bytes = len(result.c_code) + len(wrapper_code)
+    total_bytes = len(c_code) + len(wrapper_code)
     print(f"  ✓ C code: {c_file} ({total_bytes:,} bytes, includes wrapper)")
     
     for stage, dump in result.air_dumps.items():
@@ -560,7 +655,7 @@ Key Difference from acepy:
     # ========================================================================
     # Summary
     # ========================================================================
-    lines = result.c_code.split('\n')
+    lines = c_code.split('\n')
     print("\n" + "=" * 70)
     print("Summary")
     print("=" * 70)
@@ -574,10 +669,10 @@ Key Difference from acepy:
             "Bootstrap Phases (full-packed decomposition):\n"
             "  ├─ CoeffToSlot:  U0hat diagonal linear transform\n"
             "  ├─ Conjugate:    split real/imag + mul_mono\n"
-            f"  ├─ Dual EvalMod: PS Chebyshev (k=8, m=3, deg=54) + {NUM_DOUBLE_ANGLE} DA\n"
+            f"  ├─ Dual EvalMod: PS Chebyshev (k=8, m=3, deg=54) + {len(bootstrap_config.double_angle_scalars)} DA\n"
             "  ├─ Recombine:    mul_mono + add\n"
             "  ├─ SlotToCoeff:  U0 diagonal linear transform\n"
-            f"  └─ Post-scale:   * {BOOTSTRAP_POST_SCALE}"
+            f"  └─ Post-scale:   * {bootstrap_config.post_scale:g}"
         )
     print(f"""
 ✓ Full bootstrap compiled to C code!

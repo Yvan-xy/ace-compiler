@@ -28,17 +28,15 @@ Usage (from AIRValue._bootstrap_*_primitive methods):
 """
 
 import math
-import os
 import struct
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .bootstrap_math import (
     CHEBYSHEV_COEFFICIENTS,
     DOUBLE_ANGLE_SCALARS,
     NUM_DOUBLE_ANGLE,
-    BOOTSTRAP_POST_SCALE,
-    BOOTSTRAP_POST_SCALE_DEG,
     EVAL_SIN_UPPER_BOUND_K,
     compute_degree_ps,
     compute_chebyshev_depths,
@@ -48,11 +46,160 @@ from .bootstrap_math import (
 )
 
 
+@dataclass(frozen=True)
+class BootstrapConfig:
+    """Trace-time parameters for primitive full-packed bootstrap generation."""
+
+    poly_degree: int
+    mul_level: int
+    first_prime_bits: int
+    scaling_factor_bits: int
+    hamming_weight: int
+    q_parts: int
+    enc_budget: int
+    dec_budget: int
+    ct_encode: bool
+    eval_sin_upper_bound_k: int
+    chebyshev_coefficients: Tuple[float, ...]
+    double_angle_scalars: Tuple[float, ...]
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "chebyshev_coefficients",
+            tuple(float(v) for v in self.chebyshev_coefficients),
+        )
+        object.__setattr__(
+            self,
+            "double_angle_scalars",
+            tuple(float(v) for v in self.double_angle_scalars),
+        )
+        if self.poly_degree <= 0 or self.poly_degree % 2 != 0:
+            raise ValueError("BootstrapConfig.poly_degree must be a positive even value")
+        if self.slots <= 0 or (self.slots & (self.slots - 1)) != 0:
+            raise ValueError("BootstrapConfig.slots must be a positive power of two")
+        if self.mul_level <= 0:
+            raise ValueError("BootstrapConfig.mul_level must be positive")
+        if self.first_prime_bits <= 0 or self.scaling_factor_bits <= 0:
+            raise ValueError("BootstrapConfig prime bit sizes must be positive")
+        if self.first_prime_bits < self.scaling_factor_bits:
+            raise ValueError(
+                "BootstrapConfig.first_prime_bits must be >= scaling_factor_bits"
+            )
+        if self.q_parts <= 0:
+            raise ValueError("BootstrapConfig.q_parts must be positive")
+        if self.enc_budget <= 0 or self.dec_budget <= 0:
+            raise ValueError("BootstrapConfig transform budgets must be positive")
+        if self.eval_sin_upper_bound_k <= 0:
+            raise ValueError("BootstrapConfig.eval_sin_upper_bound_k must be positive")
+        if not self.chebyshev_coefficients:
+            raise ValueError("BootstrapConfig.chebyshev_coefficients must not be empty")
+
+    @property
+    def slots(self) -> int:
+        return int(self.poly_degree) // 2
+
+    @property
+    def raise_level(self) -> int:
+        return int(self.mul_level)
+
+    @property
+    def post_scale_degree(self) -> int:
+        return int(self.first_prime_bits - self.scaling_factor_bits)
+
+    @property
+    def post_scale(self) -> float:
+        return float(2 ** self.post_scale_degree)
+
+    @property
+    def bootstrap_depth(self) -> int:
+        chebyshev_degree = get_degree_from_coeffs(list(self.chebyshev_coefficients))
+        ps_k, ps_m = compute_degree_ps(chebyshev_degree)
+        approx_mod_depth = (
+            int(math.ceil(math.log2(ps_k))) + ps_m + len(self.double_angle_scalars)
+        )
+        return approx_mod_depth + int(self.enc_budget) + int(self.dec_budget)
+
+    @property
+    def transform_levels(self) -> tuple[int, int]:
+        level_0 = int(self.mul_level) + (1 if self.ct_encode else 0)
+        enc_level = max(1, level_0 - self.enc_budget)
+        dec_level = max(1, level_0 - self.bootstrap_depth)
+        return enc_level, dec_level
+
+    @property
+    def const_level(self) -> int:
+        enc_level, _ = self.transform_levels
+        return enc_level
+
+    @property
+    def num_p(self) -> int:
+        num_per_part = math.ceil(float(self.mul_level) / float(self.q_parts))
+        bit_num = self.first_prime_bits + (num_per_part - 1) * self.scaling_factor_bits
+        return int(math.ceil(float(bit_num) / 60.0))
+
+    @property
+    def coeffs_to_slots_factor(self) -> float:
+        return (
+            1.0
+            / float(self.poly_degree)
+            / float(self.eval_sin_upper_bound_k)
+            / float(self.post_scale)
+        )
+
+
+def _require_bootstrap_config(
+    config: Optional[BootstrapConfig],
+    caller: str,
+) -> BootstrapConfig:
+    if config is None:
+        raise ValueError(f"{caller} requires an explicit BootstrapConfig")
+    return config
+
+
+def _compat_bootstrap_config(x=None, num_slots: int = 0) -> BootstrapConfig:
+    """Build a deterministic config for legacy primitive stage-op calls.
+
+    Full bootstrap generation should pass BootstrapConfig explicitly. This
+    fallback keeps direct AIRValue stage primitives working when users enable
+    ACE_BOOTSTRAP_STAGE_PRIMITIVE_LOWERING without going through bootstrap_full.
+    """
+    slots = int(num_slots) if int(num_slots) > 0 else 0
+    if slots <= 0 and x is not None:
+        shape = getattr(x, "shape", None)
+        if shape:
+            try:
+                poly_degree = int(shape[0])
+            except (TypeError, ValueError, IndexError):
+                poly_degree = 0
+            if poly_degree > 0:
+                slots = poly_degree // 2
+    if slots <= 0:
+        slots = 8192
+
+    return BootstrapConfig(
+        poly_degree=slots * 2,
+        mul_level=26,
+        first_prime_bits=60,
+        scaling_factor_bits=56,
+        hamming_weight=192,
+        q_parts=3,
+        enc_budget=3,
+        dec_budget=3,
+        ct_encode=False,
+        eval_sin_upper_bound_k=EVAL_SIN_UPPER_BOUND_K,
+        chebyshev_coefficients=CHEBYSHEV_COEFFICIENTS,
+        double_angle_scalars=DOUBLE_ANGLE_SCALARS,
+    )
+
+
 # =========================================================================
 # Paterson-Stockmeyer Chebyshev evaluation
 # =========================================================================
 
-def eval_chebyshev_ps(x, coeffs: Optional[List[float]] = None):
+def eval_chebyshev_ps(
+    x, coeffs: Optional[List[float]] = None, config: Optional[BootstrapConfig] = None
+):
     """Evaluate Chebyshev series via Paterson-Stockmeyer on a ciphertext.
 
     Emits O(k + m + 2^{m-1}) multiplications with depth ceil(log2 k) + m,
@@ -66,7 +213,11 @@ def eval_chebyshev_ps(x, coeffs: Optional[List[float]] = None):
         AIRValue — Chebyshev polynomial evaluated at x.
     """
     if coeffs is None:
-        coeffs = list(CHEBYSHEV_COEFFICIENTS)
+        coeffs = list(
+            config.chebyshev_coefficients
+            if config is not None
+            else CHEBYSHEV_COEFFICIENTS
+        )
 
     n = get_degree_from_coeffs(coeffs)
     even = is_even_poly(coeffs)
@@ -95,7 +246,7 @@ def eval_chebyshev_ps(x, coeffs: Optional[List[float]] = None):
             half = t_list[i // 2 - 1]
             prod = half * half          # mul
             t_j = prod + prod           # double  (2 * T^2)
-            t_j = _add_const_like(t_j, -1.0)  # - 1
+            t_j = _add_const_like(t_j, -1.0, config)  # - 1
             t_list[j] = t_j
         elif i % 2 == 1:
             # odd, non-power-of-2
@@ -120,7 +271,7 @@ def eval_chebyshev_ps(x, coeffs: Optional[List[float]] = None):
             prod = h1 * h2
             t_j = prod + prod           # 2 * product
             if ihalf_1 == ihalf_2:
-                t_j = _add_const_like(t_j, -1.0)  # - 1
+                t_j = _add_const_like(t_j, -1.0, config)  # - 1
             else:
                 t_j = t_j - t_list[1]  # - T_2
             t_list[j] = t_j
@@ -149,7 +300,7 @@ def eval_chebyshev_ps(x, coeffs: Optional[List[float]] = None):
         prev = t2_list[i - 1]
         prod = prev * prev
         t2_i = prod + prod              # 2 * T^2
-        t2_i = _add_const_like(t2_i, -1.0)  # - 1
+        t2_i = _add_const_like(t2_i, -1.0, config)  # - 1
         t2_list[i] = t2_i
 
     # ------------------------------------------------------------------
@@ -170,14 +321,16 @@ def eval_chebyshev_ps(x, coeffs: Optional[List[float]] = None):
         f2.append(0.0)
     f2[target_len - 1] = 1.0
 
-    out = _inner_eval_chebyshev_ps(f2, k, m, t_list, t2_list, y, False, depths)
+    out = _inner_eval_chebyshev_ps(
+        f2, k, m, t_list, t2_list, y, False, depths, config
+    )
     out = out - t2km1
 
     return out
 
 
 def _inner_eval_chebyshev_ps(coeffs, k, m, t_list, t2_list, y, in_recursion,
-                             t_depths):
+                             t_depths, config: Optional[BootstrapConfig] = None):
     """Recursive PS inner evaluation (mirrors Inner_eval_chebyshev_ps)."""
     k2m2k = k * (1 << (m - 1)) - k
 
@@ -211,27 +364,27 @@ def _inner_eval_chebyshev_ps(coeffs, k, m, t_list, t2_list, y, in_recursion,
     if dc >= 1:
         if dc == 1:
             q1 = divr2_q[1]
-            cu = _mul_const_like(t_list[0], q1) if q1 != 1.0 else t_list[0]
+            cu = _mul_const_like(t_list[0], q1, config) if q1 != 1.0 else t_list[0]
         else:
-            cu = _eval_linear_wsum(t_list, divr2_q[1: dc + 1])
-        cu = _add_const_like(cu, divr2_q[0] / 2.0)
+            cu = _eval_linear_wsum(t_list, divr2_q[1: dc + 1], config)
+        cu = _add_const_like(cu, divr2_q[0] / 2.0, config)
         flag_c = True
 
     # Evaluate qu
     if get_degree_from_coeffs(div_q) > k:
         qu = _inner_eval_chebyshev_ps(
-            div_q, k, m - 1, t_list, t2_list, y, True, t_depths
+            div_q, k, m - 1, t_list, t2_list, y, True, t_depths, config
         )
     else:
-        qu = _eval_quot_or_rem(t_list, div_q, k, True, in_recursion)
+        qu = _eval_quot_or_rem(t_list, div_q, k, True, in_recursion, config)
 
     # Evaluate su
     if get_degree_from_coeffs(s2) > k:
         su = _inner_eval_chebyshev_ps(
-            s2, k, m - 1, t_list, t2_list, y, True, t_depths
+            s2, k, m - 1, t_list, t2_list, y, True, t_depths, config
         )
     else:
-        su = _eval_quot_or_rem(t_list, s2, k, False, in_recursion)
+        su = _eval_quot_or_rem(t_list, s2, k, False, in_recursion, config)
 
     # Combine: (T_{2^{m-1}·k} + cu) * qu + su
     t2_m_1 = t2_list[m - 1]
@@ -253,14 +406,14 @@ def _inner_eval_chebyshev_ps(coeffs, k, m, t_list, t2_list, y, in_recursion,
     if flag_c:
         combined = t2_m_1 + cu
     else:
-        combined = _add_const_like(t2_m_1, divr2_q[0] / 2.0)
+        combined = _add_const_like(t2_m_1, divr2_q[0] / 2.0, config)
 
     out = combined * qu
     out = out + su
     return out
 
 
-def _eval_linear_wsum(t_list, weights):
+def _eval_linear_wsum(t_list, weights, config: Optional[BootstrapConfig] = None):
     """Weighted sum: sum weights[i] * t_list[i] (mul_const + accumulate).
 
     Note (P0a): The rtlib rescales the accumulated result here
@@ -274,7 +427,7 @@ def _eval_linear_wsum(t_list, weights):
             continue
         if i >= len(t_list) or t_list[i] is None:
             continue
-        term = _mul_const_like(t_list[i], w)
+        term = _mul_const_like(t_list[i], w, config)
         if result is None:
             result = term
         else:
@@ -282,7 +435,10 @@ def _eval_linear_wsum(t_list, weights):
     return result
 
 
-def _eval_quot_or_rem(t_list, quot_rem, k, is_quotient, in_recursion):
+def _eval_quot_or_rem(
+    t_list, quot_rem, k, is_quotient, in_recursion,
+    config: Optional[BootstrapConfig] = None,
+):
     """Evaluate quotient or remainder at u using baby-step T_1..T_k.
 
     Mirrors Eval_quot_or_rem in chebyshev_impl.c.
@@ -296,7 +452,7 @@ def _eval_quot_or_rem(t_list, quot_rem, k, is_quotient, in_recursion):
     dg = get_degree_from_coeffs(qr)
 
     if dg > 0:
-        out = _eval_linear_wsum(t_list, qr[1: dg + 1])
+        out = _eval_linear_wsum(t_list, qr[1: dg + 1], config)
 
         if is_quotient:
             if in_recursion:
@@ -324,7 +480,7 @@ def _eval_quot_or_rem(t_list, quot_rem, k, is_quotient, in_recursion):
             out = t_k_1
 
     # free term (c0/2)
-    out = _add_const_like(out, qr[0] / 2.0)
+    out = _add_const_like(out, qr[0] / 2.0, config)
     return out
 
 
@@ -332,8 +488,12 @@ def _eval_quot_or_rem(t_list, quot_rem, k, is_quotient, in_recursion):
 # Double-angle iterations
 # =========================================================================
 
-def apply_double_angle(x, num_iter: int = NUM_DOUBLE_ANGLE,
-                       scalars: Optional[List[float]] = None):
+def apply_double_angle(
+    x,
+    num_iter: Optional[int] = None,
+    scalars: Optional[List[float]] = None,
+    config: Optional[BootstrapConfig] = None,
+):
     """Apply double-angle iterations: x -> 2x^2 + scalar_j, j=1..r.
 
     Mirrors Apply_double_angle_iterations in bootstrap.c.
@@ -342,11 +502,17 @@ def apply_double_angle(x, num_iter: int = NUM_DOUBLE_ANGLE,
     rescales after the x*x multiply, so no explicit rescale is needed.
     """
     if scalars is None:
-        scalars = list(DOUBLE_ANGLE_SCALARS)
+        scalars = list(
+            config.double_angle_scalars
+            if config is not None
+            else DOUBLE_ANGLE_SCALARS
+        )
+    if num_iter is None:
+        num_iter = len(scalars) if config is not None else NUM_DOUBLE_ANGLE
     for j in range(num_iter):
         x = x * x          # x^2
         x = x + x          # 2x^2
-        x = _add_const_like(x, scalars[j])  # + scalar_j
+        x = _add_const_like(x, scalars[j], config)  # + scalar_j
     return x
 
 
@@ -355,15 +521,29 @@ def apply_double_angle(x, num_iter: int = NUM_DOUBLE_ANGLE,
 # =========================================================================
 
 def eval_approx_mod(x, coeffs: Optional[List[float]] = None,
-                    num_double_angle: int = NUM_DOUBLE_ANGLE,
-                    da_scalars: Optional[List[float]] = None):
+                    num_double_angle: Optional[int] = None,
+                    da_scalars: Optional[List[float]] = None,
+                    config: Optional[BootstrapConfig] = None):
     """Approximate modular reduction: PS Chebyshev + double-angle.
 
     Mirrors Eval_approx_mod in bootstrap.c (UNIFORM_HW_UNDER_192 path,
     non-even polynomial, range [-1,1]).
     """
-    out = eval_chebyshev_ps(x, coeffs)
-    out = apply_double_angle(out, num_iter=num_double_angle, scalars=da_scalars)
+    out = eval_chebyshev_ps(x, coeffs, config)
+    if da_scalars is None:
+        da_scalars = list(
+            config.double_angle_scalars
+            if config is not None
+            else DOUBLE_ANGLE_SCALARS
+        )
+    if num_double_angle is None:
+        num_double_angle = len(da_scalars) if config is not None else NUM_DOUBLE_ANGLE
+    out = apply_double_angle(
+        out,
+        num_iter=num_double_angle,
+        scalars=da_scalars,
+        config=config,
+    )
     return out
 
 
@@ -371,109 +551,83 @@ def eval_approx_mod(x, coeffs: Optional[List[float]] = None,
 # Full-packed bootstrap primitive decomposition
 # =========================================================================
 
-def eval_mod_primitive(x):
+def eval_mod_primitive(x, config: Optional[BootstrapConfig] = None):
     """Full EvalMod decomposition for _bootstrap_eval_mod_primitive.
 
     Replaces the identity surrogate with PS Chebyshev + double-angle.
     """
-    return eval_approx_mod(x)
+    cfg = config
+    if hasattr(x, "container") and cfg is None:
+        cfg = _compat_bootstrap_config(x)
+    return eval_approx_mod(x, config=cfg)
 
 
-def _default_demo_slots(num_slots: int) -> int:
-    """Return the slot count used by the primitive bootstrap demo."""
-    if num_slots > 0:
-        return int(num_slots)
-    raw = os.environ.get("ACE_BOOTSTRAP_POLY_DEGREE", "").strip()
-    if raw:
-        try:
-            degree = int(raw)
-            if degree > 0:
-                return degree // 2
-        except ValueError:
-            pass
-    # Default to the full-packed slot count for the example's N=16384 context.
-    return 8192
+def _configured_slots(
+    num_slots: int,
+    config: Optional[BootstrapConfig],
+    caller: str,
+) -> int:
+    """Return the configured slot count and reject trace-time mismatches."""
+    cfg = _require_bootstrap_config(config, caller)
+    slots = int(num_slots) if int(num_slots) > 0 else cfg.slots
+    if slots != cfg.slots:
+        raise ValueError(
+            f"{caller} num_slots={slots} does not match config slots={cfg.slots}"
+        )
+    return slots
 
 
-def _primitive_transform_levels():
-    """Return demo encode levels for CoeffToSlot and SlotToCoeff.
-
-    Mirror the current bootstrap demo configuration:
-      mul_level ~= ACE_BOOTSTRAP_MUL_LEVEL (default 26)
-      enc_budget = 3
-      dec_budget = 3
-      approx_mod_depth = PS depth + NUM_DOUBLE_ANGLE
-    """
-    raw = os.environ.get("ACE_BOOTSTRAP_MUL_LEVEL", "").strip()
-    try:
-        mul_level = int(raw) if raw else 26
-    except ValueError:
-        mul_level = 26
-
-    enc_budget = 3
-    dec_budget = 3
-    level_0 = max(1, mul_level) + 1
-    bts_depth = _primitive_bootstrap_depth(enc_budget, dec_budget)
-
-    enc_level = max(1, level_0 - enc_budget)
-    dec_level = max(1, level_0 - bts_depth)
-    return enc_level, dec_level
+def _primitive_transform_levels(
+    config: BootstrapConfig,
+) -> tuple[int, int]:
+    """Return explicit encode levels for CoeffToSlot and SlotToCoeff."""
+    return config.transform_levels
 
 
-def _primitive_bootstrap_depth(enc_budget: int = 3, dec_budget: int = 3) -> int:
+def _primitive_bootstrap_depth(
+    enc_budget: int,
+    dec_budget: int,
+    config: BootstrapConfig,
+) -> int:
     """Return the rtlib-equivalent bootstrap depth for the primitive path."""
-    chebyshev_degree = get_degree_from_coeffs(list(CHEBYSHEV_COEFFICIENTS))
+    coeffs = list(config.chebyshev_coefficients)
+    num_double_angle = len(config.double_angle_scalars)
+    chebyshev_degree = get_degree_from_coeffs(coeffs)
     ps_k, ps_m = compute_degree_ps(chebyshev_degree)
-    approx_mod_depth = int(math.ceil(math.log2(ps_k))) + ps_m + NUM_DOUBLE_ANGLE
+    approx_mod_depth = (
+        int(math.ceil(math.log2(ps_k)))
+        + ps_m
+        + num_double_angle
+    )
     return approx_mod_depth + enc_budget + dec_budget
 
 
-def _bootstrap_const_level() -> int:
+def _bootstrap_const_level(config: BootstrapConfig) -> int:
     """Use the high bootstrap plaintext level for scalar constants too."""
-    enc_level, _ = _primitive_transform_levels()
-    return enc_level
+    return config.const_level
 
 
-def _bootstrap_ct_encode_enabled() -> bool:
-    raw = os.environ.get("ACE_BOOTSTRAP_CT_ENCODE", "").strip().lower()
-    if not raw:
-        return False
-    return raw not in ("0", "false", "off", "no")
+def _bootstrap_ct_encode_enabled(config: BootstrapConfig) -> bool:
+    return bool(config.ct_encode)
 
 
-def _coeffs_to_slots_factor(slots: int) -> float:
+def _coeffs_to_slots_factor(
+    config: BootstrapConfig,
+) -> float:
     """Return the full-packed normalization used by rtlib CoeffToSlot.
 
     rtlib scales the full-packed CoeffToSlot matrices by:
       1 / ring_degree / K / (q0 / sf)
 
-    For the full-packed path, slots = ring_degree / 2.
     """
-    ring_degree = slots * 2
-    return 1.0 / ring_degree / EVAL_SIN_UPPER_BOUND_K / float(BOOTSTRAP_POST_SCALE)
+    return config.coeffs_to_slots_factor
 
 
-def _bootstrap_num_p(slots: int) -> int:
-    """Return the exact rtlib p-prime count for the active bootstrap context."""
-
-    def _env_int(name: str, default: int) -> int:
-        raw = os.environ.get(name, "").strip()
-        if not raw:
-            return default
-        try:
-            return int(raw)
-        except ValueError:
-            return default
-
-    del slots  # p-prime count is derived from context parameters, not slot size.
-    mul_level = max(1, _env_int("ACE_BOOTSTRAP_MUL_LEVEL", 26))
-    q_parts = max(1, _env_int("ACE_BOOTSTRAP_Q_PARTS", 3))
-    first_mod_size = max(1, _env_int("ACE_BOOTSTRAP_FIRST_MOD_SIZE", 60))
-    scaling_mod_size = max(1, _env_int("ACE_BOOTSTRAP_SCALING_MOD_SIZE", 56))
-
-    num_per_part = math.ceil(float(mul_level) / float(q_parts))
-    bit_num = first_mod_size + (num_per_part - 1) * scaling_mod_size
-    return int(math.ceil(float(bit_num) / 60.0))
+def _bootstrap_num_p(
+    config: BootstrapConfig,
+) -> int:
+    """Return the p-prime count derived from the active trace config."""
+    return config.num_p
 
 
 def _reduce_rotation(index: int, slots: int) -> int:
@@ -693,15 +847,17 @@ def _coeff_collapse(slots: int, level_budget: int, encoding: bool):
     return tuple(tuple(tuple(row) for row in stage) for stage in coeff)
 
 
-def _collapsed_fft_stage_plan(slots: int, encoding: bool, level_budget: int = 3):
+def _collapsed_fft_stage_plan(config: BootstrapConfig, encoding: bool):
     """Return direct stage plans equivalent to rtlib Rotate_precomp for full-packed mode."""
+    slots = config.slots
+    level_budget = config.enc_budget if encoding else config.dec_budget
     params = _get_colls_fft_params(slots, level_budget)
     coeff = _coeff_collapse(slots, level_budget, encoding)
-    enc_level, dec_level = _primitive_transform_levels()
+    enc_level, dec_level = _primitive_transform_levels(config)
 
     # Distribute the CoeffToSlot factor across the collapsed stages exactly like
     # rtlib Coeffs2slots_precomp.
-    encode_stage_factor = _coeffs_to_slots_factor(slots) ** (1.0 / level_budget)
+    encode_stage_factor = _coeffs_to_slots_factor(config) ** (1.0 / level_budget)
     stages = []
 
     def encoding_plain_level(stage: int) -> int:
@@ -788,9 +944,14 @@ def _group_collapsed_fft_stage_terms(coeff, stage, slots: int):
     return [(rot, grouped[rot]) for rot in order]
 
 
-def _compact_grouped_stage_terms(coeff, stage, slots: int):
+def _compact_grouped_stage_terms(
+    coeff,
+    stage,
+    slots: int,
+    config: BootstrapConfig,
+):
     """Return grouped stage terms when they form a contiguous rotation run."""
-    if not _bootstrap_ct_encode_enabled():
+    if not _bootstrap_ct_encode_enabled(config):
         return None
 
     grouped_terms = _group_collapsed_fft_stage_terms(coeff, stage, slots)
@@ -817,9 +978,14 @@ def _rotate_plain_vector(values, rotation: int):
     return [values[(idx + rot) % length] for idx in range(length)]
 
 
-def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
+def _apply_collapsed_fft_transform(
+    x,
+    config: BootstrapConfig,
+    encoding: bool,
+):
     """Apply the full-packed collapsed-FFT transform with CKKS ops."""
-    coeff, stages = _collapsed_fft_stage_plan(slots, encoding)
+    slots = config.slots
+    coeff, stages = _collapsed_fft_stage_plan(config, encoding)
 
     # Cleartext fallback: bootstrap is message-preserving, so use identity.
     if not hasattr(x, "container"):
@@ -840,7 +1006,7 @@ def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
             rot = _reduce_rotation(idx, slots)
             rot_in.append(rot)
 
-        compact_terms = _compact_grouped_stage_terms(coeff, stage, slots)
+        compact_terms = _compact_grouped_stage_terms(coeff, stage, slots, config)
         if compact_terms is None:
             term_count = num_rot
             stage_giant_step = giant_step
@@ -874,7 +1040,7 @@ def _apply_collapsed_fft_transform(x, slots: int, encoding: bool):
                 if diag_rotation != 0:
                     diag = _rotate_plain_vector(diag, diag_rotation)
                 plain = _encode_plain_vector_like(
-                    x, diag, scale_degree=1, level=plain_level
+                    x, diag, scale_degree=1, level=plain_level, config=config
                 )
                 term = _mul_plain_lazy_rescale(fast_rot[j], plain)
                 inner = term if inner is None else inner + term
@@ -961,16 +1127,23 @@ def get_bootstrap_precompute_summary(slots: int, level_budget: int = 3):
     }
 
 
-def _encode_plain_vector_like(x, values, scale_degree: int = 1, level: int = 0):
+def _encode_plain_vector_like(
+    x,
+    values,
+    scale_degree: int = 1,
+    level: int = 0,
+    config: Optional[BootstrapConfig] = None,
+):
     """Encode a complex plaintext vector as a CKKS plaintext AIRValue."""
     if not hasattr(x, "container"):
         return x.__class__(values)
+    cfg = _require_bootstrap_config(config, "_encode_plain_vector_like")
 
     from .air_value import AIRValue
 
     container = x.container
     array_node = container.new_array_const(list(values))
-    num_p = _bootstrap_num_p(len(values))
+    num_p = _bootstrap_num_p(cfg)
     if hasattr(container, "new_ckks_encode_complex"):
         plain_node = container.new_ckks_encode_complex(
             array_node,
@@ -1017,16 +1190,22 @@ def _encode_scalar_like(x, value, scale_degree: int = 1, level: int = 0):
     return AIRValue(plain_node, container, domain=getattr(x, "domain", None))
 
 
-def _add_const_like(x, value):
+def _add_const_like(x, value, config: Optional[BootstrapConfig] = None):
     if not hasattr(x, "container"):
         return x + value
-    return x + _encode_scalar_like(x, value, scale_degree=1, level=_bootstrap_const_level())
+    cfg = _require_bootstrap_config(config, "_add_const_like")
+    return x + _encode_scalar_like(
+        x, value, scale_degree=1, level=_bootstrap_const_level(cfg)
+    )
 
 
-def _mul_const_like(x, value):
+def _mul_const_like(x, value, config: Optional[BootstrapConfig] = None):
     if not hasattr(x, "container"):
         return x * value
-    return x * _encode_scalar_like(x, value, scale_degree=1, level=_bootstrap_const_level())
+    cfg = _require_bootstrap_config(config, "_mul_const_like")
+    return x * _encode_scalar_like(
+        x, value, scale_degree=1, level=_bootstrap_const_level(cfg)
+    )
 
 
 def _mul_by_power_of_two(x, value: float):
@@ -1042,22 +1221,41 @@ def _mul_by_power_of_two(x, value: float):
     return out
 
 
-def coeffs_to_slots_primitive(x, num_slots: int = 0):
+def coeffs_to_slots_primitive(
+    x,
+    num_slots: int = 0,
+    config: Optional[BootstrapConfig] = None,
+):
     """CoeffToSlot decomposition using full-packed collapsed FFT semantics."""
-    slots = _default_demo_slots(num_slots)
-    return _apply_collapsed_fft_transform(x, slots, encoding=True)
+    if not hasattr(x, "container") and config is None:
+        return x.__class__(x.vals)
+    cfg = config if config is not None else _compat_bootstrap_config(x, num_slots)
+    _configured_slots(num_slots, cfg, "coeffs_to_slots_primitive")
+    return _apply_collapsed_fft_transform(
+        x, _require_bootstrap_config(cfg, "coeffs_to_slots_primitive"), encoding=True
+    )
 
 
-def slots_to_coeffs_primitive(x, num_slots: int = 0):
+def slots_to_coeffs_primitive(
+    x,
+    num_slots: int = 0,
+    config: Optional[BootstrapConfig] = None,
+):
     """SlotToCoeff decomposition using full-packed collapsed FFT semantics."""
-    slots = _default_demo_slots(num_slots)
-    return _apply_collapsed_fft_transform(x, slots, encoding=False)
+    if not hasattr(x, "container") and config is None:
+        return x.__class__(x.vals)
+    cfg = config if config is not None else _compat_bootstrap_config(x, num_slots)
+    _configured_slots(num_slots, cfg, "slots_to_coeffs_primitive")
+    return _apply_collapsed_fft_transform(
+        x, _require_bootstrap_config(cfg, "slots_to_coeffs_primitive"), encoding=False
+    )
 
 
 def fullpacked_bootstrap_primitive(ct, m_by_4: Optional[int] = None,
                                    three_m_by_4: Optional[int] = None,
                                    post_scale: float = None,
-                                   clear_imag: bool = False):
+                                   clear_imag: bool = False,
+                                   config: Optional[BootstrapConfig] = None):
     """Full-packed bootstrap branch decomposition.
 
     Implements the full-packed path from Eval_bootstrap (slots == m/4):
@@ -1079,11 +1277,11 @@ def fullpacked_bootstrap_primitive(ct, m_by_4: Optional[int] = None,
 
     Args:
         ct: AIRValue ciphertext to bootstrap.
-        m_by_4: m/4 = ring_degree/2. If omitted, derive from the active
-            bootstrap slot count.
-        three_m_by_4: 3m/4. If omitted, derive from `m_by_4`.
-        post_scale: Post-scale value (default: BOOTSTRAP_POST_SCALE).
+        m_by_4: Optional consistency check for config.slots.
+        three_m_by_4: Optional consistency check for 3 * config.slots.
+        post_scale: Optional consistency check for config.post_scale.
         clear_imag: If True, use conjugate-based imag clearing (P2).
+        config: Explicit trace-time bootstrap/FHE metadata.
 
     Returns:
         AIRValue -- bootstrapped ciphertext.
@@ -1092,16 +1290,36 @@ def fullpacked_bootstrap_primitive(ct, m_by_4: Optional[int] = None,
         # Cleartext fallback: bootstrap is message-preserving.
         return ct.__class__(ct.vals)
 
+    cfg = (
+        config
+        if config is not None
+        else _compat_bootstrap_config(ct, int(m_by_4) if m_by_4 is not None else 0)
+    )
     if m_by_4 is None:
-        m_by_4 = _default_demo_slots(0)
+        m_by_4 = cfg.slots
+    elif int(m_by_4) != cfg.slots:
+        raise ValueError(
+            f"fullpacked_bootstrap_primitive m_by_4={m_by_4} "
+            f"does not match config slots={cfg.slots}"
+        )
     if three_m_by_4 is None:
-        three_m_by_4 = 3 * m_by_4
+        three_m_by_4 = 3 * cfg.slots
+    elif int(three_m_by_4) != 3 * cfg.slots:
+        raise ValueError(
+            f"fullpacked_bootstrap_primitive three_m_by_4={three_m_by_4} "
+            f"does not match 3 * config slots={3 * cfg.slots}"
+        )
     if post_scale is None:
-        post_scale = float(BOOTSTRAP_POST_SCALE)
-    deg = BOOTSTRAP_POST_SCALE_DEG
+        post_scale = cfg.post_scale
+    elif float(post_scale) != float(cfg.post_scale):
+        raise ValueError(
+            f"fullpacked_bootstrap_primitive post_scale={post_scale} "
+            f"does not match config post_scale={cfg.post_scale}"
+        )
+    deg = cfg.post_scale_degree
 
     # Step 1: CoeffToSlot
-    enc = coeffs_to_slots_primitive(ct, num_slots=m_by_4)
+    enc = coeffs_to_slots_primitive(ct, num_slots=m_by_4, config=cfg)
 
     # Step 2: Conjugate split (full-packed)
     conj = enc.conjugate()
@@ -1110,15 +1328,15 @@ def fullpacked_bootstrap_primitive(ct, m_by_4: Optional[int] = None,
     imag_part = imag_part.mul_mono(three_m_by_4)
 
     # Step 3: Dual EvalMod
-    real_evmod = eval_approx_mod(real_part)
-    imag_evmod = eval_approx_mod(imag_part)
+    real_evmod = eval_approx_mod(real_part, config=cfg)
+    imag_evmod = eval_approx_mod(imag_part, config=cfg)
 
     # Step 4: Recombine
     imag_evmod = imag_evmod.mul_mono(m_by_4)
     combined = real_evmod + imag_evmod
 
     # Step 5: SlotToCoeff
-    out = slots_to_coeffs_primitive(combined, num_slots=m_by_4)
+    out = slots_to_coeffs_primitive(combined, num_slots=m_by_4, config=cfg)
 
     # Step 6: Post-processing (P2)
     if clear_imag and deg >= 1:
