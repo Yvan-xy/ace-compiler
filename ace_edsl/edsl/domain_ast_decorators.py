@@ -171,8 +171,10 @@ def _loop_execute_range_dynamic(
     #    Pass accumulator AIRValues (not original iter_args) so the body
     #    reads from the accumulator variables instead of the original values.
     loop_results = func(index_value, *used_args, *accum_air_values)
-    
-    container.new_loop_end()
+    if loop_results is None:
+        loop_results = []
+    if not isinstance(loop_results, list):
+        loop_results = [loop_results]
 
     # 4. Store loop body results back to accumulator variables (still inside
     #    the loop body block, before new_loop_end). This creates the
@@ -183,6 +185,8 @@ def _loop_execute_range_dynamic(
             container.new_stid(accum_name, res.value)
 
     # 5. End loop (pop body block, emit do_loop)
+    container.new_loop_end()
+
     carried_results = []
     for accum_name, res in zip(accum_names, loop_results):
         if accum_name is not None:

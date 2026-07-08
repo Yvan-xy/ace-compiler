@@ -47,7 +47,8 @@ examples_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ex
 if examples_dir not in sys.path:
     sys.path.insert(0, examples_dir)
 
-# Default this suite to primitive EDSL bootstrap unless caller overrides.
+# bootstrap_full is primitive-only; keep this env var for compatibility with
+# older callers that still set it.
 os.environ.setdefault("ACE_BOOTSTRAP_IMPL", "primitive")
 # Align with primitive-lowering default path.
 os.environ.setdefault("ACE_BOOTSTRAP_STAGE_PRIMITIVE_LOWERING", "1")
@@ -150,11 +151,6 @@ ACE_EDSL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 REPO_ROOT = os.path.abspath(os.path.join(ACE_EDSL_DIR, ".."))
 ACE_CMPLR_DIR = os.environ.get("ACE_CMPLR_DIR", "/usr/local")
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def _is_rtlib_mode() -> bool:
-    mode = os.environ.get("ACE_BOOTSTRAP_IMPL", "primitive").strip().lower()
-    return mode in ("rtlib", "runtime", "native")
 
 
 def _stage_primitive_lowering_enabled() -> bool:
@@ -470,32 +466,6 @@ finally:
         self.assertIsNotNone(values_line, f"C API subprocess did not print values.\nstdout:\n{result.stdout}")
         return json.loads(values_line.split("=", 1)[1])
 
-    def _run_demo_for_mode(self, mode: str):
-        """Run bootstrap demo in a specific mode and refresh cached C code."""
-        env = os.environ.copy()
-        env["ACE_BOOTSTRAP_IMPL"] = mode
-        demo_code = "import bootstrap_full,sys; ok=bootstrap_full.run_demo(); sys.exit(0 if ok else 1)"
-        result = subprocess.run(
-            [sys.executable, "-c", demo_code],
-            cwd=examples_dir,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"run_demo() failed in mode={mode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
-        os.environ["ACE_BOOTSTRAP_IMPL"] = mode
-        self.demo_success = True
-        if os.path.isfile(BOOTSTRAP_C_FILE):
-            with open(BOOTSTRAP_C_FILE, "r") as f:
-                self.c_code = f.read()
-        else:
-            self.c_code = ""
-
     def _run_ant_bootstrap_smoke(self):
         """Run ANT rtlib's built-in Bootstrap() (not the generated bootstrap_full).
         Returns decoded output slots; does not compare to sin(8x) reference."""
@@ -706,8 +676,6 @@ finally:
     )
     def test_primitive_raw_air_has_no_bootstrap_op(self):
         """Primitive mode must not emit CKKS.bootstrap in raw AIR."""
-        if _is_rtlib_mode():
-            self.skipTest("rtlib mode intentionally emits runtime bootstrap op")
         raw_air = os.path.join(BOOTSTRAP_OUTPUT_DIR, "bootstrap_full_raw.air")
         self.assertTrue(os.path.isfile(raw_air), f"Missing raw AIR dump: {raw_air}")
         with open(raw_air, "r", encoding="utf-8") as f:
@@ -729,18 +697,6 @@ finally:
         """
         self.assertTrue(self.demo_success, "Demo must succeed")
         self.assertTrue(self.c_code, "C code should be non-empty")
-        if _is_rtlib_mode():
-            has_rtlib_bootstrap = (
-                "Eval_bootstrap_ciph(" in self.c_code
-                or "Bootstrap(" in self.c_code
-            )
-            self.assertTrue(
-                has_rtlib_bootstrap,
-                "rtlib mode must lower to runtime bootstrap path "
-                "(Eval_bootstrap_ciph(...) or Bootstrap(...))",
-            )
-            self.assertGreater(len(self.c_code), 500, "Generated bootstrap C code should be non-trivial")
-            return
 
         self.assertNotIn(
             "Bootstrap(",
@@ -842,62 +798,6 @@ finally:
                 py_val,
                 delta=1e-2,
                 msg=f"slot[{idx}] mismatch: C API={c_val} python={py_val}",
-            )
-
-    @unittest.skipIf(
-        not IMPORTS_AVAILABLE,
-        f"Imports not available: {IMPORT_ERROR if not IMPORTS_AVAILABLE else ''}",
-    )
-    def test_z_inline_and_rtlib_results_match(self):
-        """Compare inline EDSL bootstrap output against rtlib Bootstrap output."""
-        prev_mode = os.environ.get("ACE_BOOTSTRAP_IMPL")
-        try:
-            self._run_demo_for_mode("inline")
-            inline_values = self._run_shared_lib_via_rtlib()
-
-            self._run_demo_for_mode("rtlib")
-            rtlib_values = self._run_shared_lib_via_rtlib()
-        finally:
-            if prev_mode is None:
-                os.environ.pop("ACE_BOOTSTRAP_IMPL", None)
-            else:
-                os.environ["ACE_BOOTSTRAP_IMPL"] = prev_mode
-
-        self.assertEqual(
-            len(inline_values),
-            len(rtlib_values),
-            "Inline and rtlib outputs must have the same slot count",
-        )
-        compare_rows = []
-        for idx, (inline_v, rtlib_v) in enumerate(zip(inline_values, rtlib_values)):
-            abs_err = abs(float(inline_v) - float(rtlib_v))
-            compare_rows.append(
-                {
-                    "slot": idx,
-                    "inline": float(inline_v),
-                    "rtlib": float(rtlib_v),
-                    "abs_err": abs_err,
-                }
-            )
-            self.assertAlmostEqual(
-                inline_v,
-                rtlib_v,
-                delta=1e-2,
-                msg=f"inline vs rtlib mismatch at slot[{idx}]: inline={inline_v} rtlib={rtlib_v}",
-            )
-
-        # Persist comparison for easy inspection under examples/output/.
-        compare_path = os.path.join(BOOTSTRAP_OUTPUT_DIR, "bootstrap_full_inline_vs_rtlib.json")
-        with open(compare_path, "w") as f:
-            json.dump(
-                {
-                    "input": [float(x) for x in BOOTSTRAP_INPUT_P0],
-                    "delta": 1e-2,
-                    "rows": compare_rows,
-                    "max_abs_err": max((r["abs_err"] for r in compare_rows), default=0.0),
-                },
-                f,
-                indent=2,
             )
 
     @unittest.skipIf(

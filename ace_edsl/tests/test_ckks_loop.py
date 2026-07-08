@@ -166,11 +166,18 @@ def run_test(name: str, kernel_func, expect_loop_ir: bool = False):
             print(f"    ✓ Loop IR generated as expected")
         else:
             print(f"    ⚠ Expected loop IR but found none (may be unrolled)")
+            return False
+        loop_pos = air.find("do_loop")
+        accum_store_pos = air.find('st "__loop_accum', loop_pos)
+        if accum_store_pos != -1:
+            print("    ⚠ Loop-carried accumulator store appears after do_loop")
+            return False
     else:
         if loop_count == 0:
             print(f"    ✓ No loop IR (unrolled as expected)")
         else:
             print(f"    ⚠ Found loop IR when unrolling was expected")
+            return False
     
     # Show full AIR
     print(f"\n[3] Full AIR dump:")
@@ -244,4 +251,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -2,15 +2,11 @@
 Full CKKS Bootstrap Algorithm Implementation for ACE EDSL
 =========================================================
 
-This module supports two implementations selected by `ACE_BOOTSTRAP_IMPL`:
-- `primitive` (default; aliases: `inline`, `ops`, `dsl`, `mimic`): staged
-  bootstrap ops in EDSL (`CoeffToSlot -> EvalMod -> SlotToCoeff`).
-- `rtlib`: mimic ANT rtlib bootstrap by emitting CKKS `Bootstrap` op directly.
+This module emits the primitive decomposition path in EDSL:
+`CoeffToSlot -> EvalMod -> SlotToCoeff`.
 
-`rtlib` mode is the closest match to rtlib behavior in generated code because it
-lowers to the runtime bootstrap path (`Eval_bootstrap_ciph(...)` on ANT).
-`primitive` mode emits first-class bootstrap stage ops in EDSL, providing a
-full bootstrap semantic path without direct `Bootstrap(...)` call emission.
+The primitive path keeps bootstrap visible in CKKS AIR without direct
+`Bootstrap(...)` / `Eval_bootstrap_ciph(...)` emission.
 
 **EvalMod:** The kernel mirrors ANT's EvalMod core (bootstrap.c): Chebyshev
 series (55 coeffs from G_coefficients_uniform_hw_192), double-angle iterations
@@ -104,32 +100,6 @@ def _env_int(names, default: int, min_value: int = 1) -> int:
 def _bootstrap_poly_degree() -> int:
     """Return the poly degree used when generating bootstrap demo artifacts."""
     return _env_int("ACE_BOOTSTRAP_POLY_DEGREE", 16384)
-
-
-def _skip_preprocessor(func):
-    """Mark a kernel to bypass AST preprocessing.
-
-    bootstrap_full contains ordinary Python mode-selection branches. The AST
-    preprocessor currently rewrites those branches in a way that collapses the
-    primitive path back to `ct.bootstrap()`. Skipping preprocessing for this
-    kernel preserves the real decomposition body during AIR tracing.
-    """
-    func._ace_skip_preprocessor = True
-    return func
-
-
-def _bootstrap_impl_mode() -> str:
-    """Return selected bootstrap implementation mode."""
-    mode = os.environ.get("ACE_BOOTSTRAP_IMPL", "primitive").strip().lower()
-    if mode in ("rtlib", "runtime", "native"):
-        return "rtlib"
-    if mode in ("primitive", "inline", "ops", "dsl", "mimic"):
-        return "primitive"
-    return "primitive"
-
-
-def _use_rtlib_bootstrap() -> bool:
-    return _bootstrap_impl_mode() == "rtlib"
 
 
 def _bootstrap_mul_level() -> int:
@@ -283,17 +253,8 @@ def _bootstrap_trace_config() -> BootstrapConfig:
     )
 
 
-def _identity_bootstrap_cleartext_reference(values):
-    """Cleartext model for message-preserving bootstrap paths (rtlib mode only)."""
-    return [float(v) for v in values]
-
-
 def bootstrap_full_python_reference(values):
-    """Cleartext reference matching selected implementation mode."""
-    impl_mode = _bootstrap_impl_mode()
-    if impl_mode == "rtlib":
-        return _identity_bootstrap_cleartext_reference(values)
-    # primitive mode now does real EvalMod math; use ANT reference.
+    """Cleartext reference matching primitive bootstrap EvalMod math."""
     if ant_bootstrap_full_reference is not None:
         return ant_bootstrap_full_reference(values)
     return [math.sin(8.0 * float(v)) for v in values]  # fallback
@@ -367,8 +328,6 @@ class _ClearSlots:
 
 def bootstrap_full_python_dsl_reference(values):
     """Run the undecorated @ckks_kernel body in Python and return cleartext slots."""
-    if _use_rtlib_bootstrap():
-        return _identity_bootstrap_cleartext_reference(values)
     kernel_body = getattr(bootstrap_full, "__wrapped__", bootstrap_full)
     ct = _ClearSlots(values)
     zero = _ClearSlots([0.0] * len(values))
@@ -393,7 +352,6 @@ def bootstrap_full_python_dsl_reference(values):
 # =============================================================================
 
 @ckks_kernel
-@_skip_preprocessor
 def bootstrap_full(
     ct: CkksCiphertext,
     zero: CkksCiphertext,
@@ -458,37 +416,21 @@ def bootstrap_full(
     da3: CkksPlaintext,
     post_scale: CkksPlaintext,
 ) -> CkksCiphertext:
-    """Bootstrap kernel with selectable implementation mode.
+    """Primitive bootstrap kernel: emit full CKKS-level decomposition."""
+    from ace_edsl.edsl.core.bootstrap_decomposition import (
+        fullpacked_bootstrap_primitive,
+    )
 
-    `primitive`: emit bootstrap-stage ops in EDSL
-                 (CoeffToSlot -> EvalMod -> SlotToCoeff).
-    `rtlib`: emit CKKS Bootstrap op directly (lowered by runtime bootstrap path).
-    """
-    out = ct
-    if _use_rtlib_bootstrap():
-        if hasattr(ct, "bootstrap"):
-            out = ct.bootstrap()
-        elif isinstance(ct, _ClearSlots):
-            # Python cleartext fallback path for reference execution.
-            out = _ClearSlots(_identity_bootstrap_cleartext_reference(ct.vals))
-        else:
-            # Keep kernel preprocess-friendly: no early return branches.
-            out = ct
-    else:
-        from ace_edsl.edsl.core.bootstrap_decomposition import (
-            fullpacked_bootstrap_primitive,
-        )
-        bootstrap_config = _bootstrap_trace_config()
-        # Raise to the full available tower before the staged bootstrap flow.
-        x_in = ct.raise_mod(
-            bootstrap_config.raise_level,
-            runtime_raise_level=_bootstrap_runtime_raise_level(),
-        )
-        out = fullpacked_bootstrap_primitive(
-            x_in,
-            config=bootstrap_config,
-        )
-    return out
+    bootstrap_config = _bootstrap_trace_config()
+    # Raise to the full available tower before the staged bootstrap flow.
+    x_in = ct.raise_mod(
+        bootstrap_config.raise_level,
+        runtime_raise_level=_bootstrap_runtime_raise_level(),
+    )
+    return fullpacked_bootstrap_primitive(
+        x_in,
+        config=bootstrap_config,
+    )
 
 
 # =============================================================================
@@ -497,12 +439,11 @@ def bootstrap_full(
 
 def run_demo():
     """Run bootstrap_full as a standalone demo, compiling to C code."""
-    impl_mode = _bootstrap_impl_mode()
     bootstrap_config = _bootstrap_trace_config()
     print("=" * 70)
     print("Full CKKS Bootstrap Algorithm - ACE EDSL")
     print("=" * 70)
-    print(f"Implementation mode: {impl_mode}")
+    print("Implementation mode: primitive")
     
     print(f"""
 Bootstrap Algorithm:
@@ -514,8 +455,6 @@ Bootstrap Algorithm:
 │    Recombine                   - mul_mono + add                      │
 │    SlotToCoeff                 - U0 diagonal linear transform        │
 │    Post-scale                  - * {bootstrap_config.post_scale:g} (q0/sf ratio)                  │
-│  rtlib mode:                                                        │
-│    Direct CKKS Bootstrap op   - lowers to rtlib bootstrap path      │
 └─────────────────────────────────────────────────────────────────────┘
 
 Key Difference from acepy:
@@ -659,21 +598,15 @@ Key Difference from acepy:
     print("\n" + "=" * 70)
     print("Summary")
     print("=" * 70)
-    if impl_mode == "rtlib":
-        phase_summary = (
-            "Bootstrap Phases:\n"
-            "  └─ Direct CKKS.bootstrap lowering to rtlib bootstrap path"
-        )
-    else:
-        phase_summary = (
-            "Bootstrap Phases (full-packed decomposition):\n"
-            "  ├─ CoeffToSlot:  U0hat diagonal linear transform\n"
-            "  ├─ Conjugate:    split real/imag + mul_mono\n"
-            f"  ├─ Dual EvalMod: PS Chebyshev (k=8, m=3, deg=54) + {len(bootstrap_config.double_angle_scalars)} DA\n"
-            "  ├─ Recombine:    mul_mono + add\n"
-            "  ├─ SlotToCoeff:  U0 diagonal linear transform\n"
-            f"  └─ Post-scale:   * {bootstrap_config.post_scale:g}"
-        )
+    phase_summary = (
+        "Bootstrap Phases (full-packed decomposition):\n"
+        "  ├─ CoeffToSlot:  U0hat diagonal linear transform\n"
+        "  ├─ Conjugate:    split real/imag + mul_mono\n"
+        f"  ├─ Dual EvalMod: PS Chebyshev (k=8, m=3, deg=54) + {len(bootstrap_config.double_angle_scalars)} DA\n"
+        "  ├─ Recombine:    mul_mono + add\n"
+        "  ├─ SlotToCoeff:  U0 diagonal linear transform\n"
+        f"  └─ Post-scale:   * {bootstrap_config.post_scale:g}"
+    )
     print(f"""
 ✓ Full bootstrap compiled to C code!
 
