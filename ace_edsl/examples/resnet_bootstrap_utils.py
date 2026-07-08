@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
-import re
 import sys
 import textwrap
 from pathlib import Path
@@ -65,144 +64,8 @@ def emit_body(args: argparse.Namespace) -> int:
     src_path = Path(args.bootstrap_c)
     dst_path = Path(args.output)
 
-    raw_stage_probe = os.environ.get("ACE_BOOTSTRAP_STAGE_PROBE", "").strip().lower()
-    if raw_stage_probe and raw_stage_probe not in ("0", "false", "off", "no"):
-        raise RuntimeError(
-            "ACE_BOOTSTRAP_STAGE_PROBE text injection is disabled for direct "
-            "bootstrap codegen"
-        )
-
     dst_path.write_text(src_path.read_text(encoding="utf-8"), encoding="utf-8")
     return 0
-
-
-def _inject_stage_probes(body: str) -> str:
-    support = textwrap.dedent(
-        """\
-        #include <time.h>
-        #include <stdio.h>
-        #include <stdlib.h>
-
-        static int dsl_bts_stage_probe_enabled(void) {
-          static int initialized = 0;
-          static int enabled = 0;
-          if (!initialized) {
-            const char* flag = getenv("ACE_BOOTSTRAP_STAGE_PROBE");
-            enabled = (flag != NULL && flag[0] != '\\0' && strcmp(flag, "0") != 0);
-            initialized = 1;
-          }
-          return enabled;
-        }
-
-        static double dsl_bts_stage_now_sec(void) {
-          struct timespec ts;
-          clock_gettime(CLOCK_MONOTONIC, &ts);
-          return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-        }
-
-        static void dsl_bts_stage_mark(const char* stage, double* last) {
-          if (!dsl_bts_stage_probe_enabled()) {
-            return;
-          }
-          double now = dsl_bts_stage_now_sec();
-          fprintf(stderr, "[dsl_bts_stage] %s elapsed=%.3fs\\n", stage, now - *last);
-          fflush(stderr);
-          *last = now;
-        }
-        """
-    )
-
-    include_anchor = 'void* dsl_bts_Pt_from_msg'
-    if support not in body and include_anchor in body:
-        body = body.replace(include_anchor, support + "\n" + include_anchor, 1)
-
-    fn_anchor = "CIPHERTEXT dsl_bootstrap_full(CIPHERTEXT p0_0, CIPHERTEXT p1_1) {\n"
-    if fn_anchor not in body:
-        raise RuntimeError("stage probe injection failed: bootstrap entry anchor missing")
-    body = body.replace(
-        fn_anchor,
-        fn_anchor +
-        "  double _dsl_bts_stage_last = 0.0;\n"
-        "  if (dsl_bts_stage_probe_enabled()) {\n"
-        "    _dsl_bts_stage_last = dsl_bts_stage_now_sec();\n"
-        "  }\n",
-        1,
-    )
-
-    def insert_before_once(text: str, needle: str, snippet: str) -> str:
-        idx = text.find(needle)
-        if idx < 0:
-            raise RuntimeError(f"stage probe injection failed: missing anchor {needle!r}")
-        return text[:idx] + snippet + text[idx:]
-
-    # Step 1 done: first full-packed CoeffToSlot result is ready before conjugate split.
-    body = insert_before_once(
-        body,
-        "  Conjugate_ciph(",
-        '  dsl_bts_stage_mark("coeff_to_slots", &_dsl_bts_stage_last);\n',
-    )
-
-    mul_mono_matches = list(re.finditer(r"^  Mul_mono_ciph\(", body, flags=re.M))
-    if len(mul_mono_matches) < 2:
-        raise RuntimeError("stage probe injection failed: expected two Mul_mono_ciph anchors")
-
-    first_mul = mul_mono_matches[0].start()
-    second_mul = mul_mono_matches[1].start()
-    body = (
-        body[:first_mul]
-        + '  dsl_bts_stage_mark("split", &_dsl_bts_stage_last);\n'
-        + body[first_mul:]
-    )
-    second_mul += len('  dsl_bts_stage_mark("split", &_dsl_bts_stage_last);\n')
-    body = (
-        body[:second_mul]
-        + '  dsl_bts_stage_mark("dual_evalmod", &_dsl_bts_stage_last);\n'
-        + body[second_mul:]
-    )
-
-    rotate_after_recombine = re.search(r"^  _preg_\d+ = dsl_bts_Rotate\(", body[second_mul:], flags=re.M)
-    if rotate_after_recombine is None:
-        raise RuntimeError("stage probe injection failed: missing SlotToCoeff rotate anchor")
-    rotate_pos = second_mul + rotate_after_recombine.start()
-    body = (
-        body[:rotate_pos]
-        + '  dsl_bts_stage_mark("recombine", &_dsl_bts_stage_last);\n'
-        + body[rotate_pos:]
-    )
-
-    post_scale_pos = -1
-    scan_pos = rotate_pos
-    while True:
-        line_end = body.find("\n", scan_pos)
-        if line_end < 0:
-            line_end = len(body)
-        line = body[scan_pos:line_end]
-        if line.startswith("  Init_ciph_same_scale("):
-            args = line[len("  Init_ciph_same_scale("):-2]
-            parts = [part.strip() for part in args.split(",")]
-            if len(parts) == 3 and parts[1] == parts[2]:
-                post_scale_pos = scan_pos
-                break
-        if line_end >= len(body):
-            break
-        scan_pos = line_end + 1
-    if post_scale_pos < 0:
-        raise RuntimeError("stage probe injection failed: missing post-scale doubling anchor")
-    body = (
-        body[:post_scale_pos]
-        + '  dsl_bts_stage_mark("slots_to_coeffs", &_dsl_bts_stage_last);\n'
-        + body[post_scale_pos:]
-    )
-
-    ret_pos = body.rfind("  return __ret_tmp_")
-    if ret_pos < 0:
-        raise RuntimeError("stage probe injection failed: missing bootstrap return anchor")
-    body = (
-        body[:ret_pos]
-        + '  dsl_bts_stage_mark("post_scale", &_dsl_bts_stage_last);\n'
-        + body[ret_pos:]
-    )
-    return body
 
 
 def emit_shim(args: argparse.Namespace) -> int:
@@ -243,6 +106,97 @@ def emit_shim(args: argparse.Namespace) -> int:
           struct timespec ts;
           clock_gettime(CLOCK_MONOTONIC, &ts);
           return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+        }}
+
+        typedef struct {{
+          int active;
+          int phase;
+          double last_sec;
+        }} DSL_BTS_STAGE_PROBE;
+
+        static __thread DSL_BTS_STAGE_PROBE g_dsl_bts_stage_probe = {{0, 0, 0.0}};
+
+        static int dsl_bts_env_flag_enabled(const char* name) {{
+          const char* flag = getenv(name);
+          return flag != NULL && flag[0] != '\\0' && strcmp(flag, "0") != 0 &&
+                 strcmp(flag, "false") != 0 && strcmp(flag, "off") != 0 &&
+                 strcmp(flag, "no") != 0;
+        }}
+
+        static int dsl_bts_stage_probe_enabled(void) {{
+          return dsl_bts_env_flag_enabled("ACE_BOOTSTRAP_STAGE_PROBE");
+        }}
+
+        static void dsl_bts_stage_probe_begin(void) {{
+          if (!dsl_bts_stage_probe_enabled()) {{
+            memset(&g_dsl_bts_stage_probe, 0, sizeof(g_dsl_bts_stage_probe));
+            return;
+          }}
+          g_dsl_bts_stage_probe.active = 1;
+          g_dsl_bts_stage_probe.phase = 0;
+          g_dsl_bts_stage_probe.last_sec = dsl_bts_now_sec();
+        }}
+
+        static void dsl_bts_stage_probe_mark(const char* stage) {{
+          if (!g_dsl_bts_stage_probe.active) {{
+            return;
+          }}
+          double now = dsl_bts_now_sec();
+          fprintf(stderr, "[{args.log_prefix}_stage] %s elapsed=%.3fs\\n",
+                  stage, now - g_dsl_bts_stage_probe.last_sec);
+          fflush(stderr);
+          g_dsl_bts_stage_probe.last_sec = now;
+        }}
+
+        static void dsl_bts_stage_probe_finish(void) {{
+          if (!g_dsl_bts_stage_probe.active) {{
+            return;
+          }}
+          if (g_dsl_bts_stage_probe.phase == 4) {{
+            dsl_bts_stage_probe_mark("slots_to_coeffs");
+            g_dsl_bts_stage_probe.phase = 5;
+          }}
+          if (g_dsl_bts_stage_probe.phase == 5) {{
+            dsl_bts_stage_probe_mark("post_scale");
+          }}
+          memset(&g_dsl_bts_stage_probe, 0, sizeof(g_dsl_bts_stage_probe));
+        }}
+
+        CIPHER dsl_bts_probe_Conjugate_ciph(CIPHER res, CIPHER ciph) {{
+          if (g_dsl_bts_stage_probe.active &&
+              g_dsl_bts_stage_probe.phase == 0) {{
+            dsl_bts_stage_probe_mark("coeff_to_slots");
+            g_dsl_bts_stage_probe.phase = 1;
+          }}
+          return Conjugate_ciph(res, ciph);
+        }}
+
+        CIPHER dsl_bts_probe_Mul_mono_ciph(CIPHER res, CIPHER ciph,
+                                           uint32_t power) {{
+          if (g_dsl_bts_stage_probe.active &&
+              g_dsl_bts_stage_probe.phase == 1) {{
+            CIPHER out = Mul_mono_ciph(res, ciph, power);
+            dsl_bts_stage_probe_mark("split");
+            g_dsl_bts_stage_probe.phase = 2;
+            return out;
+          }}
+          if (g_dsl_bts_stage_probe.active &&
+              g_dsl_bts_stage_probe.phase == 2) {{
+            dsl_bts_stage_probe_mark("dual_evalmod");
+            g_dsl_bts_stage_probe.phase = 3;
+          }}
+          return Mul_mono_ciph(res, ciph, power);
+        }}
+
+        void dsl_bts_probe_Init_ciph_same_scale(CIPHER res, CIPHER ciph1,
+                                                CIPHER ciph2) {{
+          if (g_dsl_bts_stage_probe.active &&
+              g_dsl_bts_stage_probe.phase == 4 && ciph1 != NULL &&
+              ciph1 == ciph2) {{
+            dsl_bts_stage_probe_mark("slots_to_coeffs");
+            g_dsl_bts_stage_probe.phase = 5;
+          }}
+          Init_ciph_same_scale(res, ciph1, ciph2);
         }}
 
         uint32_t {args.raise_level_name}(void) {{
@@ -385,6 +339,11 @@ def emit_shim(args: argparse.Namespace) -> int:
             abort();
           }}
           struct DATA_LUT_ENTRY* lut = &g_dsl_bts_pt.lut[index];
+          if (g_dsl_bts_stage_probe.active &&
+              g_dsl_bts_stage_probe.phase == 3) {{
+            dsl_bts_stage_probe_mark("recombine");
+            g_dsl_bts_stage_probe.phase = 4;
+          }}
           char* slot_ptr = dsl_bts_pt_thread_buf(lut->_size);
           ssize_t ret = pread(g_dsl_bts_pt.fd, slot_ptr, lut->_size, lut->_ent_ofst);
           if (ret != (ssize_t)lut->_size) {{
@@ -414,7 +373,9 @@ def emit_shim(args: argparse.Namespace) -> int:
 
           uint32_t prev_target_level = g_dsl_bts_target_level_after_bts;
           g_dsl_bts_target_level_after_bts = level_after_bts;
+          dsl_bts_stage_probe_begin();
           CIPHERTEXT out = {args.entry_name}(in_copy, in_copy);
+          dsl_bts_stage_probe_finish();
           g_dsl_bts_target_level_after_bts = prev_target_level;
           if (level_after_bts != 0) {{
             while (Level(&out) > level_after_bts) {{
