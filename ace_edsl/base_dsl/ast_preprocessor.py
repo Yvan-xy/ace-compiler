@@ -773,7 +773,21 @@ class DSLPreprocessor(ast.NodeTransformer):
         return new_node
 
     def visit_Call(self, node):
+        self.generic_visit(node)
         func = node.func
+
+        # Python list is a built-in immutable type, so the EDSL cannot attach
+        # a real list.to_air method. Rewrite method syntax to a helper call
+        # before Python evaluates the list expression.
+        if isinstance(func, ast.Attribute) and func.attr == "to_air":
+            return ast.copy_location(
+                ast.Call(
+                    func=ast.Name(id="to_air", ctx=ast.Load()),
+                    args=[func.value, *node.args],
+                    keywords=node.keywords,
+                ),
+                node,
+            )
 
         # Check if the function is 'bool'
         if isinstance(func, ast.Name) and func.id == "bool":
@@ -782,8 +796,6 @@ class DSLPreprocessor(ast.NodeTransformer):
                 args=[node.args[0]],
                 keywords=[],
             )
-        else:
-            self.generic_visit(node)
         return node
 
     def visit_ClassDef(self, node):

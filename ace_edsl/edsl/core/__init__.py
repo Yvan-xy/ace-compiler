@@ -8,13 +8,12 @@ from .types import (
     Ciphertext, SiheCiphertext, CkksCiphertext, CkksPlaintext, Polynomial,
     Scalar, Int, Float, is_scalar_type,
 )
-from .air_value import AIRValue
+from .air_value import AIRValue, to_air
 
 __all__ = [
     'DOMAIN_PIPELINES',
     'Tensor', 'VectorTensor', 'MemRef', 'ComputeTensor',
     'Ciphertext', 'SiheCiphertext', 'CkksCiphertext', 'CkksPlaintext', 'Polynomial',
     'Scalar', 'Int', 'Float', 'is_scalar_type',
-    'AIRValue',
+    'AIRValue', 'to_air',
 ]
-

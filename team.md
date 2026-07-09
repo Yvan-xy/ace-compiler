@@ -3,6 +3,7 @@
 This team is for performance work on the primitive/decomposition-based DSL
 bootstrap path in this repo. The target is the generated primitive bootstrap
 used by `ace_edsl/examples/bootstrap_full.py` and `a_dsl_bts.sh`.
+All the team members should be GPT 5.6 sol model
 
 The goal is functional equivalence with the RTLIB bootstrap baseline
 (`rtlib-bts`) while reaching parity with, or beating, the RTLIB runtime

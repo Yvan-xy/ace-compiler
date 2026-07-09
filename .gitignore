@@ -9,3 +9,7 @@ bindings/build/
 *.egg-info
 tmp_*/
 output/
+.worktree_docker/
+*.t
+*.zip
+resnet20_cifar10_random

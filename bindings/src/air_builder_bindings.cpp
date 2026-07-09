@@ -1514,6 +1514,84 @@ public:
         NODE_PTR n = container->New_ldc(cst, spos);
         return wrap_node(n, "air::core::LDC(ARRAY)");
     }
+
+    // Materialize a same-typed Python sequence of AIR nodes into a real AIR
+    // array local:
+    //   var arr: array[len]<elem_type>
+    //   arr[i] = values[i]
+    //   return LD(arr)
+    std::shared_ptr<Node> new_air_array(const std::string& var_name,
+                                        py::list values) {
+        if (!(container && func_scope && glob)) {
+            throw std::runtime_error("new_air_array requires real container");
+        }
+        if (values.empty()) {
+            throw std::runtime_error("new_air_array requires non-empty values");
+        }
+
+        std::vector<std::shared_ptr<Node>> elems;
+        elems.reserve(values.size());
+        TYPE_PTR elem_type = air::base::Null_ptr;
+        for (size_t i = 0; i < values.size(); ++i) {
+            auto elem = values[i].cast<std::shared_ptr<Node>>();
+            if (!elem || !elem->has_node || elem->node == air::base::Null_ptr) {
+                throw std::runtime_error(
+                    "new_air_array requires real AIR nodes at every element");
+            }
+            TYPE_PTR rtype = get_compatible_type(elem->node->Rtype());
+            if (rtype == air::base::Null_ptr) {
+                throw std::runtime_error(
+                    "new_air_array element has no result type");
+            }
+            if (elem_type == air::base::Null_ptr) {
+                elem_type = rtype;
+            } else if (rtype->Id() != elem_type->Id()) {
+                throw std::runtime_error(
+                    "new_air_array requires all elements to have the same AIR type");
+            }
+            elems.push_back(elem);
+        }
+
+        SPOS spos = get_spos();
+        std::vector<int64_t> dims = {static_cast<int64_t>(elems.size())};
+        std::string type_name = var_name + "_type";
+        TYPE_PTR arr_type = glob->New_arr_type(
+            glob->New_str(type_name.c_str()), elem_type, dims, spos);
+
+        ADDR_DATUM_PTR var;
+        auto it = var_map.find(var_name);
+        if (it != var_map.end()) {
+            var = it->second;
+            if (!var->Type()->Is_array() ||
+                var->Type()->Cast_to_arr()->Elem_count() != elems.size() ||
+                var->Type()->Cast_to_arr()->Elem_type_id() != elem_type->Id()) {
+                throw std::runtime_error(
+                    "new_air_array variable name already exists with incompatible type");
+            }
+        } else {
+            var = func_scope->New_var(arr_type, var_name.c_str(), spos);
+            var_map[var_name] = var;
+        }
+
+        TYPE_PTR idx_type = glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+        for (size_t i = 0; i < elems.size(); ++i) {
+            SPOS elem_spos = elems[i]->node->Spos();
+            NODE_PTR base_addr = container->New_lda(
+                var, air::base::POINTER_KIND::FLAT64, elem_spos);
+            NODE_PTR array = container->New_array(base_addr, 1, elem_spos);
+            NODE_PTR idx = container->New_intconst(
+                idx_type, static_cast<int64_t>(i), elem_spos);
+            container->Set_array_idx(array, 0, idx);
+            append_stmt(container->New_ist(array, elems[i]->node, elem_spos));
+        }
+
+        NODE_PTR ld = container->New_ld(var, spos);
+        auto node = wrap_node(ld, "air::core::LDID(ARRAY)");
+        for (const auto& elem : elems) {
+            node->add_child(elem);
+        }
+        return node;
+    }
     
     std::shared_ptr<Node> new_ld(std::shared_ptr<Node> addr) {
         auto node = std::make_shared<Node>(++node_counter, "air::core::LD");
@@ -5380,6 +5458,9 @@ PYBIND11_MODULE(air_builder, m) {
         .def("new_array_const", &Container::new_array_const,
              py::arg("values"),
              "Create LDC ARRAY constant from Python list: real->float32, complex/pair->interleaved float64")
+        .def("new_air_array", &Container::new_air_array,
+             py::arg("var_name"), py::arg("values"),
+             "Create an AIR array local from a same-typed Python list of AIR nodes")
         .def("new_zero", &Container::new_zero)
         .def("new_one", &Container::new_one)
         .def("new_array", &Container::new_array)

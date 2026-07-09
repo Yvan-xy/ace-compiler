@@ -34,7 +34,7 @@ from ..base_dsl.utils.logger import log
 # Import AIR bindings
 from ace_bindings import air_builder
 
-from .core.air_value import AIRValue
+from .core.air_value import AIRValue, to_air
 from .core.domain_registry import DOMAIN_PIPELINES
 from .core.type_mapping import python_type_to_air_type, is_plaintext_annotation
 from .domain_ast_decorators import (

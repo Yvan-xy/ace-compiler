@@ -49,7 +49,7 @@ from .core.types import (
 )
 
 # Export AIRValue for operator overloading
-from .core.air_value import AIRValue
+from .core.air_value import AIRValue, to_air
 
 # Export domain-specific operations
 from .core import tensor_ops
@@ -174,6 +174,7 @@ __all__ = [
     'is_tensor_type',
     'is_scalar_type',
     'AIRValue',
+    'to_air',
     # Loop and control flow helpers (from base_dsl)
     'range_dynamic',
     'range_constexpr',

@@ -14,7 +14,7 @@ Example:
 """
 
 import os
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Sequence, Tuple, Union
 
 # Import AIR bindings
 from ace_bindings import air_builder, nn_addon
@@ -959,3 +959,50 @@ class AIRValue:
     def __str__(self) -> str:
         """String representation."""
         return self.__repr__()
+
+
+def to_air(values: Sequence[Any]) -> AIRValue:
+    """Convert a Python sequence of AIR values into an AIR array value.
+
+    Python's built-in ``list`` type cannot be extended with new methods at
+    runtime. The EDSL preprocessor rewrites ``[a, b].to_air()`` to
+    ``to_air([a, b])`` before execution.
+    """
+    if not isinstance(values, (list, tuple)):
+        raise TypeError("to_air expects a Python list or tuple of AIRValue objects")
+    if not values:
+        raise ValueError("to_air requires at least one AIRValue")
+
+    container = None
+    domain = None
+    for item in values:
+        if isinstance(item, AIRValue):
+            container = item.container
+            domain = item.domain
+            break
+
+    if container is None:
+        raise TypeError("to_air requires at least one AIRValue to provide a container")
+    if not hasattr(container, "new_air_array"):
+        raise NotImplementedError("Container does not support AIR array construction")
+
+    nodes = []
+    for index, item in enumerate(values):
+        if not isinstance(item, AIRValue):
+            raise TypeError(
+                f"to_air expects AIRValue elements, got {type(item).__name__} "
+                f"at index {index}"
+            )
+        if item.container is not container:
+            raise ValueError("to_air cannot mix AIRValue objects from different containers")
+        nodes.append(item.value)
+
+    temp_name = AIRValue._next_temp_name()
+    container.new_air_array(temp_name, nodes)
+    return AIRValue(
+        node=None,
+        container=container,
+        shape=(len(values),),
+        domain=domain,
+        temp_name=temp_name,
+    )
