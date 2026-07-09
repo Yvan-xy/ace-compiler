@@ -121,15 +121,16 @@ def _loop_execute_range_dynamic(
         log().warning("No AIR container available, falling back to Python loop")
         return _loop_execute_python_fallback(func, start, stop, step, used_args, iter_args)
     
-    # Only support constant bounds for now
-    if _is_dynamic_expression(start) or _is_dynamic_expression(stop) or _is_dynamic_expression(step):
+    # Support runtime scalar start/stop bounds, but keep step constant for now.
+    if _is_dynamic_expression(step):
         raise NotImplementedError(
-            "Dynamic loop bounds (AIRValue) not yet fully implemented. "
-            "Loop bounds must be compile-time constants for now."
+            "range_dynamic currently requires step to be a compile-time constant."
         )
-    
-    start_val = int(start)
-    stop_val = int(stop)
+
+    start_is_dynamic = _is_dynamic_expression(start)
+    stop_is_dynamic = _is_dynamic_expression(stop)
+    start_val = None if start_is_dynamic else int(start)
+    stop_val = None if stop_is_dynamic else int(stop)
     step_val = int(step)
     if step_val != 1:
         # AIR loop builder only supports range(start, end) with step 1
@@ -163,7 +164,26 @@ def _loop_execute_range_dynamic(
             accum_air_values.append(arg)
 
     # 2. Begin loop (pushes loop body block)
-    loop_node = container.new_loop_begin_range(start_val, stop_val)
+    if start_is_dynamic and stop_is_dynamic:
+        if not hasattr(container, "new_loop_begin_range_dynamic_bounds"):
+            raise RuntimeError(
+                "Container missing new_loop_begin_range_dynamic_bounds (rebuild bindings)"
+            )
+        loop_node = container.new_loop_begin_range_dynamic_bounds(start.value, stop.value)
+    elif start_is_dynamic:
+        if not hasattr(container, "new_loop_begin_range_dynamic_start"):
+            raise RuntimeError(
+                "Container missing new_loop_begin_range_dynamic_start (rebuild bindings)"
+            )
+        loop_node = container.new_loop_begin_range_dynamic_start(start.value, stop_val)
+    elif stop_is_dynamic:
+        if not hasattr(container, "new_loop_begin_range_dynamic"):
+            raise RuntimeError(
+                "Container missing new_loop_begin_range_dynamic (rebuild bindings)"
+            )
+        loop_node = container.new_loop_begin_range_dynamic(start_val, stop.value)
+    else:
+        loop_node = container.new_loop_begin_range(start_val, stop_val)
     loop_index = container.new_loop_index(loop_node)
     index_value = AIRValue(loop_index, container)
     

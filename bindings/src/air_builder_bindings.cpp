@@ -1586,6 +1586,10 @@ public:
         ADDR_DATUM_PTR loop_iv;  // Induction variable
         int64_t loop_start;      // Loop start value
         int64_t loop_end;        // Loop end value
+        NODE_PTR loop_start_node; // Dynamic loop start value, if any
+        NODE_PTR loop_end_node;   // Dynamic loop end value, if any
+        bool has_dynamic_start;   // Whether loop_start_node is used
+        bool has_dynamic_end;     // Whether loop_end_node is used
         std::string type;        // "if" or "loop"
     };
     std::vector<ControlFlowFrame> cf_stack;
@@ -1596,6 +1600,10 @@ public:
         frame.type = "loop";
         frame.loop_start = start;
         frame.loop_end = end;
+        frame.loop_start_node = NODE_PTR();
+        frame.loop_end_node = NODE_PTR();
+        frame.has_dynamic_start = false;
+        frame.has_dynamic_end = false;
         
         if (container && glob && func_scope) {
             // Create induction variable
@@ -1616,6 +1624,140 @@ public:
         nodes.push_back(node);
         return node;
     }
+
+    // Create a do_loop for range(constant_start, dynamic_end), with unit step.
+    std::shared_ptr<Node> new_loop_begin_range_dynamic(
+        int64_t start, std::shared_ptr<Node> end) {
+        ControlFlowFrame frame;
+        frame.type = "loop";
+        frame.loop_start = start;
+        frame.loop_end = 0;
+        frame.loop_start_node = NODE_PTR();
+        frame.loop_end_node = NODE_PTR();
+        frame.has_dynamic_start = false;
+        frame.has_dynamic_end = false;
+
+        if (end && end->has_node && end->node != NODE_PTR()) {
+            frame.loop_end_node = end->node;
+            frame.has_dynamic_end = true;
+        }
+
+        if (container && glob && func_scope) {
+            if (!frame.has_dynamic_end) {
+                throw std::runtime_error(
+                    "new_loop_begin_range_dynamic requires a real AIR node for end");
+            }
+
+            // Create induction variable
+            PRIM_TYPE_PTR i64_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+            std::string iv_name = "_iv_" + std::to_string(node_counter);
+            ADDR_DATUM_PTR iv = func_scope->New_var(i64_type, iv_name.c_str(), get_spos());
+            frame.loop_iv = iv;
+
+            // Create loop body block
+            frame.loop_body = container->New_stmt_block(get_spos());
+
+            // Push the body block so statements go there
+            push_block(frame.loop_body);
+        }
+        cf_stack.push_back(frame);
+
+        auto node = std::make_shared<Node>(++node_counter, "air::core::DO_LOOP");
+        if (end) {
+            node->add_child(end);
+        }
+        nodes.push_back(node);
+        return node;
+    }
+
+    // Create a do_loop for range(dynamic_start, constant_end), with unit step.
+    std::shared_ptr<Node> new_loop_begin_range_dynamic_start(
+        std::shared_ptr<Node> start, int64_t end) {
+        ControlFlowFrame frame;
+        frame.type = "loop";
+        frame.loop_start = 0;
+        frame.loop_end = end;
+        frame.loop_start_node = NODE_PTR();
+        frame.loop_end_node = NODE_PTR();
+        frame.has_dynamic_start = false;
+        frame.has_dynamic_end = false;
+
+        if (start && start->has_node && start->node != NODE_PTR()) {
+            frame.loop_start_node = start->node;
+            frame.has_dynamic_start = true;
+        }
+
+        if (container && glob && func_scope) {
+            if (!frame.has_dynamic_start) {
+                throw std::runtime_error(
+                    "new_loop_begin_range_dynamic_start requires a real AIR node for start");
+            }
+
+            PRIM_TYPE_PTR i64_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+            std::string iv_name = "_iv_" + std::to_string(node_counter);
+            ADDR_DATUM_PTR iv = func_scope->New_var(i64_type, iv_name.c_str(), get_spos());
+            frame.loop_iv = iv;
+
+            frame.loop_body = container->New_stmt_block(get_spos());
+            push_block(frame.loop_body);
+        }
+        cf_stack.push_back(frame);
+
+        auto node = std::make_shared<Node>(++node_counter, "air::core::DO_LOOP");
+        if (start) {
+            node->add_child(start);
+        }
+        nodes.push_back(node);
+        return node;
+    }
+
+    // Create a do_loop for range(dynamic_start, dynamic_end), with unit step.
+    std::shared_ptr<Node> new_loop_begin_range_dynamic_bounds(
+        std::shared_ptr<Node> start, std::shared_ptr<Node> end) {
+        ControlFlowFrame frame;
+        frame.type = "loop";
+        frame.loop_start = 0;
+        frame.loop_end = 0;
+        frame.loop_start_node = NODE_PTR();
+        frame.loop_end_node = NODE_PTR();
+        frame.has_dynamic_start = false;
+        frame.has_dynamic_end = false;
+
+        if (start && start->has_node && start->node != NODE_PTR()) {
+            frame.loop_start_node = start->node;
+            frame.has_dynamic_start = true;
+        }
+        if (end && end->has_node && end->node != NODE_PTR()) {
+            frame.loop_end_node = end->node;
+            frame.has_dynamic_end = true;
+        }
+
+        if (container && glob && func_scope) {
+            if (!frame.has_dynamic_start || !frame.has_dynamic_end) {
+                throw std::runtime_error(
+                    "new_loop_begin_range_dynamic_bounds requires real AIR nodes for start and end");
+            }
+
+            PRIM_TYPE_PTR i64_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+            std::string iv_name = "_iv_" + std::to_string(node_counter);
+            ADDR_DATUM_PTR iv = func_scope->New_var(i64_type, iv_name.c_str(), get_spos());
+            frame.loop_iv = iv;
+
+            frame.loop_body = container->New_stmt_block(get_spos());
+            push_block(frame.loop_body);
+        }
+        cf_stack.push_back(frame);
+
+        auto node = std::make_shared<Node>(++node_counter, "air::core::DO_LOOP");
+        if (start) {
+            node->add_child(start);
+        }
+        if (end) {
+            node->add_child(end);
+        }
+        nodes.push_back(node);
+        return node;
+    }
     
     std::shared_ptr<Node> new_loop_begin(std::shared_ptr<Node> iterable) {
         // Fallback for non-range iterables
@@ -1623,6 +1765,10 @@ public:
         frame.type = "loop";
         frame.loop_start = 0;
         frame.loop_end = 10;  // Default
+        frame.loop_start_node = NODE_PTR();
+        frame.loop_end_node = NODE_PTR();
+        frame.has_dynamic_start = false;
+        frame.has_dynamic_end = false;
         
         if (container && glob && func_scope) {
             PRIM_TYPE_PTR i64_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
@@ -1673,14 +1819,19 @@ public:
             // Create the real do_loop statement
             if (container && frame.loop_iv != ADDR_DATUM_PTR() && 
                 frame.loop_body != NODE_PTR()) {
-                // Create init: 0 (or loop_start)
-                NODE_PTR init = container->New_intconst(
-                    glob->Prim_type(PRIMITIVE_TYPE::INT_S64), frame.loop_start, get_spos());
+                // Create init: loop_start
+                NODE_PTR init = frame.has_dynamic_start
+                    ? frame.loop_start_node
+                    : container->New_intconst(
+                        glob->Prim_type(PRIMITIVE_TYPE::INT_S64),
+                        frame.loop_start, get_spos());
                 
                 // Create comparison: iv < loop_end
                 NODE_PTR ld_iv = container->New_ld(frame.loop_iv, get_spos());
-                NODE_PTR end_val = container->New_intconst(
-                    glob->Prim_type(PRIMITIVE_TYPE::INT_S64), frame.loop_end, get_spos());
+                NODE_PTR end_val = frame.has_dynamic_end
+                    ? frame.loop_end_node
+                    : container->New_intconst(
+                        glob->Prim_type(PRIMITIVE_TYPE::INT_S64), frame.loop_end, get_spos());
                 OPCODE lt_op(air::core::CORE, air::core::OPCODE::LT);
                 NODE_PTR comp = container->New_bin_arith(lt_op, ld_iv->Rtype(), ld_iv, end_val, get_spos());
                 
@@ -2081,9 +2232,6 @@ public:
         const Type& ret_type,
         const std::vector<Type>& param_types) {
 
-        std::cerr << "[DEBUG-BINDING] new_func_with_param_types called for: " << name << std::endl;
-        std::cerr << "[DEBUG-BINDING]   GlobScope addr: " << glob << std::endl;
-
         // Ensure CKKS types (CIPHERTEXT3) exist so cipher×cipher muls get correct result type during tracing
         ensure_lower_ctx();
         ensure_fhe_types_registered();
@@ -2097,60 +2245,15 @@ public:
         auto resolve_type = [&](const Type& t) -> TYPE_PTR {
             // Check for CIPHERTEXT marker
             if (t.name == "CIPHERTEXT") {
-                std::cerr << "[DEBUG-BINDING]   Resolving CIPHERTEXT type..." << std::endl;
-                // Create CIPHERTEXT RECORD_TYPE if not already created for this GlobScope instance
                 ensure_lower_ctx();
-                std::cerr << "[DEBUG-BINDING]     lower_ctx addr: " << lower_ctx.get() << std::endl;
-                std::cerr << "[DEBUG-BINDING]     cipher_types_initialized: " << cipher_types_initialized << std::endl;
-
-                // Use instance flag instead of static set to avoid cross-kernel contamination
-                if (!cipher_types_initialized) {
-                    std::cerr << "[DEBUG-BINDING]     NEW instance - initializing types..." << std::endl;
-
-                    // Create CIPHERTEXT type
-                    STR_PTR cipher_str = glob->New_str("CIPHERTEXT");
-                    RECORD_TYPE_PTR rec_type = glob->New_rec_type(RECORD_KIND::STRUCT, cipher_str, spos);
-                    TYPE_PTR cipher_type = static_cast<TYPE_PTR>(rec_type);
-                    std::cerr << "[DEBUG-BINDING]       CIPHERTEXT type ID: " << cipher_type->Id().Value() << std::endl;
-                    lower_ctx->Set_cipher_type_id(cipher_type->Id());
-
-                    // Also create PLAINTEXT type
-                    STR_PTR plain_str = glob->New_str("PLAINTEXT");
-                    RECORD_TYPE_PTR plain_rec_type = glob->New_rec_type(RECORD_KIND::STRUCT, plain_str, spos);
-                    std::cerr << "[DEBUG-BINDING]       PLAINTEXT type ID: " << plain_rec_type->Id().Value() << std::endl;
-                    lower_ctx->Set_plain_type_id(plain_rec_type->Id());
-
-                    cipher_types_initialized = true;
-                    std::cerr << "[DEBUG-BINDING]     Types initialized for this GlobScope instance" << std::endl;
-                } else {
-                    std::cerr << "[DEBUG-BINDING]     Types already initialized for this instance" << std::endl;
-                }
+                ensure_fhe_types_registered();
                 return lower_ctx->Get_cipher_type(glob);
             }
             
             // Check for PLAINTEXT marker
             if (t.name == "PLAINTEXT") {
-                std::cerr << "[DEBUG-BINDING]   Resolving PLAINTEXT type..." << std::endl;
                 ensure_lower_ctx();
-                
-                // Create types if not already created
-                if (!cipher_types_initialized) {
-                    std::cerr << "[DEBUG-BINDING]     NEW instance - initializing types for PLAINTEXT..." << std::endl;
-
-                    // Create CIPHERTEXT type first (needed for lower_ctx)
-                    STR_PTR cipher_str = glob->New_str("CIPHERTEXT");
-                    RECORD_TYPE_PTR rec_type = glob->New_rec_type(RECORD_KIND::STRUCT, cipher_str, spos);
-                    TYPE_PTR cipher_type = static_cast<TYPE_PTR>(rec_type);
-                    lower_ctx->Set_cipher_type_id(cipher_type->Id());
-
-                    // Create PLAINTEXT type
-                    STR_PTR plain_str = glob->New_str("PLAINTEXT");
-                    RECORD_TYPE_PTR plain_rec_type = glob->New_rec_type(RECORD_KIND::STRUCT, plain_str, spos);
-                    std::cerr << "[DEBUG-BINDING]       PLAINTEXT type ID: " << plain_rec_type->Id().Value() << std::endl;
-                    lower_ctx->Set_plain_type_id(plain_rec_type->Id());
-
-                    cipher_types_initialized = true;
-                }
+                ensure_fhe_types_registered();
                 return lower_ctx->Get_plain_type(glob);
             }
 
@@ -5294,6 +5397,17 @@ PYBIND11_MODULE(air_builder, m) {
         .def("new_loop_begin_range", &Container::new_loop_begin_range,
              py::arg("start"), py::arg("end"),
              "Create a do_loop for range(start, end)")
+        .def("new_loop_begin_range_dynamic", &Container::new_loop_begin_range_dynamic,
+             py::arg("start"), py::arg("end"),
+             "Create a do_loop for range(start, dynamic_end)")
+        .def("new_loop_begin_range_dynamic_start",
+             &Container::new_loop_begin_range_dynamic_start,
+             py::arg("start"), py::arg("end"),
+             "Create a do_loop for range(dynamic_start, end)")
+        .def("new_loop_begin_range_dynamic_bounds",
+             &Container::new_loop_begin_range_dynamic_bounds,
+             py::arg("start"), py::arg("end"),
+             "Create a do_loop for range(dynamic_start, dynamic_end)")
         .def("new_loop_begin", &Container::new_loop_begin)
         .def("new_loop_index", &Container::new_loop_index)
         .def("new_loop_end", &Container::new_loop_end)

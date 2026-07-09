@@ -233,16 +233,19 @@ RETV CORE_DATA_FLOW_HANDLER::Handle_do_loop(VISITOR* visitor,
   // 1. handle phi list
   Handle_phi_list(ctx, do_loop);
 
-  // 2. cal and record iteration count of do_loop
+  // 2. cal and record iteration count of do_loop when statically known.
+  // Runtime scalar starts/bounds are represented as normal expressions, but
+  // the DFG frequency metadata cannot encode a symbolic trip count today.
   NODE_PTR init_node = do_loop->Child(0);
-  AIR_ASSERT(init_node->Opcode() == air::core::OPC_INTCONST);
-  int64_t init_val = init_node->Intconst();
+  int64_t init_val = 0;
+  bool    init_is_static = init_node->Opcode() == air::core::OPC_INTCONST;
+  if (init_is_static) {
+    init_val = init_node->Intconst();
+  }
 
   NODE_PTR condition_node = do_loop->Child(1);
   AIR_ASSERT(condition_node->Opcode() == air::core::OPC_LT);
   NODE_PTR upper_node = condition_node->Child(1);
-  AIR_ASSERT(upper_node->Opcode() == air::core::OPC_INTCONST);
-  int64_t upper_bound = upper_node->Intconst();
 
   NODE_PTR incr_node = do_loop->Child(2);
   AIR_ASSERT(incr_node->Opcode() == air::core::OPC_ADD &&
@@ -250,8 +253,13 @@ RETV CORE_DATA_FLOW_HANDLER::Handle_do_loop(VISITOR* visitor,
   int64_t incr_val = incr_node->Child(1)->Intconst();
   AIR_ASSERT_MSG(incr_val != 0, "loop incr must not be zero");
 
-  int64_t cur_freq = (upper_bound - init_val) / incr_val;
-  AIR_ASSERT(cur_freq > 0);
+  uint32_t cur_freq = DFG_BUILD_CTX::INVALID_FREQ;
+  if (init_is_static && upper_node->Opcode() == air::core::OPC_INTCONST) {
+    int64_t upper_bound = upper_node->Intconst();
+    int64_t static_freq = (upper_bound - init_val) / incr_val;
+    AIR_ASSERT(static_freq > 0);
+    cur_freq = static_cast<uint32_t>(static_freq);
+  }
   ctx.Push_freq(cur_freq);
 
   // 3. handle loop body

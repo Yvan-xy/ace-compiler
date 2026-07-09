@@ -227,19 +227,35 @@ int64_t CORE_ANA_IMPL::Get_itr_cnt(air::base::OPCODE cmp_op, int64_t init,
 IV_INFO CORE_ANA_IMPL::Get_loop_iv_info(NODE_PTR loop) {
   // only support do_loop
   AIR_ASSERT(loop->Is_do_loop());
-  // 1. get init value of iv
-  int64_t init_val = Get_init_val_of_iv(loop);
+
+  // 1. get init value of iv when statically known. Runtime scalar starts are
+  // valid loop operands, but their concrete value is unavailable during
+  // context-parameter analysis.
+  NODE_PTR init_val_node = loop->Child(0);
+  int64_t  init_val      = 0;
+  bool     init_is_static =
+      init_val_node->Opcode().Domain() == air::core::CORE &&
+      init_val_node->Operator() == air::core::OPCODE::INTCONST;
+  if (init_is_static) {
+    init_val = init_val_node->Intconst();
+  }
 
   // 2. get stride value of iv
   int64_t stride_val = Get_strid_of_iv(loop);
 
-  // 3. get bound value of iv
-  int64_t bound_val = Get_bound_of_iv(loop);
-
-  // 4. cal iteration number of loop
+  // 3. cal iteration number of loop when both init and bound are static.
+  // Runtime scalar bounds are valid do_loop operands, but their trip count is
+  // unknown during context-parameter analysis.
   NODE_PTR cmp_node = loop->Child(1);
-  int64_t  itr_cnt =
-      Get_itr_cnt(cmp_node->Opcode(), init_val, stride_val, bound_val);
+  NODE_PTR bound_val_node = cmp_node->Child(1);
+  int64_t  itr_cnt        = -1;
+  bool     bound_is_static =
+      bound_val_node->Opcode().Domain() == air::core::CORE &&
+      bound_val_node->Operator() == air::core::OPCODE::INTCONST;
+  if (init_is_static && bound_is_static) {
+    int64_t bound_val = bound_val_node->Intconst();
+    itr_cnt = Get_itr_cnt(cmp_node->Opcode(), init_val, stride_val, bound_val);
+  }
 
   NODE_PTR iv_node = cmp_node->Child(0);
   AIR_ASSERT(META_INFO::Has_prop<OPR_PROP::LOAD>(iv_node->Opcode()));

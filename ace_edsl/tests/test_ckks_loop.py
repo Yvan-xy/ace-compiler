@@ -4,7 +4,7 @@ Test CKKS kernels with loop constructs.
 
 This test demonstrates:
 1. range_constexpr - compile-time unrolled loops
-2. range_dynamic - AIR do_loop generation (constant bounds, step=1)
+2. range_dynamic - AIR do_loop generation (constant or runtime scalar bounds, step=1)
 3. Kernel instantiation with actual CkksCiphertext instances
 
 Usage:
@@ -13,6 +13,7 @@ Usage:
 
 import sys
 import os
+import re
 
 # Setup path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,6 +26,7 @@ from ace_edsl.edsl import (
     range_dynamic,
     range_constexpr,
 )
+from ace_edsl.edsl.pipeline import AcePipeline
 
 
 # =============================================================================
@@ -63,7 +65,7 @@ def ckks_loop_constexpr(ct: CkksCiphertext, zero: CkksCiphertext) -> CkksCiphert
 def ckks_loop_dynamic(ct: CkksCiphertext, zero: CkksCiphertext) -> CkksCiphertext:
     """
     Loop with range_dynamic - generates AIR do_loop.
-    Only supports constant bounds and step=1.
+    Supports constant bounds and step=1.
     """
     result = ct
     
@@ -75,7 +77,74 @@ def ckks_loop_dynamic(ct: CkksCiphertext, zero: CkksCiphertext) -> CkksCiphertex
 
 
 # =============================================================================
-# Test 3: Nested loops (constexpr)
+# Test 3: range_dynamic with runtime scalar stop bound
+# =============================================================================
+
+@ckks_kernel
+def ckks_loop_dynamic_runtime_bound(
+    ct: CkksCiphertext,
+    zero: CkksCiphertext,
+    n: int,
+) -> CkksCiphertext:
+    """
+    Loop with runtime scalar upper bound - generates AIR do_loop.
+    Supports dynamic stop bound with constant start=0 and step=1.
+    """
+    result = ct
+
+    for i in range_dynamic(0, n):
+        result = result + ct
+
+    return result
+
+
+# =============================================================================
+# Test 4: range_dynamic with runtime scalar start bound
+# =============================================================================
+
+@ckks_kernel
+def ckks_loop_dynamic_runtime_start(
+    ct: CkksCiphertext,
+    zero: CkksCiphertext,
+    start: int,
+) -> CkksCiphertext:
+    """
+    Loop with runtime scalar lower bound - generates AIR do_loop.
+    Supports dynamic start bound with constant stop and step=1.
+    """
+    result = ct
+
+    for i in range_dynamic(start, 5):
+        result = result + ct
+
+    return result
+
+
+# =============================================================================
+# Test 5: range_dynamic with runtime scalar start and stop bounds
+# =============================================================================
+
+@ckks_kernel
+def ckks_loop_dynamic_runtime_start_stop(
+    ct: CkksCiphertext,
+    zero: CkksCiphertext,
+    start: int,
+    stop: int,
+) -> CkksCiphertext:
+    """
+    Loop with runtime scalar lower and upper bounds - generates AIR do_loop.
+    Supports dynamic start/stop bounds with step=1.
+    """
+    result = ct
+
+    for i in range_dynamic(start, stop):
+        result = result + ct
+
+    return result
+
+
+# =============================================================================
+# Test 6: Nested loops (constexpr)
 # =============================================================================
 
 @ckks_kernel
@@ -93,7 +162,7 @@ def ckks_nested_loop_constexpr(ct: CkksCiphertext, zero: CkksCiphertext) -> Ckks
 
 
 # =============================================================================
-# Test 4: Loop with rotate (common FHE pattern)
+# Test 7: Loop with rotate (common FHE pattern)
 # =============================================================================
 
 @ckks_kernel
@@ -116,7 +185,15 @@ def ckks_rotate_loop(ct: CkksCiphertext, zero: CkksCiphertext) -> CkksCiphertext
 # Test Runner
 # =============================================================================
 
-def run_test(name: str, kernel_func, expect_loop_ir: bool = False):
+def run_test(
+    name: str,
+    kernel_func,
+    expect_loop_ir: bool = False,
+    extra_args=None,
+    expect_dynamic_bound: bool = False,
+    expected_dynamic_loads=None,
+    forbidden_loop_consts=None,
+):
     """Run a single test and report results."""
     print(f"\n{'='*60}")
     print(f"Test: {name}")
@@ -134,8 +211,11 @@ def run_test(name: str, kernel_func, expect_loop_ir: bool = False):
     print(f"\n[1] Executing kernel with instances:")
     print(f"    ct   = {ct}")
     print(f"    zero = {zero}")
+    if extra_args is None:
+        extra_args = []
+
     try:
-        kernel_func(ct, zero)
+        kernel_func(ct, zero, *extra_args)
         print(f"    ✓ Kernel executed successfully")
     except Exception as e:
         print(f"    ✗ Kernel execution failed: {e}")
@@ -172,6 +252,28 @@ def run_test(name: str, kernel_func, expect_loop_ir: bool = False):
         if accum_store_pos != -1:
             print("    ⚠ Loop-carried accumulator store appears after do_loop")
             return False
+        if expect_dynamic_bound:
+            # AIR dumps the init/compare/increment immediately before the
+            # `do_loop` marker. Formal parameter names are currently positional
+            # p0, p1, ...
+            loop_header = air[max(0, loop_pos - 1200): loop_pos]
+            if expected_dynamic_loads is None:
+                expected_dynamic_loads = ["p2"]
+            for load_name in expected_dynamic_loads:
+                if f'ld "{load_name}"' not in loop_header:
+                    print(
+                        f"    ⚠ Dynamic loop bound does not reference runtime scalar parameter {load_name}"
+                    )
+                    return False
+            if forbidden_loop_consts is None:
+                forbidden_loop_consts = ["#0x4"]
+            for const_text in forbidden_loop_consts:
+                if f"intconst {const_text}" in loop_header:
+                    print(
+                        f"    ⚠ Dynamic loop bound was folded to runtime argument value {const_text}"
+                    )
+                    return False
+            print(f"    ✓ Dynamic loop bounds reference runtime scalar parameters")
     else:
         if loop_count == 0:
             print(f"    ✓ No loop IR (unrolled as expected)")
@@ -189,13 +291,116 @@ def run_test(name: str, kernel_func, expect_loop_ir: bool = False):
     return True
 
 
+def run_dynamic_bound_pipeline_test() -> bool:
+    """Run runtime-bound CKKS loop through CKKS driver, poly driver, and poly2c."""
+    print(f"\n{'='*60}")
+    print("Test: range_dynamic runtime scalar bound pipeline")
+    print(f"{'='*60}")
+
+    AceEDSL._get_dsl.cache_clear()
+    dsl = AceEDSL._get_dsl()
+
+    ct = CkksCiphertext(shape=(16384,), name="ct_input")
+    zero = CkksCiphertext(shape=(16384,), name="ct_zero")
+
+    try:
+        ckks_loop_dynamic_runtime_bound(ct, zero, 4)
+        glob = dsl.current_air_module
+        pipeline = AcePipeline(glob).configure_fhe(
+            poly_degree=16384,
+            mul_level=5,
+            data_file="",
+        )
+
+        ckks_result = pipeline.run_ckks_driver()
+        if not ckks_result.get("success", False):
+            print(f"    ✗ CKKS driver failed: {ckks_result}")
+            return False
+        print("    ✓ CKKS driver succeeded")
+
+        poly_result = pipeline.run_poly_driver()
+        if not poly_result.get("success", False):
+            print(f"    ✗ Poly driver failed: {poly_result}")
+            return False
+        print("    ✓ Poly driver succeeded")
+
+        c_code = pipeline.run_poly2c()
+        if not c_code:
+            print("    ✗ poly2c did not return generated C")
+            return False
+        if "int64_t p2" not in c_code or not re.search(
+            r"< p2(?:_\d+)?;",
+            c_code,
+        ):
+            print("    ✗ Generated C does not keep runtime scalar loop bound")
+            return False
+        print(f"    ✓ poly2c generated C with runtime loop bound ({len(c_code)} chars)")
+        return True
+    except Exception as e:
+        print(f"    ✗ Pipeline test failed: {e}")
+        return False
+
+
+def run_dynamic_start_stop_pipeline_test() -> bool:
+    """Run runtime start/stop CKKS loop through CKKS driver, poly driver, and poly2c."""
+    print(f"\n{'='*60}")
+    print("Test: range_dynamic runtime scalar start/stop pipeline")
+    print(f"{'='*60}")
+
+    AceEDSL._get_dsl.cache_clear()
+    dsl = AceEDSL._get_dsl()
+
+    ct = CkksCiphertext(shape=(16384,), name="ct_input")
+    zero = CkksCiphertext(shape=(16384,), name="ct_zero")
+
+    try:
+        ckks_loop_dynamic_runtime_start_stop(ct, zero, 2, 5)
+        glob = dsl.current_air_module
+        pipeline = AcePipeline(glob).configure_fhe(
+            poly_degree=16384,
+            mul_level=5,
+            data_file="",
+        )
+
+        ckks_result = pipeline.run_ckks_driver()
+        if not ckks_result.get("success", False):
+            print(f"    ✗ CKKS driver failed: {ckks_result}")
+            return False
+        print("    ✓ CKKS driver succeeded")
+
+        poly_result = pipeline.run_poly_driver()
+        if not poly_result.get("success", False):
+            print(f"    ✗ Poly driver failed: {poly_result}")
+            return False
+        print("    ✓ Poly driver succeeded")
+
+        c_code = pipeline.run_poly2c()
+        if not c_code:
+            print("    ✗ poly2c did not return generated C")
+            return False
+        if "int64_t p2" not in c_code or "int64_t p3" not in c_code:
+            print("    ✗ Generated C signature is missing runtime scalar bounds")
+            return False
+        if not re.search(
+            r"for \([^;]+ = p2(?:_\d+)?; [^;]+ < p3(?:_\d+)?;",
+            c_code,
+        ):
+            print("    ✗ Generated C does not keep runtime scalar start/stop in the loop")
+            return False
+        print(f"    ✓ poly2c generated C with runtime start/stop bounds ({len(c_code)} chars)")
+        return True
+    except Exception as e:
+        print(f"    ✗ Pipeline test failed: {e}")
+        return False
+
+
 def main():
     print("=" * 60)
     print("CKKS Loop Test Suite")
     print("=" * 60)
     print("\nThis test demonstrates loop constructs in ace_edsl:")
     print("- range_constexpr: Compile-time unrolled (no loop IR)")
-    print("- range_dynamic: AIR do_loop (constant bounds, step=1)")
+    print("- range_dynamic: AIR do_loop (constant or runtime scalar bounds, step=1)")
     
     results = {}
     
@@ -212,20 +417,52 @@ def main():
         ckks_loop_dynamic,
         expect_loop_ir=True  # Should generate loop IR
     )
+
+    # Test 3: range_dynamic with runtime scalar stop bound
+    results["dynamic_runtime_bound_loop"] = run_test(
+        "range_dynamic (runtime scalar stop bound)",
+        ckks_loop_dynamic_runtime_bound,
+        expect_loop_ir=True,
+        extra_args=[4],
+        expect_dynamic_bound=True,
+    )
+
+    results["dynamic_runtime_start_loop"] = run_test(
+        "range_dynamic (runtime scalar start bound)",
+        ckks_loop_dynamic_runtime_start,
+        expect_loop_ir=True,
+        extra_args=[2],
+        expect_dynamic_bound=True,
+        expected_dynamic_loads=["p2"],
+        forbidden_loop_consts=["#0x2"],
+    )
+
+    results["dynamic_runtime_start_stop_loop"] = run_test(
+        "range_dynamic (runtime scalar start/stop bounds)",
+        ckks_loop_dynamic_runtime_start_stop,
+        expect_loop_ir=True,
+        extra_args=[2, 5],
+        expect_dynamic_bound=True,
+        expected_dynamic_loads=["p2", "p3"],
+        forbidden_loop_consts=["#0x2", "#0x5"],
+    )
     
-    # Test 3: Nested constexpr
+    # Test 6: Nested constexpr
     results["nested_constexpr"] = run_test(
         "Nested range_constexpr",
         ckks_nested_loop_constexpr,
         expect_loop_ir=False  # Should be unrolled
     )
     
-    # Test 4: Rotate loop
+    # Test 7: Rotate loop
     results["rotate_loop"] = run_test(
         "Rotate loop (range_constexpr)",
         ckks_rotate_loop,
         expect_loop_ir=False  # Should be unrolled
     )
+
+    results["dynamic_runtime_bound_pipeline"] = run_dynamic_bound_pipeline_test()
+    results["dynamic_runtime_start_stop_pipeline"] = run_dynamic_start_stop_pipeline_test()
     
     # Summary
     print("\n" + "=" * 60)

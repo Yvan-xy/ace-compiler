@@ -115,7 +115,6 @@ public:
     // update freq
     uint32_t orig_freq     = _freq;
     uint32_t orig_est_freq = _est_freq;
-    AIR_ASSERT(node->Child(0)->Opcode() == air::core::OPC_INTCONST);
     AIR_ASSERT(node->Child(1)->Opcode() == air::core::OPC_LT);
     AIR_ASSERT(node->Child(1)->Child(0)->Opcode() == air::core::OPC_LD);
     AIR_ASSERT(node->Child(1)->Child(0)->Addr_datum_id() == node->Iv_id());
@@ -124,8 +123,12 @@ public:
     AIR_ASSERT(node->Child(2)->Child(0)->Addr_datum_id() == node->Iv_id());
     AIR_ASSERT(node->Child(2)->Child(1)->Opcode() == air::core::OPC_INTCONST);
     AIR_ASSERT(node->Child(2)->Child(1)->Intconst() == 1);
-    if (node->Child(1)->Child(1)->Opcode() == air::core::OPC_INTCONST) {
-      uint32_t trip_cnt = node->Child(1)->Child(1)->Intconst() - node->Child(0)->Intconst();
+    bool init_is_static  = node->Child(0)->Opcode() == air::core::OPC_INTCONST;
+    bool bound_is_static =
+        node->Child(1)->Child(1)->Opcode() == air::core::OPC_INTCONST;
+    if (init_is_static && bound_is_static) {
+      uint32_t trip_cnt =
+          node->Child(1)->Child(1)->Intconst() - node->Child(0)->Intconst();
       _freq *= trip_cnt;
       _est_freq *= trip_cnt;
     } else {
