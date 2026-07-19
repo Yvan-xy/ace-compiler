@@ -15,6 +15,8 @@
 namespace nn {
 namespace vector {
 
+class VECTOR_KERNEL_LOWERING_REGISTRY;
+
 using NODE_MASK_PAIR = std::pair<NODE_ID, uint32_t>;
 using MF_WORKLIST    = std::vector<NODE_MASK_PAIR>;
 using SS_WORKLIST    = std::vector<NODE_ID>;
@@ -22,7 +24,10 @@ using SS_WORKLIST    = std::vector<NODE_ID>;
 //! @brief Context for passes in VECTOR phase
 class VECTOR_CTX {
 public:
-  VECTOR_CTX() : _num_vloop(0), _slot(MIN_SLOT_ALLOWED) {}
+  VECTOR_CTX()
+      : _num_vloop(0),
+        _slot(MIN_SLOT_ALLOWED),
+        _vector_kernel_lowering_registry(nullptr) {}
 
   void     Incr_num_vloop() { _num_vloop++; }
   uint32_t Get_num_vloop() const { return _num_vloop; }
@@ -51,6 +56,15 @@ public:
 
   SS_WORKLIST Get_ss_worklist() { return _ss_wl; }
 
+  void Set_vector_kernel_lowering_registry(
+      VECTOR_KERNEL_LOWERING_REGISTRY* registry) {
+    _vector_kernel_lowering_registry = registry;
+  }
+
+  VECTOR_KERNEL_LOWERING_REGISTRY* Vector_kernel_lowering_registry() const {
+    return _vector_kernel_lowering_registry;
+  }
+
 private:
   VECTOR_CTX(const VECTOR_CTX&)            = delete;
   VECTOR_CTX& operator=(const VECTOR_CTX&) = delete;
@@ -59,6 +73,7 @@ private:
   uint32_t    _slot;
   MF_WORKLIST _mf_wl;  // used for mask fusion
   SS_WORKLIST _ss_wl;  // used for strided_slice fusion
+  VECTOR_KERNEL_LOWERING_REGISTRY* _vector_kernel_lowering_registry;
 };
 
 //! @brief Macro to define API to access context
@@ -72,7 +87,10 @@ private:
   }                                                                          \
   MF_WORKLIST Get_mf_worklist() { return cfg.Get_mf_worklist(); }            \
   void        Register_ss_node(NODE_ID node) { cfg.Register_ss_node(node); } \
-  SS_WORKLIST Get_ss_worklist() { return cfg.Get_ss_worklist(); }
+  SS_WORKLIST Get_ss_worklist() { return cfg.Get_ss_worklist(); }            \
+  VECTOR_KERNEL_LOWERING_REGISTRY* Vector_kernel_lowering_registry() const { \
+    return cfg.Vector_kernel_lowering_registry();                            \
+  }
 
 }  // namespace vector
 }  // namespace nn

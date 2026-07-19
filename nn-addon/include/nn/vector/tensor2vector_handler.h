@@ -15,6 +15,7 @@
 #include "nn/core/rt_timing.h"
 #include "nn/vector/skip_lowering.h"
 #include "nn/vector/tensor2vector_ctx.h"
+#include "nn/vector/tensor2vector_dsl.h"
 #include "nn/vector/tensor2vector_py_airgen.h"
 #include "nn/vector/tensor2vector_util.h"
 #include "nn/vector/vector_opcode.h"
@@ -58,18 +59,33 @@ public:
 
   template <typename RETV, typename VISITOR>
   RETV Handle_add(VISITOR* visitor, air::base::NODE_PTR node) {
+    TENSOR2VECTOR_CTX& ctx = visitor->Context();
+
+    // M1's synthetic integration seam runs before the legacy skip-only path.
+    // M4 will connect the same generic registry/materializer after real
+    // Gemm/Conv planning has frozen a VECTOR_KERNEL_PLAN.
+    NODE_PTR new_ld0 = air::base::Null_ptr;
+    NODE_PTR new_ld1 = air::base::Null_ptr;
+    VECTOR_KERNEL_LOWERING_REGISTRY* registry =
+        ctx.Vector_kernel_lowering_registry();
+    if (registry != nullptr && registry->Has(node->Opcode())) {
+      new_ld0 = visitor->template Visit<RETV>(node->Child(0));
+      new_ld1 = visitor->template Visit<RETV>(node->Child(1));
+      std::optional<VECTOR_KERNEL_LOWERING_RESULT> lowering =
+          Try_materialize_registered_vector_kernel(ctx, node,
+                                                   {new_ld0, new_ld1});
+      AIR_ASSERT(lowering.has_value());
+      return lowering->_replacement;
+    }
+
     // Check if Python has a registered lowering for this op
     if (Should_skip_lowering("nn::core", "add")) {
       return Clone_with_visited_children<RETV>(visitor, node);
     }
-    TENSOR2VECTOR_CTX& ctx    = visitor->Context();
-    CONTAINER*         cntr   = ctx.Container();
-    GLOB_SCOPE*        gscope = cntr->Glob_scope();
-    SPOS               spos   = node->Spos();
 
     TENSOR2VECTOR_UTIL vgen(ctx);
-    NODE_PTR           new_ld0 = visitor->template Visit<RETV>(node->Child(0));
-    NODE_PTR           new_ld1 = visitor->template Visit<RETV>(node->Child(1));
+    new_ld0 = visitor->template Visit<RETV>(node->Child(0));
+    new_ld1 = visitor->template Visit<RETV>(node->Child(1));
     if (ctx.Config().Python_dsl()) {
       TENSOR2VECTOR_PY_IMPL py_gen(ctx);
       return py_gen.New_py_add(node, new_ld0, new_ld1, node->Spos());
