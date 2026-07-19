@@ -281,7 +281,7 @@ void Expect_helper_ownership(NODE_PTR node, FUNC_SCOPE& helper) {
   }
 }
 
-class Tensor2VectorM1 : public ::testing::Test {
+class Tensor2VectorDslMaterialization : public ::testing::Test {
 protected:
   void SetUp() override {
     _had_core   = META_INFO::Valid_domain(air::core::CORE);
@@ -316,7 +316,8 @@ private:
 
 }  // namespace
 
-TEST_F(Tensor2VectorM1, MaterializesDestinationHelperAndTypedCallBridge) {
+TEST_F(Tensor2VectorDslMaterialization,
+       MaterializesDestinationHelperAndTypedCallBridge) {
   SOURCE_ADD_IR source = Build_source_add("m1_source_add", 13);
   ASSERT_TRUE(source._glob->Verify_ir());
 
@@ -476,7 +477,8 @@ TEST_F(Tensor2VectorM1, MaterializesDestinationHelperAndTypedCallBridge) {
             "the supplied CALL is not present exactly once in caller");
 }
 
-TEST_F(Tensor2VectorM1, DisabledRegistryPreservesNativeLowering) {
+TEST_F(Tensor2VectorDslMaterialization,
+       DisabledRegistryPreservesNativeLowering) {
   SOURCE_ADD_IR source = Build_source_add("m1_disabled_add", 29);
   ASSERT_TRUE(source._glob->Verify_ir());
 
@@ -500,7 +502,8 @@ TEST_F(Tensor2VectorM1, DisabledRegistryPreservesNativeLowering) {
   EXPECT_EQ(stats._loops, 0U);
 }
 
-TEST_F(Tensor2VectorM1, RegistryRejectsDuplicateOpcodeAndSupportsRemoval) {
+TEST_F(Tensor2VectorDslMaterialization,
+       RegistryRejectsDuplicateOpcodeAndSupportsRemoval) {
   VECTOR_KERNEL_LOWERING_REGISTRY registry;
   const OPCODE add_opcode(nn::core::NN, nn::core::OPCODE::ADD);
   auto selector = [](NODE_PTR, const std::vector<NODE_PTR>&,

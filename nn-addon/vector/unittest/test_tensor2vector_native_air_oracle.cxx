@@ -155,7 +155,7 @@ std::string Snapshot(const NATIVE_GEMM_IR& fixture) {
       *fixture._func_scope);
 }
 
-class Tensor2VectorM0Native : public ::testing::Test {
+class Tensor2VectorNativeAirOracle : public ::testing::Test {
 protected:
   void SetUp() override {
     _had_core   = META_INFO::Valid_domain(air::core::CORE);
@@ -183,7 +183,8 @@ private:
 
 }  // namespace
 
-TEST_F(Tensor2VectorM0Native, BaselineGemmFourByFourDirectNativeOracle) {
+TEST_F(Tensor2VectorNativeAirOracle,
+       BaselineGemmFourByFourDirectNativeOracle) {
   VECTOR_CONFIG default_config;
   EXPECT_FALSE(default_config.Python_dsl());
 
@@ -212,7 +213,8 @@ TEST_F(Tensor2VectorM0Native, BaselineGemmFourByFourDirectNativeOracle) {
   EXPECT_EQ(normalized, Snapshot(renamed));
 }
 
-TEST_F(Tensor2VectorM0Native, BaselineGemmTwoByEightReductionAndMaskOracle) {
+TEST_F(Tensor2VectorNativeAirOracle,
+       BaselineGemmTwoByEightReductionAndMaskOracle) {
   NATIVE_GEMM_IR fixture =
       Build_native_gemm("baseline_gemm_2x8", 17, 2, 8, true);
   ASSERT_TRUE(fixture._glob->Verify_ir());

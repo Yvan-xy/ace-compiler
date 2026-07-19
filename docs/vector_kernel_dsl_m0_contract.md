@@ -155,7 +155,8 @@ The M0 acceptance fixtures are:
 
 - `test_tensor2vector_plan.cxx`, which freezes all four immutable plan keys,
   canonical constant hashing, helper naming, and helper ABI;
-- `test_tensor2vector_m0_native.cxx`, which calls the public baseline-Gemm
+- `test_tensor2vector_native_air_oracle.cxx`, which calls the public
+  baseline-Gemm
   emitter directly for both required cases, verifies the resulting AIR, and
   freezes ID/name/source-independent structural fingerprints.
 
@@ -169,12 +170,12 @@ expected-actual identity and formal types, the caller result preg, one attached
 replacing `LDP`, one attached call site, and the helper's single terminal
 `RETV`.
 
-`test_tensor2vector_m1.cxx` exercises the normalizer through a synthetic native
-region and a destination-owned helper built with different IDs, names, and
-source positions. Constant-content, kernel operand-order, bridge actual-order,
-wrong-preg, detached-call, and detached-`LDP` changes are required to fail.
-The frozen M0 whole-function fingerprints use the same object walker, so
-extraction of the reusable harness cannot silently weaken M0.
+`test_tensor2vector_dsl_materialization.cxx` exercises the normalizer through
+a synthetic native region and a destination-owned helper built with different
+IDs, names, and source positions. Constant-content, kernel operand-order,
+bridge actual-order, wrong-preg, detached-call, and detached-`LDP` changes are
+required to fail. The frozen M0 whole-function fingerprints use the same object
+walker, so extraction of the reusable harness cannot silently weaken M0.
 
 ## M1 destination helper and call seam
 
