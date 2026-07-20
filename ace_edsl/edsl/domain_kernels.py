@@ -84,12 +84,8 @@ def _make_kernel_decorator(domain: str):
                 """
                 # Get DSL at call time (not decoration time!)
                 dsl = _get_ace_edsl()
-                
-                # Set domain on DSL
-                dsl.current_domain = domain
-                dsl._original_funcBody = original_func
-                
-                # Call the kernel helper
+
+                # _kernel_helper owns lexical domain/original-function state.
                 return dsl._kernel_helper(func_to_use, *args, **inner_kwargs)
             
             return kernel_wrapper

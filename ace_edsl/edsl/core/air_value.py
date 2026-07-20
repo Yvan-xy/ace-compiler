@@ -78,12 +78,79 @@ class AIRValue:
         shape: Optional[Tuple[int, ...]] = None,
         domain: Optional[str] = None,
         temp_name: Optional[str] = None,
+        air_type: Any = None,
     ):
         self._node = node
         self._container = container
         self._shape = shape
         self._domain = domain
         self._temp_name = temp_name  # For on-demand fresh loads
+        self._air_type = air_type or self._infer_air_type(node)
+
+    @staticmethod
+    def _infer_air_type(node: Any) -> Any:
+        if node is not None and hasattr(node, "rtype"):
+            try:
+                inferred = node.rtype()
+                if inferred is not None and inferred.to_string() != "void":
+                    return inferred
+            except (AttributeError, RuntimeError):
+                pass
+        return None
+
+    def _is_core_scalar(self) -> bool:
+        if self._air_type is None:
+            return self._domain == "air::core"
+        try:
+            return bool(self._air_type.is_scalar())
+        except (AttributeError, RuntimeError):
+            return self._domain == "air::core"
+
+    def view(self, target_domain: str) -> 'AIRValue':
+        """Return a non-mutating lexical view in ``target_domain``.
+
+        Primitive values remain Core scalars even while a Vector kernel is
+        active; ranked operands adopt the target kernel domain.
+        """
+        domain = "air::core" if self._is_core_scalar() else target_domain
+        return AIRValue(
+            self._node,
+            self._container,
+            self._shape,
+            domain,
+            self._temp_name,
+            self._air_type,
+        )
+
+    def cast(self, air_type: Any) -> 'AIRValue':
+        """Perform an explicit checked cast.
+
+        AIR Core currently has no integer width-conversion opcode, so only an
+        already structurally compatible type is a legal no-op cast.
+        """
+        if not hasattr(self._container, "new_checked_cast"):
+            raise NotImplementedError("Container does not support checked casts")
+        cast_node = self._container.new_checked_cast(self.value, air_type)
+        return AIRValue(
+            cast_node,
+            self._container,
+            self._shape,
+            "air::core" if air_type.is_scalar() else self._domain,
+            air_type=air_type,
+        )
+
+    def zero_like(self) -> 'AIRValue':
+        """Create a real zero carrying this value's exact AIR type."""
+        if self._air_type is None:
+            raise TypeError("zero_like requires AIR type metadata")
+        zero = self._container.new_zero(self._air_type)
+        return AIRValue(
+            zero,
+            self._container,
+            self._shape,
+            self._domain,
+            air_type=self._air_type,
+        )
     
     def _flatten_result(self, result_node: Any) -> 'AIRValue':
         """
@@ -99,11 +166,17 @@ class AIRValue:
         creates a fresh load to avoid sharing the same node across multiple uses.
         """
         if not AIRValue.FLAT_IR_MODE:
-            return AIRValue(result_node, self._container, self._shape, self._domain)
+            return AIRValue(
+                result_node, self._container, self._shape, self._domain
+            )
         
         # Store result to a temporary
         temp_name = AIRValue._next_temp_name()
         if hasattr(self._container, 'new_stid'):
+            result_type = self._infer_air_type(result_node)
+            if (result_type is not None and
+                    hasattr(self._container, "new_local")):
+                self._container.new_local(temp_name, result_type)
             store_node = self._container.new_stid(temp_name, result_node)
             # Return AIRValue with temp_name - loads created on-demand in .value
             if hasattr(self._container, 'new_ldid'):
@@ -112,7 +185,8 @@ class AIRValue:
                     container=self._container, 
                     shape=self._shape, 
                     domain=self._domain,
-                    temp_name=temp_name  # Store the name for fresh loads
+                    temp_name=temp_name,  # Store the name for fresh loads
+                    air_type=result_type,
                 )
             else:
                 # Fallback: use the store node directly
@@ -151,6 +225,11 @@ class AIRValue:
     def domain(self) -> Optional[str]:
         """Return the current domain for this value (if set)."""
         return self._domain
+
+    @property
+    def air_type(self) -> Any:
+        """Return the exact AIR result type carried by this value."""
+        return self._air_type
     
     def _get_other_node(self, other: Any) -> Any:
         """Helper to extract node from other (AIRValue, scalar, or node).
@@ -163,10 +242,23 @@ class AIRValue:
         elif isinstance(other, (int, float)):
             # Convert scalar to constant node
             if isinstance(other, int):
-                const_node = self._container.new_intconst(other)
+                if (self._is_core_scalar() and self._air_type is not None and
+                        hasattr(self._container, "new_intconst_typed") and
+                        self._air_type.is_integer()):
+                    const_node = self._container.new_intconst_typed(
+                        other, self._air_type
+                    )
+                else:
+                    const_node = self._container.new_intconst(other)
             else:
                 # For float, create float constant if available, else use int
-                if hasattr(self._container, 'new_floatconst'):
+                if (self._is_core_scalar() and self._air_type is not None and
+                        hasattr(self._container, "new_floatconst_typed") and
+                        self._air_type.is_float()):
+                    const_node = self._container.new_floatconst_typed(
+                        other, self._air_type
+                    )
+                elif hasattr(self._container, 'new_floatconst'):
                     const_node = self._container.new_floatconst(other)
                 else:
                     const_node = self._container.new_intconst(int(other))
@@ -216,15 +308,15 @@ class AIRValue:
         # Try domain-specific operations first, then fallback to generic
         # Use self.value to get fresh load if in flat IR mode
         self_node = self.value
-        if self._domain == "fhe::ckks" and hasattr(self._container, 'new_ckks_add'):
+        if self._is_core_scalar() and hasattr(self._container, 'new_core_add'):
+            result_node = self._container.new_core_add(self_node, other_node)
+        elif self._domain == "fhe::ckks" and hasattr(self._container, 'new_ckks_add'):
             result_node = self._container.new_ckks_add(self_node, other_node)
         elif self._domain == "fhe::sihe" and hasattr(self._container, 'new_sihe_add'):
             result_node = self._container.new_sihe_add(self_node, other_node)
         elif self._domain == "nn::core" and hasattr(self._container, 'new_nn_add'):
             result_node = self._container.new_nn_add(self_node, other_node)
         elif self._domain == "nn::vector" and hasattr(self._container, 'new_vec_add'):
-            result_node = self._container.new_vec_add(self_node, other_node)
-        elif hasattr(self._container, 'new_vec_add'):
             result_node = self._container.new_vec_add(self_node, other_node)
         elif hasattr(self._container, 'new_add'):
             result_node = self._container.new_add(self_node, other_node)
@@ -284,15 +376,15 @@ class AIRValue:
         other_node = self._get_other_node(other)
         
         self_node = self.value
-        if self._domain == "fhe::ckks" and hasattr(self._container, 'new_ckks_mul'):
+        if self._is_core_scalar() and hasattr(self._container, 'new_core_mul'):
+            result_node = self._container.new_core_mul(self_node, other_node)
+        elif self._domain == "fhe::ckks" and hasattr(self._container, 'new_ckks_mul'):
             result_node = self._container.new_ckks_mul(self_node, other_node)
         elif self._domain == "fhe::sihe" and hasattr(self._container, 'new_sihe_mul'):
             result_node = self._container.new_sihe_mul(self_node, other_node)
         elif self._domain == "nn::core" and hasattr(self._container, 'new_nn_mul'):
             result_node = self._container.new_nn_mul(self_node, other_node)
         elif self._domain == "nn::vector" and hasattr(self._container, 'new_vec_mul'):
-            result_node = self._container.new_vec_mul(self_node, other_node)
-        elif hasattr(self._container, 'new_vec_mul'):
             result_node = self._container.new_vec_mul(self_node, other_node)
         elif hasattr(self._container, 'new_mul'):
             result_node = self._container.new_mul(self_node, other_node)
@@ -306,6 +398,38 @@ class AIRValue:
     def __rmul__(self, other: Any) -> 'AIRValue':
         """Handle reverse multiply."""
         return self.__mul__(other)
+
+    def __lshift__(self, other: Any) -> 'AIRValue':
+        """Emit typed Core left shift: ``a << b``."""
+        self._set_loc()
+        if not self._is_core_scalar():
+            raise TypeError("left shift requires a Core scalar AIRValue")
+        other_node = self._get_other_node(other)
+        if hasattr(self._container, "new_core_shl"):
+            result_node = self._container.new_core_shl(
+                self.value, other_node
+            )
+        elif hasattr(self._container, "new_shl"):
+            result_node = self._container.new_shl(self.value, other_node)
+        else:
+            raise NotImplementedError("Container does not support Core SHL")
+        return self._flatten_result(result_node)
+
+    def __rlshift__(self, other: Any) -> 'AIRValue':
+        """Emit typed Core left shift for a Python literal lhs."""
+        self._set_loc()
+        if not isinstance(other, int):
+            raise TypeError("reverse left shift requires an integer lhs")
+        if not self._is_core_scalar() or self._air_type is None:
+            raise TypeError("reverse left shift requires a typed Core scalar")
+        lhs = self._container.new_intconst_typed(other, self._air_type)
+        if hasattr(self._container, "new_core_shl"):
+            result_node = self._container.new_core_shl(lhs, self.value)
+        elif hasattr(self._container, "new_shl"):
+            result_node = self._container.new_shl(lhs, self.value)
+        else:
+            raise NotImplementedError("Container does not support Core SHL")
+        return self._flatten_result(result_node)
     
     def __truediv__(self, other: Any) -> 'AIRValue':
         """Emit AIR divide operation: a / b → container.new_div()"""
@@ -404,7 +528,10 @@ class AIRValue:
             result_node = self._container.new_core_neg(self_node)
         else:
             # Negation as 0 - self
-            zero_node = self._container.new_zero() if hasattr(self._container, 'new_zero') else self._container.new_intconst(0)
+            if self._air_type is not None and hasattr(self._container, 'new_zero'):
+                zero_node = self._container.new_zero(self._air_type)
+            else:
+                zero_node = self._container.new_intconst(0)
             result_node = self._container.new_sub(zero_node, self_node)
         
         return self._flatten_result(result_node)
@@ -462,14 +589,23 @@ class AIRValue:
         other_node = self._get_other_node(other)
         self_node = self.value
         
-        if hasattr(self._container, 'new_lt'):
+        if self._is_core_scalar() and hasattr(self._container, 'new_core_lt'):
+            result_node = self._container.new_core_lt(self_node, other_node)
+        elif hasattr(self._container, 'new_lt'):
             result_node = self._container.new_lt(self_node, other_node)
         elif hasattr(self._container, 'new_core_lt'):
             result_node = self._container.new_core_lt(self_node, other_node)
         else:
             raise NotImplementedError("Container does not support lt operation")
         
-        return AIRValue(result_node, self._container, self._shape, self._domain)
+        result_type = self._infer_air_type(result_node)
+        return AIRValue(
+            result_node,
+            self._container,
+            self._shape,
+            "air::core" if self._is_core_scalar() else self._domain,
+            air_type=result_type,
+        )
     
     def __le__(self, other: Any) -> 'AIRValue':
         """Emit AIR less-than-or-equal comparison: a <= b"""

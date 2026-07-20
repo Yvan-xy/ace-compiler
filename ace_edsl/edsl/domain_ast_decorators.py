@@ -25,15 +25,23 @@ from .core.air_value import AIRValue
 # This is set by AceEDSL when generating AIR
 _current_container = None
 _current_func_scope = None
+_current_domain = None
 _loop_temp_counter = 0
 _if_temp_counter = 0
 _loop_accum_counter = 0
 
-def set_current_container(container, func_scope=None):
+def set_current_container(container, func_scope=None, domain=None):
     """Set the current container for loop operations."""
-    global _current_container, _current_func_scope
+    global _current_container, _current_func_scope, _current_domain
     _current_container = container
     _current_func_scope = func_scope
+    _current_domain = domain
+
+
+def set_current_domain(domain):
+    """Update the lexical kernel domain used by control-flow lowering."""
+    global _current_domain
+    _current_domain = domain
     
 def get_current_container():
     """Get the current container for loop operations."""
@@ -78,6 +86,23 @@ def _is_dynamic_expression(value: Any) -> bool:
         True if value is AIRValue (dynamic), False if compile-time constant
     """
     return isinstance(value, AIRValue)
+
+
+def _validate_carried_air_value(
+    initial: AIRValue, result: Any, construct: str
+) -> AIRValue:
+    """Require a control-flow result to preserve its AIR metadata."""
+    if not isinstance(result, AIRValue):
+        raise TypeError(f"{construct} result must be an AIRValue")
+    if result.air_type is None or initial.air_type is None:
+        raise TypeError(f"{construct} result requires exact AIR type metadata")
+    if result.air_type != initial.air_type:
+        raise TypeError(f"{construct} result type does not match its initial value")
+    if result.domain != initial.domain:
+        raise TypeError(f"{construct} result domain does not match its initial value")
+    if result.shape != initial.shape:
+        raise TypeError(f"{construct} result shape does not match its initial value")
+    return result
 
 
 def _loop_execute_range_dynamic(
@@ -144,10 +169,16 @@ def _loop_execute_range_dynamic(
     #    instead of the previous iteration's result.
     accum_names = []
     accum_air_values = []
+    accum_metadata = []
     for arg in iter_args:
         if isinstance(arg, AIRValue):
+            if arg.air_type is None:
+                raise TypeError("loop-carried AIRValue requires exact AIR type metadata")
             accum_name = _next_loop_accum_name()
             accum_names.append(accum_name)
+            accum_metadata.append(arg)
+            if hasattr(container, "new_local"):
+                container.new_local(accum_name, arg.air_type)
             # Initialize: accum = initial_value (emulates scf.ForOp init_values)
             container.new_stid(accum_name, arg.value)
             # Create AIRValue that loads from this variable on each .value access
@@ -158,34 +189,45 @@ def _loop_execute_range_dynamic(
                 shape=arg.shape,
                 domain=arg.domain,
                 temp_name=accum_name,
+                air_type=arg.air_type,
             ))
         else:
             accum_names.append(None)
             accum_air_values.append(arg)
+            accum_metadata.append(None)
 
     # 2. Begin loop (pushes loop body block)
+    loop_bit_width = 32 if _current_domain == "nn::vector" else 64
     if start_is_dynamic and stop_is_dynamic:
         if not hasattr(container, "new_loop_begin_range_dynamic_bounds"):
             raise RuntimeError(
                 "Container missing new_loop_begin_range_dynamic_bounds (rebuild bindings)"
             )
-        loop_node = container.new_loop_begin_range_dynamic_bounds(start.value, stop.value)
+        loop_node = container.new_loop_begin_range_dynamic_bounds(
+            start.value, stop.value, loop_bit_width
+        )
     elif start_is_dynamic:
         if not hasattr(container, "new_loop_begin_range_dynamic_start"):
             raise RuntimeError(
                 "Container missing new_loop_begin_range_dynamic_start (rebuild bindings)"
             )
-        loop_node = container.new_loop_begin_range_dynamic_start(start.value, stop_val)
+        loop_node = container.new_loop_begin_range_dynamic_start(
+            start.value, stop_val, loop_bit_width
+        )
     elif stop_is_dynamic:
         if not hasattr(container, "new_loop_begin_range_dynamic"):
             raise RuntimeError(
                 "Container missing new_loop_begin_range_dynamic (rebuild bindings)"
             )
-        loop_node = container.new_loop_begin_range_dynamic(start_val, stop.value)
+        loop_node = container.new_loop_begin_range_dynamic(
+            start_val, stop.value, loop_bit_width
+        )
     else:
-        loop_node = container.new_loop_begin_range(start_val, stop_val)
+        loop_node = container.new_loop_begin_range(
+            start_val, stop_val, loop_bit_width
+        )
     loop_index = container.new_loop_index(loop_node)
-    index_value = AIRValue(loop_index, container)
+    index_value = AIRValue(loop_index, container, domain="air::core")
     
     # 3. Execute loop body ONCE to generate IR pattern.
     #    Pass accumulator AIRValues (not original iter_args) so the body
@@ -195,26 +237,46 @@ def _loop_execute_range_dynamic(
         loop_results = []
     if not isinstance(loop_results, list):
         loop_results = [loop_results]
+    if len(loop_results) != len(accum_names):
+        raise ValueError(
+            "range_dynamic body must yield exactly one result per iter_arg"
+        )
 
     # 4. Store loop body results back to accumulator variables (still inside
     #    the loop body block, before new_loop_end). This creates the
     #    loop-carried dependency (emulates scf.YieldOp): each iteration
     #    reads the accumulator, computes, and writes the result back.
-    for accum_name, res in zip(accum_names, loop_results):
-        if accum_name is not None and isinstance(res, AIRValue):
-            container.new_stid(accum_name, res.value)
+    for accum_name, res, initial in zip(
+        accum_names, loop_results, accum_metadata
+    ):
+        if accum_name is not None:
+            validated = _validate_carried_air_value(
+                initial, res, "loop-carried"
+            )
+            container.new_stid(accum_name, validated.value)
 
     # 5. End loop (pop body block, emit do_loop)
     container.new_loop_end()
 
     carried_results = []
-    for accum_name, res in zip(accum_names, loop_results):
+    for accum_name, res, initial in zip(
+        accum_names, loop_results, accum_metadata
+    ):
         if accum_name is not None:
+            metadata = initial
             temp_name = _next_loop_temp_name()
             load_node = container.new_ldid(accum_name)
-            carried_node = container.new_stid(temp_name, load_node)
-            shape = res.shape if isinstance(res, AIRValue) else None
-            carried_results.append(AIRValue(carried_node, container, shape))
+            if hasattr(container, "new_local"):
+                container.new_local(temp_name, metadata.air_type)
+            container.new_stid(temp_name, load_node)
+            carried_results.append(AIRValue(
+                node=None,
+                container=container,
+                shape=metadata.shape,
+                domain=metadata.domain,
+                temp_name=temp_name,
+                air_type=metadata.air_type,
+            ))
         else:
             carried_results.append(res)
     
@@ -328,9 +390,15 @@ def _if_execute_dynamic(
 
     # Create temporaries for merge results and seed with current values
     temp_names = []
+    merge_metadata = []
     for arg in yield_args:
         temp_name = _next_if_temp_name()
         temp_names.append(temp_name)
+        merge_metadata.append(arg if isinstance(arg, AIRValue) else None)
+        if isinstance(arg, AIRValue) and hasattr(container, "new_local"):
+            if arg.air_type is None:
+                raise TypeError("conditional yield requires AIR type metadata")
+            container.new_local(temp_name, arg.air_type)
         node = _to_node(arg)
         if node is not None:
             container.new_stid(temp_name, node)
@@ -339,9 +407,15 @@ def _if_execute_dynamic(
     pred_node = pred.value if isinstance(pred, AIRValue) else pred
     container.new_if_begin(pred_node)
     then_results = _normalize_results(then_block(*used_args, *yield_args))
+    if len(then_results) != len(temp_names):
+        raise ValueError("then branch result count does not match yield args")
     for idx, res in enumerate(then_results):
         if idx >= len(temp_names):
             break
+        if isinstance(merge_metadata[idx], AIRValue):
+            res = _validate_carried_air_value(
+                merge_metadata[idx], res, "conditional"
+            )
         node = _to_node(res)
         if node is not None:
             container.new_stid(temp_names[idx], node)
@@ -349,9 +423,15 @@ def _if_execute_dynamic(
     if else_block is not None:
         container.new_else()
         else_results = _normalize_results(else_block(*used_args, *yield_args))
+        if len(else_results) != len(temp_names):
+            raise ValueError("else branch result count does not match yield args")
         for idx, res in enumerate(else_results):
             if idx >= len(temp_names):
                 break
+            if isinstance(merge_metadata[idx], AIRValue):
+                res = _validate_carried_air_value(
+                    merge_metadata[idx], res, "conditional"
+                )
             node = _to_node(res)
             if node is not None:
                 container.new_stid(temp_names[idx], node)
@@ -361,10 +441,19 @@ def _if_execute_dynamic(
     if not hasattr(container, "new_ldid"):
         raise RuntimeError("Container missing new_ldid (rebuild bindings)")
 
-    merged_results = [
-        AIRValue(container.new_ldid(name), container)
-        for name in temp_names
-    ]
+    merged_results = []
+    for name, metadata in zip(temp_names, merge_metadata):
+        if isinstance(metadata, AIRValue):
+            merged_results.append(AIRValue(
+                node=None,
+                container=container,
+                shape=metadata.shape,
+                domain=metadata.domain,
+                temp_name=name,
+                air_type=metadata.air_type,
+            ))
+        else:
+            merged_results.append(AIRValue(container.new_ldid(name), container))
 
     return executor.converge_ret_val(merged_results)
 

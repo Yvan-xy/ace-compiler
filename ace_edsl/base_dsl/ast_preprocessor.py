@@ -269,6 +269,13 @@ class DSLPreprocessor(ast.NodeTransformer):
             try:
                 if globals:
                     called_function_pointer = globals.get(func_name)
+                    # Domain-kernel wrappers own their own preprocessing and,
+                    # critically, their lexical domain transition. Re-emitting
+                    # the wrapped function as an undecorated sibling here would
+                    # overwrite the wrapper in exec_globals and bypass operand
+                    # re-viewing for nested @vector_kernel calls.
+                    if getattr(called_function_pointer, "_py_domain", None):
+                        continue
                     self.file_name = globals.get("__file__", None)
                     combined_body += self.transform_function(
                         func_name, called_function_pointer, globals

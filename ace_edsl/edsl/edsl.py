@@ -13,6 +13,7 @@ IMPORTANT: We do NOT generate MLIR.
 """
 
 from typing import Any, Optional, Dict
+from contextlib import contextmanager
 import inspect
 import sys
 import os
@@ -84,6 +85,7 @@ class AceEDSL(BaseDSL):
         )
         self.no_cache = True
         self.current_domain = None  # Set by decorator
+        self._domain_stack = []
         self.current_air_module = None  # Store AIR module after generation
         self._ret_temp_counter = 0
         self._in_air_context = False  # Track if we're inside AIR generation
@@ -99,6 +101,46 @@ class AceEDSL(BaseDSL):
             if_dynamic=_if_execute_dynamic,
             while_dynamic=_while_execute_dynamic,
         )
+
+    @contextmanager
+    def _domain_scope(self, domain):
+        """Push a nested kernel domain and restore it even on failure."""
+        previous_domain = self.current_domain
+        self._domain_stack.append(domain)
+        self.current_domain = domain
+        from .domain_ast_decorators import set_current_domain
+        set_current_domain(domain)
+        try:
+            yield
+        finally:
+            self._domain_stack.pop()
+            self.current_domain = previous_domain
+            set_current_domain(previous_domain)
+
+    def _view_for_domain(self, value, domain):
+        """Recursively create non-mutating lexical views of AIR operands."""
+        if isinstance(value, AIRValue):
+            return value.view(domain)
+        if isinstance(value, list):
+            return [self._view_for_domain(item, domain) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._view_for_domain(item, domain) for item in value)
+        if isinstance(value, dict):
+            return {
+                key: self._view_for_domain(item, domain)
+                for key, item in value.items()
+            }
+        return value
+
+    @staticmethod
+    def _domain_for_air_type(air_type, default_domain):
+        if air_type is not None:
+            try:
+                if air_type.is_scalar():
+                    return "air::core"
+            except (AttributeError, RuntimeError):
+                pass
+        return default_domain
     
     def _kernel_helper(self, funcBody, *args, **kwargs):
         """
@@ -116,14 +158,29 @@ class AceEDSL(BaseDSL):
             original_funcBody = funcBody.dsl_object.funcBody
         
         domain = getattr(original_funcBody, '_py_domain', 'tensor')
+        previous_original = getattr(self, '_original_funcBody', None)
+
+        if self._in_air_context:
+            with self._domain_scope(domain):
+                self._original_funcBody = original_funcBody
+                try:
+                    viewed_args = self._view_for_domain(args, domain)
+                    viewed_kwargs = self._view_for_domain(kwargs, domain)
+                    result = self._func_air(
+                        funcBody, *viewed_args, **viewed_kwargs
+                    )
+                    return self._view_for_domain(result, domain)
+                finally:
+                    self._original_funcBody = previous_original
+
+        # Keep the top-level domain observable after generation, as before.
         self.current_domain = domain
-        
-        # Store original function for signature checking
         self._original_funcBody = original_funcBody
-        
-        # Execute function to generate AIR via operator overloading
-        # Similar to BaseDSL._func() but for AIR
-        return self._func_air(funcBody, *args, **kwargs)
+        try:
+            return self._func_air(funcBody, *args, **kwargs)
+        finally:
+            self._in_air_context = False
+            self._original_funcBody = previous_original
     
     def _func_air(self, funcBody, *args, **kwargs):
         """
@@ -187,6 +244,19 @@ class AceEDSL(BaseDSL):
                     kwonlydefaults=None,
                     annotations={}
                 )
+
+        # ``getfullargspec`` leaves postponed annotations as strings. Resolve
+        # them against the original function's globals before mapping them to
+        # AIR types so annotations such as ``Int[32]`` keep their exact width.
+        try:
+            resolved_annotations = inspect.get_annotations(
+                original_funcBody, eval_str=True
+            )
+        except (NameError, TypeError, ValueError) as exc:
+            raise TypeError(
+                f"Unable to resolve annotations for {function_name}: {exc}"
+            ) from exc
+        args_spec = args_spec._replace(annotations=resolved_annotations)
         
         # Use the actual funcBody (which may be preprocessed) for execution
         # But use original_funcBody for signature checking
@@ -290,8 +360,17 @@ class AceEDSL(BaseDSL):
                         "complex_len": len(runtime_arg),
                     }
                     continue  # Not a formal parameter
+                # An explicit annotation is authoritative. Runtime metadata is
+                # only a fallback for unannotated parameters.
                 air_type = None
-                if runtime_arg is not None:
+                if arg_type is not None:
+                    try:
+                        air_type = self._get_air_type_for_param(
+                            arg_type, self.current_domain
+                        )
+                    except Exception:
+                        air_type = None
+                if air_type is None and runtime_arg is not None:
                     try:
                         air_type = python_type_to_air_type(runtime_arg, self.current_domain)
                     except Exception:
@@ -310,55 +389,32 @@ class AceEDSL(BaseDSL):
                 except Exception:
                     ret_type = None
             if ret_type is None:
-                ret_type = air_builder.Type.make_array([64], air_builder.Type.make_float(32))
-
-            # Get type name for domain-specific function creation
-            # This is critical for FHE domains to register cipher types correctly
-            type_name = self._get_domain_type_name()
-            
-            # Get parameter shape from annotations or use default
-            param_shape = [64]  # Default shape
-            for arg_name in param_names:
-                arg_type = args_spec.annotations.get(arg_name, None)
-                if arg_type is not None:
-                    # Handle instance with shape attribute
-                    if hasattr(arg_type, '_shape') and isinstance(arg_type._shape, (list, tuple)):
-                        param_shape = list(arg_type._shape)
-                        break
-                    # Handle class type with shape property (need to instantiate)
-                    elif isinstance(arg_type, type):
-                        try:
-                            instance = arg_type()
-                            if hasattr(instance, '_shape') and instance._shape:
-                                param_shape = list(instance._shape)
-                                break
-                        except Exception:
-                            pass
-                    elif hasattr(arg_type, 'degree') and isinstance(arg_type.degree, int):
-                        param_shape = [arg_type.degree]
-                        break
-            
-            # Check if parameters have heterogeneous types (e.g., CIPHERTEXT and PLAINTEXT)
-            # If so, use new_func_with_param_types to preserve per-parameter types
-            has_heterogeneous_types = False
-            if len(param_types) > 1 and hasattr(glob_scope, "new_func_with_param_types"):
-                # Check if any parameter has a different type
-                # This is important for cipher+plaintext operations
-                first_type_str = str(param_types[0]) if param_types else ""
-                for pt in param_types[1:]:
-                    if str(pt) != first_type_str:
-                        has_heterogeneous_types = True
-                        break
-            
-            # Use new_func_with_param_types for heterogeneous parameter types
-            # Otherwise use new_func_with_type for FHE domains to register cipher types
-            if has_heterogeneous_types and hasattr(glob_scope, "new_func_with_param_types"):
-                func_scope = glob_scope.new_func_with_param_types(
-                    function_name, ret_type, param_types
+                # Preserve the historical unannotated-kernel convention: use
+                # the first formal type rather than silently fabricating a
+                # differently ranked [64] return.
+                ret_type = (
+                    param_types[0]
+                    if param_types
+                    else air_builder.Type.make_array(
+                        [64], air_builder.Type.make_float(32)
+                    )
                 )
-            elif type_name and hasattr(glob_scope, "new_func_with_type"):
+
+            # Preserve exact return and per-formal types, including ranked
+            # shapes and scalar widths. Marker types (cipher/plaintext) are
+            # resolved lazily by this API. Keep the established uniform
+            # ciphertext path because it also initializes the FHE lowering
+            # context expected by the CKKS driver.
+            uniform_ciphertext_signature = (
+                ret_type.to_string() == "CIPHERTEXT"
+                and all(
+                    param_type.to_string() == "CIPHERTEXT"
+                    for param_type in param_types
+                )
+            )
+            if uniform_ciphertext_signature:
                 func_scope = glob_scope.new_func_with_type(
-                    function_name, num_params, param_shape, type_name
+                    function_name, num_params, [64], "CIPHERTEXT"
                 )
             elif hasattr(glob_scope, "new_func_with_param_types"):
                 func_scope = glob_scope.new_func_with_param_types(
@@ -377,7 +433,7 @@ class AceEDSL(BaseDSL):
             
             # Set the current container for loop operations (used by _loop_execute_range_dynamic)
             from .domain_ast_decorators import set_current_container
-            set_current_container(container, func_scope)
+            set_current_container(container, func_scope, self.current_domain)
             
             # Execute function body - operator overloading generates AIR
             # Similar to BaseDSL.generate_original_ir() where funcBody(*ir_args, **kwargs) is called
@@ -417,6 +473,9 @@ class AceEDSL(BaseDSL):
                         ret_container = result.container or container
                         temp_name = f"__ret_tmp_{self._ret_temp_counter}"
                         self._ret_temp_counter += 1
+                        if (result.air_type is not None and
+                                hasattr(ret_container, "new_local")):
+                            ret_container.new_local(temp_name, result.air_type)
                         ret_node = ret_container.new_stid(temp_name, result.value)
                         ret_container.new_retv(ret_node)
                         log().debug(f"Returning AIRValue via temp '{temp_name}'")
@@ -430,7 +489,7 @@ class AceEDSL(BaseDSL):
                 raise RuntimeError(f"Error during AIR generation: {e}") from e
             finally:
                 # Clear the container reference
-                set_current_container(None, None)
+                set_current_container(None, None, None)
                 # Exit AIR generation context
                 self._in_air_context = False
             
@@ -538,21 +597,45 @@ class AceEDSL(BaseDSL):
                 ir_args.append(air_value)
                 continue
 
-            # Extract shape from runtime instance if available
-            shape = None
+            # An explicit ranked annotation is authoritative for both the AIR
+            # type and the wrapper metadata. Reject a conflicting runtime
+            # descriptor instead of constructing an internally inconsistent
+            # AIRValue.
+            annotation_shape = tuple(
+                getattr(arg_type, "_shape", ()) or ()
+            )
+            runtime_shape = None
             instance_name = None
-            if runtime_arg is not None and runtime_arg is not None:
+            if runtime_arg is not None:
                 # Check if it's a ciphertext/tensor instance with shape
                 if hasattr(runtime_arg, 'shape'):
-                    shape = runtime_arg.shape
+                    candidate_shape = runtime_arg.shape
+                    try:
+                        runtime_shape = tuple(candidate_shape)
+                    except TypeError:
+                        runtime_shape = None
                 if hasattr(runtime_arg, 'name') and runtime_arg.name:
                     instance_name = runtime_arg.name
                     log().debug(f"Using instance name '{instance_name}' for parameter '{arg_name}'")
+            if (annotation_shape and runtime_shape and
+                    annotation_shape != runtime_shape):
+                raise TypeError(
+                    f"Runtime shape {runtime_shape} for '{arg_name}' does not "
+                    f"match annotated shape {annotation_shape}"
+                )
+            shape = annotation_shape or runtime_shape
 
             # Create AIR parameter node
             # Map to AIR types based on domain, prefer runtime instance if provided
             air_type = None
-            if runtime_arg is not None:
+            if arg_type is not None:
+                try:
+                    air_type = self._get_air_type_for_param(
+                        arg_type, self.current_domain
+                    )
+                except Exception:
+                    air_type = None
+            if air_type is None and runtime_arg is not None:
                 try:
                     air_type = python_type_to_air_type(runtime_arg, self.current_domain)
                 except Exception:
@@ -560,6 +643,11 @@ class AceEDSL(BaseDSL):
             if air_type is None:
                 air_type = self._get_air_type_for_param(arg_type, self.current_domain)
             param_node = func_scope.new_param(arg_name, air_type)
+            formal_type = (
+                param_node.rtype()
+                if hasattr(param_node, "rtype")
+                else air_type
+            )
             
             # Wrap in AIRValue for operator overloading
             # Pass shape from instance if available
@@ -567,7 +655,10 @@ class AceEDSL(BaseDSL):
                 param_node, 
                 container, 
                 shape=shape,
-                domain=self.current_domain
+                domain=self._domain_for_air_type(
+                    formal_type, self.current_domain
+                ),
+                air_type=formal_type,
             )
             ir_args.append(air_value)
         
