@@ -20,6 +20,7 @@
 #include <memory>
 #include <sstream>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <set>
 #include <complex>
@@ -218,32 +219,69 @@ public:
     static Type make_int(int bits) { 
         ensure_air_initialized();
         GLOB_SCOPE* glob = active_binding_glob();
+        if (glob == nullptr) {
+            throw std::runtime_error(
+                "integer type creation requires an active GLOB_SCOPE");
+        }
         TYPE_PTR t;
-        if (bits == 32) t = glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
+        if (bits == 1) t = glob->Prim_type(PRIMITIVE_TYPE::BOOL);
+        else if (bits == 8) t = glob->Prim_type(PRIMITIVE_TYPE::INT_S8);
+        else if (bits == 16) t = glob->Prim_type(PRIMITIVE_TYPE::INT_S16);
+        else if (bits == 32) t = glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
         else if (bits == 64) t = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
-        else t = glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
+        else throw std::runtime_error(
+            "integer type width must be one of 1, 8, 16, 32, or 64 bits");
         return Type(t, "i" + std::to_string(bits));
     }
     
     static Type make_float(int bits) { 
         ensure_air_initialized();
         GLOB_SCOPE* glob = active_binding_glob();
+        if (glob == nullptr) {
+            throw std::runtime_error(
+                "floating type creation requires an active GLOB_SCOPE");
+        }
         TYPE_PTR t;
         if (bits == 32) t = glob->Prim_type(PRIMITIVE_TYPE::FLOAT_32);
         else if (bits == 64) t = glob->Prim_type(PRIMITIVE_TYPE::FLOAT_64);
-        else t = glob->Prim_type(PRIMITIVE_TYPE::FLOAT_32);
+        else throw std::runtime_error(
+            "floating type width must be either 32 or 64 bits");
         return Type(t, "f" + std::to_string(bits));
     }
-    
-    static Type make_array(const std::vector<int>& shape, Type elem) {
-        ensure_air_initialized();
-        GLOB_SCOPE* glob = active_binding_glob();
+
+    static Type make_array_in_glob(GLOB_SCOPE* glob,
+                                   const std::vector<int>& shape,
+                                   const Type& elem) {
+        if (glob == nullptr) {
+            throw std::runtime_error(
+                "array type creation requires an active GLOB_SCOPE");
+        }
+        if (shape.empty()) {
+            throw std::runtime_error(
+                "ranked array type requires at least one dimension");
+        }
+        for (int dim : shape) {
+            if (dim <= 0) {
+                throw std::runtime_error(
+                    "ranked array dimensions must be positive");
+            }
+        }
+        if (!elem.has_type || elem.type == Null_ptr ||
+            &elem.type->Glob_scope() != glob) {
+            throw std::runtime_error(
+                "array element type belongs to a different GLOB_SCOPE");
+        }
         SPOS spos = glob->Unknown_simple_spos();
         std::vector<int64_t> dims;
         for (int s : shape) dims.push_back(static_cast<int64_t>(s));
         STR_PTR type_name = glob->New_str("array");
         TYPE_PTR arr_type = glob->New_arr_type(type_name, elem.type, dims, spos);
         return Type(arr_type, "array", shape);
+    }
+
+    static Type make_array(const std::vector<int>& shape, Type elem) {
+        ensure_air_initialized();
+        return make_array_in_glob(active_binding_glob(), shape, elem);
     }
     
     static Type make_ciphertext(const std::string& domain = "sihe") {
@@ -267,12 +305,106 @@ public:
     static Type make_polynomial(int degree = 4096) {
         ensure_air_initialized();
         GLOB_SCOPE* glob = active_binding_glob();
+        if (glob == nullptr) {
+            throw std::runtime_error(
+                "polynomial type creation requires an active GLOB_SCOPE");
+        }
         SPOS spos = glob->Unknown_simple_spos();
         TYPE_PTR elem_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
         std::vector<int64_t> dims = {static_cast<int64_t>(degree)};
         STR_PTR type_name = glob->New_str("polynomial");
         TYPE_PTR arr_type = glob->New_arr_type(type_name, elem_type, dims, spos);
         return Type(arr_type, "polynomial", {degree});
+    }
+
+    static Type from_air_type(TYPE_PTR air_type) {
+        if (air_type == Null_ptr) return make_void();
+
+        std::string type_name = air_type->Type_kind_name();
+        std::vector<int> type_shape;
+        if (air_type->Is_prim()) {
+            switch (air_type->Cast_to_prim()->Encoding()) {
+                case PRIMITIVE_TYPE::BOOL: type_name = "bool"; break;
+                case PRIMITIVE_TYPE::INT_S8: type_name = "i8"; break;
+                case PRIMITIVE_TYPE::INT_S16: type_name = "i16"; break;
+                case PRIMITIVE_TYPE::INT_S32: type_name = "i32"; break;
+                case PRIMITIVE_TYPE::INT_S64: type_name = "i64"; break;
+                case PRIMITIVE_TYPE::INT_U8: type_name = "u8"; break;
+                case PRIMITIVE_TYPE::INT_U16: type_name = "u16"; break;
+                case PRIMITIVE_TYPE::INT_U32: type_name = "u32"; break;
+                case PRIMITIVE_TYPE::INT_U64: type_name = "u64"; break;
+                case PRIMITIVE_TYPE::FLOAT_32: type_name = "f32"; break;
+                case PRIMITIVE_TYPE::FLOAT_64: type_name = "f64"; break;
+                default: break;
+            }
+        } else if (air_type->Is_array()) {
+            type_name = "array";
+            for (int64_t dim : air_type->Cast_to_arr()->Shape()) {
+                type_shape.push_back(static_cast<int>(dim));
+            }
+        } else if (air_type->Name() != Null_ptr) {
+            type_name = air_type->Name()->Char_str();
+        }
+        return Type(air_type, type_name, type_shape);
+    }
+
+    static bool structurally_equal_air_types(CONST_TYPE_PTR lhs,
+                                             CONST_TYPE_PTR rhs) {
+        if (lhs == Null_ptr || rhs == Null_ptr) return lhs == rhs;
+        if (lhs->Kind() != rhs->Kind()) return false;
+        if (lhs->Is_prim()) {
+            return lhs->Cast_to_prim()->Encoding() ==
+                   rhs->Cast_to_prim()->Encoding();
+        }
+        if (lhs->Is_array()) {
+            CONST_ARRAY_TYPE_PTR lhs_array = lhs->Cast_to_arr();
+            CONST_ARRAY_TYPE_PTR rhs_array = rhs->Cast_to_arr();
+            return lhs_array->Shape() == rhs_array->Shape() &&
+                   structurally_equal_air_types(lhs_array->Elem_type(),
+                                                rhs_array->Elem_type());
+        }
+        if (&lhs->Glob_scope() == &rhs->Glob_scope()) {
+            return lhs->Is_compatible_type(rhs);
+        }
+        // Ranked arrays and primitive leaves are compared recursively above.
+        // Other aggregate types require a shared symbol/type owner; equal
+        // names across independent scopes are not structural proof.
+        return false;
+    }
+
+    bool structurally_equal(const Type& other) const {
+        if (!has_type || !other.has_type) {
+            return has_type == other.has_type && name == other.name &&
+                   shape == other.shape;
+        }
+        return structurally_equal_air_types(type, other.type);
+    }
+
+    bool same_scope(const Type& other) const {
+        return has_type && other.has_type &&
+               &type->Glob_scope() == &other.type->Glob_scope();
+    }
+
+    bool is_integer() const { return has_type && type->Is_int(); }
+    bool is_float() const { return has_type && type->Is_float(); }
+    bool is_scalar() const { return has_type && type->Is_scalar(); }
+
+    int bit_width() const {
+        if (!has_type || !type->Is_prim()) return 0;
+        switch (type->Cast_to_prim()->Encoding()) {
+            case PRIMITIVE_TYPE::BOOL: return 1;
+            case PRIMITIVE_TYPE::INT_S8:
+            case PRIMITIVE_TYPE::INT_U8: return 8;
+            case PRIMITIVE_TYPE::INT_S16:
+            case PRIMITIVE_TYPE::INT_U16: return 16;
+            case PRIMITIVE_TYPE::INT_S32:
+            case PRIMITIVE_TYPE::INT_U32:
+            case PRIMITIVE_TYPE::FLOAT_32: return 32;
+            case PRIMITIVE_TYPE::INT_S64:
+            case PRIMITIVE_TYPE::INT_U64:
+            case PRIMITIVE_TYPE::FLOAT_64: return 64;
+            default: return static_cast<int>(type->Bit_size());
+        }
     }
     
     std::string to_string() const { return name; }
@@ -298,6 +430,13 @@ public:
     std::string name() const { return "%" + std::to_string(id); }
     std::string opcode_name() const { return opcode_str; }
     bool is_valid() const { return has_node; }
+
+    Type rtype() const {
+        if (!has_node || node == NODE_PTR() || !node->Has_rtype()) {
+            return Type::make_void();
+        }
+        return Type::from_air_type(node->Rtype());
+    }
     
     void add_child(std::shared_ptr<Node> child) { children.push_back(child); }
     
@@ -386,23 +525,53 @@ public:
     // Helper to get type from container's glob_scope by type ID
     TYPE_PTR get_compatible_type(TYPE_PTR src_type) {
         if (src_type == air::base::Null_ptr) return src_type;
-        // Get type from container's glob_scope by ID
-        // This ensures we use types from the correct scope
-        GLOB_SCOPE* glob = container->Glob_scope();
-        TYPE_ID tid = src_type->Id();
-        // Try to find the type in the container's glob_scope
-        TYPE_PTR local_type = glob->Type(tid);
-        if (local_type != air::base::Null_ptr) {
-            return local_type;
+        GLOB_SCOPE* container_glob = container->Glob_scope();
+        if (&src_type->Glob_scope() != container_glob) {
+            throw std::runtime_error(
+                "AIR type belongs to a different GLOB_SCOPE");
         }
-        // Fallback to original type
         return src_type;
     }
 
-    std::shared_ptr<Node> new_add(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
-        if (!container || !a->has_node || !b->has_node) {
-            throw std::runtime_error("new_add requires real container and operands");
+    void require_compatible_operands(const std::shared_ptr<Node>& a,
+                                     const std::shared_ptr<Node>& b,
+                                     const char* operation,
+                                     bool require_integer = false,
+                                     bool require_scalar = false) {
+        if (!container || !a || !b || !a->has_node || !b->has_node ||
+            a->node == NODE_PTR() || b->node == NODE_PTR()) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires real AIR operands");
         }
+        if (a->node->Container() != container ||
+            b->node->Container() != container) {
+            throw std::runtime_error(std::string(operation) +
+                                     " cannot mix AIR containers");
+        }
+        if (!a->node->Has_rtype() || !b->node->Has_rtype()) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires expression operands with result types");
+        }
+        TYPE_PTR lhs_type = get_compatible_type(a->node->Rtype());
+        TYPE_PTR rhs_type = get_compatible_type(b->node->Rtype());
+        if (!lhs_type->Is_compatible_type(rhs_type)) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires structurally compatible operands");
+        }
+        if (require_scalar &&
+            (!lhs_type->Is_scalar() || !rhs_type->Is_scalar())) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires scalar operands");
+        }
+        if (require_integer &&
+            (!lhs_type->Is_signed_int() || !rhs_type->Is_signed_int())) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires signed integer operands");
+        }
+    }
+
+    std::shared_ptr<Node> new_add(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_compatible_operands(a, b, "new_add");
         OPCODE op(air::core::CORE, air::core::OPCODE::ADD);
         TYPE_PTR rtype = get_compatible_type(a->node->Rtype());
         NODE_PTR n = container->New_bin_arith(op, rtype, a->node, b->node, get_spos());
@@ -411,11 +580,15 @@ public:
         node->add_child(b);
         return node;
     }
+
+    std::shared_ptr<Node> new_core_add(std::shared_ptr<Node> a,
+                                       std::shared_ptr<Node> b) {
+        require_compatible_operands(a, b, "new_core_add", false, true);
+        return new_add(a, b);
+    }
     
     std::shared_ptr<Node> new_sub(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
-        if (!container || !a->has_node || !b->has_node) {
-            throw std::runtime_error("new_sub requires real container and operands");
-        }
+        require_compatible_operands(a, b, "new_sub");
         OPCODE op(air::core::CORE, air::core::OPCODE::SUB);
         TYPE_PTR rtype = get_compatible_type(a->node->Rtype());
         NODE_PTR n = container->New_bin_arith(op, rtype, a->node, b->node, get_spos());
@@ -426,13 +599,43 @@ public:
     }
     
     std::shared_ptr<Node> new_mul(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
-        if (!container || !a->has_node || !b->has_node) {
-            throw std::runtime_error("new_mul requires real container and operands");
-        }
+        require_compatible_operands(a, b, "new_mul");
         OPCODE op(air::core::CORE, air::core::OPCODE::MUL);
         TYPE_PTR rtype = get_compatible_type(a->node->Rtype());
         NODE_PTR n = container->New_bin_arith(op, rtype, a->node, b->node, get_spos());
         auto node = wrap_node(n, "air::core::MUL");
+        node->add_child(a);
+        node->add_child(b);
+        return node;
+    }
+
+    std::shared_ptr<Node> new_core_mul(std::shared_ptr<Node> a,
+                                       std::shared_ptr<Node> b) {
+        require_compatible_operands(a, b, "new_core_mul", false, true);
+        return new_mul(a, b);
+    }
+
+    std::shared_ptr<Node> new_shl(std::shared_ptr<Node> a,
+                                  std::shared_ptr<Node> b) {
+        require_compatible_operands(a, b, "new_shl", true);
+        OPCODE op(air::core::CORE, air::core::OPCODE::SHL);
+        TYPE_PTR rtype = get_compatible_type(a->node->Rtype());
+        NODE_PTR n = container->New_bin_arith(
+            op, rtype, a->node, b->node, get_spos());
+        auto node = wrap_node(n, "air::core::SHL");
+        node->add_child(a);
+        node->add_child(b);
+        return node;
+    }
+
+    std::shared_ptr<Node> new_core_lt(std::shared_ptr<Node> a,
+                                      std::shared_ptr<Node> b) {
+        require_compatible_operands(a, b, "new_core_lt", true);
+        OPCODE op(air::core::CORE, air::core::OPCODE::LT);
+        TYPE_PTR rtype = get_compatible_type(a->node->Rtype());
+        NODE_PTR n = container->New_bin_arith(
+            op, rtype, a->node, b->node, get_spos());
+        auto node = wrap_node(n, "air::core::LT");
         node->add_child(a);
         node->add_child(b);
         return node;
@@ -1319,17 +1522,20 @@ public:
     }
     
     std::shared_ptr<Node> new_retv(std::shared_ptr<Node> val) {
-        if (container && val->has_node) {
+        if (container && val && val->has_node &&
+            val->node != NODE_PTR() && val->node->Has_rtype()) {
+            if (val->node->Container() != container) {
+                throw std::runtime_error(
+                    "new_retv cannot return a value from another AIR container");
+            }
             STMT_PTR stmt = container->New_retv(val->node, get_spos());
             append_stmt(stmt);
             auto node = wrap_node(stmt->Node(), "air::core::RETV");
             node->add_child(val);
             return node;
         }
-        auto node = std::make_shared<Node>(++node_counter, "air::core::RETV");
-        node->add_child(val);
-        nodes.push_back(node);
-        return node;
+        throw std::runtime_error(
+            "new_retv requires an expression value with a result type");
     }
     
     std::shared_ptr<Node> new_ret() {
@@ -1342,19 +1548,60 @@ public:
         nodes.push_back(node);
         return node;
     }
+
+    TYPE_PTR require_local_type(const Type& requested,
+                                const char* operation) const {
+        if (!requested.has_type || requested.type == Null_ptr) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires a concrete AIR type");
+        }
+        if (!glob || &requested.type->Glob_scope() != glob) {
+            throw std::runtime_error(std::string(operation) +
+                                     " type belongs to a different GLOB_SCOPE");
+        }
+        return requested.type;
+    }
+
+    // Declare a named local with an explicit type and return a load of it.
+    std::shared_ptr<Node> new_local(const std::string& var_name,
+                                    const Type& requested_type) {
+        if (!(container && func_scope)) {
+            throw std::runtime_error("new_local requires a real function scope");
+        }
+        TYPE_PTR type = require_local_type(requested_type, "new_local");
+        auto it = var_map.find(var_name);
+        ADDR_DATUM_PTR var;
+        if (it != var_map.end()) {
+            var = it->second;
+            if (!var->Type()->Is_compatible_type(type)) {
+                throw std::runtime_error(
+                    "new_local redeclaration has an incompatible type: " +
+                    var_name);
+            }
+        } else {
+            var = func_scope->New_var(type, var_name.c_str(), get_spos());
+            var_map[var_name] = var;
+        }
+        return wrap_node(container->New_ld(var, get_spos()),
+                         "air::core::LDID");
+    }
     
     // Store value to a variable (creates a statement in current block)
     // var_node should be a load node for the target variable
     std::shared_ptr<Node> new_stid(const std::string& var_name, std::shared_ptr<Node> val) {
-        if (!(container && func_scope && val->has_node)) {
+        if (!(container && func_scope) || !val || !val->has_node ||
+            val->node == NODE_PTR()) {
             throw std::runtime_error("new_stid requires real container and value");
         }
-        // Get type from the value's result type, default to float32
-        TYPE_PTR type = glob->Prim_type(PRIMITIVE_TYPE::FLOAT_32);
-        TYPE_ID rtype_id = val->node->Rtype_id();
-        if (rtype_id != TYPE_ID()) {
-            type = glob->Type(rtype_id);
+        if (val->node->Container() != container) {
+            throw std::runtime_error(
+                "new_stid cannot store a value from another AIR container");
         }
+        if (!val->node->Has_rtype()) {
+            throw std::runtime_error(
+                "new_stid requires an expression value with a result type");
+        }
+        TYPE_PTR type = get_compatible_type(val->node->Rtype());
         
         // Inherit source position from the value node to preserve line info
         SPOS val_spos = val->node->Spos();
@@ -1364,6 +1611,11 @@ public:
         auto it = var_map.find(var_name);
         if (it != var_map.end()) {
             var = it->second;
+            if (!var->Type()->Is_compatible_type(type)) {
+                throw std::runtime_error(
+                    "new_stid value type is incompatible with local '" +
+                    var_name + "'");
+            }
         } else {
             var = func_scope->New_var(type, var_name.c_str(), val_spos);
             var_map[var_name] = var;
@@ -1410,6 +1662,25 @@ public:
         return node;
     }
 
+    std::shared_ptr<Node> new_intconst_typed(int64_t val,
+                                             const Type& requested_type) {
+        TYPE_PTR type = require_local_type(requested_type,
+                                           "new_intconst_typed");
+        if (!type->Is_signed_int()) {
+            throw std::runtime_error(
+                "new_intconst_typed requires a signed integer type");
+        }
+        if (type->Is_prim() &&
+            type->Cast_to_prim()->Encoding() == PRIMITIVE_TYPE::INT_S32 &&
+            (val < std::numeric_limits<int32_t>::min() ||
+             val > std::numeric_limits<int32_t>::max())) {
+            throw std::runtime_error(
+                "new_intconst_typed value is out of range for signed i32");
+        }
+        NODE_PTR n = container->New_intconst(type, val, get_spos());
+        return wrap_node(n, "air::core::INTCONST");
+    }
+
     std::shared_ptr<Node> new_floatconst(double val) {
         if (container && glob) {
             TYPE_PTR f64_type = glob->Prim_type(PRIMITIVE_TYPE::FLOAT_64);
@@ -1422,9 +1693,53 @@ public:
         nodes.push_back(node);
         return node;
     }
+
+    std::shared_ptr<Node> new_floatconst_typed(
+        double val, const Type& requested_type) {
+        TYPE_PTR type = require_local_type(requested_type,
+                                           "new_floatconst_typed");
+        if (!type->Is_real_float()) {
+            throw std::runtime_error(
+                "new_floatconst_typed requires a real floating-point type");
+        }
+        CONSTANT_PTR cst = glob->New_const(
+            CONSTANT_KIND::FLOAT, type, static_cast<long double>(val));
+        NODE_PTR n = container->New_ldc(cst, get_spos());
+        return wrap_node(n, "air::core::LDC");
+    }
     
     std::shared_ptr<Node> new_zero() { return new_intconst(0); }
+    std::shared_ptr<Node> new_zero(const Type& requested_type) {
+        TYPE_PTR type = require_local_type(requested_type, "new_zero");
+        if (type->Is_int()) {
+            NODE_PTR n = container->New_intconst(type, 0, get_spos());
+            return wrap_node(n, "air::core::INTCONST");
+        }
+        NODE_PTR n = container->New_zero(type, get_spos());
+        return wrap_node(n, "air::core::ZERO");
+    }
     std::shared_ptr<Node> new_one() { return new_intconst(1); }
+
+    std::shared_ptr<Node> new_checked_cast(std::shared_ptr<Node> value,
+                                           const Type& requested_type) {
+        if (!value || !value->has_node || value->node == NODE_PTR() ||
+            value->node->Container() != container) {
+            throw std::runtime_error(
+                "new_checked_cast requires a value in the current container");
+        }
+        if (!value->node->Has_rtype()) {
+            throw std::runtime_error(
+                "new_checked_cast requires an expression value with a result type");
+        }
+        TYPE_PTR type = require_local_type(requested_type,
+                                           "new_checked_cast");
+        if (!value->node->Rtype()->Is_compatible_type(type)) {
+            throw std::runtime_error(
+                "AIR Core has no width-conversion opcode; checked cast requires "
+                "an already compatible type");
+        }
+        return value;
+    }
     
     // Create an LDC node referencing a CONSTANT_KIND::ARRAY constant.
     // Accepts:
@@ -1666,28 +1981,82 @@ public:
         int64_t loop_end;        // Loop end value
         NODE_PTR loop_start_node; // Dynamic loop start value, if any
         NODE_PTR loop_end_node;   // Dynamic loop end value, if any
+        TYPE_PTR loop_type;       // Signed integer type shared by IV/bounds
         bool has_dynamic_start;   // Whether loop_start_node is used
         bool has_dynamic_end;     // Whether loop_end_node is used
         std::string type;        // "if" or "loop"
     };
     std::vector<ControlFlowFrame> cf_stack;
+
+    TYPE_PTR signed_loop_type(int bit_width) const {
+        if (!glob) return Null_ptr;
+        if (bit_width == 32) {
+            return glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
+        }
+        if (bit_width == 64) {
+            return glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+        }
+        throw std::runtime_error(
+            "range_dynamic supports only signed 32-bit or 64-bit indices");
+    }
+
+    void require_loop_literal(int64_t value, int bit_width,
+                              const char* operation) const {
+        if (bit_width == 32 &&
+            (value < std::numeric_limits<int32_t>::min() ||
+             value > std::numeric_limits<int32_t>::max())) {
+            throw std::runtime_error(
+                std::string(operation) +
+                " literal is out of range for a signed 32-bit loop index");
+        }
+    }
+
+    void require_loop_bound_type(NODE_PTR bound, TYPE_PTR loop_type,
+                                 const char* operation) const {
+        if (bound == NODE_PTR() || loop_type == Null_ptr) {
+            throw std::runtime_error(
+                std::string(operation) + " requires a real AIR bound");
+        }
+        if (bound->Container() != container) {
+            throw std::runtime_error(
+                std::string(operation) +
+                " bound belongs to a different AIR container");
+        }
+        if (!bound->Has_rtype()) {
+            throw std::runtime_error(
+                std::string(operation) +
+                " bound must be an expression with a result type");
+        }
+        if (
+            !bound->Rtype()->Is_signed_int() ||
+            !bound->Rtype()->Is_compatible_type(loop_type)) {
+            throw std::runtime_error(
+                std::string(operation) +
+                " bound must have the requested signed integer width; "
+                "use a matching Int annotation (AIR Core has no width-conversion opcode)");
+        }
+    }
     
     // Create a do_loop for range(start, end)
-    std::shared_ptr<Node> new_loop_begin_range(int64_t start, int64_t end) {
+    std::shared_ptr<Node> new_loop_begin_range(int64_t start, int64_t end,
+                                               int bit_width = 64) {
+        require_loop_literal(start, bit_width, "range_dynamic start");
+        require_loop_literal(end, bit_width, "range_dynamic end");
         ControlFlowFrame frame;
         frame.type = "loop";
         frame.loop_start = start;
         frame.loop_end = end;
         frame.loop_start_node = NODE_PTR();
         frame.loop_end_node = NODE_PTR();
+        frame.loop_type = signed_loop_type(bit_width);
         frame.has_dynamic_start = false;
         frame.has_dynamic_end = false;
         
         if (container && glob && func_scope) {
             // Create induction variable
-            PRIM_TYPE_PTR i64_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
             std::string iv_name = "_iv_" + std::to_string(node_counter);
-            ADDR_DATUM_PTR iv = func_scope->New_var(i64_type, iv_name.c_str(), get_spos());
+            ADDR_DATUM_PTR iv = func_scope->New_var(
+                frame.loop_type, iv_name.c_str(), get_spos());
             frame.loop_iv = iv;
             
             // Create loop body block
@@ -1705,13 +2074,15 @@ public:
 
     // Create a do_loop for range(constant_start, dynamic_end), with unit step.
     std::shared_ptr<Node> new_loop_begin_range_dynamic(
-        int64_t start, std::shared_ptr<Node> end) {
+        int64_t start, std::shared_ptr<Node> end, int bit_width = 64) {
+        require_loop_literal(start, bit_width, "range_dynamic start");
         ControlFlowFrame frame;
         frame.type = "loop";
         frame.loop_start = start;
         frame.loop_end = 0;
         frame.loop_start_node = NODE_PTR();
         frame.loop_end_node = NODE_PTR();
+        frame.loop_type = signed_loop_type(bit_width);
         frame.has_dynamic_start = false;
         frame.has_dynamic_end = false;
 
@@ -1725,11 +2096,13 @@ public:
                 throw std::runtime_error(
                     "new_loop_begin_range_dynamic requires a real AIR node for end");
             }
+            require_loop_bound_type(frame.loop_end_node, frame.loop_type,
+                                    "new_loop_begin_range_dynamic");
 
             // Create induction variable
-            PRIM_TYPE_PTR i64_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
             std::string iv_name = "_iv_" + std::to_string(node_counter);
-            ADDR_DATUM_PTR iv = func_scope->New_var(i64_type, iv_name.c_str(), get_spos());
+            ADDR_DATUM_PTR iv = func_scope->New_var(
+                frame.loop_type, iv_name.c_str(), get_spos());
             frame.loop_iv = iv;
 
             // Create loop body block
@@ -1750,13 +2123,15 @@ public:
 
     // Create a do_loop for range(dynamic_start, constant_end), with unit step.
     std::shared_ptr<Node> new_loop_begin_range_dynamic_start(
-        std::shared_ptr<Node> start, int64_t end) {
+        std::shared_ptr<Node> start, int64_t end, int bit_width = 64) {
+        require_loop_literal(end, bit_width, "range_dynamic end");
         ControlFlowFrame frame;
         frame.type = "loop";
         frame.loop_start = 0;
         frame.loop_end = end;
         frame.loop_start_node = NODE_PTR();
         frame.loop_end_node = NODE_PTR();
+        frame.loop_type = signed_loop_type(bit_width);
         frame.has_dynamic_start = false;
         frame.has_dynamic_end = false;
 
@@ -1770,10 +2145,12 @@ public:
                 throw std::runtime_error(
                     "new_loop_begin_range_dynamic_start requires a real AIR node for start");
             }
+            require_loop_bound_type(frame.loop_start_node, frame.loop_type,
+                                    "new_loop_begin_range_dynamic_start");
 
-            PRIM_TYPE_PTR i64_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
             std::string iv_name = "_iv_" + std::to_string(node_counter);
-            ADDR_DATUM_PTR iv = func_scope->New_var(i64_type, iv_name.c_str(), get_spos());
+            ADDR_DATUM_PTR iv = func_scope->New_var(
+                frame.loop_type, iv_name.c_str(), get_spos());
             frame.loop_iv = iv;
 
             frame.loop_body = container->New_stmt_block(get_spos());
@@ -1791,13 +2168,15 @@ public:
 
     // Create a do_loop for range(dynamic_start, dynamic_end), with unit step.
     std::shared_ptr<Node> new_loop_begin_range_dynamic_bounds(
-        std::shared_ptr<Node> start, std::shared_ptr<Node> end) {
+        std::shared_ptr<Node> start, std::shared_ptr<Node> end,
+        int bit_width = 64) {
         ControlFlowFrame frame;
         frame.type = "loop";
         frame.loop_start = 0;
         frame.loop_end = 0;
         frame.loop_start_node = NODE_PTR();
         frame.loop_end_node = NODE_PTR();
+        frame.loop_type = signed_loop_type(bit_width);
         frame.has_dynamic_start = false;
         frame.has_dynamic_end = false;
 
@@ -1815,10 +2194,14 @@ public:
                 throw std::runtime_error(
                     "new_loop_begin_range_dynamic_bounds requires real AIR nodes for start and end");
             }
+            require_loop_bound_type(frame.loop_start_node, frame.loop_type,
+                                    "new_loop_begin_range_dynamic_bounds");
+            require_loop_bound_type(frame.loop_end_node, frame.loop_type,
+                                    "new_loop_begin_range_dynamic_bounds");
 
-            PRIM_TYPE_PTR i64_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
             std::string iv_name = "_iv_" + std::to_string(node_counter);
-            ADDR_DATUM_PTR iv = func_scope->New_var(i64_type, iv_name.c_str(), get_spos());
+            ADDR_DATUM_PTR iv = func_scope->New_var(
+                frame.loop_type, iv_name.c_str(), get_spos());
             frame.loop_iv = iv;
 
             frame.loop_body = container->New_stmt_block(get_spos());
@@ -1845,13 +2228,17 @@ public:
         frame.loop_end = 10;  // Default
         frame.loop_start_node = NODE_PTR();
         frame.loop_end_node = NODE_PTR();
+        frame.loop_type = TYPE_PTR();
+        if (glob) {
+            frame.loop_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+        }
         frame.has_dynamic_start = false;
         frame.has_dynamic_end = false;
         
         if (container && glob && func_scope) {
-            PRIM_TYPE_PTR i64_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
             std::string iv_name = "_iv_" + std::to_string(node_counter);
-            ADDR_DATUM_PTR iv = func_scope->New_var(i64_type, iv_name.c_str(), get_spos());
+            ADDR_DATUM_PTR iv = func_scope->New_var(
+                frame.loop_type, iv_name.c_str(), get_spos());
             frame.loop_iv = iv;
             frame.loop_body = container->New_stmt_block(get_spos());
             
@@ -1901,22 +2288,21 @@ public:
                 NODE_PTR init = frame.has_dynamic_start
                     ? frame.loop_start_node
                     : container->New_intconst(
-                        glob->Prim_type(PRIMITIVE_TYPE::INT_S64),
-                        frame.loop_start, get_spos());
+                        frame.loop_type, frame.loop_start, get_spos());
                 
                 // Create comparison: iv < loop_end
                 NODE_PTR ld_iv = container->New_ld(frame.loop_iv, get_spos());
                 NODE_PTR end_val = frame.has_dynamic_end
                     ? frame.loop_end_node
                     : container->New_intconst(
-                        glob->Prim_type(PRIMITIVE_TYPE::INT_S64), frame.loop_end, get_spos());
+                        frame.loop_type, frame.loop_end, get_spos());
                 OPCODE lt_op(air::core::CORE, air::core::OPCODE::LT);
                 NODE_PTR comp = container->New_bin_arith(lt_op, ld_iv->Rtype(), ld_iv, end_val, get_spos());
                 
                 // Create increment: iv + 1
                 NODE_PTR ld_iv2 = container->New_ld(frame.loop_iv, get_spos());
                 NODE_PTR one = container->New_intconst(
-                    glob->Prim_type(PRIMITIVE_TYPE::INT_S64), 1, get_spos());
+                    frame.loop_type, 1, get_spos());
                 OPCODE add_op(air::core::CORE, air::core::OPCODE::ADD);
                 NODE_PTR incr = container->New_bin_arith(add_op, ld_iv2->Rtype(), ld_iv2, one, get_spos());
                 
@@ -2206,13 +2592,18 @@ public:
     std::vector<std::shared_ptr<Node>> params;
     Container container;
     std::vector<ADDR_DATUM_PTR> formal_params;
+    bool strict_param_types;
     
-    FuncScope(const std::string& n) : name(n), func_scope(nullptr), glob(nullptr) {}
+    FuncScope(const std::string& n)
+        : name(n), func_scope(nullptr), glob(nullptr),
+          strict_param_types(false) {}
     
     FuncScope(const std::string& n, FUNC_SCOPE* fs, GLOB_SCOPE* g,
-              const std::vector<ADDR_DATUM_PTR>& formals) 
+              const std::vector<ADDR_DATUM_PTR>& formals,
+              bool strict_types = false)
         : name(n), func_scope(fs), glob(g),
-          container(&fs->Container(), fs, g), formal_params(formals) {}
+          container(&fs->Container(), fs, g), formal_params(formals),
+          strict_param_types(strict_types) {}
     
     // Get parameter - loads from formal that was set up during function creation
     std::shared_ptr<Node> new_param(const std::string& param_name, Type type) {
@@ -2220,6 +2611,19 @@ public:
         
         if (func_scope && glob && idx < formal_params.size()) {
             ADDR_DATUM_PTR formal = formal_params[idx];
+            if (type.has_type) {
+                if (type.type == Null_ptr || &type.type->Glob_scope() != glob) {
+                    throw std::runtime_error(
+                        "new_param type belongs to a different GLOB_SCOPE: " +
+                        param_name);
+                }
+                if (strict_param_types &&
+                    !formal->Type()->Is_compatible_type(type.type)) {
+                    throw std::runtime_error(
+                        "new_param type does not match the function signature: " +
+                        param_name);
+                }
+            }
             NODE_PTR ld_node = func_scope->Container().New_ld(formal, 
                 glob->Unknown_simple_spos());
             auto node = std::make_shared<Node>(ld_node, container.node_counter++, "PARAM");
@@ -2310,10 +2714,6 @@ public:
         const Type& ret_type,
         const std::vector<Type>& param_types) {
 
-        // Ensure CKKS types (CIPHERTEXT3) exist so cipher×cipher muls get correct result type during tracing
-        ensure_lower_ctx();
-        ensure_fhe_types_registered();
-
         SPOS spos = glob->Unknown_simple_spos();
         STR_PTR func_str = glob->New_str(name.c_str());
         FUNC_PTR func = glob->New_func(func_str, spos);
@@ -2337,6 +2737,10 @@ public:
 
             // Check for has_type
             if (t.has_type) {
+                if (t.type == Null_ptr || &t.type->Glob_scope() != glob) {
+                    throw std::runtime_error(
+                        "function signature type belongs to a different GLOB_SCOPE");
+                }
                 return t.type;
             }
 
@@ -2370,7 +2774,8 @@ public:
             formals.push_back(func_scope->Formal(static_cast<uint32_t>(i)));
         }
 
-        auto fs = std::make_shared<FuncScope>(name, func_scope, glob, formals);
+        auto fs = std::make_shared<FuncScope>(name, func_scope, glob, formals,
+                                              true);
         functions.push_back(fs);
         return fs;
     }
@@ -2461,7 +2866,7 @@ public:
     }
     
     Type new_array_type(const std::vector<int>& shape, const std::string& elem = "f32") {
-        return Type::make_array(shape, get_type(elem));
+        return Type::make_array_in_glob(glob, shape, get_type(elem));
     }
     
     std::string dump() const {
@@ -3635,6 +4040,7 @@ public:
     }
     
     bool has_native_ir() const { return glob != nullptr; }
+    bool verify_ir() const { return glob != nullptr && glob->Verify_ir(); }
     
 public:
     // For external access by run_ckks_driver wrapper
@@ -5343,12 +5749,20 @@ PYBIND11_MODULE(air_builder, m) {
                     "Create a polynomial type for fhe::poly domain")
         .def("to_string", &Type::to_string)
         .def("is_array", &Type::is_array)
+        .def("is_integer", &Type::is_integer)
+        .def("is_float", &Type::is_float)
+        .def("is_scalar", &Type::is_scalar)
+        .def("bit_width", &Type::bit_width)
+        .def("structurally_equal", &Type::structurally_equal)
+        .def("same_scope", &Type::same_scope)
         .def("shape", &Type::get_shape)
+        .def("__eq__", &Type::structurally_equal, py::is_operator())
         .def("__repr__", &Type::to_string);
     
     py::class_<Node, std::shared_ptr<Node>>(m, "Node")
         .def("name", &Node::name)
         .def("opcode_name", &Node::opcode_name)
+        .def("rtype", &Node::rtype)
         .def("to_string", &Node::to_string)
         .def("set_u32_attr", &Node::set_u32_attr,
              py::arg("attr_name"), py::arg("value"))
@@ -5361,8 +5775,13 @@ PYBIND11_MODULE(air_builder, m) {
              "Set source location for subsequent operations")
         // Basic arithmetic (air::core)
         .def("new_add", &Container::new_add)
+        .def("new_core_add", &Container::new_core_add)
         .def("new_sub", &Container::new_sub)
         .def("new_mul", &Container::new_mul)
+        .def("new_core_mul", &Container::new_core_mul)
+        .def("new_shl", &Container::new_shl)
+        .def("new_core_shl", &Container::new_shl)
+        .def("new_core_lt", &Container::new_core_lt)
         .def("new_div", &Container::new_div)
         .def("new_matmul", &Container::new_matmul)
         // Domain: nn::core
@@ -5453,22 +5872,39 @@ PYBIND11_MODULE(air_builder, m) {
         .def("new_ild", &Container::new_ild)
         .def("new_ist", &Container::new_ist)
         .def("new_intconst", &Container::new_intconst)
+        .def("new_intconst_typed", &Container::new_intconst_typed,
+             py::arg("value"), py::arg("type"),
+             "Create a signed integer constant with an explicit AIR type")
         .def("new_floatconst", &Container::new_floatconst,
              "Create LDC node for a double constant (for CKKS scalar encode)")
+        .def("new_floatconst_typed", &Container::new_floatconst_typed,
+             py::arg("value"), py::arg("type"),
+             "Create a floating constant with an explicit AIR type")
         .def("new_array_const", &Container::new_array_const,
              py::arg("values"),
              "Create LDC ARRAY constant from Python list: real->float32, complex/pair->interleaved float64")
         .def("new_air_array", &Container::new_air_array,
              py::arg("var_name"), py::arg("values"),
              "Create an AIR array local from a same-typed Python list of AIR nodes")
-        .def("new_zero", &Container::new_zero)
+        .def("new_zero",
+             py::overload_cast<>(&Container::new_zero))
+        .def("new_zero",
+             py::overload_cast<const Type&>(&Container::new_zero),
+             py::arg("type"),
+             "Create CORE.ZERO for a concrete non-integer type, or a typed integer zero")
         .def("new_one", &Container::new_one)
+        .def("new_checked_cast", &Container::new_checked_cast,
+             py::arg("value"), py::arg("type"),
+             "Validate an explicit no-op cast; width conversions are unsupported")
         .def("new_array", &Container::new_array)
         .def("new_retv", &Container::new_retv)
         .def("new_ret", &Container::new_ret)
         .def("new_stid", &Container::new_stid,
              py::arg("var_name"), py::arg("value"),
              "Store value to a named variable")
+        .def("new_local", &Container::new_local,
+             py::arg("var_name"), py::arg("type"),
+             "Declare a named local with an explicit AIR type")
         .def("new_ldid", &Container::new_ldid,
              py::arg("var_name"),
              "Load value from a named variable")
@@ -5476,18 +5912,18 @@ PYBIND11_MODULE(air_builder, m) {
              "Check if inside a loop or if body")
         // Control flow
         .def("new_loop_begin_range", &Container::new_loop_begin_range,
-             py::arg("start"), py::arg("end"),
+             py::arg("start"), py::arg("end"), py::arg("bit_width") = 64,
              "Create a do_loop for range(start, end)")
         .def("new_loop_begin_range_dynamic", &Container::new_loop_begin_range_dynamic,
-             py::arg("start"), py::arg("end"),
+             py::arg("start"), py::arg("end"), py::arg("bit_width") = 64,
              "Create a do_loop for range(start, dynamic_end)")
         .def("new_loop_begin_range_dynamic_start",
              &Container::new_loop_begin_range_dynamic_start,
-             py::arg("start"), py::arg("end"),
+             py::arg("start"), py::arg("end"), py::arg("bit_width") = 64,
              "Create a do_loop for range(dynamic_start, end)")
         .def("new_loop_begin_range_dynamic_bounds",
              &Container::new_loop_begin_range_dynamic_bounds,
-             py::arg("start"), py::arg("end"),
+             py::arg("start"), py::arg("end"), py::arg("bit_width") = 64,
              "Create a do_loop for range(dynamic_start, dynamic_end)")
         .def("new_loop_begin", &Container::new_loop_begin)
         .def("new_loop_index", &Container::new_loop_index)
@@ -5564,6 +6000,8 @@ PYBIND11_MODULE(air_builder, m) {
         .def("dump_flat", &GlobScope::dump_flat, "Dump IR in flattened SSA-like format")
         .def("get_native_ptr", &GlobScope::get_native_ptr)
         .def("has_native_ir", &GlobScope::has_native_ir)
+        .def("verify_ir", &GlobScope::verify_ir,
+             "Run the native AIR verifier on this global scope")
         // C++ pass integration
         .def("run_cpp_pass", &GlobScope::run_cpp_pass,
              py::arg("pass_name"), py::arg("skip_ops") = std::vector<std::string>{},
