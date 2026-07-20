@@ -92,6 +92,74 @@ SYNTHETIC_BODY_RESULT Emit_synthetic_kernel_body(
       cntr.New_ld(accumulator, spos), {input0, input1}};
 }
 
+NODE_PTR Emit_typed_nested_loop_kernel_body(FUNC_SCOPE& scope, NODE_PTR body,
+                                            const SPOS& spos) {
+  CONTAINER& cntr = scope.Container();
+  GLOB_SCOPE& glob = scope.Glob_scope();
+  TYPE_PTR    vector_type = scope.Formal(0)->Type();
+  TYPE_PTR    s32 = glob.Prim_type(PRIMITIVE_TYPE::INT_S32);
+  AIR_ASSERT(vector_type->Is_array());
+  AIR_ASSERT(vector_type->Is_compatible_type(scope.Formal(1)->Type()));
+
+  ADDR_DATUM_PTR accumulator =
+      scope.New_var(vector_type, "typed_vector_accumulator", spos);
+  STMT_LIST(body).Append(
+      cntr.New_st(cntr.New_zero(vector_type, spos), accumulator, spos));
+
+  ADDR_DATUM_PTR linear_index =
+      scope.New_var(s32, "typed_linear_index", spos);
+  ADDR_DATUM_PTR shift_amount =
+      scope.New_var(s32, "typed_shift_amount", spos);
+
+  ADDR_DATUM_PTR cin = scope.New_var(s32, "typed_cin", spos);
+  NODE_PTR outer_body = cntr.New_stmt_block(spos);
+  NODE_PTR outer_condition = cntr.New_bin_arith(
+      air::core::OPC_LT, s32, cntr.New_ld(cin, spos),
+      cntr.New_intconst(s32, 2, spos), spos);
+  NODE_PTR outer_increment = cntr.New_bin_arith(
+      air::core::OPC_ADD, s32, cntr.New_ld(cin, spos),
+      cntr.New_intconst(s32, 1, spos), spos);
+
+  ADDR_DATUM_PTR khw = scope.New_var(s32, "typed_khw", spos);
+  NODE_PTR inner_body = cntr.New_stmt_block(spos);
+  NODE_PTR inner_condition = cntr.New_bin_arith(
+      air::core::OPC_LT, s32, cntr.New_ld(khw, spos),
+      cntr.New_intconst(s32, 3, spos), spos);
+  NODE_PTR inner_increment = cntr.New_bin_arith(
+      air::core::OPC_ADD, s32, cntr.New_ld(khw, spos),
+      cntr.New_intconst(s32, 1, spos), spos);
+
+  NODE_PTR scaled_cin = cntr.New_bin_arith(
+      air::core::OPC_MUL, s32, cntr.New_ld(cin, spos),
+      cntr.New_intconst(s32, 3, spos), spos);
+  NODE_PTR affine_index = cntr.New_bin_arith(
+      air::core::OPC_ADD, s32, scaled_cin, cntr.New_ld(khw, spos), spos);
+  STMT_LIST(inner_body).Append(
+      cntr.New_st(affine_index, linear_index, spos));
+
+  NODE_PTR shifted_one = cntr.New_bin_arith(
+      air::core::OPC_SHL, s32, cntr.New_intconst(s32, 1, spos),
+      cntr.New_ld(khw, spos), spos);
+  STMT_LIST(inner_body).Append(
+      cntr.New_st(shifted_one, shift_amount, spos));
+
+  VECTOR_GEN vector_gen(&cntr);
+  NODE_PTR operands = vector_gen.New_add(
+      cntr.New_ld(scope.Formal(0), spos),
+      cntr.New_ld(scope.Formal(1), spos), spos);
+  NODE_PTR update = vector_gen.New_add(
+      cntr.New_ld(accumulator, spos), operands, spos);
+  STMT_LIST(inner_body).Append(cntr.New_st(update, accumulator, spos));
+
+  STMT_LIST(outer_body).Append(cntr.New_do_loop(
+      khw, cntr.New_intconst(s32, 0, spos), inner_condition,
+      inner_increment, inner_body, spos));
+  STMT_LIST(body).Append(cntr.New_do_loop(
+      cin, cntr.New_intconst(s32, 0, spos), outer_condition,
+      outer_increment, outer_body, spos));
+  return cntr.New_ld(accumulator, spos);
+}
+
 struct SOURCE_ADD_IR {
   std::unique_ptr<GLOB_SCOPE> _glob;
   FUNC_SCOPE*                 _scope;
@@ -191,6 +259,11 @@ struct AIR_STATS {
   uint32_t              _loops       = 0;
   uint32_t              _retvs       = 0;
   uint32_t              _ldcs        = 0;
+  uint32_t              _core_adds   = 0;
+  uint32_t              _core_muls   = 0;
+  uint32_t              _core_lts    = 0;
+  uint32_t              _core_shls   = 0;
+  uint32_t              _zeros       = 0;
   std::vector<STMT_PTR> _call_stmts;
 };
 
@@ -208,6 +281,11 @@ void Collect_stats(NODE_PTR node, AIR_STATS& stats) {
   if (node->Is_do_loop()) ++stats._loops;
   if (node->Opcode() == air::core::OPC_RETV) ++stats._retvs;
   if (node->Opcode() == air::core::OPC_LDC) ++stats._ldcs;
+  if (node->Opcode() == air::core::OPC_ADD) ++stats._core_adds;
+  if (node->Opcode() == air::core::OPC_MUL) ++stats._core_muls;
+  if (node->Opcode() == air::core::OPC_LT) ++stats._core_lts;
+  if (node->Opcode() == air::core::OPC_SHL) ++stats._core_shls;
+  if (node->Opcode() == air::core::OPC_ZERO) ++stats._zeros;
 
   if (node->Is_block()) {
     for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
@@ -277,6 +355,36 @@ void Expect_helper_ownership(NODE_PTR node, FUNC_SCOPE& helper) {
   } else {
     for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
       Expect_helper_ownership(node->Child(idx), helper);
+    }
+  }
+}
+
+void Expect_typed_nested_loop_air(NODE_PTR node, FUNC_SCOPE& helper,
+                                  TYPE_PTR vector_type, TYPE_PTR s32) {
+  if (node->Is_do_loop()) {
+    EXPECT_TRUE(node->Iv()->Type()->Is_compatible_type(s32));
+  }
+  const OPCODE opcode = node->Opcode();
+  if (opcode == air::core::OPC_ADD || opcode == air::core::OPC_MUL ||
+      opcode == air::core::OPC_LT || opcode == air::core::OPC_SHL) {
+    EXPECT_TRUE(node->Rtype()->Is_compatible_type(s32));
+  }
+  if (opcode == air::core::OPC_ZERO) {
+    EXPECT_TRUE(node->Rtype()->Is_compatible_type(vector_type));
+  }
+  if (node->Is_st() && node->Has_sym()) {
+    EXPECT_TRUE(node->Addr_datum()->Type()->Is_compatible_type(
+        node->Child(0)->Rtype()));
+  }
+
+  if (node->Is_block()) {
+    for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+         stmt          = stmt->Next()) {
+      Expect_typed_nested_loop_air(stmt->Node(), helper, vector_type, s32);
+    }
+  } else {
+    for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
+      Expect_typed_nested_loop_air(node->Child(idx), helper, vector_type, s32);
     }
   }
 }
@@ -475,6 +583,113 @@ TEST_F(Tensor2VectorDslMaterialization,
   EXPECT_FALSE(detached_bridge._equal);
   EXPECT_EQ(detached_bridge._message,
             "the supplied CALL is not present exactly once in caller");
+}
+
+TEST_F(Tensor2VectorDslMaterialization,
+       MaterializesDestinationOwnedTypedNestedLoopHelper) {
+  SOURCE_ADD_IR source = Build_source_add("typed_nested_loop_source", 211);
+  ASSERT_TRUE(source._glob->Verify_ir());
+
+  const std::string specialization_key =
+      "vector-kernel-typed-nested-loop:v1";
+  const std::string helper_name =
+      "__ace_vkernel_typed_nested_loop_" +
+      Vector_kernel_sha256(specialization_key);
+  uint32_t callback_count = 0;
+
+  VECTOR_KERNEL_LOWERING_REGISTRY registry;
+  ASSERT_TRUE(registry.Register(
+      OPCODE(nn::core::NN, nn::core::OPCODE::ADD),
+      [&](NODE_PTR source_node, const std::vector<NODE_PTR>& actuals,
+          GLOB_SCOPE& destination) {
+        ++callback_count;
+        EXPECT_EQ(source_node->Opcode(),
+                  OPCODE(nn::core::NN, nn::core::OPCODE::ADD));
+        EXPECT_EQ(actuals.size(), 2U);
+        EXPECT_EQ(actuals[0]->Container()->Glob_scope(), &destination);
+        EXPECT_EQ(actuals[1]->Container()->Glob_scope(), &destination);
+
+        VECTOR_KERNEL_HELPER_SPEC spec;
+        spec._specialization_key = specialization_key;
+        spec._helper_name        = helper_name;
+        spec._formal_types       = {actuals[0]->Rtype(), actuals[1]->Rtype()};
+        spec._result_type        = actuals[0]->Rtype();
+        spec._build_body = [](FUNC_SCOPE& helper, NODE_PTR body,
+                              const SPOS& spos) {
+          return Emit_typed_nested_loop_kernel_body(helper, body, spos);
+        };
+        return spec;
+      }));
+
+  VECTOR_CTX vector_ctx;
+  vector_ctx.Set_vector_kernel_lowering_registry(&registry);
+  VECTOR_CONFIG config;
+  config._decompose_mid_op = true;
+  std::unique_ptr<GLOB_SCOPE> lowered(
+      Vector_driver(source._glob.get(), vector_ctx, nullptr, config));
+
+  ASSERT_NE(lowered, nullptr);
+  ASSERT_TRUE(lowered->Verify_ir());
+  EXPECT_EQ(callback_count, 1U);
+  EXPECT_EQ(Function_count(*lowered), 2U);
+
+  FUNC_SCOPE& caller = lowered->Open_func_scope(source._scope->Id());
+  FUNC_SCOPE* helper = Find_helper(*lowered, caller.Id());
+  ASSERT_NE(helper, nullptr);
+  EXPECT_STREQ(helper->Owning_func()->Name()->Char_str(), helper_name.c_str());
+  ASSERT_EQ(helper->Formal_cnt(), 2U);
+
+  const AIR_STATS caller_stats = Get_stats(caller);
+  EXPECT_EQ(caller_stats._calls, 1U);
+  EXPECT_EQ(caller_stats._nn_adds, 0U);
+  ASSERT_EQ(caller_stats._call_stmts.size(), 1U);
+
+  const AIR_STATS helper_stats = Get_stats(*helper);
+  EXPECT_EQ(helper_stats._calls, 0U);
+  EXPECT_EQ(helper_stats._nn_adds, 0U);
+  EXPECT_EQ(helper_stats._vector_adds, 2U);
+  EXPECT_EQ(helper_stats._loops, 2U);
+  EXPECT_EQ(helper_stats._retvs, 1U);
+  EXPECT_EQ(helper_stats._zeros, 1U);
+  EXPECT_EQ(helper_stats._core_muls, 1U);
+  EXPECT_EQ(helper_stats._core_lts, 2U);
+  EXPECT_EQ(helper_stats._core_shls, 1U);
+  EXPECT_EQ(helper_stats._core_adds, 3U);
+  Expect_helper_ownership(helper->Container().Entry_node(), *helper);
+
+  TYPE_PTR vector_type = helper->Formal(0)->Type();
+  TYPE_PTR s32 = lowered->Prim_type(PRIMITIVE_TYPE::INT_S32);
+  Expect_typed_nested_loop_air(helper->Container().Entry_node(), *helper,
+                               vector_type, s32);
+
+  NODE_PTR caller_body = caller.Container().Entry_node()->Last_child();
+  STMT_PTR terminal    = Null_ptr;
+  for (STMT_PTR stmt = caller_body->Begin_stmt();
+       stmt != caller_body->End_stmt(); stmt = stmt->Next()) {
+    terminal = stmt;
+  }
+  ASSERT_NE(terminal, Null_ptr);
+  ASSERT_EQ(terminal->Node()->Opcode(), air::core::OPC_RETV);
+  NODE_PTR replacement = terminal->Node()->Child(0);
+  STMT_PTR call = caller_stats._call_stmts[0];
+  ASSERT_EQ(call->Node()->Num_arg(), 2U);
+  ASSERT_EQ(call->Node()->Child(0)->Opcode(), air::core::OPC_LD);
+  ASSERT_EQ(call->Node()->Child(1)->Opcode(), air::core::OPC_LD);
+  EXPECT_EQ(call->Node()->Child(0)->Addr_datum(), caller.Formal(0));
+  EXPECT_EQ(call->Node()->Child(1)->Addr_datum(), caller.Formal(1));
+  std::vector<NODE_PTR> expected_actuals;
+  for (uint32_t idx = 0; idx < call->Node()->Num_arg(); ++idx) {
+    expected_actuals.push_back(call->Node()->Child(idx));
+  }
+  VECTOR_KERNEL_AIR_COMPARE_RESULT bridge =
+      Check_vector_kernel_call_bridge(caller, call, expected_actuals,
+                                      replacement, *helper);
+  EXPECT_TRUE(bridge._equal) << bridge._message;
+
+  // This is deliberately the pre-inline Phase-A handoff: the typed CALL/LDP
+  // remains present and no Python inliner/pass runs in this fixture.
+  EXPECT_EQ(Get_stats(caller)._calls, 1U);
+  ASSERT_TRUE(lowered->Verify_ir());
 }
 
 TEST_F(Tensor2VectorDslMaterialization,
