@@ -121,8 +121,9 @@ void Collect_stats(NODE_PTR node, NATIVE_GEMM_STATS& stats) {
     ++stats._slices;
   }
   if (META_INFO::Has_prop<OPR_PROP::ATTR>(node->Opcode())) {
-    uint32_t   count = 0;
-    const int* slot  = node->Attr<int>(nn::core::ATTR::SLOT, &count);
+    uint32_t count = 0;
+    const uint32_t* slot =
+        node->Attr<uint32_t>(nn::core::ATTR::SLOT, &count);
     if (slot != nullptr) ++stats._slot_attrs;
     const int* rotations = node->Attr<int>(nn::core::ATTR::RNUM, &count);
     if (rotations != nullptr) {

@@ -10,6 +10,7 @@ from ace_bindings import air_builder
 from ace_edsl.base_dsl.ast_helpers import dynamic_expr
 from ace_edsl.edsl import AceEDSL, nn_kernel, range_dynamic, vector_kernel
 from ace_edsl.edsl.core.air_value import AIRValue
+from ace_edsl.edsl.core import vector_ops
 from ace_edsl.edsl.core.types import Int, Tensor, VectorTensor
 
 
@@ -63,6 +64,23 @@ def _heterogeneous_vector_signature(
     count: Int[32],
 ) -> VectorTensor[float, 8]:
     return wide + wide
+
+
+@vector_kernel
+def _genuine_vector_primitives(
+    narrow: VectorTensor[float, 4],
+    wide: VectorTensor[float, 8],
+    rows: VectorTensor[float, 3, 8],
+    shift: Int[32],
+    start: Int[32],
+) -> VectorTensor[float, 8]:
+    widened = vector_ops.vec_add(narrow, wide)
+    rolled = vector_ops.vec_roll(wide, shift, [-3, 0, 5])
+    sliced = vector_ops.vec_slice(rows, start, 8)
+    product = vector_ops.vec_mul(rolled, sliced)
+    return vector_ops.vec_set_slot(
+        vector_ops.vec_add(widened, product), 8
+    )
 
 
 @vector_kernel
@@ -202,6 +220,239 @@ def test_explicit_signature_keeps_heterogeneous_ranked_and_scalar_formals():
     assert re.search(r'FML\[.*\] "p0".*\(array,"array"\)', dump)
     assert re.search(r'FML\[.*\] "p1".*\(array,"array"\)', dump)
     assert re.search(r'FML\[.*\] "p2".*\(primitive,"int32_t"\)', dump)
+
+
+def test_decorated_helper_emits_genuine_vector_primitives_and_terminal_slot():
+    dsl = _fresh_dsl()
+
+    result = _genuine_vector_primitives(
+        VectorTensor[float, 4],
+        VectorTensor[float, 8],
+        VectorTensor[float, 3, 8],
+        1,
+        0,
+    )
+
+    _assert_ranked_vector_result(result, (8,))
+    assert dsl.current_air_module.verify_ir()
+    dump = dsl.current_air_module.dump()
+    upper_dump = dump.upper()
+    assert upper_dump.count("VECTOR.ADD") == 2
+    assert upper_dump.count("VECTOR.MUL") == 1
+    assert upper_dump.count("VECTOR.ROLL") == 1
+    assert upper_dump.count("VECTOR.SLICE") == 1
+    assert "NN.ADD" not in upper_dump
+    assert "NN.MUL" not in upper_dump
+    assert "nums=(-3,0,5)" in dump
+    assert dump.count("ATTR[slot=8]") == 1
+    assert re.search(
+        r'ld "__ret_tmp_\d+".*ATTR\[slot=8\]', dump
+    )
+
+
+def test_vector_wrappers_reject_invalid_domains_types_owners_and_metadata():
+    glob = air_builder.create_glob_scope()
+    i32 = air_builder.Type.make_int(32)
+    i64 = air_builder.Type.make_int(64)
+    f32 = air_builder.Type.make_float(32)
+    vector4 = air_builder.Type.make_array([4], f32)
+
+    function = glob.new_func_with_param_types(
+        "m3_vector_wrapper_validation",
+        vector4,
+        [vector4, i32, i64],
+    )
+    container = function.container()
+    vector_param = function.new_param("vector", vector4)
+    index_param = function.new_param("index", i32)
+    index64_param = function.new_param("index64", i64)
+    vector = AIRValue(
+        vector_param,
+        container,
+        shape=(4,),
+        domain="nn::vector",
+        air_type=vector4,
+    )
+    index = AIRValue(
+        index_param,
+        container,
+        domain="air::core",
+        air_type=i32,
+    )
+    index64 = AIRValue(
+        index64_param,
+        container,
+        domain="air::core",
+        air_type=i64,
+    )
+
+    with pytest.raises(TypeError, match="nn::vector"):
+        vector_ops.vec_add(index, vector)
+    with pytest.raises(TypeError, match="ranked Vector AIR type"):
+        vector_ops.vec_mul(
+            AIRValue(None, container, domain="nn::vector"), vector
+        )
+    with pytest.raises(TypeError, match="air::core scalar"):
+        vector_ops.vec_roll(vector, vector, [0])
+    with pytest.raises(TypeError, match="signed Core i32 AIR type"):
+        vector_ops.vec_roll(vector, index64, [0])
+    with pytest.raises(TypeError, match="sequence of integers"):
+        vector_ops.vec_roll(vector, index, 1)
+    with pytest.raises(ValueError, match="must not be empty"):
+        vector_ops.vec_roll(vector, index, [])
+    with pytest.raises(TypeError, match="must be integers"):
+        vector_ops.vec_roll(vector, index, [False])
+    with pytest.raises(ValueError, match="signed i32 range"):
+        vector_ops.vec_roll(vector, index, [1 << 31])
+    with pytest.raises(TypeError, match="signed Core i32 AIR type"):
+        vector_ops.vec_slice(vector, index64, 1)
+    with pytest.raises(TypeError, match="slice_size must be an integer"):
+        vector_ops.vec_slice(vector, index, True)
+    with pytest.raises(ValueError, match="positive signed i32"):
+        vector_ops.vec_slice(vector, index, 0)
+    with pytest.raises(TypeError, match="nn::vector"):
+        vector_ops.vec_set_slot(index, 1)
+    with pytest.raises(TypeError, match="SLOT must be an integer"):
+        vector_ops.vec_set_slot(vector, True)
+    with pytest.raises(ValueError, match="positive u32"):
+        vector_ops.vec_set_slot(vector, 0)
+    with pytest.raises(ValueError, match="positive u32"):
+        vector_ops.vec_set_slot(vector, 1 << 32)
+
+    foreign_function = glob.new_func_with_param_types(
+        "m3_vector_wrapper_foreign_owner", vector4, [vector4, i32]
+    )
+    foreign_param = foreign_function.new_param("vector", vector4)
+    foreign_index_param = foreign_function.new_param("index", i32)
+    foreign_vector = AIRValue(
+        foreign_param,
+        foreign_function.container(),
+        shape=(4,),
+        domain="nn::vector",
+        air_type=vector4,
+    )
+    with pytest.raises(ValueError, match="cannot mix AIR containers"):
+        vector_ops.vec_add(vector, foreign_vector)
+    foreign_index = AIRValue(
+        foreign_index_param,
+        foreign_function.container(),
+        domain="air::core",
+        air_type=i32,
+    )
+    with pytest.raises(ValueError, match="cannot mix AIR containers"):
+        vector_ops.vec_roll(vector, foreign_index, [0])
+
+
+def test_native_vector_binding_result_rules_attributes_and_validation():
+    glob = air_builder.create_glob_scope()
+    i32 = air_builder.Type.make_int(32)
+    i64 = air_builder.Type.make_int(64)
+    f32 = air_builder.Type.make_float(32)
+    vector4 = air_builder.Type.make_array([4], f32)
+    vector8 = air_builder.Type.make_array([8], f32)
+    matrix3x8 = air_builder.Type.make_array([3, 8], f32)
+    matrix2x2 = air_builder.Type.make_array([2, 2], f32)
+    int_vector4 = air_builder.Type.make_array([4], i32)
+
+    function = glob.new_func_with_param_types(
+        "m3_native_vector_primitives",
+        vector8,
+        [vector4, vector8, matrix3x8, matrix2x2, i32, i64, int_vector4],
+    )
+    container = function.container()
+    narrow = function.new_param("narrow", vector4)
+    wide = function.new_param("wide", vector8)
+    rows = function.new_param("rows", matrix3x8)
+    square = function.new_param("square", matrix2x2)
+    index = function.new_param("index", i32)
+    index64 = function.new_param("index64", i64)
+    ints = function.new_param("ints", int_vector4)
+
+    assert container.new_vec_add(narrow, wide).rtype() == vector8
+    assert container.new_vec_add(wide, narrow).rtype() == vector8
+    assert container.new_vec_add(square, narrow).rtype() == matrix2x2
+    assert container.new_vec_add(narrow, square).rtype() == vector4
+    assert container.new_vec_mul(narrow, wide).rtype() == vector4
+    assert container.new_vec_mul(wide, narrow).rtype() == vector8
+
+    widened = container.new_vec_add(narrow, wide)
+    rolled = container.new_vec_roll(wide, index, [-8, -1, 0, 3])
+    sliced = container.new_vec_slice(rows, index, 8)
+    assert rolled.opcode_name() == "nn::vector::ROLL"
+    assert rolled.rtype() == vector8
+    assert sliced.opcode_name() == "nn::vector::SLICE"
+    assert sliced.rtype() == vector8
+
+    rolled.set_s32_attr("signed_scalar", -2)
+    rolled.set_s32_array_attr("signed_vector", [-3, 0, 5])
+    rolled.set_u32_array_attr("unsigned_vector", [1, 8])
+    product = container.new_vec_mul(widened, sliced)
+    result = container.new_vec_add(product, rolled)
+    result.set_vector_slot(8)
+
+    with pytest.raises(RuntimeError, match="ranked array operands"):
+        container.new_vec_add(narrow, index)
+    with pytest.raises(RuntimeError, match="compatible vector element types"):
+        container.new_vec_mul(narrow, ints)
+    with pytest.raises(RuntimeError, match="Core signed i32 scalar"):
+        container.new_vec_roll(wide, wide, [0])
+    with pytest.raises(RuntimeError, match="Core signed i32 scalar"):
+        container.new_vec_roll(wide, index64, [0])
+    with pytest.raises(RuntimeError, match="non-empty rotation candidates"):
+        container.new_vec_roll(wide, index, [])
+    with pytest.raises(RuntimeError, match="out of range for signed i32"):
+        container.new_vec_roll(wide, index, [1 << 31])
+    with pytest.raises(RuntimeError, match="rank-2 source"):
+        container.new_vec_slice(wide, index, 8)
+    with pytest.raises(RuntimeError, match="Core signed i32 scalar"):
+        container.new_vec_slice(rows, index64, 8)
+    with pytest.raises(RuntimeError, match="positive signed i32"):
+        container.new_vec_slice(rows, index, 0)
+    with pytest.raises(RuntimeError, match="trailing dimension"):
+        container.new_vec_slice(rows, index, 4)
+
+    with pytest.raises(RuntimeError, match="requires at least one value"):
+        rolled.set_s32_array_attr("empty", [])
+    with pytest.raises(RuntimeError, match="signed i32"):
+        rolled.set_s32_attr("overflow", 1 << 31)
+    with pytest.raises(RuntimeError, match="unsigned i32"):
+        rolled.set_u32_attr("negative", -1)
+    with pytest.raises(RuntimeError, match="ranked Vector value"):
+        index.set_vector_slot(1)
+    with pytest.raises(RuntimeError, match="positive slot count"):
+        result.set_vector_slot(0)
+    with pytest.raises(RuntimeError, match="unsigned i32"):
+        result.set_vector_slot(1 << 32)
+
+    empty_container = air_builder.Container()
+    with pytest.raises(RuntimeError, match="real AIR operands"):
+        empty_container.new_vec_add(narrow, wide)
+
+    plain_core_add = container.new_core_add(index, index)
+    with pytest.raises(RuntimeError, match="opcode that supports AIR attributes"):
+        plain_core_add.set_u32_attr("invalid", 1)
+    container.new_retv(result)
+
+    foreign_function = glob.new_func_with_param_types(
+        "m3_foreign_vector_owner", vector8, [vector8, i32]
+    )
+    foreign_wide = foreign_function.new_param("wide", vector8)
+    foreign_index = foreign_function.new_param("index", i32)
+    with pytest.raises(RuntimeError, match="cannot mix AIR containers"):
+        container.new_vec_add(wide, foreign_wide)
+    with pytest.raises(RuntimeError, match="cannot mix AIR containers"):
+        container.new_vec_roll(wide, foreign_index, [0])
+    with pytest.raises(RuntimeError, match="cannot mix AIR containers"):
+        container.new_vec_slice(rows, foreign_index, 8)
+    foreign_function.container().new_retv(foreign_wide)
+
+    assert glob.verify_ir()
+    dump = glob.dump()
+    assert "nums=(-8,-1,0,3)" in dump
+    assert "signed_scalar=-2" in dump
+    assert "signed_vector=(-3,0,5)" in dump
+    assert "unsigned_vector=(1,8)" in dump
+    assert "slot=8" in dump
 
 
 def test_structural_types_typed_core_ops_locals_and_zero():

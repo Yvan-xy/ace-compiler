@@ -16,6 +16,7 @@
 #include "air/base/meta_info.h"
 #include "air/base/st.h"
 #include "air/core/opcode.h"
+#include "nn/core/attr.h"
 #include "nn/core/opcode.h"
 #include "nn/vector/config.h"
 #include "nn/vector/skip_lowering.h"
@@ -33,6 +34,8 @@ using namespace nn::vector::test;
 namespace {
 
 constexpr int64_t SYNTHETIC_WIDTH = 4;
+constexpr int64_t M3_WIDE_WIDTH   = 8;
+constexpr int64_t M3_ROW_COUNT    = 3;
 
 struct SYNTHETIC_BODY_RESULT {
   NODE_PTR              _result;
@@ -160,6 +163,69 @@ NODE_PTR Emit_typed_nested_loop_kernel_body(FUNC_SCOPE& scope, NODE_PTR body,
   return cntr.New_ld(accumulator, spos);
 }
 
+NODE_PTR Emit_vector_primitive_kernel_body(FUNC_SCOPE& scope, NODE_PTR body,
+                                           const SPOS& spos) {
+  CONTAINER& cntr = scope.Container();
+  GLOB_SCOPE& glob = scope.Glob_scope();
+  AIR_ASSERT(scope.Formal_cnt() == 2U);
+  TYPE_PTR narrow_type = scope.Formal(0)->Type();
+  TYPE_PTR wide_type   = scope.Formal(1)->Type();
+  AIR_ASSERT(narrow_type->Is_array() && wide_type->Is_array());
+  AIR_ASSERT(narrow_type->Cast_to_arr()->Elem_count() == SYNTHETIC_WIDTH);
+  AIR_ASSERT(wide_type->Cast_to_arr()->Elem_count() == M3_WIDE_WIDTH);
+  AIR_ASSERT(narrow_type->Cast_to_arr()->Elem_type()->Is_compatible_type(
+      wide_type->Cast_to_arr()->Elem_type()));
+
+  ADDR_DATUM_PTR accumulator =
+      scope.New_var(wide_type, "m3_vector_accumulator", spos);
+  STMT_LIST(body).Append(
+      cntr.New_st(cntr.New_zero(wide_type, spos), accumulator, spos));
+
+  TYPE_PTR           element_type = wide_type->Cast_to_arr()->Elem_type();
+  std::vector<float> values(M3_ROW_COUNT * M3_WIDE_WIDTH);
+  for (size_t idx = 0; idx < values.size(); ++idx) {
+    values[idx] = static_cast<float>(idx + 1) / 32.0F;
+  }
+  CONSTANT_PTR rows = New_array_const(
+      &glob, "m3_slice_rows", values.size(), element_type,
+      {M3_ROW_COUNT, M3_WIDE_WIDTH}, values.data(), spos);
+
+  TYPE_PTR       s32 = glob.Prim_type(PRIMITIVE_TYPE::INT_S32);
+  ADDR_DATUM_PTR iv  = scope.New_var(s32, "m3_vector_iv", spos);
+  NODE_PTR loop_body = cntr.New_stmt_block(spos);
+  NODE_PTR condition = cntr.New_bin_arith(
+      air::core::OPC_LT, s32, cntr.New_ld(iv, spos),
+      cntr.New_intconst(s32, M3_ROW_COUNT, spos), spos);
+  NODE_PTR increment = cntr.New_bin_arith(
+      air::core::OPC_ADD, s32, cntr.New_ld(iv, spos),
+      cntr.New_intconst(s32, 1, spos), spos);
+
+  NODE_PTR shift = cntr.New_bin_arith(
+      air::core::OPC_ADD, s32, cntr.New_ld(iv, spos),
+      cntr.New_intconst(s32, -1, spos), spos);
+  VECTOR_GEN vector_gen(&cntr);
+  NODE_PTR roll = vector_gen.New_roll(
+      cntr.New_ld(scope.Formal(1), spos), shift, {-1, 0, 1}, spos);
+  NODE_PTR slice = vector_gen.New_slice(
+      cntr.New_ldc(rows, spos), cntr.New_ld(iv, spos),
+      cntr.New_intconst(s32, M3_WIDE_WIDTH, spos), spos);
+  NODE_PTR widened = vector_gen.New_add(
+      cntr.New_ld(scope.Formal(0), spos), roll, spos);
+  NODE_PTR product = vector_gen.New_mul(widened, slice, spos);
+  NODE_PTR update = vector_gen.New_add(
+      cntr.New_ld(accumulator, spos), product, spos);
+  STMT_LIST(loop_body).Append(cntr.New_st(update, accumulator, spos));
+
+  STMT_LIST(body).Append(cntr.New_do_loop(
+      iv, cntr.New_intconst(s32, 0, spos), condition, increment, loop_body,
+      spos));
+
+  NODE_PTR result = cntr.New_ld(accumulator, spos);
+  uint32_t slot   = M3_WIDE_WIDTH;
+  result->Set_attr(nn::core::ATTR::SLOT, &slot, 1);
+  return result;
+}
+
 struct SOURCE_ADD_IR {
   std::unique_ptr<GLOB_SCOPE> _glob;
   FUNC_SCOPE*                 _scope;
@@ -190,6 +256,41 @@ SOURCE_ADD_IR Build_source_add(const char* function_name, uint32_t line) {
   cntr.New_func_entry(spos);
   NODE_PTR add = cntr.New_bin_arith(
       OPCODE(nn::core::NN, nn::core::OPCODE::ADD), array_type,
+      cntr.New_ld(fixture._scope->Formal(0), spos),
+      cntr.New_ld(fixture._scope->Formal(1), spos), spos);
+  cntr.Stmt_list().Append(cntr.New_retv(add, spos));
+  return fixture;
+}
+
+SOURCE_ADD_IR Build_heterogeneous_source_add(const char* function_name,
+                                             uint32_t line) {
+  SOURCE_ADD_IR fixture;
+  fixture._glob = std::make_unique<GLOB_SCOPE>(0, true);
+  GLOB_SCOPE& glob = *fixture._glob;
+  const SPOS  spos(0, line, 1, 0);
+
+  TYPE_PTR f32 = glob.Prim_type(PRIMITIVE_TYPE::FLOAT_32);
+  TYPE_PTR narrow_type = New_array_type(
+      &glob, std::string(function_name) + "_narrow", f32,
+      {SYNTHETIC_WIDTH}, spos);
+  TYPE_PTR wide_type = New_array_type(
+      &glob, std::string(function_name) + "_wide", f32, {M3_WIDE_WIDTH},
+      spos);
+  STR_PTR  name = glob.New_str(function_name);
+  FUNC_PTR func = glob.New_func(name, spos);
+  func->Set_parent(glob.Comp_env_id());
+  SIGNATURE_TYPE_PTR signature = glob.New_sig_type();
+  glob.New_ret_param(wide_type, signature);
+  glob.New_param("narrow", narrow_type, signature, spos);
+  glob.New_param("wide", wide_type, signature, spos);
+  signature->Set_complete();
+  glob.New_entry_point(signature, func, name, spos);
+
+  fixture._scope = &glob.New_func_scope(func);
+  CONTAINER& cntr = fixture._scope->Container();
+  cntr.New_func_entry(spos);
+  NODE_PTR add = cntr.New_bin_arith(
+      OPCODE(nn::core::NN, nn::core::OPCODE::ADD), wide_type,
       cntr.New_ld(fixture._scope->Formal(0), spos),
       cntr.New_ld(fixture._scope->Formal(1), spos), spos);
   cntr.Stmt_list().Append(cntr.New_retv(add, spos));
@@ -253,18 +354,27 @@ VECTOR_KERNEL_NATIVE_AIR_VIEW Native_view(REFERENCE_KERNEL_IR& fixture) {
 }
 
 struct AIR_STATS {
-  uint32_t              _calls       = 0;
-  uint32_t              _nn_adds     = 0;
-  uint32_t              _vector_adds = 0;
-  uint32_t              _loops       = 0;
-  uint32_t              _retvs       = 0;
-  uint32_t              _ldcs        = 0;
-  uint32_t              _core_adds   = 0;
-  uint32_t              _core_muls   = 0;
-  uint32_t              _core_lts    = 0;
-  uint32_t              _core_shls   = 0;
-  uint32_t              _zeros       = 0;
-  std::vector<STMT_PTR> _call_stmts;
+  uint32_t                      _calls         = 0;
+  uint32_t                      _nn_adds       = 0;
+  uint32_t                      _vector_adds   = 0;
+  uint32_t                      _vector_muls   = 0;
+  uint32_t                      _vector_rolls  = 0;
+  uint32_t                      _vector_slices = 0;
+  uint32_t                      _loops         = 0;
+  uint32_t                      _retvs         = 0;
+  uint32_t                      _ldcs          = 0;
+  uint32_t                      _core_adds     = 0;
+  uint32_t                      _core_muls     = 0;
+  uint32_t                      _core_lts      = 0;
+  uint32_t                      _core_shls     = 0;
+  uint32_t                      _zeros         = 0;
+  std::vector<STMT_PTR>         _call_stmts;
+  std::vector<NODE_PTR>         _vector_add_nodes;
+  std::vector<NODE_PTR>         _vector_mul_nodes;
+  std::vector<NODE_PTR>         _vector_roll_nodes;
+  std::vector<NODE_PTR>         _vector_slice_nodes;
+  std::vector<std::vector<int>> _rnums;
+  std::vector<uint32_t>         _slots;
 };
 
 void Collect_stats(NODE_PTR node, AIR_STATS& stats) {
@@ -277,6 +387,32 @@ void Collect_stats(NODE_PTR node, AIR_STATS& stats) {
   }
   if (node->Opcode() == OPCODE(VECTOR_DOMAIN::ID, VECTOR_OPCODE::ADD)) {
     ++stats._vector_adds;
+    stats._vector_add_nodes.push_back(node);
+  }
+  if (node->Opcode() == OPCODE(VECTOR_DOMAIN::ID, VECTOR_OPCODE::MUL)) {
+    ++stats._vector_muls;
+    stats._vector_mul_nodes.push_back(node);
+  }
+  if (node->Opcode() == OPCODE(VECTOR_DOMAIN::ID, VECTOR_OPCODE::ROLL)) {
+    ++stats._vector_rolls;
+    stats._vector_roll_nodes.push_back(node);
+  }
+  if (node->Opcode() == OPCODE(VECTOR_DOMAIN::ID, VECTOR_OPCODE::SLICE)) {
+    ++stats._vector_slices;
+    stats._vector_slice_nodes.push_back(node);
+  }
+  if (META_INFO::Has_prop<OPR_PROP::ATTR>(node->Opcode())) {
+    uint32_t count = 0;
+    const int* rnum = node->Attr<int>(nn::core::ATTR::RNUM, &count);
+    if (rnum != nullptr) {
+      stats._rnums.emplace_back(rnum, rnum + count);
+    }
+    count = 0;
+    const uint32_t* slot =
+        node->Attr<uint32_t>(nn::core::ATTR::SLOT, &count);
+    if (slot != nullptr) {
+      stats._slots.insert(stats._slots.end(), slot, slot + count);
+    }
   }
   if (node->Is_do_loop()) ++stats._loops;
   if (node->Opcode() == air::core::OPC_RETV) ++stats._retvs;
@@ -688,6 +824,157 @@ TEST_F(Tensor2VectorDslMaterialization,
 
   // This is deliberately the pre-inline Phase-A handoff: the typed CALL/LDP
   // remains present and no Python inliner/pass runs in this fixture.
+  EXPECT_EQ(Get_stats(caller)._calls, 1U);
+  ASSERT_TRUE(lowered->Verify_ir());
+}
+
+TEST_F(Tensor2VectorDslMaterialization,
+       MaterializesGenuineVectorPrimitivesAfterMv2vOpt) {
+  SOURCE_ADD_IR source =
+      Build_heterogeneous_source_add("m3_vector_primitive_source", 307);
+  ASSERT_TRUE(source._glob->Verify_ir());
+
+  const std::string specialization_key =
+      "vector-kernel-genuine-primitives:v1";
+  const std::string helper_name =
+      "__ace_vkernel_genuine_primitives_" +
+      Vector_kernel_sha256(specialization_key);
+  uint32_t callback_count = 0;
+
+  VECTOR_KERNEL_LOWERING_REGISTRY registry;
+  ASSERT_TRUE(registry.Register(
+      OPCODE(nn::core::NN, nn::core::OPCODE::ADD),
+      [&](NODE_PTR source_node, const std::vector<NODE_PTR>& actuals,
+          GLOB_SCOPE& destination) {
+        ++callback_count;
+        EXPECT_EQ(source_node->Opcode(),
+                  OPCODE(nn::core::NN, nn::core::OPCODE::ADD));
+        EXPECT_EQ(actuals.size(), 2U);
+        EXPECT_EQ(actuals[0]->Container()->Glob_scope(), &destination);
+        EXPECT_EQ(actuals[1]->Container()->Glob_scope(), &destination);
+
+        VECTOR_KERNEL_HELPER_SPEC spec;
+        spec._specialization_key = specialization_key;
+        spec._helper_name        = helper_name;
+        spec._formal_types       = {actuals[0]->Rtype(), actuals[1]->Rtype()};
+        spec._result_type        = actuals[1]->Rtype();
+        spec._build_body = [](FUNC_SCOPE& helper, NODE_PTR body,
+                              const SPOS& spos) {
+          return Emit_vector_primitive_kernel_body(helper, body, spos);
+        };
+        return spec;
+      }));
+
+  VECTOR_CTX vector_ctx;
+  vector_ctx.Set_vector_kernel_lowering_registry(&registry);
+  VECTOR_CONFIG config;
+  config._decompose_mid_op = true;
+  std::unique_ptr<GLOB_SCOPE> lowered(
+      Vector_driver(source._glob.get(), vector_ctx, nullptr, config));
+
+  ASSERT_NE(lowered, nullptr);
+  ASSERT_TRUE(lowered->Verify_ir());
+  EXPECT_EQ(callback_count, 1U);
+  EXPECT_EQ(Function_count(*lowered), 2U);
+
+  FUNC_SCOPE& caller = lowered->Open_func_scope(source._scope->Id());
+  FUNC_SCOPE* helper = Find_helper(*lowered, caller.Id());
+  ASSERT_NE(helper, nullptr);
+  EXPECT_STREQ(helper->Owning_func()->Name()->Char_str(), helper_name.c_str());
+  ASSERT_EQ(helper->Formal_cnt(), 2U);
+  EXPECT_EQ(helper->Formal(0)->Type()->Cast_to_arr()->Shape(),
+            std::vector<int64_t>({SYNTHETIC_WIDTH}));
+  EXPECT_EQ(helper->Formal(1)->Type()->Cast_to_arr()->Shape(),
+            std::vector<int64_t>({M3_WIDE_WIDTH}));
+
+  const AIR_STATS caller_stats = Get_stats(caller);
+  EXPECT_EQ(caller_stats._calls, 1U);
+  EXPECT_EQ(caller_stats._nn_adds, 0U);
+  ASSERT_EQ(caller_stats._call_stmts.size(), 1U);
+
+  const AIR_STATS helper_stats = Get_stats(*helper);
+  EXPECT_EQ(helper_stats._calls, 0U);
+  EXPECT_EQ(helper_stats._nn_adds, 0U);
+  EXPECT_EQ(helper_stats._vector_adds, 2U);
+  EXPECT_EQ(helper_stats._vector_muls, 1U);
+  EXPECT_EQ(helper_stats._vector_rolls, 1U);
+  EXPECT_EQ(helper_stats._vector_slices, 1U);
+  EXPECT_EQ(helper_stats._loops, 1U);
+  EXPECT_EQ(helper_stats._retvs, 1U);
+  EXPECT_EQ(helper_stats._zeros, 1U);
+  EXPECT_EQ(helper_stats._ldcs, 1U);
+  Expect_helper_ownership(helper->Container().Entry_node(), *helper);
+
+  ASSERT_EQ(helper_stats._vector_roll_nodes.size(), 1U);
+  NODE_PTR roll = helper_stats._vector_roll_nodes[0];
+  ASSERT_EQ(roll->Num_child(), 2U);
+  ASSERT_TRUE(roll->Has_rtype());
+  EXPECT_EQ(roll->Rtype(), roll->Child(0)->Rtype());
+  EXPECT_EQ(roll->Child(1)->Domain(), air::core::CORE);
+  ASSERT_TRUE(roll->Child(1)->Rtype()->Is_prim());
+  EXPECT_EQ(roll->Child(1)->Rtype()->Cast_to_prim()->Encoding(),
+            PRIMITIVE_TYPE::INT_S32);
+  ASSERT_EQ(helper_stats._rnums.size(), 1U);
+  EXPECT_EQ(helper_stats._rnums[0], std::vector<int>({-1, 0, 1}));
+
+  ASSERT_EQ(helper_stats._vector_slice_nodes.size(), 1U);
+  NODE_PTR slice = helper_stats._vector_slice_nodes[0];
+  ASSERT_EQ(slice->Num_child(), 3U);
+  EXPECT_EQ(slice->Child(0)->Opcode(), air::core::OPC_LDC);
+  EXPECT_EQ(slice->Child(0)->Rtype()->Cast_to_arr()->Shape(),
+            std::vector<int64_t>({M3_ROW_COUNT, M3_WIDE_WIDTH}));
+  EXPECT_EQ(slice->Child(1)->Domain(), air::core::CORE);
+  EXPECT_EQ(slice->Child(1)->Rtype()->Cast_to_prim()->Encoding(),
+            PRIMITIVE_TYPE::INT_S32);
+  EXPECT_EQ(slice->Child(2)->Opcode(), air::core::OPC_INTCONST);
+  EXPECT_EQ(slice->Child(2)->Rtype()->Cast_to_prim()->Encoding(),
+            PRIMITIVE_TYPE::INT_S32);
+  EXPECT_EQ(slice->Child(2)->Intconst(), M3_WIDE_WIDTH);
+  EXPECT_EQ(slice->Rtype()->Cast_to_arr()->Shape(),
+            std::vector<int64_t>({M3_WIDE_WIDTH}));
+
+  ASSERT_EQ(helper_stats._vector_mul_nodes.size(), 1U);
+  NODE_PTR multiply = helper_stats._vector_mul_nodes[0];
+  EXPECT_EQ(multiply->Rtype(), multiply->Child(0)->Rtype());
+
+  NODE_PTR widening_add = Null_ptr;
+  for (NODE_PTR add : helper_stats._vector_add_nodes) {
+    if (add->Child(0)->Rtype()->Cast_to_arr()->Elem_count() ==
+        SYNTHETIC_WIDTH) {
+      widening_add = add;
+    }
+  }
+  ASSERT_NE(widening_add, Null_ptr);
+  EXPECT_EQ(widening_add->Rtype(), widening_add->Child(1)->Rtype());
+  EXPECT_EQ(widening_add->Rtype()->Cast_to_arr()->Shape(),
+            std::vector<int64_t>({M3_WIDE_WIDTH}));
+
+  EXPECT_EQ(helper_stats._slots,
+            std::vector<uint32_t>({static_cast<uint32_t>(M3_WIDE_WIDTH)}));
+  const std::string normalized = Normalize_vector_kernel_helper(*helper);
+  EXPECT_NE(normalized.find("nums:s32:3:"), std::string::npos);
+  EXPECT_NE(normalized.find("slot:u32:1:"), std::string::npos);
+
+  NODE_PTR caller_body = caller.Container().Entry_node()->Last_child();
+  STMT_PTR terminal    = Null_ptr;
+  for (STMT_PTR stmt = caller_body->Begin_stmt();
+       stmt != caller_body->End_stmt(); stmt = stmt->Next()) {
+    terminal = stmt;
+  }
+  ASSERT_NE(terminal, Null_ptr);
+  ASSERT_EQ(terminal->Node()->Opcode(), air::core::OPC_RETV);
+  NODE_PTR replacement = terminal->Node()->Child(0);
+  STMT_PTR call        = caller_stats._call_stmts[0];
+  std::vector<NODE_PTR> expected_actuals;
+  for (uint32_t idx = 0; idx < call->Node()->Num_arg(); ++idx) {
+    expected_actuals.push_back(call->Node()->Child(idx));
+  }
+  VECTOR_KERNEL_AIR_COMPARE_RESULT bridge =
+      Check_vector_kernel_call_bridge(caller, call, expected_actuals,
+                                      replacement, *helper);
+  EXPECT_TRUE(bridge._equal) << bridge._message;
+
+  // M3 intentionally stops at valid post-Mv2v pre-Vector2SIHE AIR.
   EXPECT_EQ(Get_stats(caller)._calls, 1U);
   ASSERT_TRUE(lowered->Verify_ir());
 }
