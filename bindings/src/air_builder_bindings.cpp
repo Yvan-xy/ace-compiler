@@ -450,11 +450,104 @@ public:
         return s;
     }
 
-    void set_u32_attr(const std::string& attr_name, uint32_t value) {
+    void require_attribute_target(const char* operation,
+                                  const std::string& attr_name) const {
         if (!has_node || node == NODE_PTR()) {
-            throw std::runtime_error("set_u32_attr requires a real AIR node");
+            throw std::runtime_error(std::string(operation) +
+                                     " requires a real AIR node");
         }
-        node->Set_attr(attr_name.c_str(), &value, 1);
+        if (attr_name.empty()) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires a non-empty attribute name");
+        }
+        if (!META_INFO::Has_prop<OPR_PROP::ATTR>(node->Opcode())) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires an opcode that supports AIR attributes");
+        }
+    }
+
+    static int32_t checked_s32_attr_value(int64_t value,
+                                          const char* operation) {
+        if (value < std::numeric_limits<int32_t>::min() ||
+            value > std::numeric_limits<int32_t>::max()) {
+            throw std::runtime_error(std::string(operation) +
+                                     " value is out of range for signed i32");
+        }
+        return static_cast<int32_t>(value);
+    }
+
+    static uint32_t checked_u32_attr_value(int64_t value,
+                                           const char* operation) {
+        if (value < 0 ||
+            static_cast<uint64_t>(value) >
+                std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error(std::string(operation) +
+                                     " value is out of range for unsigned i32");
+        }
+        return static_cast<uint32_t>(value);
+    }
+
+    template <typename T>
+    void set_array_attr(const std::string& attr_name,
+                        const std::vector<T>& values,
+                        const char* operation) {
+        require_attribute_target(operation, attr_name);
+        if (values.empty()) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires at least one value");
+        }
+        if (values.size() >= (1U << 24)) {
+            throw std::runtime_error(std::string(operation) +
+                                     " has too many values for AIR attribute storage");
+        }
+        node->Set_attr(attr_name.c_str(), values.data(), values.size());
+    }
+
+    void set_s32_attr(const std::string& attr_name, int64_t value) {
+        require_attribute_target("set_s32_attr", attr_name);
+        int32_t checked = checked_s32_attr_value(value, "set_s32_attr");
+        node->Set_attr(attr_name.c_str(), &checked, 1);
+    }
+
+    void set_s32_array_attr(const std::string& attr_name,
+                            const std::vector<int64_t>& values) {
+        std::vector<int32_t> checked;
+        checked.reserve(values.size());
+        for (int64_t value : values) {
+            checked.push_back(
+                checked_s32_attr_value(value, "set_s32_array_attr"));
+        }
+        set_array_attr(attr_name, checked, "set_s32_array_attr");
+    }
+
+    void set_u32_attr(const std::string& attr_name, int64_t value) {
+        require_attribute_target("set_u32_attr", attr_name);
+        uint32_t checked = checked_u32_attr_value(value, "set_u32_attr");
+        node->Set_attr(attr_name.c_str(), &checked, 1);
+    }
+
+    void set_u32_array_attr(const std::string& attr_name,
+                            const std::vector<int64_t>& values) {
+        std::vector<uint32_t> checked;
+        checked.reserve(values.size());
+        for (int64_t value : values) {
+            checked.push_back(
+                checked_u32_attr_value(value, "set_u32_array_attr"));
+        }
+        set_array_attr(attr_name, checked, "set_u32_array_attr");
+    }
+
+    void set_vector_slot(int64_t slot) {
+        require_attribute_target("set_vector_slot", nn::core::ATTR::SLOT);
+        if (!node->Has_rtype() || !node->Rtype()->Is_array()) {
+            throw std::runtime_error(
+                "set_vector_slot requires a ranked Vector value");
+        }
+        if (slot <= 0) {
+            throw std::runtime_error(
+                "set_vector_slot requires a positive slot count");
+        }
+        set_u32_attr(nn::core::ATTR::SLOT, slot);
     }
 };
 
@@ -531,6 +624,58 @@ public:
                 "AIR type belongs to a different GLOB_SCOPE");
         }
         return src_type;
+    }
+
+    TYPE_PTR require_real_expression(const std::shared_ptr<Node>& value,
+                                     const char* operation) {
+        if (!container || !value || !value->has_node ||
+            value->node == NODE_PTR()) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires real AIR operands");
+        }
+        if (value->node->Container() != container) {
+            throw std::runtime_error(std::string(operation) +
+                                     " cannot mix AIR containers");
+        }
+        if (!value->node->Has_rtype()) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires expression operands with result types");
+        }
+        return get_compatible_type(value->node->Rtype());
+    }
+
+    TYPE_PTR require_vector_operand(const std::shared_ptr<Node>& value,
+                                    const char* operation) {
+        TYPE_PTR type = require_real_expression(value, operation);
+        if (!type->Is_array()) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires ranked array operands");
+        }
+        return type;
+    }
+
+    TYPE_PTR require_core_s32_operand(const std::shared_ptr<Node>& value,
+                                      const char* operation) {
+        TYPE_PTR type = require_real_expression(value, operation);
+        if (value->node->Domain() != air::core::CORE || !type->Is_prim() ||
+            type->Cast_to_prim()->Encoding() != PRIMITIVE_TYPE::INT_S32) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires a Core signed i32 scalar");
+        }
+        return type;
+    }
+
+    void require_vector_binary_operands(const std::shared_ptr<Node>& lhs,
+                                        const std::shared_ptr<Node>& rhs,
+                                        const char* operation) {
+        TYPE_PTR lhs_type = require_vector_operand(lhs, operation);
+        TYPE_PTR rhs_type = require_vector_operand(rhs, operation);
+        if (!Type::structurally_equal_air_types(
+                lhs_type->Cast_to_arr()->Elem_type(),
+                rhs_type->Cast_to_arr()->Elem_type())) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires compatible vector element types");
+        }
     }
 
     void require_compatible_operands(const std::shared_ptr<Node>& a,
@@ -726,18 +871,12 @@ public:
     // ═══════════════════════════════════════════════════════════════════════
     
     std::shared_ptr<Node> new_vec_add(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
-        if (container && a->has_node && b->has_node) {
-            OPCODE op(nn::vector::VECTOR, nn::vector::VECTOR_OPCODE::ADD);
-            NODE_PTR n = container->New_bin_arith(op, a->node->Rtype(), a->node, b->node, get_spos());
-            auto node = wrap_node(n, "nn::vector::ADD");
-            node->add_child(a);
-            node->add_child(b);
-            return node;
-        }
-        auto node = std::make_shared<Node>(++node_counter, "nn::vector::ADD");
+        require_vector_binary_operands(a, b, "new_vec_add");
+        nn::vector::VECTOR_GEN vector_gen(container);
+        NODE_PTR n = vector_gen.New_add(a->node, b->node, get_spos());
+        auto node = wrap_node(n, "nn::vector::ADD");
         node->add_child(a);
         node->add_child(b);
-        nodes.push_back(node);
         return node;
     }
     
@@ -759,18 +898,85 @@ public:
     }
     
     std::shared_ptr<Node> new_vec_mul(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
-        if (container && a->has_node && b->has_node) {
-            OPCODE op(nn::vector::VECTOR, nn::vector::VECTOR_OPCODE::MUL);
-            NODE_PTR n = container->New_bin_arith(op, a->node->Rtype(), a->node, b->node, get_spos());
-            auto node = wrap_node(n, "nn::vector::MUL");
-            node->add_child(a);
-            node->add_child(b);
-            return node;
-        }
-        auto node = std::make_shared<Node>(++node_counter, "nn::vector::MUL");
+        require_vector_binary_operands(a, b, "new_vec_mul");
+        nn::vector::VECTOR_GEN vector_gen(container);
+        NODE_PTR n = vector_gen.New_mul(a->node, b->node, get_spos());
+        auto node = wrap_node(n, "nn::vector::MUL");
         node->add_child(a);
         node->add_child(b);
-        nodes.push_back(node);
+        return node;
+    }
+
+    std::shared_ptr<Node> new_vec_roll(
+        std::shared_ptr<Node> value, std::shared_ptr<Node> shift,
+        const std::vector<int64_t>& candidates) {
+        require_vector_operand(value, "new_vec_roll");
+        require_core_s32_operand(shift, "new_vec_roll");
+        if (candidates.empty()) {
+            throw std::runtime_error(
+                "new_vec_roll requires non-empty rotation candidates");
+        }
+        if (candidates.size() >= (1U << 24)) {
+            throw std::runtime_error(
+                "new_vec_roll has too many candidates for AIR "
+                "attribute storage");
+        }
+
+
+        static_assert(sizeof(int) == sizeof(int32_t),
+                      "VECTOR RNUM attributes require 32-bit int");
+        std::vector<int> checked_candidates;
+        checked_candidates.reserve(candidates.size());
+        for (int64_t candidate : candidates) {
+            if (candidate < std::numeric_limits<int32_t>::min() ||
+                candidate > std::numeric_limits<int32_t>::max()) {
+                throw std::runtime_error(
+                    "new_vec_roll candidate is out of range for signed i32");
+            }
+            checked_candidates.push_back(static_cast<int>(candidate));
+        }
+
+        nn::vector::VECTOR_GEN vector_gen(container);
+        NODE_PTR n = vector_gen.New_roll(
+            value->node, shift->node, checked_candidates, get_spos());
+        auto node = wrap_node(n, "nn::vector::ROLL");
+        node->add_child(value);
+        node->add_child(shift);
+        return node;
+    }
+
+    std::shared_ptr<Node> new_vec_slice(std::shared_ptr<Node> value,
+                                        std::shared_ptr<Node> start,
+                                        int64_t slice_size) {
+        TYPE_PTR value_type = require_vector_operand(value, "new_vec_slice");
+        require_core_s32_operand(start, "new_vec_slice");
+        if (slice_size <= 0 ||
+            slice_size > std::numeric_limits<int32_t>::max()) {
+            throw std::runtime_error(
+                "new_vec_slice size must be a positive signed i32 value");
+        }
+
+        const std::vector<int64_t> shape =
+            value_type->Cast_to_arr()->Shape();
+        if (shape.size() != 2) {
+            throw std::runtime_error(
+                "new_vec_slice requires a rank-2 source");
+        }
+        if (shape[1] != slice_size) {
+            throw std::runtime_error(
+                "new_vec_slice size must match the source trailing dimension");
+        }
+
+        TYPE_PTR s32_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
+        NODE_PTR size = container->New_intconst(
+            s32_type, slice_size, get_spos());
+        nn::vector::VECTOR_GEN vector_gen(container);
+        NODE_PTR n =
+            vector_gen.New_slice(value->node, start->node, size, get_spos());
+        auto node = wrap_node(n, "nn::vector::SLICE");
+        node->add_child(value);
+        node->add_child(start);
+        node->add_child(wrap_node(size, "air::core::INTCONST"));
         return node;
     }
     
@@ -5764,8 +5970,15 @@ PYBIND11_MODULE(air_builder, m) {
         .def("opcode_name", &Node::opcode_name)
         .def("rtype", &Node::rtype)
         .def("to_string", &Node::to_string)
+        .def("set_s32_attr", &Node::set_s32_attr,
+             py::arg("attr_name"), py::arg("value"))
+        .def("set_s32_array_attr", &Node::set_s32_array_attr,
+             py::arg("attr_name"), py::arg("values"))
         .def("set_u32_attr", &Node::set_u32_attr,
              py::arg("attr_name"), py::arg("value"))
+        .def("set_u32_array_attr", &Node::set_u32_array_attr,
+             py::arg("attr_name"), py::arg("values"))
+        .def("set_vector_slot", &Node::set_vector_slot, py::arg("slot"))
         .def("__repr__", &Node::to_string);
     
     py::class_<Container>(m, "Container")
@@ -5794,6 +6007,10 @@ PYBIND11_MODULE(air_builder, m) {
         .def("new_vec_add", &Container::new_vec_add)
         .def("new_vec_sub", &Container::new_vec_sub)
         .def("new_vec_mul", &Container::new_vec_mul)
+        .def("new_vec_roll", &Container::new_vec_roll,
+             py::arg("value"), py::arg("shift"), py::arg("candidates"))
+        .def("new_vec_slice", &Container::new_vec_slice,
+             py::arg("value"), py::arg("start"), py::arg("slice_size"))
         // Domain: fhe::sihe
         .def("new_sihe_add", &Container::new_sihe_add)
         .def("new_sihe_sub", &Container::new_sihe_sub)
