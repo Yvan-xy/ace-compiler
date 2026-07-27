@@ -476,7 +476,10 @@ class AceEDSL(BaseDSL):
                         if (result.air_type is not None and
                                 hasattr(ret_container, "new_local")):
                             ret_container.new_local(temp_name, result.air_type)
-                        ret_node = ret_container.new_stid(temp_name, result.value)
+                        ret_node = ret_container.new_stid(
+                            temp_name, result._value_without_vector_slot()
+                        )
+                        result._apply_vector_slot(ret_node)
                         ret_container.new_retv(ret_node)
                         log().debug(f"Returning AIRValue via temp '{temp_name}'")
                     else:
@@ -648,6 +651,12 @@ class AceEDSL(BaseDSL):
                 if hasattr(param_node, "rtype")
                 else air_type
             )
+            if (
+                not shape
+                and formal_type is not None
+                and formal_type.is_array()
+            ):
+                shape = tuple(formal_type.shape())
             
             # Wrap in AIRValue for operator overloading
             # Pass shape from instance if available

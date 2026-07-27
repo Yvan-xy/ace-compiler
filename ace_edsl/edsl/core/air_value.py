@@ -79,6 +79,7 @@ class AIRValue:
         domain: Optional[str] = None,
         temp_name: Optional[str] = None,
         air_type: Any = None,
+        vector_slot: Optional[int] = None,
     ):
         self._node = node
         self._container = container
@@ -86,6 +87,7 @@ class AIRValue:
         self._domain = domain
         self._temp_name = temp_name  # For on-demand fresh loads
         self._air_type = air_type or self._infer_air_type(node)
+        self._vector_slot = vector_slot
 
     @staticmethod
     def _infer_air_type(node: Any) -> Any:
@@ -120,6 +122,7 @@ class AIRValue:
             domain,
             self._temp_name,
             self._air_type,
+            self._vector_slot,
         )
 
     def cast(self, air_type: Any) -> 'AIRValue':
@@ -151,6 +154,40 @@ class AIRValue:
             self._domain,
             air_type=self._air_type,
         )
+
+    def _apply_vector_slot(self, node: Any) -> Any:
+        """Attach a pending typed Vector SLOT to ``node`` when present."""
+        if self._vector_slot is not None:
+            if node is None or not hasattr(node, "set_vector_slot"):
+                raise NotImplementedError(
+                    "AIR node does not support typed Vector SLOT attributes"
+                )
+            node.set_vector_slot(self._vector_slot)
+        return node
+
+    def with_slot(self, slot: int) -> 'AIRValue':
+        """Return this Vector value with a positive typed ``SLOT`` attribute."""
+        if self._domain != "nn::vector":
+            raise TypeError("with_slot requires an nn::vector AIRValue")
+        if isinstance(slot, bool) or not isinstance(slot, int):
+            raise TypeError("Vector SLOT must be an integer")
+        if slot <= 0 or slot >= (1 << 32):
+            raise ValueError("Vector SLOT must be a positive u32 value")
+        return AIRValue(
+            self._node,
+            self._container,
+            self._shape,
+            self._domain,
+            temp_name=self._temp_name,
+            air_type=self._air_type,
+            vector_slot=slot,
+        )
+
+    def _value_without_vector_slot(self) -> Any:
+        """Materialize a value without applying its pending Vector SLOT."""
+        if self._temp_name is not None and hasattr(self._container, "new_ldid"):
+            return self._container.new_ldid(self._temp_name)
+        return self._node
     
     def _flatten_result(self, result_node: Any) -> 'AIRValue':
         """
@@ -165,15 +202,20 @@ class AIRValue:
         Note: We store the temp_name, not the load_node. Each access to .value
         creates a fresh load to avoid sharing the same node across multiple uses.
         """
+        result_type = self._infer_air_type(result_node)
+        result_shape = self._shape
+        if result_type is not None and result_type.is_array():
+            result_shape = tuple(result_type.shape())
+
         if not AIRValue.FLAT_IR_MODE:
             return AIRValue(
-                result_node, self._container, self._shape, self._domain
+                result_node, self._container, result_shape, self._domain,
+                air_type=result_type,
             )
         
         # Store result to a temporary
         temp_name = AIRValue._next_temp_name()
         if hasattr(self._container, 'new_stid'):
-            result_type = self._infer_air_type(result_node)
             if (result_type is not None and
                     hasattr(self._container, "new_local")):
                 self._container.new_local(temp_name, result_type)
@@ -183,17 +225,29 @@ class AIRValue:
                 return AIRValue(
                     node=None,  # No cached node - will load on demand
                     container=self._container, 
-                    shape=self._shape, 
+                    shape=result_shape,
                     domain=self._domain,
                     temp_name=temp_name,  # Store the name for fresh loads
                     air_type=result_type,
                 )
             else:
                 # Fallback: use the store node directly
-                return AIRValue(store_node, self._container, self._shape, self._domain)
+                return AIRValue(
+                    store_node,
+                    self._container,
+                    result_shape,
+                    self._domain,
+                    air_type=result_type,
+                )
         else:
             # Fallback: no flattening if stid not available
-            return AIRValue(result_node, self._container, self._shape, self._domain)
+            return AIRValue(
+                result_node,
+                self._container,
+                result_shape,
+                self._domain,
+                air_type=result_type,
+            )
     
     @property
     def value(self) -> Any:
@@ -206,10 +260,7 @@ class AIRValue:
         to ensure each use gets a distinct node. This avoids issues where
         the same node is used in multiple places.
         """
-        # If we have a temp_name, create a fresh load each access
-        if self._temp_name is not None and hasattr(self._container, 'new_ldid'):
-            return self._container.new_ldid(self._temp_name)
-        return self._node
+        return self._apply_vector_slot(self._value_without_vector_slot())
     
     @property
     def container(self) -> Any:
