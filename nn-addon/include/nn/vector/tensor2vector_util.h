@@ -36,6 +36,13 @@ typedef struct {
   int _num_dup_input;
 } SHARD_MAP_PARAMS;
 
+struct FAST_CONV_PREPARED_CONSTANTS {
+  air::base::CONSTANT_PTR _cyclic_mask_left = air::base::Null_ptr;
+  air::base::CONSTANT_PTR _cyclic_mask_right = air::base::Null_ptr;
+  air::base::CONSTANT_PTR _collective_mask = air::base::Null_ptr;
+  air::base::CONSTANT_PTR _collective_gap_mask = air::base::Null_ptr;
+};
+
 void Compute_pad_gemm(int64_t& n, int64_t& k, int64_t num_slots);
 // Cost Model for MetaKernel
 int      Get_costmodel_mini_factor1(int c);
@@ -50,9 +57,14 @@ public:
       : VECTOR_GEN(ctx.Container()), _ctx(ctx) {}
 
   NODE_PTR Roll_cyclic(ADDR_DATUM_PTR input, int len, int block_size, int n,
-                       ADDR_DATUM_PTR iv, const SPOS& spos);
+                       ADDR_DATUM_PTR iv, const SPOS& spos,
+                       const FAST_CONV_PREPARED_CONSTANTS*
+                           prepared_constants = nullptr);
   NODE_PTR New_gemm_metakernel(NODE_PTR op0, NODE_PTR op1, NODE_PTR op2,
-                               bool need_mask, const SPOS& spos);
+                               bool need_mask, const SPOS& spos,
+                               int64_t prepared_duplications = 0,
+                               air::base::CONSTANT_PTR prepared_mask =
+                                   air::base::Null_ptr);
   ADDR_DATUM_PTR New_gemm_metakernel_fast(NODE_PTR op0, NODE_PTR op1,
                                           NODE_PTR op2, int64_t n, int64_t k,
                                           int h1, int h2, const SPOS& spos);
@@ -60,7 +72,9 @@ public:
                                std::vector<int> ra, int channel_in,
                                int channel_out, int output_height,
                                int output_width, int kernel_hw, int stride,
-                               const SPOS& spos);
+                               const SPOS& spos,
+                               int64_t prepared_duplications = 0,
+                               bool rotations_are_scaled = false);
   NODE_PTR New_conv_metakernel_fast(
       NODE_PTR input, NODE_PTR weight, NODE_PTR bias, std::vector<int> ra,
       int channel_in, int channel_out, int output_height, int output_width,
@@ -99,12 +113,16 @@ public:
   }
 
   NODE_PTR Gen_mask_node(int64_t valid_len, TYPE_PTR etype, float val,
-                         const SPOS& spos);
+                         const SPOS& spos,
+                         air::base::CONSTANT_PTR prepared_mask =
+                             air::base::Null_ptr);
 
   //! @brief only used for input that all invalid data are
   //! placed at last.
   void Gen_clear_data_stmt(ADDR_DATUM_PTR input_var, int64_t valid_len,
-                           TYPE_PTR etype, const SPOS& spos);
+                           TYPE_PTR etype, const SPOS& spos,
+                           air::base::CONSTANT_PTR prepared_mask =
+                               air::base::Null_ptr);
 
   //! @brief till now only used for global average pool
   void Gen_clear_data_stmt(NODE_PTR input_node, const SPOS& spos);
@@ -192,11 +210,17 @@ public:
   PREG_PTR Gen_collective_reduce_stmt(ADDR_DATUM_PTR input_var, TYPE_PTR etype,
                                       const SPOS& spos, int num_block,
                                       int width_block_data, int width_block_pad,
-                                      int output_size, bool need_mask);
+                                      int output_size, bool need_mask,
+                                      int64_t prepared_slots = 0,
+                                      const FAST_CONV_PREPARED_CONSTANTS*
+                                          prepared_constants = nullptr);
 
   PREG_PTR Gen_collective_reduce_stmt(ADDR_DATUM_PTR input_var, TYPE_PTR etype,
                                       const SPOS& spos, int width_block_data,
-                                      int output_size, bool need_mask);
+                                      int output_size, bool need_mask,
+                                      int64_t prepared_slots = 0,
+                                      const FAST_CONV_PREPARED_CONSTANTS*
+                                          prepared_constants = nullptr);
 
   //! @brief this is only used to process roll sum when the
   //! number of valid data in kernel shape is 4, no loop used.

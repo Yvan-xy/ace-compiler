@@ -162,26 +162,36 @@ ADDR_DATUM_PTR TENSOR2VECTOR_UTIL::Reduce_add_intra(ADDR_DATUM_PTR input,
 // so total size=n*len masks, each grid loop need 1.
 NODE_PTR TENSOR2VECTOR_UTIL::Roll_cyclic(ADDR_DATUM_PTR input, int len,
                                          int block_size, int n,
-                                         ADDR_DATUM_PTR iv, const SPOS& spos) {
+                                         ADDR_DATUM_PTR iv, const SPOS& spos,
+                                         const FAST_CONV_PREPARED_CONSTANTS*
+                                             prepared_constants) {
   //  Gen mask1 [shift=1, len-shift=0], [n,len]
   //  Gen mask2 [shift=0, len-shift=1]  [n,len]
-  FPVEC mask1(n * len, 0.0), mask2(n * len, 1.0);
-  for (int i = 0; i < n; i++) {
-    for (int s = 0; s < i * block_size; s++) {
-      mask1[i * len + s] = 1.0;
-      mask2[i * len + s] = 0.0;
-    }
-  }
-
   CONST_TYPE_PTR s32t = _cntr->Glob_scope()->Prim_type(PRIMITIVE_TYPE::INT_S32);
-  CONST_TYPE_PTR f32t =
-      _cntr->Glob_scope()->Prim_type(PRIMITIVE_TYPE::FLOAT_32);
-  CONSTANT_PTR mask1_const =
-      New_array_const(_cntr->Glob_scope(), "roll_mask1", n * len, f32t,
-                      {n, len}, (void*)mask1.data(), spos);
-  CONSTANT_PTR mask2_const =
-      New_array_const(_cntr->Glob_scope(), "roll_mask2", n * len, f32t,
-                      {n, len}, (void*)mask2.data(), spos);
+  CONSTANT_PTR mask1_const = air::base::Null_ptr;
+  CONSTANT_PTR mask2_const = air::base::Null_ptr;
+  if (prepared_constants != nullptr) {
+    mask1_const = prepared_constants->_cyclic_mask_left;
+    mask2_const = prepared_constants->_cyclic_mask_right;
+    AIR_ASSERT(mask1_const != air::base::Null_ptr);
+    AIR_ASSERT(mask2_const != air::base::Null_ptr);
+  } else {
+    FPVEC mask1(n * len, 0.0), mask2(n * len, 1.0);
+    for (int i = 0; i < n; i++) {
+      for (int s = 0; s < i * block_size; s++) {
+        mask1[i * len + s] = 1.0;
+        mask2[i * len + s] = 0.0;
+      }
+    }
+    CONST_TYPE_PTR f32t =
+        _cntr->Glob_scope()->Prim_type(PRIMITIVE_TYPE::FLOAT_32);
+    mask1_const =
+        New_array_const(_cntr->Glob_scope(), "roll_mask1", n * len, f32t,
+                        {n, len}, (void*)mask1.data(), spos);
+    mask2_const =
+        New_array_const(_cntr->Glob_scope(), "roll_mask2", n * len, f32t,
+                        {n, len}, (void*)mask2.data(), spos);
+  }
   NODE_PTR mask1_slice =
       New_slice(_cntr->New_ldc(mask1_const, spos), _cntr->New_ld(iv, spos),
                 _cntr->New_intconst(s32t, len, spos), spos);
@@ -222,22 +232,30 @@ NODE_PTR TENSOR2VECTOR_UTIL::Roll_cyclic(ADDR_DATUM_PTR input, int len,
 PREG_PTR TENSOR2VECTOR_UTIL::Gen_collective_reduce_stmt(
     ADDR_DATUM_PTR result_var, TYPE_PTR etype, const SPOS& spos, int num_block,
     int width_block_data, int width_block_pad, int output_size,
-    bool need_mask) {
+    bool need_mask, int64_t prepared_slots,
+    const FAST_CONV_PREPARED_CONSTANTS* prepared_constants) {
+  const int64_t active_slots = prepared_slots > 0 ? prepared_slots : _ctx.Get_slot();
   FUNC_SCOPE* fscope = _cntr->Parent_func_scope();
   GLOB_SCOPE* gscope = _cntr->Glob_scope();
 
   // corner case
-  if (output_size == _ctx.Get_slot()) {
+  if (output_size == active_slots) {
     _ctx.Trace(TF_LOWER,
                "Gen_collective_reduce_stmt: output_size == _ctx.Get_slot() ",
                output_size, "\n");
     AIR_ASSERT_MSG(num_block == 1, "if output_size == _ctx.Get_slot()");
     if (need_mask) {
-      FPVEC                mask1(width_block_data, 1.0);
-      std::vector<int64_t> mask_shape{width_block_data};
-      CONSTANT_PTR         mask1_const =
-          New_array_const(gscope, "mask1", width_block_data, etype, mask_shape,
-                          (void*)mask1.data(), spos);
+      CONSTANT_PTR mask1_const = air::base::Null_ptr;
+      if (prepared_constants != nullptr) {
+        mask1_const = prepared_constants->_collective_mask;
+        AIR_ASSERT(mask1_const != air::base::Null_ptr);
+      } else {
+        FPVEC                mask1(width_block_data, 1.0);
+        std::vector<int64_t> mask_shape{width_block_data};
+        mask1_const = New_array_const(gscope, "mask1", width_block_data,
+                                      etype, mask_shape, (void*)mask1.data(),
+                                      spos);
+      }
       NODE_PTR init_m1 = New_mul(_cntr->New_ld(result_var, spos),
                                  _cntr->New_ldc(mask1_const, spos), spos);
 
@@ -259,21 +277,32 @@ PREG_PTR TENSOR2VECTOR_UTIL::Gen_collective_reduce_stmt(
 
   int width_block = width_block_data + width_block_pad;
 
-  FPVEC mask1(width_block_data, 1.0);
-  FPVEC mask2(width_block_data, 0.0);
-  // if (num_block == 1) width_block_pad = width_block_data;
-  std::cout << "width_block_data=" << width_block_data
-            << " width_block_pad=" << width_block_pad << std::endl;
-  for (int i = width_block_data - width_block_pad; i < width_block_data; i++)
-    mask2[i] = 1.0;
+  CONSTANT_PTR mask1_const = air::base::Null_ptr;
+  CONSTANT_PTR mask2_const = air::base::Null_ptr;
+  if (prepared_constants != nullptr) {
+    mask1_const = prepared_constants->_collective_mask;
+    mask2_const = prepared_constants->_collective_gap_mask;
+  } else {
+    FPVEC mask1(width_block_data, 1.0);
+    FPVEC mask2(width_block_data, 0.0);
+    // if (num_block == 1) width_block_pad = width_block_data;
+    std::cout << "width_block_data=" << width_block_data
+              << " width_block_pad=" << width_block_pad << std::endl;
+    for (int i = width_block_data - width_block_pad; i < width_block_data; i++)
+      mask2[i] = 1.0;
 
-  std::vector<int64_t> mask_shape{width_block_data};
-  CONSTANT_PTR         mask1_const =
-      New_array_const(gscope, "mask1", width_block_data, etype, mask_shape,
-                      (void*)mask1.data(), spos);
-  CONSTANT_PTR mask2_const =
-      New_array_const(gscope, "mask2", width_block_data, etype, mask_shape,
-                      (void*)mask2.data(), spos);
+    std::vector<int64_t> mask_shape{width_block_data};
+    mask1_const =
+        New_array_const(gscope, "mask1", width_block_data, etype, mask_shape,
+                        (void*)mask1.data(), spos);
+    mask2_const =
+        New_array_const(gscope, "mask2", width_block_data, etype, mask_shape,
+                        (void*)mask2.data(), spos);
+  }
+  AIR_ASSERT(!need_mask || mask1_const != air::base::Null_ptr);
+  AIR_ASSERT(num_block <= 1 || mask1_const != air::base::Null_ptr);
+  AIR_ASSERT((!need_mask && num_block <= 1) ||
+             mask2_const != air::base::Null_ptr);
 
   NODE_PTR init_m1;
   if (need_mask) {
@@ -361,21 +390,29 @@ PREG_PTR TENSOR2VECTOR_UTIL::Gen_collective_reduce_stmt(
 
 PREG_PTR TENSOR2VECTOR_UTIL::Gen_collective_reduce_stmt(
     ADDR_DATUM_PTR result_var, TYPE_PTR etype, const SPOS& spos,
-    int width_block_data, int output_size, bool need_mask) {
+    int width_block_data, int output_size, bool need_mask,
+    int64_t prepared_slots,
+    const FAST_CONV_PREPARED_CONSTANTS* prepared_constants) {
+  const int64_t active_slots = prepared_slots > 0 ? prepared_slots : _ctx.Get_slot();
   FUNC_SCOPE* fscope = _cntr->Parent_func_scope();
   GLOB_SCOPE* gscope = _cntr->Glob_scope();
 
   // corner case
-  if (output_size == _ctx.Get_slot()) {
+  if (output_size == active_slots) {
     _ctx.Trace(TF_LOWER,
                "Gen_collective_reduce_stmt: output_size == _ctx.Get_slot() ",
                output_size, "\n");
     if (need_mask) {
-      FPVEC                mask(width_block_data, 1.0);
-      std::vector<int64_t> mask_shape{width_block_data};
-      CONSTANT_PTR         mask_const =
-          New_array_const(gscope, "mask", width_block_data, etype, mask_shape,
-                          (void*)mask.data(), spos);
+      CONSTANT_PTR mask_const = air::base::Null_ptr;
+      if (prepared_constants != nullptr) {
+        mask_const = prepared_constants->_collective_mask;
+        AIR_ASSERT(mask_const != air::base::Null_ptr);
+      } else {
+        FPVEC                mask(width_block_data, 1.0);
+        std::vector<int64_t> mask_shape{width_block_data};
+        mask_const = New_array_const(gscope, "mask", width_block_data, etype,
+                                     mask_shape, (void*)mask.data(), spos);
+      }
       NODE_PTR init_m1 = New_mul(_cntr->New_ld(result_var, spos),
                                  _cntr->New_ldc(mask_const, spos), spos);
 
@@ -406,13 +443,17 @@ PREG_PTR TENSOR2VECTOR_UTIL::Gen_collective_reduce_stmt(
 
   NODE_PTR init_m1;
   if (need_mask) {
-    FPVEC mask(width_block_data, 1.0);
-    std::cout << "width_block_data=" << width_block_data << std::endl;
-
-    std::vector<int64_t> mask_shape{width_block_data};
-    CONSTANT_PTR         mask_const =
-        New_array_const(gscope, "mask", width_block_data, etype, mask_shape,
-                        (void*)mask.data(), spos);
+    CONSTANT_PTR mask_const = air::base::Null_ptr;
+    if (prepared_constants != nullptr) {
+      mask_const = prepared_constants->_collective_mask;
+      AIR_ASSERT(mask_const != air::base::Null_ptr);
+    } else {
+      FPVEC mask(width_block_data, 1.0);
+      std::cout << "width_block_data=" << width_block_data << std::endl;
+      std::vector<int64_t> mask_shape{width_block_data};
+      mask_const = New_array_const(gscope, "mask", width_block_data, etype,
+                                   mask_shape, (void*)mask.data(), spos);
+    }
 
     init_m1 = New_mul(fini_add, _cntr->New_ldc(mask_const, spos), spos);
   } else {
@@ -428,22 +469,27 @@ PREG_PTR TENSOR2VECTOR_UTIL::Gen_collective_reduce_stmt(
 }
 
 NODE_PTR TENSOR2VECTOR_UTIL::Gen_mask_node(int64_t valid_len, TYPE_PTR etype,
-                                           float val, const SPOS& spos) {
+                                           float val, const SPOS& spos,
+                                           CONSTANT_PTR prepared_mask) {
   GLOB_SCOPE* gscope = _cntr->Glob_scope();
   _ctx.Trace(TF_LOWER, "clean 0: len_mask=", valid_len, "\n");
-  FPVEC                mask(valid_len, val);
-  std::vector<int64_t> mask_shape{valid_len};
-  CONSTANT_PTR         mask_const =
-      New_array_const(gscope, "clear_mask_n", _ctx.Get_num_vloop(), valid_len,
-                      etype, mask_shape, (void*)mask.data(), spos);
+  CONSTANT_PTR mask_const = prepared_mask;
+  if (mask_const == air::base::Null_ptr) {
+    FPVEC                mask(valid_len, val);
+    std::vector<int64_t> mask_shape{valid_len};
+    mask_const = New_array_const(gscope, "clear_mask_n", _ctx.Get_num_vloop(),
+                                 valid_len, etype, mask_shape,
+                                 (void*)mask.data(), spos);
+  }
   NODE_PTR mask_node = _cntr->New_ldc(mask_const, spos);
   return mask_node;
 }
 
 void TENSOR2VECTOR_UTIL::Gen_clear_data_stmt(ADDR_DATUM_PTR input_var,
                                              int64_t valid_len, TYPE_PTR etype,
-                                             const SPOS& spos) {
-  NODE_PTR mask_node = Gen_mask_node(valid_len, etype, 1, spos);
+                                             const SPOS& spos,
+                                             CONSTANT_PTR prepared_mask) {
+  NODE_PTR mask_node = Gen_mask_node(valid_len, etype, 1, spos, prepared_mask);
 
   _ctx.Trace_cmd(TF_LOWER, Trace_float_array, mask_node->Const(),
                  "clean 0 mask");
@@ -722,7 +768,8 @@ STMT_PTR TENSOR2VECTOR_UTIL::New_loop(const char* index_str, int init,
 NODE_PTR TENSOR2VECTOR_UTIL::New_conv_metakernel(
     NODE_PTR input, NODE_PTR weight, NODE_PTR bias, std::vector<int> ra,
     int channel_in, int channel_out, int output_height, int output_width,
-    int kernel_hw, int stride, const SPOS& spos) {
+    int kernel_hw, int stride, const SPOS& spos,
+    int64_t prepared_duplications, bool rotations_are_scaled) {
   _ctx.Incr_num_vloop();
   GLOB_SCOPE* gscope = _cntr->Glob_scope();
   FUNC_SCOPE* fscope = _cntr->Parent_func_scope();
@@ -759,20 +806,25 @@ NODE_PTR TENSOR2VECTOR_UTIL::New_conv_metakernel(
 
   // input_dup = input + roll(input, -output_height*output_width)
   // duplicate input value several times to make sure later roll works well
-  int     dup_num = static_cast<int>(ceil(1.0 * channel_out / channel_in)) + 1;
+  int dup_num = prepared_duplications > 0
+                    ? static_cast<int>(prepared_duplications)
+                    : static_cast<int>(ceil(1.0 * channel_out / channel_in)) + 1;
   int64_t input_size = channel_in * output_height * output_width;
-  if (Is_power_of_two(input_size)) {
+  if (prepared_duplications == 0 && Is_power_of_two(input_size)) {
     int t = this->_ctx.Get_slot() / input_size;
     if (dup_num > t) dup_num = t;
   }
 
-  if (channel_in * output_height * output_width * 2 > this->_ctx.Get_slot()) {
+  if (prepared_duplications == 0 &&
+      channel_in * output_height * output_width * 2 > this->_ctx.Get_slot()) {
     dup_num = 1;  // no need duplicate
   }
 
-  AIR_ASSERT_MSG(channel_in * output_height * output_width * dup_num <=
-                     this->_ctx.Get_slot(),
-                 "after duplicate input, size should <= slot");
+  if (prepared_duplications == 0) {
+    AIR_ASSERT_MSG(channel_in * output_height * output_width * dup_num <=
+                       this->_ctx.Get_slot(),
+                   "after duplicate input, size should <= slot");
+  }
   Gen_dup_input_stmt(input, dup_num, channel_in * output_height * output_width,
                      input_dup_var, spos);
 
@@ -788,7 +840,9 @@ NODE_PTR TENSOR2VECTOR_UTIL::New_conv_metakernel(
   // input_roll = ROLL(input_dup, ra[i])
   std::vector<int64_t> ra_shape(1, ra.size());
 
-  for (int i = 0; i < ra.size(); i++) ra[i] *= stride;
+  if (!rotations_are_scaled) {
+    for (int i = 0; i < ra.size(); i++) ra[i] *= stride;
+  }
   TYPE_PTR     ra_type  = New_array_type(gscope, "ra_int", _ctx.Get_num_vloop(),
                                          s32_type, ra_shape, spos);
   CONSTANT_PTR ra_const = gscope->New_const(CONSTANT_KIND::ARRAY, ra_type,
@@ -1239,7 +1293,9 @@ ADDR_DATUM_PTR TENSOR2VECTOR_UTIL::New_gemm_metakernel_fast(
  */
 NODE_PTR TENSOR2VECTOR_UTIL::New_gemm_metakernel(NODE_PTR op0, NODE_PTR op1,
                                                  NODE_PTR op2, bool need_mask,
-                                                 const SPOS& spos) {
+                                                 const SPOS& spos,
+                                                 int64_t prepared_duplications,
+                                                 CONSTANT_PTR prepared_mask) {
   _ctx.Incr_num_vloop();
   GLOB_SCOPE* gscope = _cntr->Glob_scope();
   FUNC_SCOPE* fscope = _cntr->Parent_func_scope();
@@ -1268,8 +1324,10 @@ NODE_PTR TENSOR2VECTOR_UTIL::New_gemm_metakernel(NODE_PTR op0, NODE_PTR op1,
   int64_t width  = op1_shape[1];
   // may need duplicate
   // input_dup = input + roll(input, -width)
-  int dup_num = 2;
-  if (width == _ctx.Get_slot()) {
+  int dup_num = prepared_duplications > 0
+                    ? static_cast<int>(prepared_duplications)
+                    : 2;
+  if (prepared_duplications == 0 && width == _ctx.Get_slot()) {
     dup_num = 1;  // no need duplicate
   }
   std::vector<int64_t> shape(1, dup_num * width);
@@ -1352,7 +1410,8 @@ NODE_PTR TENSOR2VECTOR_UTIL::New_gemm_metakernel(NODE_PTR op0, NODE_PTR op1,
   _ctx.Prepend(vaddc_stmt);
 
   if (need_mask) {
-    Gen_clear_data_stmt(tmp_result, height, op0_ty_arr->Elem_type(), spos);
+    Gen_clear_data_stmt(tmp_result, height, op0_ty_arr->Elem_type(), spos,
+                        prepared_mask);
   }
 
   NODE_PTR ld_result = _cntr->New_ld(tmp_result, spos);

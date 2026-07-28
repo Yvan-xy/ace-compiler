@@ -19,6 +19,7 @@
 #include "air/base/opcode.h"
 #include "air/base/spos.h"
 #include "air/base/st.h"
+#include "nn/vector/tensor2vector_planning.h"
 
 namespace nn {
 namespace vector {
@@ -35,9 +36,9 @@ using VECTOR_KERNEL_BODY_BUILDER = std::function<air::base::NODE_PTR(
     air::base::FUNC_SCOPE&, air::base::NODE_PTR, const air::base::SPOS&)>;
 
 struct VECTOR_KERNEL_HELPER_SPEC {
-  // Stable plan key and deterministic helper name. The M4 planner connection
-  // will populate these from VECTOR_KERNEL_PLAN. M1's synthetic fixture uses
-  // a deterministic test specialization.
+  // Stable plan key and deterministic helper name. Prepared plans populate
+  // these from VECTOR_KERNEL_PLAN; synthetic fixtures use deterministic test
+  // specializations.
   std::string _specialization_key;
   std::string _helper_name;
 
@@ -56,6 +57,16 @@ using VECTOR_KERNEL_LOWERING_SELECTOR =
         air::base::NODE_PTR, const std::vector<air::base::NODE_PTR>&,
         air::base::GLOB_SCOPE&)>;
 
+// A canonical-plan recipe is selected only after the provider result has
+// passed central validation. It receives the immutable prepared package and
+// destination-owned actuals, and creates no AIR until the materializer invokes
+// its returned body builder.
+using VECTOR_KERNEL_PLAN_RECIPE =
+    std::function<VECTOR_KERNEL_HELPER_SPEC(
+        const PREPARED_VECTOR_KERNEL_PLAN&,
+        const std::vector<air::base::NODE_PTR>&,
+        air::base::GLOB_SCOPE&)>;
+
 // Registration is explicitly per VECTOR_CTX/Vector_driver invocation. This
 // avoids process-global callbacks, stale module pointers, and shuffled-test
 // order dependencies. Merely setting the legacy skip registry is not a DSL
@@ -71,8 +82,40 @@ public:
   const VECTOR_KERNEL_LOWERING_SELECTOR* Lookup(
       air::base::OPCODE opcode) const;
 
+  bool Register(VECTOR_KERNEL_PLAN_KIND kind,
+                VECTOR_KERNEL_PLAN_RECIPE recipe);
+  bool Unregister(VECTOR_KERNEL_PLAN_KIND kind);
+  bool Has(VECTOR_KERNEL_PLAN_KIND kind) const;
+  const VECTOR_KERNEL_PLAN_RECIPE* Lookup(
+      VECTOR_KERNEL_PLAN_KIND kind) const;
+
+  // Materialized helpers are cached per active destination GLOB_SCOPE. These
+  // methods are used by the materializer after validating the complete
+  // specialization key, deterministic name, and ordered signature.
+  air::base::FUNC_SCOPE* Lookup_materialized_helper(
+      air::base::GLOB_SCOPE& destination,
+      const VECTOR_KERNEL_HELPER_SPEC& spec) const;
+  void Remember_materialized_helper(
+      air::base::GLOB_SCOPE& destination,
+      const VECTOR_KERNEL_HELPER_SPEC& spec,
+      air::base::FUNC_SCOPE& helper);
+  // A registry may be reused by its owner, but helper IDs and destination
+  // addresses are valid only for one Vector_driver invocation.
+  void Clear_materialized_helpers();
+
 private:
+  struct MATERIALIZED_HELPER {
+    std::string        _helper_name;
+    air::base::FUNC_ID _helper_func_id;
+  };
+
+  using DESTINATION_HELPER_CACHE =
+      std::unordered_map<std::string, MATERIALIZED_HELPER>;
+
   std::unordered_map<uint32_t, VECTOR_KERNEL_LOWERING_SELECTOR> _selectors;
+  std::unordered_map<uint8_t, VECTOR_KERNEL_PLAN_RECIPE> _plan_recipes;
+  std::unordered_map<air::base::GLOB_SCOPE*, DESTINATION_HELPER_CACHE>
+      _materialized_helpers;
 };
 
 struct VECTOR_KERNEL_LOWERING_RESULT {
@@ -89,6 +132,17 @@ std::optional<VECTOR_KERNEL_LOWERING_RESULT>
 Try_materialize_registered_vector_kernel(
     TENSOR2VECTOR_CTX& ctx, air::base::NODE_PTR source_node,
     const std::vector<air::base::NODE_PTR>& actuals);
+
+// Materialize the recipe registered for prepared.Plan()'s canonical kind.
+// The prepared specialization key and helper name are authoritative: a recipe
+// may leave them empty, but may not replace them. The helper is cached by the
+// complete prepared specialization key in the active destination GLOB_SCOPE.
+std::optional<VECTOR_KERNEL_LOWERING_RESULT>
+Try_materialize_prepared_vector_kernel(
+    TENSOR2VECTOR_CTX& ctx,
+    const PREPARED_VECTOR_KERNEL_PLAN& prepared,
+    const std::vector<air::base::NODE_PTR>& actuals,
+    const air::base::SPOS& spos);
 
 }  // namespace vector
 }  // namespace nn

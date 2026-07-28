@@ -16,6 +16,7 @@
 #include "nn/vector/skip_lowering.h"
 #include "nn/vector/tensor2vector_ctx.h"
 #include "nn/vector/tensor2vector_dsl.h"
+#include "nn/vector/tensor2vector_prepared_lowering.h"
 #include "nn/vector/tensor2vector_py_airgen.h"
 #include "nn/vector/tensor2vector_util.h"
 #include "nn/vector/vector_opcode.h"
@@ -61,9 +62,8 @@ public:
   RETV Handle_add(VISITOR* visitor, air::base::NODE_PTR node) {
     TENSOR2VECTOR_CTX& ctx = visitor->Context();
 
-    // M1's synthetic integration seam runs before the legacy skip-only path.
-    // M4 will connect the same generic registry/materializer after real
-    // Gemm/Conv planning has frozen a VECTOR_KERNEL_PLAN.
+    // The synthetic integration seam runs before the legacy skip-only path.
+    // Prepared Gemm/Conv plans use the plan-kind registry in their handlers.
     NODE_PTR new_ld0 = air::base::Null_ptr;
     NODE_PTR new_ld1 = air::base::Null_ptr;
     VECTOR_KERNEL_LOWERING_REGISTRY* registry =
@@ -200,9 +200,45 @@ public:
 
   template <typename RETV, typename VISITOR>
   RETV Handle_conv(VISITOR* visitor, air::base::NODE_PTR node) {
-    // Check if Python has a registered lowering for this op
-    if (Should_skip_lowering("nn::core", "conv")) {
-      // Visit children but preserve original conv node for Python pass
+    TENSOR2VECTOR_CTX& planning_ctx = visitor->Context();
+    const bool legacy_skip = Should_skip_lowering("nn::core", "conv");
+    std::optional<VECTOR_KERNEL_RESOLUTION_RESULT> prepared_resolution;
+    if (!planning_ctx.Config().Python_dsl()) {
+      VECTOR_KERNEL_SELECTION_RESULT parsed = Parse_vector_kernel_selection(
+          planning_ctx.Plan_provider(), planning_ctx.Kernel_impl(),
+          planning_ctx.Plan_kind(), planning_ctx.Fallback());
+      AIR_ASSERT_MSG(parsed._selection.has_value(), "%s",
+                     parsed._diagnostic.c_str());
+      VECTOR_KERNEL_REQUEST_BUILD_RESULT built =
+          Build_vector_kernel_planning_request(
+              planning_ctx, node, parsed._selection->_plan_kind);
+      AIR_ASSERT_MSG(built.Ok(), "%s", built._diagnostic.c_str());
+
+      VECTOR_KERNEL_LOWERING_REGISTRY* dsl_registry =
+          planning_ctx.Vector_kernel_lowering_registry();
+      prepared_resolution.emplace(Resolve_vector_kernel_plan(
+          *built._request, *parsed._selection,
+          planning_ctx.Vector_kernel_plan_provider_registry(),
+          [dsl_registry](VECTOR_KERNEL_PLAN_KIND kind) {
+            return dsl_registry != nullptr && dsl_registry->Has(kind);
+          }));
+      AIR_ASSERT_MSG(prepared_resolution->Ok(), "%s",
+                     prepared_resolution->_diagnostic.c_str());
+      if (prepared_resolution->_used_fallback) {
+        CMPLR_DEV_WARN(prepared_resolution->_diagnostic);
+        planning_ctx.Trace(TF_LOWER, prepared_resolution->_diagnostic, "\n");
+      }
+
+      // A requested prepared DSL implementation owns the operator even if
+      // resolution falls back to C++/native. Other successfully validated
+      // selections retain the legacy skip behavior.
+      if (parsed._selection->_kernel_implementation !=
+              VECTOR_KERNEL_IMPLEMENTATION::DSL &&
+          legacy_skip) {
+        return Clone_with_visited_children<RETV>(visitor, node);
+      }
+    } else if (legacy_skip) {
+      // Preserve the separate legacy Python AIR compatibility path.
       return Clone_with_visited_children<RETV>(visitor, node);
     }
     if (visitor->Context().Type_check()) {
@@ -210,6 +246,51 @@ public:
           node, std::vector{node->Child(0)->Rtype(), node->Child(1)->Rtype(),
                             node->Child(2)->Rtype()});
       AIR_ASSERT(res != NULL_PTR());
+    }
+
+    // Every ordinary Conv is planned and fully validated before visiting an
+    // operand or creating destination AIR.
+    if (prepared_resolution.has_value()) {
+      VECTOR_KERNEL_RESOLUTION_RESULT& resolved = *prepared_resolution;
+      TENSOR2VECTOR_UTIL vgen(planning_ctx);
+      NODE_PTR input = visitor->template Visit<RETV>(node->Child(0));
+      AIR_ASSERT(input->Rtype()->Is_array());
+      const VECTOR_KERNEL_RUNTIME_PREPARATION& preparation =
+          resolved._prepared->Runtime_preparations().front();
+      if (input->Rtype()->Cast_to_arr()->Shape() !=
+          preparation._result_type._shape) {
+        input = vgen.New_reshape(input, preparation._result_type._shape,
+                                 node->Spos());
+      }
+      if (input->Opcode() != air::core::LD &&
+          input->Opcode() != air::core::LDP) {
+        input = planning_ctx.Store_temp_result_to_preg(
+            input, static_cast<int>(preparation._outer_block_depth));
+      }
+
+      std::vector<NODE_PTR> scalar_actuals;
+      if (!resolved._prepared->Scalar_preparations().empty()) {
+        NODE_PTR source_scalar = Find_vector_kernel_source_scalar(node);
+        AIR_ASSERT(source_scalar != air::base::Null_ptr);
+        scalar_actuals.push_back(
+            visitor->template Visit<RETV>(source_scalar));
+      }
+      if (resolved._resolved_implementation ==
+          VECTOR_KERNEL_IMPLEMENTATION::DSL) {
+        std::vector<NODE_PTR> helper_actuals{input};
+        helper_actuals.insert(helper_actuals.end(), scalar_actuals.begin(),
+                              scalar_actuals.end());
+        std::optional<VECTOR_KERNEL_LOWERING_RESULT> materialized =
+            Try_materialize_prepared_vector_kernel(
+                planning_ctx, *resolved._prepared, helper_actuals,
+                node->Spos());
+        AIR_ASSERT_MSG(materialized.has_value(),
+                       "validated DSL recipe was not materialized");
+        return materialized->_replacement;
+      }
+      return Emit_prepared_vector_kernel_native(
+          planning_ctx, *resolved._prepared, input, scalar_actuals,
+          node->Spos());
     }
 
     TENSOR2VECTOR_CTX& ctx  = visitor->Context();
@@ -615,11 +696,76 @@ public:
 
   template <typename RETV, typename VISITOR>
   RETV Handle_gemm(VISITOR* visitor, air::base::NODE_PTR node) {
-    // Check if Python has a registered lowering for gemm/matmul
-    if (Should_skip_lowering("nn::core", "gemm") ||
-        Should_skip_lowering("nn::core", "matmul")) {
+    TENSOR2VECTOR_CTX& planning_ctx = visitor->Context();
+    const bool legacy_skip = Should_skip_lowering("nn::core", "gemm") ||
+                             Should_skip_lowering("nn::core", "matmul");
+    std::optional<VECTOR_KERNEL_RESOLUTION_RESULT> prepared_resolution;
+    if (!planning_ctx.Config().Python_dsl()) {
+      VECTOR_KERNEL_SELECTION_RESULT parsed = Parse_vector_kernel_selection(
+          planning_ctx.Plan_provider(), planning_ctx.Kernel_impl(),
+          planning_ctx.Plan_kind(), planning_ctx.Fallback());
+      AIR_ASSERT_MSG(parsed._selection.has_value(), "%s",
+                     parsed._diagnostic.c_str());
+      VECTOR_KERNEL_REQUEST_BUILD_RESULT built =
+          Build_vector_kernel_planning_request(
+              planning_ctx, node, parsed._selection->_plan_kind);
+      AIR_ASSERT_MSG(built.Ok(), "%s", built._diagnostic.c_str());
+
+      VECTOR_KERNEL_LOWERING_REGISTRY* dsl_registry =
+          planning_ctx.Vector_kernel_lowering_registry();
+      prepared_resolution.emplace(Resolve_vector_kernel_plan(
+          *built._request, *parsed._selection,
+          planning_ctx.Vector_kernel_plan_provider_registry(),
+          [dsl_registry](VECTOR_KERNEL_PLAN_KIND kind) {
+            return dsl_registry != nullptr && dsl_registry->Has(kind);
+          }));
+      AIR_ASSERT_MSG(prepared_resolution->Ok(), "%s",
+                     prepared_resolution->_diagnostic.c_str());
+      if (prepared_resolution->_used_fallback) {
+        CMPLR_DEV_WARN(prepared_resolution->_diagnostic);
+        planning_ctx.Trace(TF_LOWER, prepared_resolution->_diagnostic, "\n");
+      }
+      if (parsed._selection->_kernel_implementation !=
+              VECTOR_KERNEL_IMPLEMENTATION::DSL &&
+          legacy_skip) {
+        return Clone_with_visited_children<RETV>(visitor, node);
+      }
+    } else if (legacy_skip) {
       return Clone_with_visited_children<RETV>(visitor, node);
     }
+
+    // Plan and validate before the first destination mutation. The legacy
+    // Python AIR flag is intentionally not a plan-provider selector.
+    if (prepared_resolution.has_value()) {
+      VECTOR_KERNEL_RESOLUTION_RESULT& resolved = *prepared_resolution;
+      TENSOR2VECTOR_UTIL vgen(planning_ctx);
+      NODE_PTR input = visitor->template Visit<RETV>(node->Child(0));
+      AIR_ASSERT(input->Rtype()->Is_array());
+      const VECTOR_KERNEL_RUNTIME_PREPARATION& preparation =
+          resolved._prepared->Runtime_preparations().front();
+      if (input->Rtype()->Cast_to_arr()->Shape() !=
+          preparation._result_type._shape) {
+        input = vgen.New_reshape(input, preparation._result_type._shape,
+                                 node->Spos());
+      }
+      if (input->Opcode() != air::core::LD &&
+          input->Opcode() != air::core::LDP) {
+        input = planning_ctx.Store_temp_result_to_preg(input);
+      }
+
+      if (resolved._resolved_implementation ==
+          VECTOR_KERNEL_IMPLEMENTATION::DSL) {
+        std::optional<VECTOR_KERNEL_LOWERING_RESULT> materialized =
+            Try_materialize_prepared_vector_kernel(
+                planning_ctx, *resolved._prepared, {input}, node->Spos());
+        AIR_ASSERT_MSG(materialized.has_value(),
+                       "validated DSL recipe was not materialized");
+        return materialized->_replacement;
+      }
+      return Emit_prepared_vector_kernel_native(
+          planning_ctx, *resolved._prepared, input, {}, node->Spos());
+    }
+
     TENSOR2VECTOR_CTX& ctx  = visitor->Context();
     CONTAINER*         cntr = ctx.Container();
     TENSOR2VECTOR_UTIL vgen(ctx);

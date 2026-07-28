@@ -280,6 +280,10 @@ static GLOB_SCOPE* Lower_to_vector(GLOB_SCOPE* glob, VECTOR_CTX& ctx,
 GLOB_SCOPE* Vector_driver(GLOB_SCOPE* glob, VECTOR_CTX& ctx,
                           const air::driver::DRIVER_CTX* driver_ctx,
                           const VECTOR_CONFIG&           cfg) {
+  if (VECTOR_KERNEL_LOWERING_REGISTRY* registry =
+          ctx.Vector_kernel_lowering_registry()) {
+    registry->Clear_materialized_helpers();
+  }
   Instrument_nn_ir(glob, ctx, driver_ctx, cfg);
 
   GLOB_SCOPE* tmp_glob = Run_sharding_opt(glob, ctx, driver_ctx, cfg);

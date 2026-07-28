@@ -8,7 +8,10 @@
 
 #include "gtest/gtest.h"
 
+#include <cstdint>
+#include <cstring>
 #include <memory>
+#include <new>
 #include <set>
 #include <string>
 #include <vector>
@@ -20,6 +23,7 @@
 #include "nn/core/opcode.h"
 #include "nn/vector/config.h"
 #include "nn/vector/skip_lowering.h"
+#include "nn/vector/tensor2vector_ctx.h"
 #include "nn/vector/tensor2vector_dsl.h"
 #include "nn/vector/tensor2vector_plan.h"
 #include "nn/vector/vector_gen.h"
@@ -36,6 +40,37 @@ namespace {
 constexpr int64_t SYNTHETIC_WIDTH = 4;
 constexpr int64_t M3_WIDE_WIDTH   = 8;
 constexpr int64_t M3_ROW_COUNT    = 3;
+
+VECTOR_KERNEL_TYPED_PAYLOAD Dsl_float_payload(
+    std::string role, std::vector<int64_t> shape,
+    const std::vector<float>& values) {
+  std::vector<uint8_t> bytes;
+  bytes.reserve(values.size() * sizeof(float));
+  for (float value : values) {
+    uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    for (uint32_t shift = 0; shift != 32; shift += 8) {
+      bytes.push_back(static_cast<uint8_t>((bits >> shift) & 0xffU));
+    }
+  }
+  VECTOR_KERNEL_RANKED_TYPE_PLAN type{PRIMITIVE_TYPE::FLOAT_32,
+                                      std::move(shape)};
+  const std::string hash = Build_vector_kernel_constant_hash(
+      type._element_type, type._shape, values.data(),
+      values.size() * sizeof(float));
+  return VECTOR_KERNEL_TYPED_PAYLOAD{
+      std::move(role), std::move(type), std::move(bytes), hash};
+}
+
+const VECTOR_KERNEL_COMMON_PLAN& Dsl_common_plan(
+    const PREPARED_VECTOR_KERNEL_PLAN& prepared) {
+  return std::visit(
+      [](const auto& typed_plan) -> const VECTOR_KERNEL_COMMON_PLAN& {
+        return typed_plan._common;
+      },
+      prepared.Plan());
+}
 
 struct SYNTHETIC_BODY_RESULT {
   NODE_PTR              _result;
@@ -1005,6 +1040,369 @@ TEST_F(Tensor2VectorDslMaterialization,
 }
 
 TEST_F(Tensor2VectorDslMaterialization,
+       PreparedPlanMaterializesTypedBridgeAndDeduplicatesHelper) {
+  const VECTOR_KERNEL_RANKED_TYPE_PLAN input_type{
+      PRIMITIVE_TYPE::FLOAT_32, {4}};
+  const VECTOR_KERNEL_RANKED_TYPE_PLAN weight_type{
+      PRIMITIVE_TYPE::FLOAT_32, {2, 4}};
+  const VECTOR_KERNEL_RANKED_TYPE_PLAN bias_type{
+      PRIMITIVE_TYPE::FLOAT_32, {2}};
+  const VECTOR_KERNEL_PLANNING_REQUEST request{
+      VECTOR_KERNEL_OPERATION::GEMM,
+      {},
+      {input_type, weight_type, bias_type},
+      VECTOR_KERNEL_RANKED_TYPE_PLAN{PRIMITIVE_TYPE::FLOAT_32, {2}},
+      VECTOR_KERNEL_OPTION_SNAPSHOT{false, false, false, false, false},
+      VECTOR_KERNEL_TARGET_SNAPSHOT{16, 1, 65536},
+      {Dsl_float_payload("weight", {2, 4},
+                         {1.0F, 2.0F, 3.0F, 4.0F,
+                          5.0F, 6.0F, 7.0F, 8.0F}),
+       Dsl_float_payload("bias", {2}, {0.25F, -0.5F})},
+      VECTOR_KERNEL_REQUESTED_PLAN_KIND::BASELINE_GEMM};
+  const VECTOR_KERNEL_SELECTION selection{
+      VECTOR_KERNEL_PLAN_PROVIDER_KIND::CPP,
+      VECTOR_KERNEL_IMPLEMENTATION::DSL,
+      VECTOR_KERNEL_REQUESTED_PLAN_KIND::BASELINE_GEMM,
+      VECTOR_KERNEL_FALLBACK_POLICY::ERROR};
+  const VECTOR_KERNEL_RESOLUTION_RESULT resolution =
+      Resolve_vector_kernel_plan(
+          request, selection, nullptr,
+          [](VECTOR_KERNEL_PLAN_KIND kind) {
+            return kind == VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM;
+          });
+  ASSERT_TRUE(resolution.Ok()) << resolution._diagnostic;
+  ASSERT_NE(resolution._prepared, nullptr);
+  const PREPARED_VECTOR_KERNEL_PLAN& prepared = *resolution._prepared;
+  ASSERT_EQ(Get_vector_kernel_plan_kind(prepared.Plan()),
+            VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM);
+  const VECTOR_KERNEL_PLANNING_REQUEST different_request{
+      VECTOR_KERNEL_OPERATION::GEMM,
+      {},
+      {input_type, weight_type, bias_type},
+      VECTOR_KERNEL_RANKED_TYPE_PLAN{PRIMITIVE_TYPE::FLOAT_32, {2}},
+      VECTOR_KERNEL_OPTION_SNAPSHOT{false, false, false, false, false},
+      VECTOR_KERNEL_TARGET_SNAPSHOT{16, 1, 65536},
+      {Dsl_float_payload("weight", {2, 4},
+                         {1.0F, 2.0F, 3.0F, 4.0F,
+                          5.0F, 6.0F, 7.0F, 8.0F}),
+       Dsl_float_payload("bias", {2}, {0.5F, -0.5F})},
+      VECTOR_KERNEL_REQUESTED_PLAN_KIND::BASELINE_GEMM};
+  const VECTOR_KERNEL_RESOLUTION_RESULT different_resolution =
+      Resolve_vector_kernel_plan(
+          different_request, selection, nullptr,
+          [](VECTOR_KERNEL_PLAN_KIND kind) {
+            return kind == VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM;
+          });
+  ASSERT_TRUE(different_resolution.Ok())
+      << different_resolution._diagnostic;
+  ASSERT_NE(different_resolution._prepared, nullptr);
+  const PREPARED_VECTOR_KERNEL_PLAN& different_prepared =
+      *different_resolution._prepared;
+  EXPECT_NE(prepared.Specialization_key(),
+            different_prepared.Specialization_key());
+  EXPECT_NE(prepared.Helper_name(), different_prepared.Helper_name());
+  const VECTOR_KERNEL_COMMON_PLAN& common = Dsl_common_plan(prepared);
+  ASSERT_EQ(common._runtime_vector_inputs.size(), 1U);
+  ASSERT_TRUE(common._runtime_scalar_inputs.empty());
+
+  std::unique_ptr<GLOB_SCOPE> destination =
+      std::make_unique<GLOB_SCOPE>(0, true);
+  const SPOS spos(0, 401, 1, 0);
+  TYPE_PTR element =
+      destination->Prim_type(common._result_type._element_type);
+  TYPE_PTR formal_type = New_array_type(
+      destination.get(), "prepared_dsl_formal", element,
+      common._runtime_vector_inputs[0]._shape, spos);
+  TYPE_PTR result_type = New_array_type(
+      destination.get(), "prepared_dsl_result", element,
+      common._result_type._shape, spos);
+
+  struct CALLER_FIXTURE {
+    FUNC_SCOPE* _scope;
+    NODE_PTR    _body;
+  };
+  auto make_caller = [&](const char* name, const SPOS& caller_spos) {
+    STR_PTR caller_name = destination->New_str(name);
+    FUNC_PTR caller_func = destination->New_func(caller_name, caller_spos);
+    caller_func->Set_parent(destination->Comp_env_id());
+    SIGNATURE_TYPE_PTR signature = destination->New_sig_type();
+    destination->New_ret_param(result_type, signature);
+    destination->New_param(destination->New_str("packed_input"), formal_type,
+                           signature, caller_spos);
+    signature->Set_complete();
+    destination->New_entry_point(signature, caller_func, caller_name,
+                                 caller_spos);
+    FUNC_SCOPE& scope = destination->New_func_scope(caller_func);
+    STMT_PTR entry = scope.Container().New_func_entry(caller_spos);
+    return CALLER_FIXTURE{&scope, entry->Node()->Last_child()};
+  };
+
+  uint32_t recipe_count = 0;
+  uint32_t body_builder_count = 0;
+  VECTOR_KERNEL_LOWERING_REGISTRY registry;
+  ASSERT_TRUE(registry.Register(
+      VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM,
+      [&](const PREPARED_VECTOR_KERNEL_PLAN& recipe_plan,
+          const std::vector<NODE_PTR>& actuals, GLOB_SCOPE& glob) {
+        ++recipe_count;
+        EXPECT_EQ(&glob, destination.get());
+        EXPECT_TRUE(
+            recipe_plan.Specialization_key() ==
+                prepared.Specialization_key() ||
+            recipe_plan.Specialization_key() ==
+                different_prepared.Specialization_key());
+        EXPECT_EQ(actuals.size(), 1U);
+        VECTOR_KERNEL_HELPER_SPEC spec;
+        spec._formal_types = {actuals[0]->Rtype()};
+        spec._result_type = result_type;
+        spec._build_body =
+            [&](FUNC_SCOPE& helper, NODE_PTR, const SPOS& helper_spos) {
+              ++body_builder_count;
+              return helper.Container().New_zero(result_type, helper_spos);
+            };
+        return spec;
+      }));
+
+  VECTOR_CTX vector_ctx;
+  vector_ctx.Set_vector_kernel_lowering_registry(&registry);
+  VECTOR_CONFIG config;
+  CALLER_FIXTURE first_caller =
+      make_caller("prepared_dsl_caller_first", spos);
+  CONTAINER& first_cntr = first_caller._scope->Container();
+  TENSOR2VECTOR_CTX first_ctx(&first_cntr, vector_ctx, nullptr, config);
+  first_ctx.Set_cur_func_scope(first_caller._scope);
+  first_ctx.Push(first_caller._body, first_caller._body);
+  const std::vector<NODE_PTR> first_actuals{
+      first_cntr.New_ld(first_caller._scope->Formal(0), spos)};
+  const auto first = Try_materialize_prepared_vector_kernel(
+      first_ctx, prepared, first_actuals, spos);
+  ASSERT_TRUE(first.has_value());
+  STMT_LIST(first_caller._body)
+      .Append(first_cntr.New_retv(first->_replacement, spos));
+  first_ctx.Pop(first_caller._body, first_caller._body);
+  const VECTOR_KERNEL_AIR_COMPARE_RESULT first_bridge =
+      Check_vector_kernel_call_bridge(
+          *first_caller._scope, first->_call_stmt, first_actuals,
+          first->_replacement, *first->_helper_scope);
+  EXPECT_TRUE(first_bridge._equal) << first_bridge._message;
+
+  const SPOS second_spos(0, 402, 1, 0);
+  CALLER_FIXTURE second_caller =
+      make_caller("prepared_dsl_caller_second", second_spos);
+  CONTAINER& second_cntr = second_caller._scope->Container();
+  TENSOR2VECTOR_CTX second_ctx(&second_cntr, vector_ctx, nullptr, config);
+  second_ctx.Set_cur_func_scope(second_caller._scope);
+  second_ctx.Push(second_caller._body, second_caller._body);
+  const std::vector<NODE_PTR> second_actuals{
+      second_cntr.New_ld(second_caller._scope->Formal(0), second_spos)};
+  const auto second = Try_materialize_prepared_vector_kernel(
+      second_ctx, prepared, second_actuals, second_spos);
+  ASSERT_TRUE(second.has_value());
+  STMT_LIST(second_caller._body)
+      .Append(second_cntr.New_retv(second->_replacement, second_spos));
+  second_ctx.Pop(second_caller._body, second_caller._body);
+  const VECTOR_KERNEL_AIR_COMPARE_RESULT second_bridge =
+      Check_vector_kernel_call_bridge(
+          *second_caller._scope, second->_call_stmt, second_actuals,
+          second->_replacement, *second->_helper_scope);
+  EXPECT_TRUE(second_bridge._equal) << second_bridge._message;
+
+  const SPOS third_spos(0, 403, 1, 0);
+  CALLER_FIXTURE third_caller =
+      make_caller("prepared_dsl_caller_different", third_spos);
+  CONTAINER& third_cntr = third_caller._scope->Container();
+  TENSOR2VECTOR_CTX third_ctx(&third_cntr, vector_ctx, nullptr, config);
+  third_ctx.Set_cur_func_scope(third_caller._scope);
+  third_ctx.Push(third_caller._body, third_caller._body);
+  const std::vector<NODE_PTR> third_actuals{
+      third_cntr.New_ld(third_caller._scope->Formal(0), third_spos)};
+  const auto third = Try_materialize_prepared_vector_kernel(
+      third_ctx, different_prepared, third_actuals, third_spos);
+  ASSERT_TRUE(third.has_value());
+  STMT_LIST(third_caller._body)
+      .Append(third_cntr.New_retv(third->_replacement, third_spos));
+  third_ctx.Pop(third_caller._body, third_caller._body);
+  const VECTOR_KERNEL_AIR_COMPARE_RESULT third_bridge =
+      Check_vector_kernel_call_bridge(
+          *third_caller._scope, third->_call_stmt, third_actuals,
+          third->_replacement, *third->_helper_scope);
+  EXPECT_TRUE(third_bridge._equal) << third_bridge._message;
+
+  EXPECT_EQ(recipe_count, 3U);
+  EXPECT_EQ(body_builder_count, 2U);
+  EXPECT_EQ(first->_helper_scope, second->_helper_scope);
+  EXPECT_NE(first->_helper_scope, third->_helper_scope);
+  EXPECT_STREQ(second->_helper_scope->Owning_func()->Name()->Char_str(),
+               prepared.Helper_name().c_str());
+  EXPECT_STREQ(third->_helper_scope->Owning_func()->Name()->Char_str(),
+               different_prepared.Helper_name().c_str());
+  EXPECT_EQ(Function_count(*destination), 5U);
+  ASSERT_TRUE(destination->Verify_ir());
+}
+
+TEST_F(Tensor2VectorDslMaterialization,
+       HelperCacheIsDestinationLocalAndRejectsIncompatibleSignature) {
+  const std::string specialization_key =
+      "vector-kernel-prepared-cache-signature:v1";
+  const std::string helper_name =
+      "__ace_vkernel_prepared_cache_" +
+      Vector_kernel_sha256(specialization_key);
+  const SPOS spos(0, 421, 1, 0);
+  VECTOR_KERNEL_LOWERING_REGISTRY registry;
+
+  struct CACHED_HELPER_FIXTURE {
+    TYPE_PTR                  _formal_type;
+    TYPE_PTR                  _result_type;
+    FUNC_SCOPE*               _helper;
+    VECTOR_KERNEL_HELPER_SPEC _spec;
+  };
+  auto make_cached_helper =
+      [&](GLOB_SCOPE& destination, const char* type_prefix,
+          int64_t formal_width) {
+        TYPE_PTR element =
+            destination.Prim_type(PRIMITIVE_TYPE::FLOAT_32);
+        TYPE_PTR formal_type = New_array_type(
+            &destination, std::string(type_prefix) + "_formal", element,
+            {formal_width}, spos);
+        TYPE_PTR result_type = New_array_type(
+            &destination, std::string(type_prefix) + "_result", element,
+            {2}, spos);
+        STR_PTR helper_str = destination.New_str(helper_name.c_str());
+        FUNC_PTR helper_func = destination.New_func(helper_str, spos);
+        helper_func->Set_parent(destination.Comp_env_id());
+        SIGNATURE_TYPE_PTR signature = destination.New_sig_type();
+        destination.New_ret_param(result_type, signature);
+        destination.New_param("packed_input", formal_type, signature, spos);
+        signature->Set_complete();
+        destination.New_entry_point(signature, helper_func, helper_str, spos);
+        FUNC_SCOPE& helper = destination.New_func_scope(helper_func);
+        STMT_PTR entry = helper.Container().New_func_entry(spos);
+        STMT_LIST(entry->Node()->Last_child())
+            .Append(helper.Container().New_retv(
+                helper.Container().New_zero(result_type, spos), spos));
+
+        VECTOR_KERNEL_HELPER_SPEC spec;
+        spec._specialization_key = specialization_key;
+        spec._helper_name = helper_name;
+        spec._formal_types = {formal_type};
+        spec._result_type = result_type;
+        spec._build_body =
+            [result_type](FUNC_SCOPE& scope, NODE_PTR, const SPOS& body_spos) {
+              return scope.Container().New_zero(result_type, body_spos);
+            };
+        registry.Remember_materialized_helper(destination, spec, helper);
+        return CACHED_HELPER_FIXTURE{
+            formal_type, result_type, &helper, std::move(spec)};
+      };
+
+  GLOB_SCOPE first_destination(0, true);
+  GLOB_SCOPE second_destination(0, true);
+  CACHED_HELPER_FIXTURE first =
+      make_cached_helper(first_destination, "first_cache", 8);
+  CACHED_HELPER_FIXTURE second =
+      make_cached_helper(second_destination, "second_cache", 4);
+
+  EXPECT_EQ(registry.Lookup_materialized_helper(first_destination,
+                                                first._spec),
+            first._helper);
+  EXPECT_EQ(registry.Lookup_materialized_helper(second_destination,
+                                                second._spec),
+            second._helper);
+  EXPECT_NE(first._helper, second._helper);
+  EXPECT_EQ(&first._helper->Glob_scope(), &first_destination);
+  EXPECT_EQ(&second._helper->Glob_scope(), &second_destination);
+  ASSERT_TRUE(first_destination.Verify_ir());
+  ASSERT_TRUE(second_destination.Verify_ir());
+
+  TYPE_PTR incompatible_formal = New_array_type(
+      &first_destination, "first_cache_incompatible_formal",
+      first_destination.Prim_type(PRIMITIVE_TYPE::FLOAT_32), {4}, spos);
+  VECTOR_KERNEL_HELPER_SPEC incompatible_spec;
+  incompatible_spec._specialization_key = specialization_key;
+  incompatible_spec._helper_name = helper_name;
+  incompatible_spec._formal_types = {incompatible_formal};
+  incompatible_spec._result_type = first._result_type;
+  incompatible_spec._build_body =
+      [result_type = first._result_type](
+          FUNC_SCOPE& scope, NODE_PTR, const SPOS& body_spos) {
+        return scope.Container().New_zero(result_type, body_spos);
+      };
+
+  EXPECT_DEATH(
+      {
+        registry.Lookup_materialized_helper(first_destination,
+                                            incompatible_spec);
+      },
+      "incompatible ordered formal type");
+
+  registry.Clear_materialized_helpers();
+  EXPECT_EQ(registry.Lookup_materialized_helper(first_destination,
+                                                first._spec),
+            nullptr);
+  EXPECT_EQ(registry.Lookup_materialized_helper(second_destination,
+                                                second._spec),
+            nullptr);
+}
+
+TEST_F(Tensor2VectorDslMaterialization,
+       HelperCacheResetRejectsReusedDestinationAddress) {
+  alignas(GLOB_SCOPE) unsigned char storage[sizeof(GLOB_SCOPE)];
+  const std::string specialization_key =
+      "vector-kernel-destination-address-reuse:v1";
+  const std::string helper_name =
+      "__ace_vkernel_address_reuse_" +
+      Vector_kernel_sha256(specialization_key);
+  const SPOS spos(0, 457, 1, 0);
+  VECTOR_KERNEL_LOWERING_REGISTRY registry;
+
+  auto make_spec = [&](GLOB_SCOPE& destination, const char* prefix) {
+    TYPE_PTR element = destination.Prim_type(PRIMITIVE_TYPE::FLOAT_32);
+    TYPE_PTR formal = New_array_type(
+        &destination, std::string(prefix) + "_formal", element, {8}, spos);
+    TYPE_PTR result = New_array_type(
+        &destination, std::string(prefix) + "_result", element, {2}, spos);
+    VECTOR_KERNEL_HELPER_SPEC spec;
+    spec._specialization_key = specialization_key;
+    spec._helper_name = helper_name;
+    spec._formal_types = {formal};
+    spec._result_type = result;
+    spec._build_body =
+        [result](FUNC_SCOPE& helper, NODE_PTR, const SPOS& body_spos) {
+          return helper.Container().New_zero(result, body_spos);
+        };
+    return spec;
+  };
+
+  GLOB_SCOPE* first = new (storage) GLOB_SCOPE(0, true);
+  VECTOR_KERNEL_HELPER_SPEC first_spec = make_spec(*first, "first_reuse");
+  STR_PTR helper_string = first->New_str(helper_name.c_str());
+  FUNC_PTR helper_function = first->New_func(helper_string, spos);
+  helper_function->Set_parent(first->Comp_env_id());
+  SIGNATURE_TYPE_PTR signature = first->New_sig_type();
+  first->New_ret_param(first_spec._result_type, signature);
+  first->New_param("packed_input", first_spec._formal_types[0], signature,
+                   spos);
+  signature->Set_complete();
+  first->New_entry_point(signature, helper_function, helper_string, spos);
+  FUNC_SCOPE& helper = first->New_func_scope(helper_function);
+  STMT_PTR entry = helper.Container().New_func_entry(spos);
+  STMT_LIST(entry->Node()->Last_child())
+      .Append(helper.Container().New_retv(
+          helper.Container().New_zero(first_spec._result_type, spos), spos));
+  registry.Remember_materialized_helper(*first, first_spec, helper);
+  EXPECT_EQ(registry.Lookup_materialized_helper(*first, first_spec), &helper);
+
+  first->~GLOB_SCOPE();
+  registry.Clear_materialized_helpers();
+  GLOB_SCOPE* second = new (storage) GLOB_SCOPE(0, true);
+  ASSERT_EQ(second, first);
+  VECTOR_KERNEL_HELPER_SPEC second_spec = make_spec(*second, "second_reuse");
+  EXPECT_EQ(registry.Lookup_materialized_helper(*second, second_spec),
+            nullptr);
+  second->~GLOB_SCOPE();
+}
+
+TEST_F(Tensor2VectorDslMaterialization,
        RegistryRejectsDuplicateOpcodeAndSupportsRemoval) {
   VECTOR_KERNEL_LOWERING_REGISTRY registry;
   const OPCODE add_opcode(nn::core::NN, nn::core::OPCODE::ADD);
@@ -1017,4 +1415,31 @@ TEST_F(Tensor2VectorDslMaterialization,
   EXPECT_TRUE(registry.Unregister(add_opcode));
   EXPECT_FALSE(registry.Has(add_opcode));
   EXPECT_FALSE(registry.Unregister(add_opcode));
+}
+
+TEST_F(Tensor2VectorDslMaterialization,
+       PlanRecipeRegistryIsPerKindAndSupportsRemoval) {
+  VECTOR_KERNEL_LOWERING_REGISTRY registry;
+  VECTOR_KERNEL_PLAN_RECIPE recipe =
+      [](const PREPARED_VECTOR_KERNEL_PLAN&,
+         const std::vector<NODE_PTR>&, GLOB_SCOPE&) {
+        return VECTOR_KERNEL_HELPER_SPEC{};
+      };
+
+  EXPECT_TRUE(
+      registry.Register(VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM, recipe));
+  EXPECT_TRUE(registry.Has(VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM));
+  EXPECT_NE(registry.Lookup(VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM),
+            nullptr);
+  EXPECT_FALSE(
+      registry.Register(VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM, recipe));
+  registry.Clear_materialized_helpers();
+  EXPECT_TRUE(registry.Has(VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM));
+  EXPECT_FALSE(registry.Has(VECTOR_KERNEL_PLAN_KIND::FAST_GEMM));
+  EXPECT_EQ(registry.Lookup(VECTOR_KERNEL_PLAN_KIND::FAST_GEMM), nullptr);
+  EXPECT_TRUE(
+      registry.Unregister(VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM));
+  EXPECT_FALSE(registry.Has(VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM));
+  EXPECT_FALSE(
+      registry.Unregister(VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM));
 }
