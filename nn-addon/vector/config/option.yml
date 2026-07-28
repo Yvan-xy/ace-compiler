@@ -35,6 +35,30 @@ group:
       kind: uint
       value: 0
       value_maker: "="
+    - name: plan_provider
+      abbrev_name: pp
+      description: Vector-kernel plan provider (cpp or python)
+      kind: str
+      value: '"cpp"'
+      value_maker: "="
+    - name: kernel_impl
+      abbrev_name: ki
+      description: Vector-kernel implementation (native or dsl)
+      kind: str
+      value: '"native"'
+      value_maker: "="
+    - name: plan_kind
+      abbrev_name: pk
+      description: Vector-kernel plan kind (auto or a forced Conv/Gemm variant)
+      kind: str
+      value: '"auto"'
+      value_maker: "="
+    - name: fallback
+      abbrev_name: fb
+      description: Vector-kernel fallback policy (error or cpp-native)
+      kind: str
+      value: '"error"'
+      value_maker: "="
     - name: python_dsl
       abbrev_name: pdsl
       description: Use python DSL to lower operators

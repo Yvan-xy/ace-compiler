@@ -17,6 +17,7 @@ namespace vector {
 
 class VECTOR_KERNEL_LOWERING_REGISTRY;
 
+class VECTOR_KERNEL_PLAN_PROVIDER_REGISTRY;
 using NODE_MASK_PAIR = std::pair<NODE_ID, uint32_t>;
 using MF_WORKLIST    = std::vector<NODE_MASK_PAIR>;
 using SS_WORKLIST    = std::vector<NODE_ID>;
@@ -27,7 +28,8 @@ public:
   VECTOR_CTX()
       : _num_vloop(0),
         _slot(MIN_SLOT_ALLOWED),
-        _vector_kernel_lowering_registry(nullptr) {}
+        _vector_kernel_lowering_registry(nullptr),
+        _vector_kernel_plan_provider_registry(nullptr) {}
 
   void     Incr_num_vloop() { _num_vloop++; }
   uint32_t Get_num_vloop() const { return _num_vloop; }
@@ -65,6 +67,16 @@ public:
     return _vector_kernel_lowering_registry;
   }
 
+  void Set_vector_kernel_plan_provider_registry(
+      VECTOR_KERNEL_PLAN_PROVIDER_REGISTRY* registry) {
+    _vector_kernel_plan_provider_registry = registry;
+  }
+
+  VECTOR_KERNEL_PLAN_PROVIDER_REGISTRY*
+  Vector_kernel_plan_provider_registry() const {
+    return _vector_kernel_plan_provider_registry;
+  }
+
 private:
   VECTOR_CTX(const VECTOR_CTX&)            = delete;
   VECTOR_CTX& operator=(const VECTOR_CTX&) = delete;
@@ -74,6 +86,8 @@ private:
   MF_WORKLIST _mf_wl;  // used for mask fusion
   SS_WORKLIST _ss_wl;  // used for strided_slice fusion
   VECTOR_KERNEL_LOWERING_REGISTRY* _vector_kernel_lowering_registry;
+  VECTOR_KERNEL_PLAN_PROVIDER_REGISTRY*
+      _vector_kernel_plan_provider_registry;
 };
 
 //! @brief Macro to define API to access context
@@ -90,6 +104,10 @@ private:
   SS_WORKLIST Get_ss_worklist() { return cfg.Get_ss_worklist(); }            \
   VECTOR_KERNEL_LOWERING_REGISTRY* Vector_kernel_lowering_registry() const { \
     return cfg.Vector_kernel_lowering_registry();                            \
+  }                                                                          \
+  VECTOR_KERNEL_PLAN_PROVIDER_REGISTRY*                                      \
+  Vector_kernel_plan_provider_registry() const {                             \
+    return cfg.Vector_kernel_plan_provider_registry();                       \
   }
 
 }  // namespace vector
