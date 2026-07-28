@@ -7,12 +7,21 @@ native lowering.
 
 ## Plan ownership and variants
 
-C++ remains authoritative for validation, cost modeling, packing, constant
-preparation, and mask selection. Planning may use mutable working storage, but
-it must freeze the result into exactly one immutable variant from
-`nn/vector/tensor2vector_plan.h` before either the native or DSL emitter runs:
+M0 froze provider-neutral plan semantics from the existing C++ implementation.
+Under M4 during Phase A, the existing C++ cost-model, packing, constant
+preparation, mask-selection, and other planning algorithms serve as the default
+and reference provider. C++ remains authoritative for validating and
+canonicalizing provider results and for materializing destination AIR. A
+selected provider may use mutable working storage, but its result must freeze
+into exactly one immutable variant from `nn/vector/tensor2vector_plan.h` before
+either the native or DSL emitter runs.
 
-| Variant | AIR-affecting fields owned by the plan |
+This amendment supersedes only the original provider-ownership statement. The
+v1 plan variants, canonical hashes and keys, helper ABI, and structural fixtures
+remain frozen; M4 must add a companion owned data package rather than
+retroactively adding a provider interface to M0.
+
+| Variant | AIR-affecting semantics described by the plan |
 | --- | --- |
 | `BASELINE_GEMM_PLAN` | Prepared diagonal weight and bias, semantic input/result types, `height`, `width`, input duplication, primary and block-reduction loops, ordered slices and rotations, mask decision, and the native slot policy. |
 | `BASELINE_CONV_PLAN` | Flattened input, prepared im2col weight, expanded bias, scaled s32 rotation table, effective channel/output/kernel/stride dimensions, duplication policy, nested loop bounds, ordered slices and rotations, result type, and slot policy. |
@@ -22,14 +31,30 @@ it must freeze the result into exactly one immutable variant from
 `VECTOR_KERNEL_COMMON_PLAN` stores ordered runtime formals, constant
 descriptors, structural loop/slice/rotation/reduction descriptors, and result,
 mask, and slot policies. A constant descriptor uses a semantic role and a
-structural type; it never uses an AIR ID, generated symbol, or pointer.
+structural type plus canonical content hash; it never uses an AIR ID, generated
+symbol, or pointer. The v1 plan intentionally describes constants without
+owning their payload bytes or operand-preparation recipes.
+
+M4 must introduce a companion `PreparedVectorKernelPlan` that owns the
+canonical v1 plan, typed constant payloads keyed by semantic role, runtime
+operand/preparation descriptors, and optional scalar/sharding descriptors. It
+contains no AIR handles or borrowed provider/Python buffers. Provider
+provenance is diagnostic only. C++ must copy and validate this data, recompute
+hashes, and materialize it in the active destination `GLOB_SCOPE` before an
+emitter runs.
+
+The entire semantic package participates in normalized provider comparison;
+diagnostics-only provenance does not. Every helper-body-affecting companion
+descriptor must be uniquely derived from and validated against v1. Introducing
+any new AIR semantic requires a versioned plan and specialization-key schema.
 
 The current native baseline Gemm path emits no `SLOT` attribute. M0 records
-that fact as `ABSENT_NATIVE_BASELINE`; M5 must resolve it explicitly before
-requiring native/DSL `SLOT` parity. Recording the current behavior prevents an
-unrelated native change from being hidden inside planner extraction.
+that fact as `ABSENT_NATIVE_BASELINE`; M5 must initially preserve the absence in
+both native and DSL emission. Changing that policy requires a separate
+native-oracle and plan amendment, so planner extraction cannot hide an unrelated
+native semantic change.
 
-### Native input coverage audit
+### Reference C++ provider input coverage audit
 
 The schema records resolved AIR decisions rather than mutable configuration
 flags. The four current native emitters and their caller epilogues map into it
@@ -42,9 +67,10 @@ as follows:
 | Fast Gemm blocked input, IRMA weight, `np/kp/bs/gs`, blocking alignment/replication, and caller bias/reduction/mask/`SLOT` | Common input/constants/result/mask/slot plus all original/padded dimensions and `bs/pb/ps/sf/gs`, loops, slices, rotations, reductions, and replication fields in `FAST_GEMM_PLAN` |
 | Fast Conv blocked input, prepared weight/bias/`ra`, every `SHARD_MAP_PARAMS` value, effective dimensions/group/stride, cyclic decision, collective-reduction/mask epilogue, caller `SLOT`, and optional runtime weight offset | Common input/constants/result/mask/slot plus `FAST_CONV_PLAN` effective dimensions, full shard-map values, blocking placement, cyclic flag, selected reduction records, and optional typed/scaled sharding offset |
 
-When planner extraction lands, changing a mutable option that selects a
-different topology must therefore produce a different frozen plan, and a
-plan-consuming emitter must not re-read that option after planning.
+When M4 planner extraction lands, every mutable input capable of changing the
+topology must enter the immutable planning request. A change that selects a
+different topology must produce a different frozen plan package, and a native
+or DSL plan-consuming emitter must not re-read that option after planning.
 
 ## Helper ABI
 
@@ -53,11 +79,13 @@ A generated helper is leaf and nonrecursive. Its formal order is:
 1. one or more packed ranked-vector inputs, in source operand order;
 2. for sharded fast Conv only, one Core `s32` weight-slice offset.
 
-Weight, bias, rotation, and mask data are same-`GLOB_SCOPE` constants referenced
-by `CORE.LDC`; they are not ordinary formals. The helper owns the complete
-selected lowering, including blocking, reductions, bias, masking, and `SLOT`
-semantics. It returns one ranked vector through exactly one terminal
-`CORE.RETV`.
+Weight, bias, rotation, and mask data are C++-materialized same-`GLOB_SCOPE`
+constants referenced by `CORE.LDC`; they are not ordinary formals. For every
+provider, C++ first copies and validates the owned typed payload and recomputes
+its hash. A provider never returns an `LDC`, AIR node, symbol, or constant ID.
+The helper owns the complete selected lowering, including blocking, reductions,
+bias, masking, and `SLOT` semantics. It returns one ranked vector through
+exactly one terminal `CORE.RETV`.
 
 The optional scalar is required because the sharded weight offset is computed
 from runtime sharding loop IVs. Its scale is immutable plan data, but its value
@@ -73,7 +101,11 @@ The variant token is a C-safe spelling: `baseline_gemm`, `baseline_conv`,
 `fast_gemm`, or `fast_conv`. The digest is the full 64-character lowercase
 SHA-256 encoding. A cache entry is local to the active destination
 `GLOB_SCOPE` and is valid only when both the canonical key and helper signature
-match.
+match. Plan-provider identity, kernel implementation, and provenance are not
+part of the key or name. When materialized as DSL helpers in the same
+destination, canonically equal C++ and Python provider results must deduplicate
+to the same helper; provenance belongs only in diagnostics and any separate
+plan-computation cache.
 
 ## Constant and specialization keys
 
@@ -82,6 +114,9 @@ used by fixtures and future helper caching. Vector order is significant for
 formals, constants, loops, slices, rotations, and reductions. Changing any
 AIR-affecting type, shape, constant digest, loop bound/nesting, slice index,
 rotation order, reduction, mask, slot, or offset policy must change the key.
+M4 validation must reject a companion descriptor that changes helper AIR but is
+neither represented in nor uniquely derived from this key; accepting such a
+descriptor requires a versioned schema/key update.
 
 Constant hashes use this lowercase form:
 
@@ -102,6 +137,12 @@ payload:
 ```
 
 The raw payload begins immediately after the final newline shown above.
+
+For every provider package, M4 requires C++ to recompute this hash from the
+declared primitive type and shape plus the copied row-major payload bytes. A
+provider-supplied digest is checked but never trusted. This portable byte
+representation is also the Python-provider ABI. Unsupported or ambiguous
+representations are rejected before AIR mutation.
 
 Integer elements use fixed-width two's-complement little-endian bytes.
 Floating and complex components use their exact fixed-width IEEE bit patterns
@@ -128,6 +169,13 @@ The DSL caller bridge is checked separately against the helper ABI: one typed
 `CORE.CALL`, compatible actual/formal types and result preg, and the replacing
 caller-owned `CORE.LDP`.
 
+Once M12 adds the Python provider, provider differential comparison is a
+separate host-data oracle. Before either emitter is compared, C++ and Python
+results for the same request must have equal normalized semantic packages,
+excluding diagnostics-only provenance but including every preparation/scalar
+descriptor, exact owned payload bytes and hashes, specialization key, and helper
+name. Matching native/DSL AIR cannot substitute for package equivalence.
+
 Normalization assigns formals, locals, pregs, and loop IVs ordinal identities
 by structural declaration/traversal order. It then compares:
 
@@ -145,19 +193,20 @@ Only generated AIR IDs, source positions, and symbol spelling are ignored.
 compared; changing that policy requires an explicit plan amendment. Both input
 modules must pass `GLOB_SCOPE::Verify_ir()` before comparison.
 
-Native lowering remains the default throughout M0. A native baseline-Gemm
-oracle must call public `TENSOR2VECTOR_UTIL::New_gemm_metakernel` directly in a
-controlled destination function rather than changing the production
-hard-selected fast-Gemm dispatch. The required cases are `[height,width]=[4,4]`
-without reduction/mask and `[2,8]` with block reduction and mask.
+M0 behavior corresponds to the later `plan_provider=cpp`,
+`kernel_impl=native`, and `plan_kind=auto` tuple; M0 itself exposed no provider
+interface or selection controls. A native baseline-Gemm oracle must call public
+`TENSOR2VECTOR_UTIL::New_gemm_metakernel` directly in a controlled destination
+function rather than changing the production hard-selected fast-Gemm dispatch.
+The required cases are `[height,width]=[4,4]` without reduction/mask and
+`[2,8]` with block reduction and mask.
 
 The M0 acceptance fixtures are:
 
 - `test_tensor2vector_plan.cxx`, which freezes all four immutable plan keys,
   canonical constant hashing, helper naming, and helper ABI;
-- `test_tensor2vector_native_air_oracle.cxx`, which calls the public
-  baseline-Gemm
-  emitter directly for both required cases, verifies the resulting AIR, and
+- `test_tensor2vector_native_air_oracle.cxx`, which directly calls the public
+  baseline-Gemm emitter for both required cases, verifies the resulting AIR, and
   freezes ID/name/source-independent structural fingerprints.
 
 The reusable native-versus-DSL normalizer now lives in
@@ -195,8 +244,11 @@ caller, prepends exactly one `CORE.CALL`, and returns the caller-owned
 The synthetic M1 selector is connected ahead of the legacy skip-only path for
 `NN.ADD`, proving the invocation seam through the public `Vector_driver` and
 through `Mv2v_opt`. M4 will connect the same generic registry/materializer to
-the frozen Gemm/Conv plans. With no registry attached, existing native lowering
-remains unchanged.
+a centrally validated `PreparedVectorKernelPlan` and select a helper recipe by
+canonical plan kind. Under M4, provider and DSL registries are scoped to one
+`VECTOR_CTX`/`Vector_driver` invocation. With no registry or option override,
+the default is `plan_provider=cpp`, `kernel_impl=native`, and
+`plan_kind=auto`.
 
 The future phase handoff remains:
 
@@ -204,4 +256,6 @@ The future phase handoff remains:
 Tensor2Vector/Mv2v -> pre-inline Vector AIR -> Python inliner -> Vector2SIHE
 ```
 
-M0, M1, and the rest of Phase A do not implement or invoke that Python pass.
+This Python AIR inliner is distinct from the later Python `PlanProvider`, which
+computes host-side plan data and never transforms AIR. M0, M1, and the rest of
+Phase A do not implement or invoke either one.

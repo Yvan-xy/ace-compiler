@@ -12,13 +12,21 @@ The intended lowering is:
 NN.GEMM / NN.CONV
         |
         v
-C++ planner and constant preparation
+AIR-independent VectorKernelPlanningRequest
         |
         v
-destination-owned @vector_kernel helper function
+selected PlanProvider
+  cpp (default/reference) | python (implemented later)
         |
         v
-CORE.CALL + CORE.LDP in the original caller
+C++ validation, canonicalization, and owned PreparedVectorKernelPlan
+        |
+        v
+selected kernel implementation
+  native | destination-owned @vector_kernel helper
+        |
+        v
+native Vector AIR | CORE.CALL + CORE.LDP in the original caller
         |
         v
 Vector middle-op lowering (`Mv2v_opt`)
@@ -26,7 +34,7 @@ Vector middle-op lowering (`Mv2v_opt`)
         v
 verified pre-inline Vector AIR             <-- current DSL phase
         |
-        | later Python-pass phase
+        | later Python AIR-inliner phase for the DSL branch
         v
 independent Python FunctionInlinerPass + dead-helper cleanup
         |
@@ -40,6 +48,10 @@ Vector -> SIHE -> CKKS -> POLY -> C
 There are no `VECTOR.GEMM` or `VECTOR.CONV` operators. `@vector_kernel`
 describes how an NN operator is decomposed into Vector-domain operations. The
 loop, block, scalar-index, and memory structure remains AIR Core IR.
+
+Planning runs at compile time before either kernel implementation is invoked.
+The prepared plan is host data whose decisions and constants are emitted into
+the body; the object itself is not an AIR formal or traced by `@vector_kernel`.
 
 ## Scope
 
@@ -56,14 +68,23 @@ This plan covers:
   inlines generated helpers before Vector-to-SIHE;
 - invoking a DSL lowering during the real Tensor-to-Vector pass;
 - adding the missing Core and Vector authoring APIs to `ace_edsl`;
-- retaining the existing C++ planning, packing, and cost-model logic initially;
+- defining a provider-neutral planning request and prepared-plan package;
+- selecting the plan provider, kernel implementation, and forced plan kind
+  independently;
+- retaining the existing C++ planning, packing, and cost-model algorithms as
+  the initial default/reference provider;
 - matching the native lowering structurally and end to end;
 - completing NN-level Conv/Gemm authoring after the lowering substrate is
   stable.
 
 Initial non-goals:
 
-- reimplementing the packing and cost model in Python;
+- implementing the production Python planning, packing, and cost-model
+  algorithms before the four kernel implementations are stable;
+- allowing a plan provider to return AIR nodes, IDs, pointers, symbols, or
+  borrowed buffers;
+- silently changing provider or kernel implementation after a planning or
+  emission failure;
 - inventing composite `VECTOR.GEMM` or `VECTOR.CONV` operators;
 - unrolling the native loop structure to avoid implementing Core control flow;
 - accepting placeholder arithmetic in place of `VECTOR.ROLL` or
@@ -89,19 +110,29 @@ This phase includes:
 - Core loops, typed scalar/index arithmetic, typed locals, and typed zero;
 - genuine Vector roll, slice, add, multiply, and attributes;
 - mutable arrays of vectors needed by the fast kernels;
-- the C++ planner contract and all four DSL kernel bodies;
+- the provider-neutral planning contract, C++ reference provider, central
+  validator/materializer, and all four DSL kernel bodies;
 - complete typed NN-level Conv/Gemm authoring;
 - native-versus-DSL comparison of pre-inline Vector AIR.
 
-It does not implement or invoke a function inliner and does not claim full
-Vector-to-SIHE-to-C completion for DSL-generated helper calls.
+It implements neither the production Python planning algorithms nor a function
+inliner, and it does not claim full Vector-to-SIHE-to-C completion for
+DSL-generated helper calls.
 
-### Phase B: Python AIR pass and downstream integration (later)
+### Phase B: Python planning provider (later)
 
-After Phase A is structurally complete, add an independent Python pass module
-for function inlining, the structural AIR bindings it needs, a Python pipeline
-hook between Tensor-to-Vector and Vector-to-SIHE, dead-helper cleanup, full
-end-to-end validation, and controlled rollout.
+After Phase A is structurally complete, implement the four planning algorithms
+behind the provider-neutral M4 interface in ordinary, separately testable
+Python. The Python provider computes host-side plan data only; it does not run
+inside `@vector_kernel` and does not build or transform AIR. C++ remains the
+owner and authoritative validator/materializer of every returned package.
+
+### Phase C: Python AIR inlining and downstream integration (later)
+
+After the provider/emitter matrix is validated, add an independent Python AIR
+pass module for function inlining, the structural AIR bindings it needs, a
+Python pipeline hook between Tensor-to-Vector and Vector-to-SIHE, dead-helper
+cleanup, full end-to-end validation, and controlled rollout.
 
 The inliner is a separate DSL pass module, not part of the Gemm/Conv kernel
 implementation and not embedded inside the C++ Vector driver. It transforms the
@@ -169,19 +200,22 @@ Initial helper ABI:
 ```text
 leaf, nonrecursive @vector_kernel helper
   runtime packed-vector input(s)
-  compile-time plan embedded in the body
+  compile-time PreparedVectorKernelPlan input to helper tracing (not a formal)
   same-GLOB_SCOPE weight/bias/mask/rotation constants
   one ranked-vector result
   one final CORE.RETV
 ```
 
-Shape, layout, loop bounds, rotation candidates, masking policy, and other
-planner decisions should be baked into a specialized helper. Constant weights
-and bias should initially be referenced with same-module `LDC` nodes instead of
-ordinary array formals, because current Vector-to-SIHE parameter conversion
-does not distinguish plaintext arrays from ciphertext arrays. Deterministic
-helper naming and caching should use the complete immutable plan and relevant
-constant identities or content hashes.
+Shape, layout, loop bounds, rotation candidates, masking policy, and every other
+planning decision are frozen in a centrally validated
+`PreparedVectorKernelPlan` before helper tracing. Constant weights and bias are
+materialized by C++ as same-module `LDC` nodes instead of ordinary array
+formals, because current Vector-to-SIHE parameter conversion does not
+distinguish plaintext arrays from ciphertext arrays. Deterministic helper
+naming and destination-local caching use the canonical immutable plan and
+constant content hashes. Provider, kernel-implementation, and provenance
+labels are diagnostic metadata only; they do not affect the specialization key
+or helper identity.
 
 Required caller bridge:
 
@@ -230,21 +264,20 @@ Source positions and node attributes such as `RNUM`, `SLOT`, and `MASK` must be
 preserved. The return must become a `CORE.STP` to the call-result preg so the
 existing caller `CORE.LDP` remains valid.
 
-The Python pass framework also needs a generic phase hook after
-Tensor-to-Vector, which already includes `Mv2v_opt`, and before
-Vector-to-SIHE. The existing callback fixed after SIHE-to-CKKS is the wrong
-phase.
+The Python AIR-inliner framework also needs a generic phase hook after
+Tensor-to-Vector, which already includes `Mv2v_opt`, and before Vector-to-SIHE.
+The existing callback fixed after SIHE-to-CKKS is the wrong phase.
 
 Current bindings are insufficient for a genuinely Python-authored structural
-inliner. Phase B must expose safe APIs for function and statement traversal,
+inliner. Phase C must expose safe APIs for function and statement traversal,
 call/callee and preg inspection, clone/splice/remove operations, function
 reachability/removal, attribute preservation, and AIR verification. Prefer
 transactional or coarse safe editing operations over unrestricted raw-pointer
 mutation.
 
 The initial supported subset is a leaf, nonrecursive, non-variadic generated
-helper with one `RETV` and no escaping local address. A separate Python dead-
-function elimination pass, or an explicit cleanup stage following the inliner,
+helper with one `RETV` and no escaping local address. A separate Python
+dead-function elimination pass, or an explicit cleanup stage after the inliner,
 must remove unreachable generated helpers before downstream lowering.
 
 Allowing calls to remain un-inlined in the FHE pipeline is a still later
@@ -375,8 +408,9 @@ Relevant implementation:
 
 ### G8. Ranked types, constants, and typed attributes are incomplete
 
-The Conv/Gemm lowering uses shaped signed-integer rotation arrays, two-
-dimensional packed weights, expanded bias vectors, masks, and typed attributes.
+The Conv/Gemm lowering uses shaped signed-integer rotation arrays,
+two-dimensional packed weights, expanded bias vectors, masks, and typed
+attributes.
 The current constant builder flattens real arrays to one-dimensional `f32`, and
 the generic node attribute API supports only one scalar `u32` value.
 
@@ -389,32 +423,57 @@ Required capability:
 - scalar and vector attributes with signed and unsigned element types;
 - constant content hashing for deterministic comparison.
 
-Native planning may continue to construct packed weights and expanded bias in
-C++ initially, but the DSL still needs typed constants for masks, rotation
-tables, tests, and eventual NN-level authoring.
+The default C++ provider initially constructs packed weights and expanded bias.
+Owned typed host-payload records form the portable boundary for the later Python
+provider. Typed DSL constants are their materialized/authoring representation
+for masks, rotation tables, tests, and eventual NN-level authoring.
 
-### G9. The planner/emitter contract is implicit
+### G9. No provider-neutral planner/emitter boundary
 
 The four named metakernel functions are emitters, not complete operator
 lowerings. The handlers surrounding them also perform shape validation,
-packing, cost modeling, mask policy, dispatch, and epilogues.
+packing, cost modeling, mask policy, dispatch, operand preparation, and
+epilogues. Planning and AIR construction are interleaved, so a second provider
+cannot currently compute plans without reproducing C++ AIR ownership details.
 
-Important examples:
-
-- fast Gemm's named function emits the central block product, while reductions,
-  bias, mask, and `SLOT` are emitted by its caller;
-- fast Conv depends on blocking, grid/block planning, optional sharding offset,
-  cyclic masks, and collective reduction parameters;
-- the baseline Gemm path is currently unreachable through normal handler
-  dispatch because fast Gemm is selected unconditionally.
+The frozen v1 `VECTOR_KERNEL_PLAN` is the provider-neutral semantic core. Its
+constant descriptors intentionally record roles, types, and hashes rather than
+owning payload bytes or operand-preparation recipes. M4 must preserve that
+schema and add a companion prepared package instead of putting AIR identities
+or language-specific ownership into the plan.
 
 Required capability:
 
-- immutable plan variants for baseline Gemm, baseline Conv, fast Gemm, and fast
-  Conv;
-- explicit ownership of every AIR-emitting operation;
-- deterministic prepared operands and constants;
-- explicit native/DSL selection with a documented fallback policy.
+- an immutable, AIR-independent `VectorKernelPlanningRequest` containing
+  portable normalized opcode and attribute records, structural type
+  descriptors, immutable option/context and target-capability snapshots, owned
+  typed source-constant payloads, and the requested plan kind;
+- a synchronous provider-call lifetime: language adapters may expose read-only
+  views backed by the request only for the duration of the call, and providers
+  must not retain or mutate them;
+- a per-`Vector_driver` `PlanProvider` that returns host data only and never AIR
+  nodes, type pointers, IDs, symbols, or borrowed buffers;
+- an immutable `PreparedVectorKernelPlan` containing the canonical
+  `VECTOR_KERNEL_PLAN`, owned typed constant payloads keyed by semantic role,
+  runtime operand/preparation descriptors, optional scalar/sharding
+  descriptors, and diagnostics-only provider provenance;
+- canonical normalization and provider-differential comparison of the entire
+  semantic prepared package, including every preparation/scalar descriptor and
+  payload but excluding diagnostics-only provenance;
+- a validation invariant that every AIR-affecting decision is represented in
+  the v1 plan or is uniquely derived from and checked against it; any new
+  non-derived AIR semantic requires a versioned plan/key schema before use;
+- central C++ copying, validation, hash recomputation, canonicalization, and
+  destination-`GLOB_SCOPE` materialization for every provider result;
+- native whole-kernel and DSL emitters that consume only the same frozen plan
+  package and never re-read mutable configuration or redo planning;
+- three independent selectors for provider, kernel implementation, and
+  automatic or forced plan kind, plus an explicit diagnosed fallback policy;
+- destination-local helper deduplication by full canonical key plus compatible
+  signature, independent of provider identity.
+
+The existing `VEC:python_dsl` option selects a legacy Python emission path. It
+must not be reused for Python plan computation.
 
 ### G10. NN-level Conv/Gemm authoring is incomplete
 
@@ -455,6 +514,8 @@ Required capability:
   source positions;
 - comparison of opcodes, domains, types, loop topology, statement order,
   constants, attributes, masks, and rotation sets;
+- provider differential comparison of canonical plan fields, exact prepared
+  payload bytes, hashes, specialization keys, and helper names;
 - small deterministic runtime comparisons after code generation.
 
 All builds, experiments, benchmarks, and tests must run inside
@@ -465,32 +526,40 @@ All builds, experiments, benchmarks, and tests must run inside
 | Gap | Missing capability | Milestone(s) that first fill it | Final validation milestone |
 | --- | --- | --- | --- |
 | G1 | Destination-module helper materialization and typed call/LDP bridge | M1 | M4/M7 |
-| G2 | Independent Python AIR inliner pass, pass hook, bindings, and cleanup | M12 | M13; no-inline FHE mode is follow-on work |
+| G2 | Independent Python AIR inliner pass, pass hook, bindings, and cleanup | M13 | M14; no-inline FHE mode is follow-on work |
 | G3 | Lexical domain switching and Vector operand views | M2 | M3/M4 |
 | G4 | Typed Core scalar/index arithmetic and `SHL` | M2 | M5 |
 | G5 | Genuine Vector roll/slice/add/mul and `RNUM`/`SLOT` | M3 | M5/M6 |
 | G6 | Typed locals and typed zero | M2 | M5/M6 |
 | G7 | Real mutable arrays of vectors and indexed store/load | M8 | M9/M10 |
 | G8 | Structural ranked types, constants, and typed attributes | M2/M3; expanded in M8 | M9/M11 |
-| G9 | Explicit planner/emitter plan variants and selection | M0/M4 | M7/M10 |
+| G9 | Provider-neutral planning package, providers, plan variants, and orthogonal selection | M0/M4 | M12 |
 | G10 | Complete NN-level Conv/Gemm authoring | M11 | M11 |
-| G11 | Structural and runtime oracle | M0 | Structural: every Phase-A milestone; runtime: M13 |
+| G11 | Structural, provider-differential, and runtime oracle | M0 | Provider: M12; structural: every Phase-A milestone; runtime: M14 |
 
 Phase-A kernel ports require G1, G3-G6, and the relevant portion of G8. G2 is
 not a prerequisite for writing or structurally validating the DSL kernels.
 Fast-kernel work must not begin before G7 is closed. No DSL-generated helper
-call may enter Vector-to-SIHE until the pass is implemented at M12 and its
-pipeline integration is validated at M13.
+call may enter Vector-to-SIHE until the Python AIR inliner is implemented at
+M13 and its pipeline integration is validated at M14.
 
 ## Implementation Milestones
 
 ### M0. Freeze the DSL boundary and native structural oracle
 
-Define immutable plan variants for baseline Gemm, baseline Conv, fast Gemm, and
-fast Conv. The plans must cover prepared operands and constants, result type,
-loop bounds, rotation candidates, mask and slot policy, reduction parameters,
-and optional sharding offset. C++ remains authoritative for compile-time
-planning, layout, packing, and cost modeling.
+M0 froze provider-neutral immutable plan semantics for baseline Gemm, baseline
+Conv, fast Gemm, and fast Conv from the existing C++ implementation. The plans
+cover prepared-operand and constant descriptors, result type, loop bounds,
+rotation candidates, mask and slot policy, reduction parameters, and optional
+sharding offset. Under M4, the extracted C++ algorithms become the default/
+reference plan provider, and C++ remains the authoritative validator and
+destination materializer.
+
+This refinement supersedes only the provider-ownership statement in
+`vector_kernel_dsl_m0_contract.md`. The v1 variants, canonical hashes and keys,
+helper ABI, and native structural fixtures remain frozen. M4 adds a companion
+owned payload/preparation package without retroactively adding a provider
+interface to M0.
 
 Freeze the Phase-A helper ABI: leaf and nonrecursive, one or more packed-vector
 inputs, same-module constants, a single ranked-vector return, deterministic
@@ -506,13 +575,15 @@ Specify a normalized pre-inline AIR comparator that checks:
 - ordered slice and rotation behavior.
 
 It may ignore only generated IDs, source positions, and symbol spelling. Record
-the future Python-pass handoff point as `Tensor2Vector/Mv2v -> pre-inline
+the future Python AIR-pass handoff point as `Tensor2Vector/Mv2v -> pre-inline
 Vector AIR -> Python inliner -> Vector2SIHE`, but do not implement the pass in
 Phase A.
 
 Acceptance gate:
 
-- native lowering remains the default and normalized native AIR is unchanged;
+- M0's effective behavior corresponds to the later `plan_provider=cpp`,
+  `kernel_impl=native`, and `plan_kind=auto` tuple, but M0 exposes no such
+  controls; normalized native AIR is unchanged;
 - every input used by the four native emitters and caller-side epilogues is
   represented in a plan;
 - helper ABI and specialization-key fixtures are documented;
@@ -544,6 +615,11 @@ Acceptance gate:
 - pre-inline AIR contains the expected `CALL + LDP` bridge and complete helper
   `RETV`;
 - disabled DSL lowering leaves native behavior unchanged.
+
+M4 feeds this generic registry and materializer only a centrally validated
+`PreparedVectorKernelPlan`; recipe selection is by canonical plan kind. Under
+M4, with no provider or DSL registry override attached, the default is
+`plan_provider=cpp`, `kernel_impl=native`, and `plan_kind=auto`.
 
 Closes: G1. Begins G9's invocation seam.
 
@@ -603,41 +679,123 @@ with the M1 helper materializer and M2 type/domain substrate.
 
 Closes: G5 and the attribute portion of G8.
 
-### M4. Extract and connect the native planner contract
+### M4. Extract the provider-neutral planning contract and connect the C++ provider
 
-Refactor the existing handlers so planning produces immutable plan data without
-changing native emission. Expose prepared operands, constants, and the plan to
-the M1 helper-materialization callback.
+Refactor each Conv/Gemm handler into four explicit stages:
 
-Add explicit Phase-A selection modes:
+1. build an immutable, AIR-independent `VectorKernelPlanningRequest`;
+2. invoke a per-`Vector_driver` `PlanProvider`;
+3. centrally validate and canonicalize an immutable
+   `PreparedVectorKernelPlan` in C++;
+4. materialize destination-owned operands/constants and invoke the selected
+   kernel implementation.
 
-- `native`;
-- `dsl-plan=<baseline-gemm|baseline-conv|fast-gemm|fast-conv>` for deterministic
-  structural testing of a frozen plan;
-- later, `dsl-auto`.
+The request owns portable normalized opcode and attribute records, structural
+input/result type descriptors, immutable option/context and target-capability
+snapshots, typed source-constant payloads, and the requested plan kind. A
+language adapter may expose callback-scoped read-only views of request payloads;
+the provider may neither mutate nor retain them. The prepared package owns the
+canonical v1 `VECTOR_KERNEL_PLAN`, typed constant payloads keyed by semantic
+role, runtime operand/preparation descriptors, and optional scalar/sharding
+descriptors. Provider provenance is retained for diagnostics only. Neither
+record contains AIR nodes, type pointers, IDs, symbols, or borrowed
+provider/Python buffers.
 
-The Tensor-to-Vector handler must either materialize the selected DSL helper or
-invoke the native emitter. Unsupported plans must fail clearly or use an
-explicit documented native fallback.
+C++ copies every returned payload, recomputes its canonical content hash,
+validates schema, operation/kind compatibility, types, shapes, ranges, checked
+products, role completeness, every preparation/scalar descriptor, and
+cross-field invariants. It verifies that every AIR-affecting decision is
+represented by v1 or is its unique canonical derivation; a new semantic requires
+a versioned plan and key schema. C++ then creates every AIR object in the active
+destination `GLOB_SCOPE`. Validation must complete before helper, call,
+constant, or native-emission mutation. Both native whole-kernel and DSL emitters
+consume only the same frozen validated package; neither may re-read mutable
+configuration, redo planning, or change package ownership.
+
+The production provider in M4 wraps the extracted C++ algorithms and remains
+the default/reference provider. M4 also supplies an injected fake provider for
+seam and negative testing. A Python provider may be registered through the same
+per-pass interface, but its production algorithms are deliberately deferred to
+M12.
+
+Freeze and fixture the provider-neutral reference algorithms while extracting
+them: exact integer formulas, rounding and checked-overflow behavior, traversal
+and tie-break order, dtype and byte-order rules, constant packing, automatic
+dispatch, and forced-kind semantics. M12 must implement this specified contract
+rather than reverse-engineer platform-dependent C++ behavior.
+
+Add three orthogonal per-pass selectors and one fallback policy:
+
+- `plan_provider=cpp|python`;
+- `kernel_impl=native|dsl`;
+- `plan_kind=auto|baseline-gemm|baseline-conv|fast-gemm|fast-conv`;
+- `fallback=error|cpp-native`.
+
+Throughout this plan, `cpp + native + auto` abbreviates
+`plan_provider=cpp`, `kernel_impl=native`, and `plan_kind=auto`; fallback is
+stated separately and defaults to `error`.
+
+The defaults are `cpp`, `native`, `auto`, and `error`. `cpp-native` applies only
+when the requested provider is unavailable or a valid plan has no supported DSL
+recipe. Before destination mutation, it restarts with the C++ provider and
+native implementation while preserving the requested `plan_kind`, and emits a
+diagnostic. Provider exceptions and malformed or invalid provider results
+always fail even when fallback is enabled, and any failure after AIR emission
+starts is fatal; planner or emitter bugs cannot be hidden. Do not reuse the
+legacy `VEC:python_dsl` emission flag for plan-provider selection.
+
+The DSL registry selects a recipe by canonical plan kind. Cache helpers in the
+active destination `GLOB_SCOPE` by the complete specialization key plus helper
+signature. Provider, kernel implementation, and provenance do not enter the
+key. The validator must prove that every helper-body-affecting package field is
+represented in the v1 key or uniquely derived from it; otherwise the schema and
+key version must change before materialization. Equal validated plans from C++
+and another provider must then share one helper.
 
 Acceptance gate:
 
-- pre-refactor native AIR and plan-to-native-emitter AIR are normalized-equal;
-- identical input produces deterministic plan fields and constant hashes;
-- selected DSL lowering materializes exactly one specialized helper/call pair
-  for each non-deduplicated plan and replaces exactly one NN operator;
-- the explicit `dsl-plan` selector reaches each requested baseline or fast
-  plan without depending on automatic dispatch;
-- stopping after the Vector phase leaves no skipped NN operator;
-- native mode remains unchanged.
+- C++-provider/native-emitter AIR is normalized-equal to pre-refactor native
+  AIR for all four plan variants;
+- the reference formulas, rounding/overflow rules, traversal/tie order,
+  packing, byte order, automatic dispatch, and forced-kind behavior are
+  specification-backed and frozen by fixtures;
+- identical requests produce deterministic normalized values for every prepared
+  package descriptor, owned payload byte, hash, specialization key, and helper
+  name;
+- request and prepared-package records contain no AIR ownership; request views
+  are read-only and callback-scoped, and mutating or releasing provider-owned
+  output buffers after return cannot change the package;
+- central validation rejects missing/extra roles, wrong types or shapes, bad
+  hashes, invalid operation/kind pairs, overflow, inconsistent preparation or
+  topology, and unsupported plans before destination mutation;
+- every forced `plan_kind` reaches its valid C++ plan variant independently of
+  automatic dispatch, while invalid forced pairs fail deterministically;
+- an injected fake provider feeds both the native emitter and the M1 synthetic
+  DSL materialization path through the same validation/materialization seam;
+- selecting `python` without a registered provider under `fallback=error`, and
+  every provider exception or invalid result under either fallback mode, fails
+  clearly before mutation; explicit fallback for a missing provider or
+  unsupported DSL recipe is tested separately and emits a diagnostic;
+- changing only provider, kernel implementation, or provenance does not change
+  specialization identity;
+- repeated equal plans in one destination create one helper and multiple calls,
+  different plans create different helpers, and a key/signature mismatch fails;
+- selected DSL emission replaces exactly one NN operator, and stopping after
+  the Vector phase leaves no skipped selected operator;
+- the default `cpp + native + auto` path remains unchanged.
 
-Closes: the remaining invocation and selection portions of G9 and validates G1.
+Closes the provider-neutral seam and C++ portion of G9 and validates G1. Full
+provider parity remains open until M12.
 
 ### M5. Port baseline Gemm as a DSL helper
 
-Port `New_gemm_metakernel` first. It exercises one primary loop, dynamic roll,
-dynamic slice, accumulation, optional `SHL` reduction, bias, and mask without
-the fast array-of-vector structure.
+Port `New_gemm_metakernel` first. Both `cpp + native` and `cpp + dsl` consume the
+same frozen `PreparedVectorKernelPlan`. The DSL recipe receives it as a
+compile-time host input whose decisions and constants it emits; the object is
+never an AIR formal. The recipe must not recompute dimensions, packing, or
+policy. Baseline Gemm exercises one primary loop, dynamic roll, dynamic slice,
+accumulation, optional `SHL` reduction, bias, and mask without the fast
+array-of-vector structure.
 
 Acceptance cases:
 
@@ -646,11 +804,15 @@ Acceptance cases:
 
 Phase-A acceptance gate:
 
-- the pre-inline module contains a typed call to the specialized Gemm helper;
+- `plan_provider=cpp`, `kernel_impl=dsl`, and
+  `plan_kind=baseline-gemm` produce a typed call to the specialized helper from
+  the same validated package used by the native oracle;
 - native and DSL helper AIR have the same loop bounds and nesting;
 - slice widths, ordered shifts, `RNUM`, add/multiply counts, bias, and mask
   placement match;
-- result type and `SLOT` match;
+- result type matches, and both paths preserve `ABSENT_NATIVE_BASELINE` by
+  emitting no `SLOT`; changing that policy requires a separate intentional
+  native-oracle and plan amendment;
 - helper and caller verify after `Mv2v_opt`;
 - the test intentionally stops before Vector-to-SIHE.
 
@@ -658,9 +820,11 @@ Validates: G1 and G3-G6, G8, G9, and structural G11 for the first real kernel.
 
 ### M6. Port baseline Conv as a DSL helper
 
-Port `New_conv_metakernel` using the same substrate. C++ planning continues to
-supply flattened input, im2col weight, expanded bias, rotation data, dimensions,
-and stride.
+Port `New_conv_metakernel` using the same substrate. The selected provider
+supplies flattened input, im2col weight, expanded bias, rotation data,
+dimensions, and stride through the validated prepared package; Phase A uses the
+default C++ provider. The DSL recipe consumes all of those fields and payloads
+without recomputing them or re-reading configuration.
 
 Acceptance cases:
 
@@ -687,9 +851,14 @@ inliner.
 
 Acceptance gate:
 
-- `native` and `dsl-baseline` selection are explicit;
-- unsupported plans have a tested fallback/failure policy;
-- baseline Gemm and Conv produce deterministic helper names and plans;
+- `plan_provider`, `kernel_impl`, and `plan_kind` are independently selectable,
+  including forced baseline Gemm and Conv kinds;
+- a missing provider or valid plan with no DSL recipe has tested
+  `fallback=error` and explicit diagnosed `fallback=cpp-native` behavior;
+  invalid packages, provider exceptions, and post-mutation failures never
+  fall back;
+- baseline Gemm and Conv produce deterministic, provider-independent helper
+  names and plans;
 - normalized pre-inline helper bodies and caller bridges match their native
   structural oracles;
 - no placeholder or synthetic-only AIR node is present;
@@ -700,7 +869,9 @@ Final Phase-A baseline validation: G1, G3-G6, G8, G9, and structural G11.
 
 ### M8. Add fast-kernel DSL memory and helper substrate
 
-Implement genuine typed mutable arrays of vectors and reusable DSL helpers:
+Implement genuine typed mutable arrays of vectors and reusable DSL helpers.
+Their constant and operand inputs come from semantic roles in the validated
+prepared package rather than from C++-planner-only utilities:
 
 - typed array allocation;
 - `LDA`, `ARRAY`, `ILD`, and `IST`;
@@ -726,7 +897,8 @@ Closes: G7 and the fast-kernel portion of G8. Begins fast ownership work in G9.
 
 Port `New_gemm_metakernel_fast` plus input blocking, caller-side `ps`/`kp`
 reductions, bias, mask, and `SLOT` so the helper returns the complete Gemm
-result.
+result. Move every AIR-affecting epilogue decision behind the same frozen-plan
+consumer boundary; the DSL recipe must not call planner utilities.
 
 Acceptance cases:
 
@@ -762,7 +934,8 @@ Acceptance cases:
 
 Phase-A acceptance gate:
 
-- plan fields and prepared constant hashes match;
+- the complete frozen package is consumed without configuration rereads, and
+  plan fields and prepared constant hashes match;
 - `num_grid x cap_block` loops and statement order match;
 - zero placement, slice/index expressions, array loads, roll candidates, cyclic
   masks, collective reduction, bias, output type, and `SLOT` match;
@@ -772,8 +945,9 @@ Phase-A acceptance gate:
 - the Vector-kernel subphase ends without implementing or invoking the Python
   inliner.
 
-Closes the Vector-kernel implementation subphase and validates G1, G3-G9,
-and structural G11 for all four kernels. Phase A continues through NN-level DSL
+Closes the Vector-kernel implementation subphase and validates G1, G3-G8, the
+C++-provider portion of G9, and structural G11 for all four kernels. Python
+provider parity remains deferred to M12. Phase A continues through NN-level DSL
 authoring in M11.
 
 ### M11. Complete NN-level Gemm/Conv DSL authoring and close the current phase
@@ -788,15 +962,18 @@ Vector-AIR workflow:
 - ranked typed weight and bias constants;
 - heterogeneous operand and result types.
 
-Run a compact shape/attribute matrix through NN authoring, C++ planning, and DSL
-helper materialization, stopping after the Vector phase.
+Run a compact shape/attribute matrix through NN authoring, the default C++ plan
+provider, central validation, and DSL helper materialization, stopping after the
+Vector phase.
 
 Phase-A acceptance gate:
 
 - an `@nn_kernel` authors valid Conv and Gemm nodes with complete schemas;
+- the matrix exercises `cpp + native` and `cpp + dsl` against the same canonical
+  plans, with `cpp + native + auto` remaining the default;
 - selected DSL lowering removes every supported NN Conv/Gemm node and produces
   the expected destination-owned helper and call;
-- all four emitter families have normalized pre-inline structural coverage;
+- all four kernel variants have normalized pre-inline structural coverage;
 - helper signatures, calls, loops, constants, attributes, and result types
   verify after `Mv2v_opt`;
 - all current `ace_edsl` DSL tests relevant to NN and Vector authoring pass;
@@ -806,9 +983,57 @@ Phase-A acceptance gate:
 Closes: G10 and the current Gemm/Conv DSL phase. Provides the final Phase-A
 structural gate for G11.
 
-### M12. Implement the independent Python function-inliner pass module
+### M12. Implement the Python plan provider and differential planning validation
 
-Begin Phase B only after M11 closes the current DSL phase.
+Begin Phase B only after M11 closes the current DSL phase and all four kernel
+implementations supplied by the C++ provider are structurally stable.
+
+Implement an ordinary, separately testable Python planning module and the
+per-`Vector_driver` registration/binding that adapts it to M4's `PlanProvider`.
+It consumes `VectorKernelPlanningRequest` data and returns only the data needed
+to construct a `PreparedVectorKernelPlan`; it never creates, receives, or
+transforms AIR objects and does not execute inside `@vector_kernel`.
+
+Implement all four plan variants with specified exact integer arithmetic,
+tie-breaking, dtype/shape rules, byte order, and constant-packing behavior.
+C++ copies all returned buffers, recomputes canonical hashes, validates and
+freezes the package, and remains the production default/reference provider and
+authoritative validator/materializer.
+
+Acceptance gate:
+
+- standalone Python tests cover all four variants, boundary and invalid shapes,
+  overflow, cost-model ties, mask decisions, sharding, and deterministic
+  packing;
+- C++ and Python providers produce equal normalized semantic packages, excluding
+  diagnostics-only provenance but including canonical plan fields, every
+  preparation/scalar descriptor, exact payload bytes and hashes, specialization
+  keys, and helper names across the fixture and NN shape/attribute matrices;
+- `plan_kind=auto` and every valid forced kind agree across providers, while
+  invalid operation/kind pairs fail deterministically;
+- `cpp + native`, `cpp + dsl`, `python + native`, and `python + dsl` all consume
+  the common validated package for every supported variant and verify after
+  `Mv2v_opt` at the pre-inline boundary;
+- Python exceptions, missing or extra roles, unsupported dtypes, noncontiguous
+  or wrong-endian payloads, bad shapes or hashes, inconsistent preparation
+  descriptors, and invalid plans retain actionable diagnostics and cause no
+  partial destination mutation;
+- Python-owned arrays may be mutated or released after provider return without
+  changing the frozen package;
+- provider registration is scoped to one driver invocation, repeated and
+  shuffled test runs are order-independent, and multiple hash-seed runs are
+  deterministic;
+- provider identity and provenance never alter helper specialization or
+  destination-local deduplication;
+- `cpp + native + auto` remains the production default and any fallback remains
+  explicit and diagnosed.
+
+Closes the remaining provider-parity portion of G9 and the provider-differential
+portion of G11.
+
+### M13. Implement the independent Python AIR inliner pass module
+
+Begin Phase C only after M12 closes the Python planning-provider phase.
 
 Create a reusable module such as
 `ace_edsl/edsl/passes/function_inliner.py` with a pass-oriented API:
@@ -819,12 +1044,12 @@ FunctionInlinerPass.run(glob_scope, policy, predicate)
                 helpers_removed, diagnostics)
 ```
 
-Add a generic Python-pass pipeline hook after `run_tensor2vector()` and before
-`run_vector2sihe()`. Do not embed this pass in the C++ Vector driver and do not
+Add a generic Python AIR-pass pipeline hook after `run_tensor2vector()` and
+before `run_vector2sihe()`. Do not embed this pass in the C++ Vector driver or
 reuse dump-string pattern matching or cross-`GLOB_SCOPE` operator replacement
 as the call-site inliner.
 
-Add the structural binding substrate required by the Python algorithm:
+Add the structural binding substrate required by the Python inliner algorithm:
 
 - iterable functions, entries, formals, locals, pregs, blocks, statements, and
   nodes;
@@ -852,16 +1077,20 @@ Acceptance gate:
 
 Closes: the production-required portion of G2.
 
-### M13. Integrate the Python pass, validate downstream lowering, and roll out
+### M14. Integrate the M13 Python AIR inliner and validate downstream lowering
 
-Invoke M12 for DSL-generated helpers after Tensor-to-Vector/Mv2v and before
-Vector-to-SIHE. Keep inlining mandatory for the initial end-to-end pipeline.
-Run the NN shape/attribute matrix from M11 through the complete pipeline.
+Run the M13 inliner for DSL-generated helpers after Tensor-to-Vector/Mv2v and
+before Vector-to-SIHE. Keep inlining mandatory for the initial end-to-end
+pipeline. Run the NN shape/attribute matrix from M11 through the complete
+pipeline for all four provider/kernel-implementation combinations. Native paths
+bypass the inliner; DSL paths must pass through it.
 
 Acceptance gate:
 
-- all four DSL kernels contain calls before M12 and no generated helper calls or
-  unreachable helper functions afterward;
+- all four DSL kernels contain calls before the M13 inliner runs and contain no
+  generated helper calls or unreachable helper functions after it runs;
+- C++ and Python provider results retain M12 equality of the normalized semantic
+  package, payloads, keys, and names through both native and DSL downstream paths;
 - Vector-to-SIHE rotation sets match native lowering;
 - Vector-to-SIHE, SIHE-to-CKKS, CKKS-to-POLY, and Poly-to-C complete;
 - generated C compiles;
@@ -869,10 +1098,12 @@ Acceptance gate:
 - existing `ace_edsl`, NN, Vector, and pipeline tests pass;
 - DSL loop/op/rotation counts do not exceed the native oracle without an
   explicitly approved semantic or optimization change;
-- explicit native fallback remains available until DSL mode is intentionally
-  promoted.
+- explicit, diagnosed `fallback=cpp-native` remains available until another
+  `plan_provider`/`kernel_impl` tuple is intentionally promoted;
+  `cpp + native + auto` remains the default.
 
-Provides runtime closure for G11 and final production validation of G2 and G10.
+Provides runtime closure for G11 and final production validation of G2, G9, and
+G10.
 
 ## Parallel Work and Merge Order
 
@@ -884,14 +1115,15 @@ these DSL tracks may proceed in parallel:
 1. M1 destination-module materialization and call bridge;
 2. M2 Core/type/domain substrate and M3 Vector primitives;
 3. native fixtures and pre-inline AIR normalization;
-4. M4 planner extraction, provided the M0 schema is stable.
+4. M4 provider-neutral seam and C++ reference-provider extraction, provided the
+   M0 schema is stable.
 
 M1-M3 implementation work may proceed in parallel, but M2 and M3 close only
 after their M1-based integration fixtures pass. They merge with M4 before a real
 kernel port begins. Baseline Gemm lands first as the integration pilot, followed
-by baseline Conv and the M7 baseline structural gate. Fast-plan fixtures may be prepared during M5-M7. Fast Gemm merges before
-fast Conv because fast Conv adds cyclic masks, collective reductions, group
-handling, and sharding.
+by baseline Conv and the M7 baseline structural gate. Fast-plan fixtures may be
+prepared during M5-M7. Fast Gemm merges before fast Conv because fast Conv adds
+cyclic masks, collective reductions, group handling, and sharding.
 
 Required current-phase order:
 
@@ -902,24 +1134,29 @@ M0 -> (M1 || M2/M3 || structural test harness || M4 preparation)
 
 ### Later integration work
 
-Do not make the Python inliner a prerequisite for M5-M11. Start its
-implementation only after the four DSL helper bodies, NN-level authoring, and
-all pre-inline structural tests are stable. Then integrate downstream lowering
-and runtime parity:
+Do not make either the production Python planning algorithms or the Python AIR
+inliner a prerequisite for M5-M11. Start them only after the four DSL helper
+bodies, NN-level authoring, and all pre-inline structural tests are stable.
+First add the provider implementation and differential tests, then add the
+independent AIR inliner and downstream integration:
 
 ```text
-M11 -> M12 -> M13
+M11 -> M12 (Python plan provider)
+    -> M13 (Python AIR inliner)
+    -> M14 (downstream integration)
 ```
 
-The M12 Python pass must remain a separate reusable DSL pass module. M13 owns
-its insertion into the compilation pipeline, full-pipeline validation, and
-controlled rollout.
+The M12 Python provider is ordinary compile-time planning code behind the M4
+data boundary, not an AIR pass. The M13 inliner remains a separate reusable DSL
+AIR-pass module. M14 owns its insertion into the compilation pipeline,
+full-pipeline validation, and controlled rollout.
 
 ## Follow-on: Make Inlining Truly Optional
 
 The function-first representation deliberately permits a future pipeline in
 which selected helpers remain as calls. That mode is not part of the Full
-Project Definition of Done because current downstream call handling is incomplete.
+Project Definition of Done because current downstream call handling is
+incomplete.
 
 Before `preserve-generated` may enter Vector-to-SIHE in production, add and
 validate:
@@ -940,6 +1177,13 @@ production lowering always inlines generated Vector helpers.
 
 The current Phase-A goal is complete when:
 
+- M4 exposes the AIR-independent request, per-pass provider, centrally validated
+  owned prepared package, and default/reference C++ provider;
+- `plan_provider`, `kernel_impl`, and `plan_kind` are orthogonal, with
+  `cpp + native + auto` as the default;
+- invalid provider results fail before destination mutation, fallback is never
+  silent, and the validator proves the v1/key derivation invariant before equal
+  canonical plans receive provider-independent helper identity;
 - each selected `@vector_kernel` lowering is materialized as a complete,
   destination-module helper with a deterministic specialization identity;
 - the original NN expression is replaced by a valid typed `CORE.CALL` plus
@@ -949,21 +1193,31 @@ The current Phase-A goal is complete when:
 - dynamic rotations carry the expected signed `RNUM` candidates;
 - result types, constants, masks, reductions, bias placement, and `SLOT` match
   native pre-inline AIR;
-- no supported NN Conv/Gemm remains when DSL mode is selected;
+- no supported NN Conv/Gemm remains when `kernel_impl=dsl` is selected;
 - all four helpers and callers verify after `Mv2v_opt`;
 - all four DSL implementations pass normalized pre-inline structural comparison;
 - typed NN-level Conv/Gemm builders author complete, valid nodes and reach the
   expected pre-inline helper/call representation;
 - tests stop before Vector-to-SIHE and do not depend on an inliner;
-- native lowering remains unchanged and available as an explicit fallback.
+- native lowering remains unchanged and `fallback=cpp-native` is explicit and
+  diagnosed.
 
-Implementing the Python function-inliner pass is explicitly not required to
-finish this current phase.
+Implementing the production Python plan provider or the Python AIR function
+inliner pass is explicitly not required to finish this current phase.
 
 ## Full Project Definition of Done
 
 The full project is complete later when:
 
+- the Python plan provider implements all four variants behind the M4 data-only
+  boundary;
+- C++ and Python planning produce equal normalized semantic packages, excluding
+  diagnostics-only provenance but including every descriptor, payload byte and
+  hash, specialization key, and helper name for supported cases;
+- all four provider/kernel-implementation combinations pass the pre-inline and
+  downstream matrices;
+- malformed provider output is centrally rejected without partial AIR mutation,
+  and provider identity never changes helper deduplication;
 - the independent Python `FunctionInlinerPass` and dead-helper cleanup are
   implemented with safe structural AIR bindings;
 - the pass runs after Tensor-to-Vector/Mv2v and before Vector-to-SIHE;
@@ -974,4 +1228,6 @@ The full project is complete later when:
 - the NN Conv/Gemm programs authored in the current phase complete the full
   lowering pipeline;
 - native-versus-DSL structural, rotation-set, and runtime gates all pass;
-- native lowering remains available until DSL mode is intentionally promoted.
+- `cpp + native + auto` remains the default/reference path until another
+  `plan_provider`/`kernel_impl` tuple is intentionally promoted, and fallback
+  remains explicit and diagnosed.
