@@ -288,37 +288,15 @@ CONSTANT_PTR Source_constant_for_weight(NODE_PTR node, bool *sharded) {
              : air::base::Null_ptr;
 }
 
-const VECTOR_KERNEL_TYPED_PAYLOAD *
-Find_constant(const PREPARED_VECTOR_KERNEL_PLAN &prepared,
-              const std::string &role) {
-  for (const VECTOR_KERNEL_TYPED_PAYLOAD &payload : prepared.Constants()) {
-    if (payload._role == role)
-      return &payload;
-  }
-  return nullptr;
-}
-
-CONSTANT_PTR Materialize_constant(TENSOR2VECTOR_CTX &ctx,
-                                  const VECTOR_KERNEL_TYPED_PAYLOAD &payload,
-                                  const air::base::SPOS &spos) {
-  GLOB_SCOPE *glob = ctx.Container()->Glob_scope();
-  CONST_TYPE_PTR element = glob->Prim_type(payload._type._element_type);
-  size_t count = 0;
-  AIR_ASSERT(Checked_element_count(payload._type._shape, &count));
-  AIR_ASSERT(count <= static_cast<size_t>(std::numeric_limits<int64_t>::max()));
-  std::vector<uint8_t> host =
-      Little_to_host_endian(payload._bytes, payload._type._element_type);
-  const std::string name = "vector_kernel_" + payload._role;
-  return New_array_const(glob, name.c_str(), static_cast<int64_t>(count),
-                         element, payload._type._shape, host.data(), spos);
-}
-
 CONSTANT_PTR Materialize_optional_constant(
     TENSOR2VECTOR_CTX &ctx, const PREPARED_VECTOR_KERNEL_PLAN &prepared,
     const std::string &role, const air::base::SPOS &spos) {
-  const VECTOR_KERNEL_TYPED_PAYLOAD *payload = Find_constant(prepared, role);
+  const VECTOR_KERNEL_TYPED_PAYLOAD *payload =
+      Find_prepared_vector_kernel_constant(prepared, role);
   return payload == nullptr ? air::base::Null_ptr
-                            : Materialize_constant(ctx, *payload, spos);
+                            : Materialize_prepared_vector_kernel_constant(
+                                  *ctx.Container()->Glob_scope(), *payload,
+                                  spos);
 }
 
 std::vector<int>
@@ -545,6 +523,30 @@ NODE_PTR Emit_prepared_fast_conv_native(
 
 } // namespace
 
+const VECTOR_KERNEL_TYPED_PAYLOAD* Find_prepared_vector_kernel_constant(
+    const PREPARED_VECTOR_KERNEL_PLAN& prepared, std::string_view role) {
+  for (const VECTOR_KERNEL_TYPED_PAYLOAD& payload : prepared.Constants()) {
+    if (payload._role == role) return &payload;
+  }
+  return nullptr;
+}
+
+CONSTANT_PTR Materialize_prepared_vector_kernel_constant(
+    GLOB_SCOPE& destination, const VECTOR_KERNEL_TYPED_PAYLOAD& payload,
+    const SPOS& spos) {
+  CONST_TYPE_PTR element =
+      destination.Prim_type(payload._type._element_type);
+  size_t count = 0;
+  AIR_ASSERT(Checked_element_count(payload._type._shape, &count));
+  AIR_ASSERT(count <= static_cast<size_t>(std::numeric_limits<int64_t>::max()));
+  std::vector<uint8_t> host =
+      Little_to_host_endian(payload._bytes, payload._type._element_type);
+  const std::string name = "vector_kernel_" + payload._role;
+  return New_array_const(&destination, name.c_str(),
+                         static_cast<int64_t>(count), element,
+                         payload._type._shape, host.data(), spos);
+}
+
 VECTOR_KERNEL_REQUEST_BUILD_RESULT Build_vector_kernel_planning_request(
     TENSOR2VECTOR_CTX &ctx, NODE_PTR source_node,
     VECTOR_KERNEL_REQUESTED_PLAN_KIND requested_kind) {
@@ -661,13 +663,16 @@ NODE_PTR Emit_prepared_vector_kernel_native(
     NODE_PTR ranked_input, const std::vector<NODE_PTR> &scalar_actuals,
     const air::base::SPOS &spos) {
   const VECTOR_KERNEL_TYPED_PAYLOAD *weight_payload =
-      Find_constant(prepared, "weight");
+      Find_prepared_vector_kernel_constant(prepared, "weight");
   const VECTOR_KERNEL_TYPED_PAYLOAD *bias_payload =
-      Find_constant(prepared, "bias");
+      Find_prepared_vector_kernel_constant(prepared, "bias");
   AIR_ASSERT(weight_payload != nullptr && bias_payload != nullptr);
   CONSTANT_PTR weight_constant =
-      Materialize_constant(ctx, *weight_payload, spos);
-  CONSTANT_PTR bias_constant = Materialize_constant(ctx, *bias_payload, spos);
+      Materialize_prepared_vector_kernel_constant(
+          *ctx.Container()->Glob_scope(), *weight_payload, spos);
+  CONSTANT_PTR bias_constant =
+      Materialize_prepared_vector_kernel_constant(
+          *ctx.Container()->Glob_scope(), *bias_payload, spos);
   NODE_PTR weight = ctx.Container()->New_ldc(weight_constant, spos);
   NODE_PTR bias = ctx.Container()->New_ldc(bias_constant, spos);
   TENSOR2VECTOR_UTIL util(ctx);
@@ -688,7 +693,7 @@ NODE_PTR Emit_prepared_vector_kernel_native(
         } else if constexpr (std::is_same_v<PLAN, BASELINE_CONV_PLAN>) {
           AIR_ASSERT(scalar_actuals.empty());
           const VECTOR_KERNEL_TYPED_PAYLOAD *rotations =
-              Find_constant(prepared, "rotation-table");
+              Find_prepared_vector_kernel_constant(prepared, "rotation-table");
           AIR_ASSERT(rotations != nullptr);
           std::vector<int> values = Decode_s32_payload(*rotations);
           NODE_PTR result = util.New_conv_metakernel(
@@ -704,7 +709,7 @@ NODE_PTR Emit_prepared_vector_kernel_native(
         } else if constexpr (std::is_same_v<PLAN, FAST_GEMM_PLAN>) {
           AIR_ASSERT(scalar_actuals.empty());
           const VECTOR_KERNEL_TYPED_PAYLOAD *rotations =
-              Find_constant(prepared, "rotation-table");
+              Find_prepared_vector_kernel_constant(prepared, "rotation-table");
           AIR_ASSERT(rotations != nullptr);
           std::vector<int> alignment = Decode_s32_payload(*rotations);
           NODE_PTR input_block = util.Blocking_rot(
@@ -756,7 +761,7 @@ NODE_PTR Emit_prepared_vector_kernel_native(
           return loaded;
         } else {
           const VECTOR_KERNEL_TYPED_PAYLOAD *rotations =
-              Find_constant(prepared, "rotation-table");
+              Find_prepared_vector_kernel_constant(prepared, "rotation-table");
           AIR_ASSERT(rotations != nullptr);
           std::vector<int> alignment = Decode_s32_payload(*rotations);
           AIR_ASSERT(plan._blocking_outer_depth <=

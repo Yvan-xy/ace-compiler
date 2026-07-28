@@ -141,6 +141,102 @@ class AceEDSL(BaseDSL):
             except (AttributeError, RuntimeError):
                 pass
         return default_domain
+
+    def trace_vector_kernel_into(self, trace_context, kernel, prepared):
+        """Trace one real ``@vector_kernel`` into a C++-owned helper body.
+
+        The pass owns the function, signature, body, constants, and terminal
+        return. This method only establishes a lexical EDSL context around the
+        borrowed destination wrappers for the duration of one callback.
+        """
+        if not getattr(trace_context, "active", False):
+            raise RuntimeError("vector-kernel destination trace is not active")
+        if getattr(kernel, "_py_domain", None) != "nn::vector":
+            raise TypeError("destination recipe requires a @vector_kernel callable")
+
+        from .domain_ast_decorators import (
+            restore_tracing_state,
+            set_current_container,
+            set_destination_trace_mode,
+            snapshot_tracing_state,
+        )
+
+        trace_state = snapshot_tracing_state()
+        previous_in_context = self._in_air_context
+        previous_domain = self.current_domain
+        previous_stack = list(self._domain_stack)
+        previous_module = self.current_air_module
+        previous_flat_mode = AIRValue.FLAT_IR_MODE
+        previous_source_loc_mode = AIRValue.SOURCE_LOC_ENABLED
+        previous_fresh_load_mode = AIRValue.FRESH_LOAD_ENABLED
+        previous_temp_counter = AIRValue._temp_counter
+        missing = object()
+        previous_original = getattr(self, "_original_funcBody", missing)
+
+        container = trace_context.container
+
+        def wrap(node):
+            air_type = node.rtype()
+            shape = tuple(air_type.shape()) if air_type.is_array() else None
+            return AIRValue(
+                node,
+                container,
+                shape=shape,
+                domain=self._domain_for_air_type(air_type, "nn::vector"),
+                air_type=air_type,
+            )
+
+        formals = tuple(wrap(node) for node in trace_context.formals)
+        constants = {
+            role: wrap(trace_context.constant(role))
+            for role in trace_context.constant_roles
+        }
+        expected_type = trace_context.result_type
+
+        try:
+            self._in_air_context = True
+            self.current_domain = None
+            self._domain_stack = []
+            AIRValue.FLAT_IR_MODE = False
+            AIRValue.SOURCE_LOC_ENABLED = False
+            AIRValue.FRESH_LOAD_ENABLED = True
+            set_current_container(container, None, "nn::vector")
+            set_destination_trace_mode(True)
+            result = kernel(*formals, prepared, constants, expected_type,
+                            trace_context.i32_type)
+            if not isinstance(result, AIRValue):
+                raise TypeError(
+                    "vector-kernel destination recipe must return an AIRValue"
+                )
+            if result.container is not container:
+                raise ValueError(
+                    "vector-kernel destination recipe returned another container"
+                )
+            if result.domain != "nn::vector":
+                raise TypeError(
+                    "vector-kernel destination recipe result is not Vector AIR"
+                )
+            if result.air_type is None or result.air_type != expected_type:
+                raise TypeError(
+                    "vector-kernel destination recipe result type does not match "
+                    "the prepared ABI"
+                )
+            return result.value
+        finally:
+            restore_tracing_state(trace_state)
+            self._in_air_context = previous_in_context
+            self.current_domain = previous_domain
+            self._domain_stack = previous_stack
+            self.current_air_module = previous_module
+            AIRValue.FLAT_IR_MODE = previous_flat_mode
+            AIRValue.SOURCE_LOC_ENABLED = previous_source_loc_mode
+            AIRValue.FRESH_LOAD_ENABLED = previous_fresh_load_mode
+            AIRValue._temp_counter = previous_temp_counter
+            if previous_original is missing:
+                if hasattr(self, "_original_funcBody"):
+                    del self._original_funcBody
+            else:
+                self._original_funcBody = previous_original
     
     def _kernel_helper(self, funcBody, *args, **kwargs):
         """

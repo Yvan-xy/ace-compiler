@@ -62,6 +62,16 @@ class FHEConfig:
     raise_mod_level_func: str = ""
 
 
+@dataclass(frozen=True)
+class VectorKernelLoweringConfig:
+    plan_provider: str = "cpp"
+    kernel_impl: str = "native"
+    plan_kind: str = "auto"
+    fallback: str = "error"
+    mask_fuse: bool = False
+    max_slots: int = 0
+
+
 @dataclass
 class PipelineResult:
     """Result of running the pipeline."""
@@ -112,6 +122,8 @@ class AcePipeline:
         self._air_builder = None
         env_rewrite = os.environ.get("ACE_CKKS_PRIMITIVE_REWRITE", "").strip().lower()
         self._rewrite_ckks_extended_ops = env_rewrite in ("1", "true", "yes", "on")
+        self.vector_kernel_config: Optional[VectorKernelLoweringConfig] = None
+        self.vector_kernel_recipes: Dict[str, Callable] = {}
         
     def _get_air_builder(self):
         """Lazy import air_builder."""
@@ -188,6 +200,33 @@ class AcePipeline:
             raise_mod_level_func=raise_mod_level_func,
         )
         return self
+
+    def configure_vector_kernel_lowering(
+        self,
+        plan_provider: str = "cpp",
+        kernel_impl: str = "native",
+        plan_kind: str = "auto",
+        fallback: str = "error",
+        mask_fuse: bool = False,
+        max_slots: int = 0,
+    ) -> "AcePipeline":
+        self.vector_kernel_config = VectorKernelLoweringConfig(
+            plan_provider, kernel_impl, plan_kind, fallback, mask_fuse,
+            max_slots,
+        )
+        return self
+
+    def register_vector_kernel_recipe(
+        self, plan_kind: str, recipe: Callable
+    ) -> "AcePipeline":
+        if plan_kind != "baseline-gemm":
+            raise ValueError("M5 recipe registration supports baseline-gemm only")
+        if not callable(recipe):
+            raise TypeError("vector-kernel recipe must be callable")
+        if plan_kind in self.vector_kernel_recipes:
+            raise ValueError(f"duplicate vector-kernel recipe: {plan_kind}")
+        self.vector_kernel_recipes[plan_kind] = recipe
+        return self
     
     def dump_air(self, stage_name: str) -> str:
         """Dump current AIR state."""
@@ -205,7 +244,16 @@ class AcePipeline:
         if self.glob_scope is None:
             return False
         try:
-            self.glob_scope.run_cpp_pass("tensor2vector", [])
+            if self.vector_kernel_config is None:
+                self.glob_scope.run_cpp_pass("tensor2vector", [])
+            else:
+                config = self.vector_kernel_config
+                self.glob_scope.run_tensor2vector_with_recipes(
+                    [], config.plan_provider, config.kernel_impl,
+                    config.plan_kind, config.fallback,
+                    dict(self.vector_kernel_recipes),
+                    config.mask_fuse, config.max_slots,
+                )
             return True
         except Exception as e:
             print(f"tensor2vector failed: {e}")
@@ -619,6 +667,8 @@ class Pipeline:
         self.config = FHEConfig()
         self.skip_ops: List[str] = []
         self.python_lowering_func: Optional[Callable] = None
+        self.vector_kernel_config: Optional[VectorKernelLoweringConfig] = None
+        self.vector_kernel_recipes: Dict[str, Callable] = {}
         env_rewrite = os.environ.get("ACE_CKKS_PRIMITIVE_REWRITE", "").strip().lower()
         self.rewrite_ckks_extended_ops: bool = env_rewrite in ("1", "true", "yes", "on")
         
@@ -757,6 +807,33 @@ class Pipeline:
         self.python_lowering_func = func
         return self
 
+    def configure_vector_kernel_lowering(
+        self,
+        plan_provider: str = "cpp",
+        kernel_impl: str = "native",
+        plan_kind: str = "auto",
+        fallback: str = "error",
+        mask_fuse: bool = False,
+        max_slots: int = 0,
+    ) -> "Pipeline":
+        self.vector_kernel_config = VectorKernelLoweringConfig(
+            plan_provider, kernel_impl, plan_kind, fallback, mask_fuse,
+            max_slots,
+        )
+        return self
+
+    def register_vector_kernel_recipe(
+        self, plan_kind: str, recipe: Callable
+    ) -> "Pipeline":
+        if plan_kind != "baseline-gemm":
+            raise ValueError("M5 recipe registration supports baseline-gemm only")
+        if not callable(recipe):
+            raise TypeError("vector-kernel recipe must be callable")
+        if plan_kind in self.vector_kernel_recipes:
+            raise ValueError(f"duplicate vector-kernel recipe: {plan_kind}")
+        self.vector_kernel_recipes[plan_kind] = recipe
+        return self
+
     def set_ckks_extended_op_rewrite(self, enabled: bool = True) -> "Pipeline":
         """Enable/disable primitive rewrite of CKKS extended ops."""
         self.rewrite_ckks_extended_ops = bool(enabled)
@@ -785,7 +862,15 @@ class Pipeline:
                         relu_vr_def=self.config.relu_vr_def
                     )
             
-            return self.glob.run_cpp_pass("tensor2vector", self.skip_ops)
+            if self.vector_kernel_config is None:
+                return self.glob.run_cpp_pass("tensor2vector", self.skip_ops)
+            config = self.vector_kernel_config
+            return self.glob.run_tensor2vector_with_recipes(
+                self.skip_ops, config.plan_provider, config.kernel_impl,
+                config.plan_kind, config.fallback,
+                dict(self.vector_kernel_recipes),
+                config.mask_fuse, config.max_slots,
+            )
         
         elif phase == "vector2sihe":
             return self.glob.run_cpp_pass("vector2sihe", self.skip_ops)

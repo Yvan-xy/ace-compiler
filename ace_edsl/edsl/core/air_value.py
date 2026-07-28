@@ -48,6 +48,8 @@ class AIRValue:
     
     # Class-level settings
     FLAT_IR_MODE = True  # Enable flat IR generation to avoid exponential dump size
+    SOURCE_LOC_ENABLED = True
+    FRESH_LOAD_ENABLED = False
     _temp_counter = 0    # Counter for generating unique temp names
     
     @classmethod
@@ -187,6 +189,9 @@ class AIRValue:
         """Materialize a value without applying its pending Vector SLOT."""
         if self._temp_name is not None and hasattr(self._container, "new_ldid"):
             return self._container.new_ldid(self._temp_name)
+        if (AIRValue.FRESH_LOAD_ENABLED and self._node is not None and
+                hasattr(self._container, "new_fresh_load")):
+            return self._container.new_fresh_load(self._node)
         return self._node
     
     def _flatten_result(self, result_node: Any) -> 'AIRValue':
@@ -337,7 +342,8 @@ class AIRValue:
         Note: All values passed to set_loc() are explicitly wrapped with int()
         to ensure they are proper Python integers for the C++ binding.
         """
-        if self._container is None or not hasattr(self._container, 'set_loc'):
+        if (not AIRValue.SOURCE_LOC_ENABLED or self._container is None or
+                not hasattr(self._container, 'set_loc')):
             return
         
         try:

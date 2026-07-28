@@ -1143,7 +1143,8 @@ TEST_F(Tensor2VectorDslMaterialization,
   ASSERT_TRUE(registry.Register(
       VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM,
       [&](const PREPARED_VECTOR_KERNEL_PLAN& recipe_plan,
-          const std::vector<NODE_PTR>& actuals, GLOB_SCOPE& glob) {
+          const std::vector<NODE_PTR>& actuals, GLOB_SCOPE& glob,
+          const VECTOR_KERNEL_DESTINATION_ABI& abi) {
         ++recipe_count;
         EXPECT_EQ(&glob, destination.get());
         EXPECT_TRUE(
@@ -1152,9 +1153,15 @@ TEST_F(Tensor2VectorDslMaterialization,
             recipe_plan.Specialization_key() ==
                 different_prepared.Specialization_key());
         EXPECT_EQ(actuals.size(), 1U);
+        EXPECT_EQ(abi._formal_types.size(), actuals.size());
+        if (!abi._formal_types.empty()) {
+          EXPECT_TRUE(
+              abi._formal_types[0]->Is_compatible_type(actuals[0]->Rtype()));
+        }
+        EXPECT_TRUE(abi._result_type->Is_compatible_type(result_type));
         VECTOR_KERNEL_HELPER_SPEC spec;
-        spec._formal_types = {actuals[0]->Rtype()};
-        spec._result_type = result_type;
+        spec._formal_types = abi._formal_types;
+        spec._result_type = abi._result_type;
         spec._build_body =
             [&](FUNC_SCOPE& helper, NODE_PTR, const SPOS& helper_spos) {
               ++body_builder_count;
@@ -1422,7 +1429,8 @@ TEST_F(Tensor2VectorDslMaterialization,
   VECTOR_KERNEL_LOWERING_REGISTRY registry;
   VECTOR_KERNEL_PLAN_RECIPE recipe =
       [](const PREPARED_VECTOR_KERNEL_PLAN&,
-         const std::vector<NODE_PTR>&, GLOB_SCOPE&) {
+         const std::vector<NODE_PTR>&, GLOB_SCOPE&,
+         const VECTOR_KERNEL_DESTINATION_ABI&) {
         return VECTOR_KERNEL_HELPER_SPEC{};
       };
 

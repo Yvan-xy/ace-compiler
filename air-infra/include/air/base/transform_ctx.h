@@ -96,20 +96,26 @@ public:
   RETV Handle_block(VISITOR* visitor, air::base::NODE_PTR node) {
     NODE_PTR block = _cntr->New_stmt_block(node->Spos());
     Push(node, block);
-    STMT_LIST list(block);
-    for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
-         stmt          = stmt->Next()) {
-      NODE_PTR s_node = stmt->Node();
-      Begin_stmt(s_node);
-      RETV     retv   = visitor->template Visit<RETV>(s_node);
-      NODE_PTR n_node = Get_node_ptr(retv);
-      if (n_node != Null_ptr) {
-        AIR_ASSERT(n_node->Is_root());
-        list.Append(n_node->Stmt());
+    try {
+      STMT_LIST list(block);
+      for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+           stmt          = stmt->Next()) {
+        NODE_PTR s_node = stmt->Node();
+        Begin_stmt(s_node);
+        RETV     retv   = visitor->template Visit<RETV>(s_node);
+        NODE_PTR n_node = Get_node_ptr(retv);
+        if (n_node != Null_ptr) {
+          AIR_ASSERT(n_node->Is_root());
+          list.Append(n_node->Stmt());
+        }
+        End_stmt(s_node);
       }
-      End_stmt(s_node);
+      Pop(node, block);
+    } catch (...) {
+      _post_stmt.clear();
+      Pop(node, block);
+      throw;
     }
-    Pop(node, block);
     return RETV(block);
   }
 
@@ -119,26 +125,31 @@ public:
     // push current node to ANALYZE_CTX's stack
     ANALYZE_CTX::Push(node);
     NODE_PTR n_node = Null_ptr;
-    if (node->Is_root()) {
-      STMT_PTR n_stmt = _cntr->Clone_stmt(node->Stmt());
-      n_node          = n_stmt->Node();
-    } else {
-      n_node = _cntr->Clone_node(node);
-    }
-    // visit children
-    for (uint32_t i = 0; i < node->Num_child(); ++i) {
-      RETV     retv    = visitor->template Visit<RETV>(node->Child(i));
-      NODE_PTR n_child = Get_node_ptr(retv);
-      AIR_ASSERT(n_child != Null_ptr);
-      n_node->Set_child(i, n_child);
-
-      // add parent node for nested blocks
-      if (n_node->Is_root() && n_child->Is_block()) {
-        n_child->Set_parent_stmt(n_node->Stmt());
+    try {
+      if (node->Is_root()) {
+        STMT_PTR n_stmt = _cntr->Clone_stmt(node->Stmt());
+        n_node          = n_stmt->Node();
+      } else {
+        n_node = _cntr->Clone_node(node);
       }
+      // visit children
+      for (uint32_t i = 0; i < node->Num_child(); ++i) {
+        RETV     retv    = visitor->template Visit<RETV>(node->Child(i));
+        NODE_PTR n_child = Get_node_ptr(retv);
+        AIR_ASSERT(n_child != Null_ptr);
+        n_node->Set_child(i, n_child);
+
+        // add parent node for nested blocks
+        if (n_node->Is_root() && n_child->Is_block()) {
+          n_child->Set_parent_stmt(n_node->Stmt());
+        }
+      }
+      // pop current node from ANALYZE_CTX's stack
+      ANALYZE_CTX::Pop(node);
+    } catch (...) {
+      ANALYZE_CTX::Pop(node);
+      throw;
     }
-    // pop current node from ANALYZE_CTX's stack
-    ANALYZE_CTX::Pop(node);
     return RETV(n_node);
   }
 

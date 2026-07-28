@@ -29,6 +29,7 @@ _current_domain = None
 _loop_temp_counter = 0
 _if_temp_counter = 0
 _loop_accum_counter = 0
+_destination_trace_mode = False
 
 def set_current_container(container, func_scope=None, domain=None):
     """Set the current container for loop operations."""
@@ -36,6 +37,12 @@ def set_current_container(container, func_scope=None, domain=None):
     _current_container = container
     _current_func_scope = func_scope
     _current_domain = domain
+
+
+def set_destination_trace_mode(enabled):
+    """Enable destination-only lowering behavior for a nested trace."""
+    global _destination_trace_mode
+    _destination_trace_mode = bool(enabled)
 
 
 def set_current_domain(domain):
@@ -46,6 +53,35 @@ def set_current_domain(domain):
 def get_current_container():
     """Get the current container for loop operations."""
     return _current_container
+
+
+def snapshot_tracing_state():
+    """Capture all module-owned state changed by nested AIR tracing."""
+    return (
+        _current_container,
+        _current_func_scope,
+        _current_domain,
+        _loop_temp_counter,
+        _if_temp_counter,
+        _loop_accum_counter,
+        _destination_trace_mode,
+    )
+
+
+def restore_tracing_state(state):
+    """Restore a state produced by :func:`snapshot_tracing_state`."""
+    global _current_container, _current_func_scope, _current_domain
+    global _loop_temp_counter, _if_temp_counter, _loop_accum_counter
+    global _destination_trace_mode
+    (
+        _current_container,
+        _current_func_scope,
+        _current_domain,
+        _loop_temp_counter,
+        _if_temp_counter,
+        _loop_accum_counter,
+        _destination_trace_mode,
+    ) = state
 
 
 def _next_loop_temp_name() -> str:
@@ -174,13 +210,21 @@ def _loop_execute_range_dynamic(
         if isinstance(arg, AIRValue):
             if arg.air_type is None:
                 raise TypeError("loop-carried AIRValue requires exact AIR type metadata")
-            accum_name = _next_loop_accum_name()
+            reuse_accumulator = (
+                _destination_trace_mode
+                and arg._temp_name is not None
+                and arg._node is None
+            )
+            accum_name = (
+                arg._temp_name if reuse_accumulator else _next_loop_accum_name()
+            )
             accum_names.append(accum_name)
             accum_metadata.append(arg)
-            if hasattr(container, "new_local"):
-                container.new_local(accum_name, arg.air_type)
-            # Initialize: accum = initial_value (emulates scf.ForOp init_values)
-            container.new_stid(accum_name, arg.value)
+            if not reuse_accumulator:
+                if hasattr(container, "new_local"):
+                    container.new_local(accum_name, arg.air_type)
+                # Initialize: accum = initial_value (emulates scf.ForOp init_values)
+                container.new_stid(accum_name, arg.value)
             # Create AIRValue that loads from this variable on each .value access
             # (emulates scf.ForOp block_args — fresh value each iteration)
             accum_air_values.append(AIRValue(
@@ -264,11 +308,14 @@ def _loop_execute_range_dynamic(
     ):
         if accum_name is not None:
             metadata = initial
-            temp_name = _next_loop_temp_name()
-            load_node = container.new_ldid(accum_name)
-            if hasattr(container, "new_local"):
-                container.new_local(temp_name, metadata.air_type)
-            container.new_stid(temp_name, load_node)
+            if _destination_trace_mode:
+                temp_name = accum_name
+            else:
+                temp_name = _next_loop_temp_name()
+                load_node = container.new_ldid(accum_name)
+                if hasattr(container, "new_local"):
+                    container.new_local(temp_name, metadata.air_type)
+                container.new_stid(temp_name, load_node)
             carried_results.append(AIRValue(
                 node=None,
                 container=container,

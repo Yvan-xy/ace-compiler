@@ -49,6 +49,14 @@ struct VECTOR_KERNEL_HELPER_SPEC {
   VECTOR_KERNEL_BODY_BUILDER       _build_body;
 };
 
+// Destination-owned helper ABI prepared centrally after the provider package
+// has been validated. Recipes may observe these types, but must not replace
+// them or create AIR while selecting a body builder.
+struct VECTOR_KERNEL_DESTINATION_ABI {
+  std::vector<air::base::TYPE_PTR> _formal_types;
+  air::base::TYPE_PTR              _result_type;
+};
+
 // A selector observes the original NN node but receives already visited
 // destination-owned actuals. It returns a fully specialized helper recipe; it
 // must not return or capture AIR objects from an independent module.
@@ -65,7 +73,7 @@ using VECTOR_KERNEL_PLAN_RECIPE =
     std::function<VECTOR_KERNEL_HELPER_SPEC(
         const PREPARED_VECTOR_KERNEL_PLAN&,
         const std::vector<air::base::NODE_PTR>&,
-        air::base::GLOB_SCOPE&)>;
+        air::base::GLOB_SCOPE&, const VECTOR_KERNEL_DESTINATION_ABI&)>;
 
 // Registration is explicitly per VECTOR_CTX/Vector_driver invocation. This
 // avoids process-global callbacks, stale module pointers, and shuffled-test

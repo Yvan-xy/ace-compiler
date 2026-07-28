@@ -11,9 +11,11 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "air/base/node.h"
+#include "air/base/st.h"
 #include "nn/vector/tensor2vector_planning.h"
 
 namespace nn {
@@ -51,6 +53,17 @@ air::base::NODE_PTR Emit_prepared_vector_kernel_native(
 // only after planning and validation succeed.
 air::base::NODE_PTR Find_vector_kernel_source_scalar(
     air::base::NODE_PTR source_node);
+
+// Look up and materialize centrally validated prepared constants. The
+// materialized ARRAY constant is owned by destination and contains a private
+// host-order copy of the canonical little-endian payload.
+const VECTOR_KERNEL_TYPED_PAYLOAD* Find_prepared_vector_kernel_constant(
+    const PREPARED_VECTOR_KERNEL_PLAN& prepared, std::string_view role);
+
+air::base::CONSTANT_PTR Materialize_prepared_vector_kernel_constant(
+    air::base::GLOB_SCOPE& destination,
+    const VECTOR_KERNEL_TYPED_PAYLOAD& payload,
+    const air::base::SPOS& spos);
 
 }  // namespace vector
 }  // namespace nn

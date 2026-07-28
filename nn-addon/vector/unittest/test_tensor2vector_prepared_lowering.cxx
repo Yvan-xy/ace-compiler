@@ -678,19 +678,27 @@ TEST_F(Tensor2VectorPreparedLowering,
   ASSERT_TRUE(recipes.Register(
       VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM,
       [&](const PREPARED_VECTOR_KERNEL_PLAN& prepared,
-          const std::vector<NODE_PTR>& actuals, GLOB_SCOPE& destination) {
+          const std::vector<NODE_PTR>& actuals, GLOB_SCOPE& destination,
+          const VECTOR_KERNEL_DESTINATION_ABI& abi) {
         ++recipe_count;
         EXPECT_EQ(Get_vector_kernel_plan_kind(prepared.Plan()),
                   VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM);
         EXPECT_EQ(prepared.Provenance(), provider.Name());
         EXPECT_EQ(actuals.size(), 1U);
         EXPECT_EQ(actuals[0]->Container()->Glob_scope(), &destination);
+        EXPECT_EQ(abi._formal_types.size(), actuals.size());
+        if (!abi._formal_types.empty()) {
+          EXPECT_TRUE(
+              abi._formal_types[0]->Is_compatible_type(actuals[0]->Rtype()));
+        }
+        EXPECT_TRUE(
+            abi._result_type->Is_compatible_type(actuals[0]->Rtype()));
         expected_key = prepared.Specialization_key();
         expected_name = prepared.Helper_name();
 
         VECTOR_KERNEL_HELPER_SPEC spec;
-        spec._formal_types = {actuals[0]->Rtype()};
-        spec._result_type = actuals[0]->Rtype();
+        spec._formal_types = abi._formal_types;
+        spec._result_type = abi._result_type;
         spec._build_body =
             [&](FUNC_SCOPE& helper, NODE_PTR, const SPOS& spos) {
               ++body_builder_count;
@@ -786,7 +794,8 @@ TEST_F(Tensor2VectorPreparedLowering,
         test_case._expected_kind,
         [&, caller_id](const PREPARED_VECTOR_KERNEL_PLAN& prepared,
                        const std::vector<NODE_PTR>& actuals,
-                       GLOB_SCOPE& destination) {
+                       GLOB_SCOPE& destination,
+                       const VECTOR_KERNEL_DESTINATION_ABI&) {
           ++recipe_count;
           EXPECT_EQ(Get_vector_kernel_plan_kind(prepared.Plan()),
                     test_case._expected_kind);
@@ -1043,7 +1052,8 @@ TEST_F(Tensor2VectorPreparedLowering,
   ASSERT_TRUE(recipes.Register(
       VECTOR_KERNEL_PLAN_KIND::FAST_CONV,
       [&](const PREPARED_VECTOR_KERNEL_PLAN& prepared,
-          const std::vector<NODE_PTR>& actuals, GLOB_SCOPE& destination) {
+          const std::vector<NODE_PTR>& actuals, GLOB_SCOPE& destination,
+          const VECTOR_KERNEL_DESTINATION_ABI&) {
         ++recipe_count;
         EXPECT_EQ(Get_vector_kernel_plan_kind(prepared.Plan()),
                   VECTOR_KERNEL_PLAN_KIND::FAST_CONV);

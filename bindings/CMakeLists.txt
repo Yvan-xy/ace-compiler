@@ -21,6 +21,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+option(ACE_VECTOR_KERNEL_TEST_SUPPORT
+       "Build test-only vector-kernel AIR oracle bindings" OFF)
+
 # Find pybind11
 find_package(pybind11 REQUIRED)
 
@@ -121,10 +124,22 @@ pybind11_add_module(air_builder
     src/air_builder_bindings.cpp
     src/onnx_loader.cpp
 )
-target_include_directories(air_builder PRIVATE 
+target_include_directories(air_builder PRIVATE
     ${AIR_INFRA_DIR}/include
     ${ACE_INCLUDE_DIR}
 )
+
+if(ACE_VECTOR_KERNEL_TEST_SUPPORT)
+    target_sources(air_builder PRIVATE
+        ${NN_ADDON_DIR}/vector/unittest/tensor2vector_air_normalizer.cxx
+    )
+    target_include_directories(air_builder PRIVATE
+        ${NN_ADDON_DIR}/vector/unittest
+    )
+    target_compile_definitions(air_builder PRIVATE
+        ACE_VECTOR_KERNEL_TEST_SUPPORT=1
+    )
+endif()
 
 if(ACE_BINDINGS_ENABLED)
     target_compile_definitions(air_builder PRIVATE ACE_BINDINGS_ENABLED=1)

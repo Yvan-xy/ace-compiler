@@ -101,6 +101,56 @@ bool Matches_ranked_type(TYPE_PTR air_type,
          array->Shape() == plan_type._shape;
 }
 
+TYPE_PTR Find_or_create_destination_ranked_type(
+    GLOB_SCOPE& destination, const VECTOR_KERNEL_RANKED_TYPE_PLAN& plan_type,
+    const SPOS& spos) {
+  for (TYPE_ITER iter = destination.Begin_type();
+       iter != destination.End_type(); ++iter) {
+    TYPE_PTR type = *iter;
+    if (Matches_ranked_type(type, plan_type)) return type;
+  }
+  CONST_TYPE_PTR element = destination.Prim_type(plan_type._element_type);
+  return destination.New_arr_type(element, plan_type._shape, spos);
+}
+
+VECTOR_KERNEL_DESTINATION_ABI Build_destination_abi(
+    const PREPARED_VECTOR_KERNEL_PLAN& prepared,
+    const std::vector<NODE_PTR>& actuals, GLOB_SCOPE& destination,
+    const SPOS& spos) {
+  const VECTOR_KERNEL_COMMON_PLAN& common = Common_plan(prepared);
+  const size_t vector_count = common._runtime_vector_inputs.size();
+  const size_t scalar_count = common._runtime_scalar_inputs.size();
+  AIR_ASSERT_MSG(actuals.size() == vector_count + scalar_count,
+                 "prepared vector-kernel actual count does not match its ABI");
+
+  VECTOR_KERNEL_DESTINATION_ABI abi;
+  abi._formal_types.reserve(actuals.size());
+  for (size_t idx = 0; idx < vector_count; ++idx) {
+    NODE_PTR actual = actuals[idx];
+    AIR_ASSERT(actual != Null_ptr && actual->Has_rtype());
+    AIR_ASSERT(actual->Container()->Glob_scope() == &destination);
+    AIR_ASSERT_MSG(Matches_ranked_type(actual->Rtype(),
+                                       common._runtime_vector_inputs[idx]),
+                   "prepared vector actual does not match its ABI");
+    abi._formal_types.push_back(actual->Rtype());
+  }
+  for (size_t idx = 0; idx < scalar_count; ++idx) {
+    NODE_PTR actual = actuals[vector_count + idx];
+    AIR_ASSERT(actual != Null_ptr && actual->Has_rtype());
+    TYPE_PTR formal = actual->Rtype();
+    AIR_ASSERT_MSG(
+        actual->Container()->Glob_scope() == &destination &&
+            formal->Is_prim() &&
+            formal->Cast_to_prim()->Encoding() ==
+                common._runtime_scalar_inputs[idx],
+        "prepared scalar actual does not match its ABI");
+    abi._formal_types.push_back(formal);
+  }
+  abi._result_type = Find_or_create_destination_ranked_type(
+      destination, common._result_type, spos);
+  return abi;
+}
+
 void Validate_prepared_helper_signature(
     const PREPARED_VECTOR_KERNEL_PLAN& prepared,
     const VECTOR_KERNEL_HELPER_SPEC& spec) {
@@ -426,8 +476,10 @@ Try_materialize_prepared_vector_kernel(
   AIR_ASSERT(caller_cntr != nullptr);
   GLOB_SCOPE* destination = caller_cntr->Glob_scope();
   AIR_ASSERT(destination != nullptr);
+  VECTOR_KERNEL_DESTINATION_ABI abi =
+      Build_destination_abi(prepared, actuals, *destination, spos);
   VECTOR_KERNEL_HELPER_SPEC spec =
-      (*recipe)(prepared, actuals, *destination);
+      (*recipe)(prepared, actuals, *destination, abi);
   AIR_ASSERT_MSG(spec._specialization_key.empty() ||
                      spec._specialization_key == prepared.Specialization_key(),
                  "DSL recipe changed the validated specialization key");

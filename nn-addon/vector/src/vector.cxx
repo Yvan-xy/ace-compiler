@@ -6,6 +6,8 @@
 //
 //=============================================================================
 
+#include <memory>
+
 #include "air/base/handler_retv.h"
 #include "air/base/transform_ctx.h"
 #include "air/base/visitor.h"
@@ -249,7 +251,8 @@ static GLOB_SCOPE* Mv2v_opt(GLOB_SCOPE* glob, VECTOR_CTX& ctx,
 static GLOB_SCOPE* Lower_to_vector(GLOB_SCOPE* glob, VECTOR_CTX& ctx,
                                    const air::driver::DRIVER_CTX* driver_ctx,
                                    const VECTOR_CONFIG&           cfg) {
-  GLOB_SCOPE* new_glob = new GLOB_SCOPE(glob->Id(), true);
+  std::unique_ptr<GLOB_SCOPE> new_glob(
+      new GLOB_SCOPE(glob->Id(), true));
   AIR_ASSERT(new_glob != nullptr);
   new_glob->Clone(*glob);
   for (GLOB_SCOPE::FUNC_SCOPE_ITER it = glob->Begin_func_scope();
@@ -274,7 +277,7 @@ static GLOB_SCOPE* Lower_to_vector(GLOB_SCOPE* glob, VECTOR_CTX& ctx,
 
   // NOTE: Do NOT delete glob - it may be the singleton from GLOB_SCOPE::Get()
   // delete glob;
-  return new_glob;
+  return new_glob.release();
 }
 
 GLOB_SCOPE* Vector_driver(GLOB_SCOPE* glob, VECTOR_CTX& ctx,

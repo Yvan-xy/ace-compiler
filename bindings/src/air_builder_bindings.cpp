@@ -49,6 +49,11 @@
 // For Vector_driver
 #include "nn/vector/vector_gen.h"
 #include "nn/vector/vector_ctx.h"
+#include "nn/vector/tensor2vector_dsl.h"
+#include "nn/vector/tensor2vector_prepared_lowering.h"
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+#include "tensor2vector_air_normalizer.h"
+#endif
 #include "nn/vector/config.h"
 #include "nn/vector/skip_lowering.h"  // For selective lowering registry
 #include "fhe/sihe/skip_lowering.h"   // For SIHE selective lowering registry
@@ -94,6 +99,67 @@ using namespace air::base;
 
 static bool s_air_initialized = false;
 static GLOB_SCOPE* s_active_binding_glob = nullptr;
+
+class DESTINATION_LIFETIME {
+public:
+    explicit DESTINATION_LIFETIME(GLOB_SCOPE* owner) : _owner(owner) {
+        if (owner == nullptr) {
+            throw std::runtime_error(
+                "vector-kernel destination lifetime requires an owner");
+        }
+    }
+
+    bool owns(const GLOB_SCOPE* glob) const { return glob == _owner; }
+
+    void expire() { _active = false; }
+
+    void require_active(const char* object_kind) const {
+        if (!_active) {
+            throw std::runtime_error(
+                std::string("vector-kernel destination ") + object_kind +
+                " has expired");
+        }
+    }
+
+private:
+    GLOB_SCOPE* _owner;
+    bool _active = true;
+};
+
+static std::shared_ptr<DESTINATION_LIFETIME> s_active_binding_lifetime;
+
+std::shared_ptr<DESTINATION_LIFETIME> destination_lifetime_for_glob(
+    const GLOB_SCOPE* glob,
+    std::shared_ptr<DESTINATION_LIFETIME> candidate = nullptr) {
+    if (!candidate) candidate = s_active_binding_lifetime;
+    if (!candidate || !candidate->owns(glob)) return nullptr;
+    return candidate;
+}
+
+class ACTIVE_BINDING_GLOB_GUARD {
+public:
+    explicit ACTIVE_BINDING_GLOB_GUARD(
+        GLOB_SCOPE* active,
+        std::shared_ptr<DESTINATION_LIFETIME> lifetime = nullptr)
+        : _previous(s_active_binding_glob),
+          _previous_lifetime(s_active_binding_lifetime) {
+        s_active_binding_glob = active;
+        s_active_binding_lifetime = std::move(lifetime);
+    }
+
+    ~ACTIVE_BINDING_GLOB_GUARD() {
+        s_active_binding_glob = _previous;
+        s_active_binding_lifetime = std::move(_previous_lifetime);
+    }
+
+    ACTIVE_BINDING_GLOB_GUARD(const ACTIVE_BINDING_GLOB_GUARD&) = delete;
+    ACTIVE_BINDING_GLOB_GUARD& operator=(
+        const ACTIVE_BINDING_GLOB_GUARD&) = delete;
+
+private:
+    GLOB_SCOPE* _previous;
+    std::shared_ptr<DESTINATION_LIFETIME> _previous_lifetime;
+};
 
 void ensure_air_initialized() {
     if (!s_air_initialized) {
@@ -203,20 +269,29 @@ public:
     std::string name;
     std::vector<int> shape;
     bool has_type;
-    
+
     Type() : type(), name("void"), has_type(false) {}
-    Type(TYPE_PTR t, const std::string& n) : type(t), name(n), has_type(true) {}
-    Type(TYPE_PTR t, const std::string& n, const std::vector<int>& s) 
-        : type(t), name(n), shape(s), has_type(true) {}
-    
-    static Type make_void() { 
+    Type(TYPE_PTR t, const std::string& n,
+         std::shared_ptr<DESTINATION_LIFETIME> lifetime = nullptr)
+        : type(t), name(n), has_type(true),
+          _lifetime(destination_lifetime_for_glob(
+              t == Null_ptr ? nullptr : &t->Glob_scope(),
+              std::move(lifetime))) {}
+    Type(TYPE_PTR t, const std::string& n, const std::vector<int>& s,
+         std::shared_ptr<DESTINATION_LIFETIME> lifetime = nullptr)
+        : type(t), name(n), shape(s), has_type(true),
+          _lifetime(destination_lifetime_for_glob(
+              t == Null_ptr ? nullptr : &t->Glob_scope(),
+              std::move(lifetime))) {}
+
+    static Type make_void() {
         Type t;
         t.name = "void";
         t.has_type = false;
-        return t; 
+        return t;
     }
-    
-    static Type make_int(int bits) { 
+
+    static Type make_int(int bits) {
         ensure_air_initialized();
         GLOB_SCOPE* glob = active_binding_glob();
         if (glob == nullptr) {
@@ -233,8 +308,8 @@ public:
             "integer type width must be one of 1, 8, 16, 32, or 64 bits");
         return Type(t, "i" + std::to_string(bits));
     }
-    
-    static Type make_float(int bits) { 
+
+    static Type make_float(int bits) {
         ensure_air_initialized();
         GLOB_SCOPE* glob = active_binding_glob();
         if (glob == nullptr) {
@@ -266,6 +341,7 @@ public:
                     "ranked array dimensions must be positive");
             }
         }
+        elem.require_active();
         if (!elem.has_type || elem.type == Null_ptr ||
             &elem.type->Glob_scope() != glob) {
             throw std::runtime_error(
@@ -276,32 +352,32 @@ public:
         for (int s : shape) dims.push_back(static_cast<int64_t>(s));
         STR_PTR type_name = glob->New_str("array");
         TYPE_PTR arr_type = glob->New_arr_type(type_name, elem.type, dims, spos);
-        return Type(arr_type, "array", shape);
+        std::shared_ptr<DESTINATION_LIFETIME> lifetime = elem._lifetime;
+        if (!lifetime && glob == s_active_binding_glob) {
+            lifetime = s_active_binding_lifetime;
+        }
+        return Type(arr_type, "array", shape, std::move(lifetime));
     }
 
     static Type make_array(const std::vector<int>& shape, Type elem) {
         ensure_air_initialized();
         return make_array_in_glob(active_binding_glob(), shape, elem);
     }
-    
+
     static Type make_ciphertext(const std::string& domain = "sihe") {
-        // Return a Type marker - real RECORD_TYPE is created in new_func_with_type
-        // when type_name == "CIPHERTEXT"
         Type t;
         t.name = "CIPHERTEXT";
         t.has_type = false;
         return t;
     }
-    
+
     static Type make_plaintext() {
-        // Return a Type marker - real RECORD_TYPE is created in resolve_type
-        // when type_name == "PLAINTEXT"
         Type t;
         t.name = "PLAINTEXT";
         t.has_type = false;
         return t;
     }
-    
+
     static Type make_polynomial(int degree = 4096) {
         ensure_air_initialized();
         GLOB_SCOPE* glob = active_binding_glob();
@@ -317,7 +393,9 @@ public:
         return Type(arr_type, "polynomial", {degree});
     }
 
-    static Type from_air_type(TYPE_PTR air_type) {
+    static Type from_air_type(
+        TYPE_PTR air_type,
+        std::shared_ptr<DESTINATION_LIFETIME> lifetime = nullptr) {
         if (air_type == Null_ptr) return make_void();
 
         std::string type_name = air_type->Type_kind_name();
@@ -345,7 +423,7 @@ public:
         } else if (air_type->Name() != Null_ptr) {
             type_name = air_type->Name()->Char_str();
         }
-        return Type(air_type, type_name, type_shape);
+        return Type(air_type, type_name, type_shape, std::move(lifetime));
     }
 
     static bool structurally_equal_air_types(CONST_TYPE_PTR lhs,
@@ -366,13 +444,16 @@ public:
         if (&lhs->Glob_scope() == &rhs->Glob_scope()) {
             return lhs->Is_compatible_type(rhs);
         }
-        // Ranked arrays and primitive leaves are compared recursively above.
-        // Other aggregate types require a shared symbol/type owner; equal
-        // names across independent scopes are not structural proof.
         return false;
     }
 
+    void require_active() const {
+        if (_lifetime) _lifetime->require_active("type");
+    }
+
     bool structurally_equal(const Type& other) const {
+        require_active();
+        other.require_active();
         if (!has_type || !other.has_type) {
             return has_type == other.has_type && name == other.name &&
                    shape == other.shape;
@@ -381,15 +462,27 @@ public:
     }
 
     bool same_scope(const Type& other) const {
+        require_active();
+        other.require_active();
         return has_type && other.has_type &&
                &type->Glob_scope() == &other.type->Glob_scope();
     }
 
-    bool is_integer() const { return has_type && type->Is_int(); }
-    bool is_float() const { return has_type && type->Is_float(); }
-    bool is_scalar() const { return has_type && type->Is_scalar(); }
+    bool is_integer() const {
+        require_active();
+        return has_type && type->Is_int();
+    }
+    bool is_float() const {
+        require_active();
+        return has_type && type->Is_float();
+    }
+    bool is_scalar() const {
+        require_active();
+        return has_type && type->Is_scalar();
+    }
 
     int bit_width() const {
+        require_active();
         if (!has_type || !type->Is_prim()) return 0;
         switch (type->Cast_to_prim()->Encoding()) {
             case PRIMITIVE_TYPE::BOOL: return 1;
@@ -406,10 +499,22 @@ public:
             default: return static_cast<int>(type->Bit_size());
         }
     }
-    
-    std::string to_string() const { return name; }
-    bool is_array() const { return !shape.empty(); }
-    std::vector<int> get_shape() const { return shape; }
+
+    std::string to_string() const {
+        require_active();
+        return name;
+    }
+    bool is_array() const {
+        require_active();
+        return !shape.empty();
+    }
+    std::vector<int> get_shape() const {
+        require_active();
+        return shape;
+    }
+
+private:
+    std::shared_ptr<DESTINATION_LIFETIME> _lifetime;
 };
 
 // Node wrapper
@@ -420,26 +525,45 @@ public:
     std::string opcode_str;
     std::vector<std::shared_ptr<Node>> children;
     bool has_node;
-    
-    Node() : node(), id(0), opcode_str(""), has_node(false) {}
-    Node(NODE_PTR n, int i, const std::string& op) 
-        : node(n), id(i), opcode_str(op), has_node(true) {}
-    Node(int i, const std::string& op) 
-        : node(), id(i), opcode_str(op), has_node(false) {}
-    
+
+    Node()
+        : node(), id(0), opcode_str(""), has_node(false),
+          _lifetime(destination_lifetime_for_glob(
+              s_active_binding_glob)) {}
+    Node(NODE_PTR n, int i, const std::string& op,
+         std::shared_ptr<DESTINATION_LIFETIME> lifetime = nullptr)
+        : node(n), id(i), opcode_str(op), has_node(true),
+          _lifetime(destination_lifetime_for_glob(
+              n == Null_ptr || n->Container() == nullptr
+                  ? nullptr
+                  : n->Container()->Glob_scope(),
+              std::move(lifetime))) {}
+    Node(int i, const std::string& op,
+         std::shared_ptr<DESTINATION_LIFETIME> lifetime = nullptr)
+        : node(), id(i), opcode_str(op), has_node(false),
+          _lifetime(destination_lifetime_for_glob(
+              s_active_binding_glob, std::move(lifetime))) {}
+
     std::string name() const { return "%" + std::to_string(id); }
     std::string opcode_name() const { return opcode_str; }
     bool is_valid() const { return has_node; }
 
+    void invalidate() {
+        node = NODE_PTR();
+        has_node = false;
+        children.clear();
+    }
+
     Type rtype() const {
+        require_active();
         if (!has_node || node == NODE_PTR() || !node->Has_rtype()) {
             return Type::make_void();
         }
-        return Type::from_air_type(node->Rtype());
+        return Type::from_air_type(node->Rtype(), _lifetime);
     }
-    
+
     void add_child(std::shared_ptr<Node> child) { children.push_back(child); }
-    
+
     std::string to_string() const {
         std::string s = name() + " = " + opcode_str + "(";
         for (size_t i = 0; i < children.size(); i++) {
@@ -452,6 +576,7 @@ public:
 
     void require_attribute_target(const char* operation,
                                   const std::string& attr_name) const {
+        require_active();
         if (!has_node || node == NODE_PTR()) {
             throw std::runtime_error(std::string(operation) +
                                      " requires a real AIR node");
@@ -549,6 +674,13 @@ public:
         }
         set_u32_attr(nn::core::ATTR::SLOT, slot);
     }
+
+private:
+    void require_active() const {
+        if (_lifetime) _lifetime->require_active("node");
+    }
+
+    std::shared_ptr<DESTINATION_LIFETIME> _lifetime;
 };
 
 // Container - creates real AIR nodes
@@ -567,13 +699,41 @@ public:
     
     // Map variable names to their ADDR_DATUM for stores
     std::map<std::string, ADDR_DATUM_PTR> var_map;
-    
-    Container() : container(nullptr), func_scope(nullptr), glob(nullptr), node_counter(0) {}
-    Container(CONTAINER* c, FUNC_SCOPE* fs, GLOB_SCOPE* g) 
-        : container(c), func_scope(fs), glob(g), node_counter(0) {}
+
+    bool callback_scoped;
+    bool callback_expired;
+    std::shared_ptr<DESTINATION_LIFETIME> callback_lifetime;
+
+    Container()
+        : container(nullptr), func_scope(nullptr), glob(nullptr),
+          node_counter(0), callback_scoped(false), callback_expired(false) {}
+    Container(CONTAINER* c, FUNC_SCOPE* fs, GLOB_SCOPE* g)
+        : container(c), func_scope(fs), glob(g), node_counter(0),
+          callback_scoped(false), callback_expired(false) {}
+
+    void mark_callback_scoped() {
+        callback_scoped = true;
+        callback_expired = false;
+        callback_lifetime =
+            std::make_shared<DESTINATION_LIFETIME>(glob);
+    }
+
+    void expire_callback_scope() {
+        if (!callback_scoped) return;
+        callback_expired = true;
+        if (callback_lifetime) callback_lifetime->expire();
+    }
+
+    void require_not_expired() const {
+        if (callback_expired) {
+            throw std::runtime_error(
+                "vector-kernel destination container has expired");
+        }
+    }
     
     // Append a statement to the current block (or main container if no block)
     void append_stmt(STMT_PTR stmt) {
+        require_not_expired();
         if (!block_stack.empty() && block_stack.back() != NODE_PTR()) {
             // Create STMT_LIST for the current block and append
             STMT_LIST sl(block_stack.back());
@@ -587,11 +747,13 @@ public:
     
     // Push a new block onto the stack (for entering loop/if body)
     void push_block(NODE_PTR block) {
+        require_not_expired();
         block_stack.push_back(block);
     }
     
     // Pop the current block (for exiting loop/if body)
     void pop_block() {
+        require_not_expired();
         if (!block_stack.empty()) {
             block_stack.pop_back();
         }
@@ -599,10 +761,12 @@ public:
     
     // Set current source location from Python
     void set_loc(uint32_t file_id, uint32_t line, uint32_t col) {
+        require_not_expired();
         current_loc = SourceLoc(file_id, line, col);
     }
     
     SPOS get_spos() { 
+        require_not_expired();
         if (current_loc.is_valid()) {
             return current_loc.to_spos();
         }
@@ -610,13 +774,16 @@ public:
     }
 
     std::shared_ptr<Node> wrap_node(NODE_PTR n, const std::string& opcode) {
-        auto node = std::make_shared<Node>(n, ++node_counter, opcode);
+        require_not_expired();
+        auto node = std::make_shared<Node>(
+            n, ++node_counter, opcode, callback_lifetime);
         nodes.push_back(node);
         return node;
     }
     
     // Helper to get type from container's glob_scope by type ID
     TYPE_PTR get_compatible_type(TYPE_PTR src_type) {
+        require_not_expired();
         if (src_type == air::base::Null_ptr) return src_type;
         GLOB_SCOPE* container_glob = container->Glob_scope();
         if (&src_type->Glob_scope() != container_glob) {
@@ -628,6 +795,7 @@ public:
 
     TYPE_PTR require_real_expression(const std::shared_ptr<Node>& value,
                                      const char* operation) {
+        require_not_expired();
         if (!container || !value || !value->has_node ||
             value->node == NODE_PTR()) {
             throw std::runtime_error(std::string(operation) +
@@ -646,6 +814,7 @@ public:
 
     TYPE_PTR require_vector_operand(const std::shared_ptr<Node>& value,
                                     const char* operation) {
+        require_not_expired();
         TYPE_PTR type = require_real_expression(value, operation);
         if (!type->Is_array()) {
             throw std::runtime_error(std::string(operation) +
@@ -656,6 +825,7 @@ public:
 
     TYPE_PTR require_core_s32_operand(const std::shared_ptr<Node>& value,
                                       const char* operation) {
+        require_not_expired();
         TYPE_PTR type = require_real_expression(value, operation);
         if (value->node->Domain() != air::core::CORE || !type->Is_prim() ||
             type->Cast_to_prim()->Encoding() != PRIMITIVE_TYPE::INT_S32) {
@@ -668,6 +838,7 @@ public:
     void require_vector_binary_operands(const std::shared_ptr<Node>& lhs,
                                         const std::shared_ptr<Node>& rhs,
                                         const char* operation) {
+        require_not_expired();
         TYPE_PTR lhs_type = require_vector_operand(lhs, operation);
         TYPE_PTR rhs_type = require_vector_operand(rhs, operation);
         if (!Type::structurally_equal_air_types(
@@ -683,6 +854,7 @@ public:
                                      const char* operation,
                                      bool require_integer = false,
                                      bool require_scalar = false) {
+        require_not_expired();
         if (!container || !a || !b || !a->has_node || !b->has_node ||
             a->node == NODE_PTR() || b->node == NODE_PTR()) {
             throw std::runtime_error(std::string(operation) +
@@ -716,6 +888,7 @@ public:
     }
 
     std::shared_ptr<Node> new_add(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         require_compatible_operands(a, b, "new_add");
         OPCODE op(air::core::CORE, air::core::OPCODE::ADD);
         TYPE_PTR rtype = get_compatible_type(a->node->Rtype());
@@ -728,11 +901,13 @@ public:
 
     std::shared_ptr<Node> new_core_add(std::shared_ptr<Node> a,
                                        std::shared_ptr<Node> b) {
+        require_not_expired();
         require_compatible_operands(a, b, "new_core_add", false, true);
         return new_add(a, b);
     }
     
     std::shared_ptr<Node> new_sub(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         require_compatible_operands(a, b, "new_sub");
         OPCODE op(air::core::CORE, air::core::OPCODE::SUB);
         TYPE_PTR rtype = get_compatible_type(a->node->Rtype());
@@ -744,6 +919,7 @@ public:
     }
     
     std::shared_ptr<Node> new_mul(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         require_compatible_operands(a, b, "new_mul");
         OPCODE op(air::core::CORE, air::core::OPCODE::MUL);
         TYPE_PTR rtype = get_compatible_type(a->node->Rtype());
@@ -756,12 +932,14 @@ public:
 
     std::shared_ptr<Node> new_core_mul(std::shared_ptr<Node> a,
                                        std::shared_ptr<Node> b) {
+        require_not_expired();
         require_compatible_operands(a, b, "new_core_mul", false, true);
         return new_mul(a, b);
     }
 
     std::shared_ptr<Node> new_shl(std::shared_ptr<Node> a,
                                   std::shared_ptr<Node> b) {
+        require_not_expired();
         require_compatible_operands(a, b, "new_shl", true);
         OPCODE op(air::core::CORE, air::core::OPCODE::SHL);
         TYPE_PTR rtype = get_compatible_type(a->node->Rtype());
@@ -775,6 +953,7 @@ public:
 
     std::shared_ptr<Node> new_core_lt(std::shared_ptr<Node> a,
                                       std::shared_ptr<Node> b) {
+        require_not_expired();
         require_compatible_operands(a, b, "new_core_lt", true);
         OPCODE op(air::core::CORE, air::core::OPCODE::LT);
         TYPE_PTR rtype = get_compatible_type(a->node->Rtype());
@@ -787,11 +966,13 @@ public:
     }
     
     std::shared_ptr<Node> new_div(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         // DIV not directly in air::core - use reciprocal multiplication pattern
         throw std::runtime_error("new_div not implemented - use multiplication by reciprocal");
     }
     
     std::shared_ptr<Node> new_matmul(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         // MATMUL should use nn::core::GEMM
         throw std::runtime_error("new_matmul not implemented - use nn_gemm instead");
     }
@@ -801,6 +982,7 @@ public:
     // ═══════════════════════════════════════════════════════════════════════
     
     std::shared_ptr<Node> new_nn_add(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         if (!container || !a->has_node || !b->has_node) {
             throw std::runtime_error("new_nn_add requires real container and operands");
         }
@@ -813,6 +995,7 @@ public:
     }
     
     std::shared_ptr<Node> new_nn_sub(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         if (!container || !a->has_node || !b->has_node) {
             throw std::runtime_error("new_nn_sub requires real container and operands");
         }
@@ -825,6 +1008,7 @@ public:
     }
     
     std::shared_ptr<Node> new_nn_mul(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         if (!container || !a->has_node || !b->has_node) {
             throw std::runtime_error("new_nn_mul requires real container and operands");
         }
@@ -837,6 +1021,7 @@ public:
     }
     
     std::shared_ptr<Node> new_nn_conv(std::shared_ptr<Node> x, std::shared_ptr<Node> w, std::shared_ptr<Node> b) {
+        require_not_expired();
         if (!container || !x->has_node || !w->has_node || !b->has_node) {
             throw std::runtime_error("new_nn_conv requires real container and operands");
         }
@@ -851,6 +1036,7 @@ public:
     }
     
     std::shared_ptr<Node> new_nn_relu(std::shared_ptr<Node> x) {
+        require_not_expired();
         // nn::core::RELU - unary ReLU activation
         if (container && x->has_node) {
             OPCODE op(nn::core::NN, nn::core::OPCODE::RELU);
@@ -871,6 +1057,7 @@ public:
     // ═══════════════════════════════════════════════════════════════════════
     
     std::shared_ptr<Node> new_vec_add(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         require_vector_binary_operands(a, b, "new_vec_add");
         nn::vector::VECTOR_GEN vector_gen(container);
         NODE_PTR n = vector_gen.New_add(a->node, b->node, get_spos());
@@ -881,6 +1068,7 @@ public:
     }
     
     std::shared_ptr<Node> new_vec_sub(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         // nn::vector doesn't have SUB, use air::core::SUB with vec prefix for consistency
         if (container && a->has_node && b->has_node) {
             OPCODE op(air::core::CORE, air::core::OPCODE::SUB);
@@ -898,6 +1086,7 @@ public:
     }
     
     std::shared_ptr<Node> new_vec_mul(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         require_vector_binary_operands(a, b, "new_vec_mul");
         nn::vector::VECTOR_GEN vector_gen(container);
         NODE_PTR n = vector_gen.New_mul(a->node, b->node, get_spos());
@@ -910,6 +1099,7 @@ public:
     std::shared_ptr<Node> new_vec_roll(
         std::shared_ptr<Node> value, std::shared_ptr<Node> shift,
         const std::vector<int64_t>& candidates) {
+        require_not_expired();
         require_vector_operand(value, "new_vec_roll");
         require_core_s32_operand(shift, "new_vec_roll");
         if (candidates.empty()) {
@@ -948,6 +1138,7 @@ public:
     std::shared_ptr<Node> new_vec_slice(std::shared_ptr<Node> value,
                                         std::shared_ptr<Node> start,
                                         int64_t slice_size) {
+        require_not_expired();
         TYPE_PTR value_type = require_vector_operand(value, "new_vec_slice");
         require_core_s32_operand(start, "new_vec_slice");
         if (slice_size <= 0 ||
@@ -985,6 +1176,7 @@ public:
     // ═══════════════════════════════════════════════════════════════════════
     
     std::shared_ptr<Node> new_sihe_add(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         if (container && a && a->has_node && b && b->has_node) {
             OPCODE op(fhe::sihe::SIHE_DOMAIN::ID, fhe::sihe::SIHE_OPERATOR::ADD);
             NODE_PTR n = container->New_bin_arith(op, a->node->Rtype(), a->node, b->node, get_spos());
@@ -1001,6 +1193,7 @@ public:
     }
     
     std::shared_ptr<Node> new_sihe_sub(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         if (container && a && a->has_node && b && b->has_node) {
             OPCODE op(fhe::sihe::SIHE_DOMAIN::ID, fhe::sihe::SIHE_OPERATOR::SUB);
             NODE_PTR n = container->New_bin_arith(op, a->node->Rtype(), a->node, b->node, get_spos());
@@ -1017,6 +1210,7 @@ public:
     }
     
     std::shared_ptr<Node> new_sihe_mul(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         if (container && a && a->has_node && b && b->has_node) {
             OPCODE op(fhe::sihe::SIHE_DOMAIN::ID, fhe::sihe::SIHE_OPERATOR::MUL);
             NODE_PTR n = container->New_bin_arith(op, a->node->Rtype(), a->node, b->node, get_spos());
@@ -1033,6 +1227,7 @@ public:
     }
 
     std::shared_ptr<Node> new_sihe_encode(std::shared_ptr<Node> data) {
+        require_not_expired();
         if (container && data && data->has_node) {
             OPCODE op(fhe::sihe::SIHE_DOMAIN::ID, fhe::sihe::SIHE_OPERATOR::ENCODE);
             // Get PLAINTEXT type - use void as placeholder
@@ -1061,6 +1256,7 @@ public:
     // ═══════════════════════════════════════════════════════════════════════
     
     std::shared_ptr<Node> new_ckks_add(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         if (container && a->has_node && b->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::ADD);
             TYPE_PTR rtype = get_compatible_type(a->node->Rtype());
@@ -1085,6 +1281,7 @@ public:
     }
     
     std::shared_ptr<Node> new_ckks_sub(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         // Keep true CKKS SUB for ciphertext-ciphertext inputs so scale/level
         // tracking matches runtime subtraction semantics.
         // Fall back to add(a, mul(b, -1)) for mixed/plain cases.
@@ -1137,6 +1334,7 @@ public:
     }
     
     std::shared_ptr<Node> new_ckks_mul(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         if (container && a->has_node && b->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::MUL);
             // CKKS mul: cipher×cipher → CIPHERTEXT3 (for relin), cipher×plain → cipher, plain×cipher → cipher, plain×plain → plain
@@ -1185,6 +1383,7 @@ public:
     
     // CKKS negation
     std::shared_ptr<Node> new_ckks_neg(std::shared_ptr<Node> a) {
+        require_not_expired();
         if (container && a->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::NEG);
             TYPE_PTR rtype = get_compatible_type(a->node->Rtype());
@@ -1201,6 +1400,7 @@ public:
     
     // CKKS rotation - rotates slots by given amount
     std::shared_ptr<Node> new_ckks_rotate(std::shared_ptr<Node> ct, int32_t rotation) {
+        require_not_expired();
         if (container && ct->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::ROTATE);
             // Create rotation constant
@@ -1223,6 +1423,7 @@ public:
 
     std::shared_ptr<Node> new_ckks_rotate_batch(std::shared_ptr<Node> ct,
                                                 py::list rotations) {
+        require_not_expired();
         if (!(container && ct->has_node)) {
             auto node =
                 std::make_shared<Node>(++node_counter, "fhe::ckks::ROTATE_BATCH");
@@ -1270,6 +1471,7 @@ public:
                                           uint32_t scale_degree = 1,
                                           uint32_t level = 0,
                                           bool precompute_cache = false) {
+        require_not_expired();
         if (container && data && data->has_node && data->node != air::base::Null_ptr) {
             // Use OPC_ENCODE from ckks_opcode.h so scale manager sees same opcode (plaintext promotion)
             air::base::OPCODE op = fhe::ckks::OPC_ENCODE;
@@ -1395,6 +1597,7 @@ public:
                                                   uint32_t level = 0,
                                                   uint32_t num_p = 0,
                                                   bool precompute_cache = false) {
+        require_not_expired();
         auto encoded = new_ckks_encode(
             data, -1, scale_degree, level, precompute_cache);
         if (!(container && encoded && encoded->has_node &&
@@ -1430,6 +1633,7 @@ public:
     
     // CKKS rescale - reduces scale after multiplication
     std::shared_ptr<Node> new_ckks_rescale(std::shared_ptr<Node> ct) {
+        require_not_expired();
         if (container && ct->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::RESCALE);
             NODE_PTR n = container->New_cust_node(op, ct->node->Rtype(), get_spos());
@@ -1446,6 +1650,7 @@ public:
     
     // CKKS relin - relinearization after multiplication
     std::shared_ptr<Node> new_ckks_relin(std::shared_ptr<Node> ct) {
+        require_not_expired();
         if (container && ct->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::RELIN);
             NODE_PTR n = container->New_una_arith(op, ct->node->Rtype(), ct->node, get_spos());
@@ -1461,6 +1666,7 @@ public:
     
     // CKKS mod_switch - reduces modulus (level) by one
     std::shared_ptr<Node> new_ckks_mod_switch(std::shared_ptr<Node> ct) {
+        require_not_expired();
         if (container && ct->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::MODSWITCH);
             NODE_PTR n = container->New_cust_node(op, ct->node->Rtype(), get_spos());
@@ -1477,6 +1683,7 @@ public:
     
     // CKKS bootstrap - refreshes ciphertext noise budget
     std::shared_ptr<Node> new_ckks_bootstrap(std::shared_ptr<Node> ct) {
+        require_not_expired();
         if (container && ct->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::BOOTSTRAP);
             NODE_PTR n = container->New_cust_node(op, ct->node->Rtype(), get_spos());
@@ -1494,6 +1701,7 @@ public:
     // CKKS bootstrap stage op - coeffs to slots (context-aware runtime path)
     std::shared_ptr<Node> new_ckks_bootstrap_coeffs_to_slots(
         std::shared_ptr<Node> ct, int32_t num_slots = 0) {
+        require_not_expired();
         if (container && ct->has_node) {
             OPCODE op(
                 fhe::ckks::CKKS_DOMAIN::ID,
@@ -1516,6 +1724,7 @@ public:
 
     // CKKS bootstrap stage op - EvalMod approximation (context-aware runtime path)
     std::shared_ptr<Node> new_ckks_bootstrap_eval_mod(std::shared_ptr<Node> ct) {
+        require_not_expired();
         if (container && ct->has_node) {
             OPCODE op(
                 fhe::ckks::CKKS_DOMAIN::ID,
@@ -1537,6 +1746,7 @@ public:
     // CKKS bootstrap stage op - slots to coeffs (context-aware runtime path)
     std::shared_ptr<Node> new_ckks_bootstrap_slots_to_coeffs(
         std::shared_ptr<Node> ct, int32_t num_slots = 0) {
+        require_not_expired();
         if (container && ct->has_node) {
             OPCODE op(
                 fhe::ckks::CKKS_DOMAIN::ID,
@@ -1561,6 +1771,7 @@ public:
     std::shared_ptr<Node> new_ckks_raise_mod(
         std::shared_ptr<Node> ct, int32_t mod_size,
         bool runtime_raise_level = false) {
+        require_not_expired();
         if (container && ct->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::RAISE_MOD);
             TYPE_PTR u32_type = glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
@@ -1587,6 +1798,7 @@ public:
 
     // CKKS conjugate - complex conjugation over slots
     std::shared_ptr<Node> new_ckks_conjugate(std::shared_ptr<Node> ct) {
+        require_not_expired();
         if (container && ct->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::CONJUGATE);
             TYPE_PTR rtype = get_compatible_type(ct->node->Rtype());
@@ -1603,6 +1815,7 @@ public:
 
     // CKKS multiply-by-monomial - helper used by bootstrap paths
     std::shared_ptr<Node> new_ckks_mul_mono(std::shared_ptr<Node> ct, int32_t power) {
+        require_not_expired();
         if (container && ct->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::MUL_MONO);
             TYPE_PTR u32_type = glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
@@ -1628,6 +1841,7 @@ public:
     // ═══════════════════════════════════════════════════════════════════════
     
     std::shared_ptr<Node> new_poly_add(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         if (container && a->has_node && b->has_node) {
             OPCODE op(fhe::poly::POLYNOMIAL_DID, fhe::poly::OPCODE::ADD);
             NODE_PTR n = container->New_bin_arith(op, a->node->Rtype(), a->node, b->node, get_spos());
@@ -1644,6 +1858,7 @@ public:
     }
     
     std::shared_ptr<Node> new_poly_sub(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         if (container && a->has_node && b->has_node) {
             OPCODE op(fhe::poly::POLYNOMIAL_DID, fhe::poly::OPCODE::SUB);
             NODE_PTR n = container->New_bin_arith(op, a->node->Rtype(), a->node, b->node, get_spos());
@@ -1660,6 +1875,7 @@ public:
     }
     
     std::shared_ptr<Node> new_poly_mul(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         if (container && a->has_node && b->has_node) {
             OPCODE op(fhe::poly::POLYNOMIAL_DID, fhe::poly::OPCODE::MUL);
             NODE_PTR n = container->New_bin_arith(op, a->node->Rtype(), a->node, b->node, get_spos());
@@ -1684,6 +1900,7 @@ public:
                                         std::shared_ptr<Node> a, 
                                         std::shared_ptr<Node> b,
                                         const std::string& name) {
+        require_not_expired();
         if (container && a->has_node && b->has_node) {
             OPCODE op(air::core::CORE, opcode);
             // Comparisons return boolean, NOT the operand type
@@ -1704,30 +1921,37 @@ public:
     }
     
     std::shared_ptr<Node> new_gt(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         return new_cmp_node(air::core::OPCODE::GT, a, b, "air::core::GT");
     }
     
     std::shared_ptr<Node> new_lt(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         return new_cmp_node(air::core::OPCODE::LT, a, b, "air::core::LT");
     }
     
     std::shared_ptr<Node> new_ge(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         return new_cmp_node(air::core::OPCODE::GE, a, b, "air::core::GE");
     }
     
     std::shared_ptr<Node> new_le(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         return new_cmp_node(air::core::OPCODE::LE, a, b, "air::core::LE");
     }
     
     std::shared_ptr<Node> new_eq(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         return new_cmp_node(air::core::OPCODE::EQ, a, b, "air::core::EQ");
     }
     
     std::shared_ptr<Node> new_ne(std::shared_ptr<Node> a, std::shared_ptr<Node> b) {
+        require_not_expired();
         return new_cmp_node(air::core::OPCODE::NE, a, b, "air::core::NE");
     }
     
     std::shared_ptr<Node> new_retv(std::shared_ptr<Node> val) {
+        require_not_expired();
         if (container && val && val->has_node &&
             val->node != NODE_PTR() && val->node->Has_rtype()) {
             if (val->node->Container() != container) {
@@ -1745,6 +1969,7 @@ public:
     }
     
     std::shared_ptr<Node> new_ret() {
+        require_not_expired();
         if (container) {
             STMT_PTR stmt = container->New_ret(get_spos());
             append_stmt(stmt);
@@ -1757,6 +1982,8 @@ public:
 
     TYPE_PTR require_local_type(const Type& requested,
                                 const char* operation) const {
+        require_not_expired();
+        requested.require_active();
         if (!requested.has_type || requested.type == Null_ptr) {
             throw std::runtime_error(std::string(operation) +
                                      " requires a concrete AIR type");
@@ -1771,6 +1998,7 @@ public:
     // Declare a named local with an explicit type and return a load of it.
     std::shared_ptr<Node> new_local(const std::string& var_name,
                                     const Type& requested_type) {
+        require_not_expired();
         if (!(container && func_scope)) {
             throw std::runtime_error("new_local requires a real function scope");
         }
@@ -1795,6 +2023,7 @@ public:
     // Store value to a variable (creates a statement in current block)
     // var_node should be a load node for the target variable
     std::shared_ptr<Node> new_stid(const std::string& var_name, std::shared_ptr<Node> val) {
+        require_not_expired();
         if (!(container && func_scope) || !val || !val->has_node ||
             val->node == NODE_PTR()) {
             throw std::runtime_error("new_stid requires real container and value");
@@ -1838,8 +2067,80 @@ public:
         return node;
     }
 
+    // Store a planned packed Vector value into a wider destination local.
+    // Native metakernels use this representation for duplicated inputs: the
+    // expression keeps its logical source shape while the local carries the
+    // prepared packed result width.
+    std::shared_ptr<Node> new_vector_widening_stid(
+        const std::string& var_name, const Type& requested_type,
+        std::shared_ptr<Node> val) {
+        require_not_expired();
+        if (!(container && func_scope) || !val || !val->has_node ||
+            val->node == NODE_PTR()) {
+            throw std::runtime_error(
+                "new_vector_widening_stid requires real container and value");
+        }
+        TYPE_PTR target = require_local_type(
+            requested_type, "new_vector_widening_stid");
+        TYPE_PTR source = require_vector_operand(
+            val, "new_vector_widening_stid");
+        if (!target->Is_array() ||
+            !Type::structurally_equal_air_types(
+                source->Cast_to_arr()->Elem_type(),
+                target->Cast_to_arr()->Elem_type())) {
+            throw std::runtime_error(
+                "new_vector_widening_stid requires matching ranked element types");
+        }
+        const uint64_t source_count = source->Cast_to_arr()->Elem_count();
+        const uint64_t target_count = target->Cast_to_arr()->Elem_count();
+        if (source_count == 0 || target_count < source_count ||
+            target_count % source_count != 0) {
+            throw std::runtime_error(
+                "new_vector_widening_stid target is not a valid packed widening");
+        }
+
+        ADDR_DATUM_PTR var;
+        auto it = var_map.find(var_name);
+        if (it != var_map.end()) {
+            var = it->second;
+            if (!var->Type()->Is_compatible_type(target)) {
+                throw std::runtime_error(
+                    "new_vector_widening_stid local type mismatch: " +
+                    var_name);
+            }
+        } else {
+            var = func_scope->New_var(target, var_name.c_str(), val->node->Spos());
+            var_map[var_name] = var;
+        }
+        STMT_PTR stmt = container->New_st(val->node, var, val->node->Spos());
+        append_stmt(stmt);
+        return wrap_node(container->New_ld(var, val->node->Spos()),
+                         "air::core::STID");
+    }
+
+    std::shared_ptr<Node> new_fresh_load(std::shared_ptr<Node> value) {
+        require_not_expired();
+        if (!(container && value && value->has_node) ||
+            value->node == NODE_PTR() || value->node->Container() != container) {
+            throw std::runtime_error(
+                "new_fresh_load requires a value in the current AIR container");
+        }
+        NODE_PTR fresh = NODE_PTR();
+        if (value->node->Opcode() == air::core::OPC_LD) {
+            fresh = container->New_ld(value->node->Addr_datum(), get_spos());
+        } else if (value->node->Opcode() == air::core::OPC_LDP) {
+            fresh = container->New_ldp(value->node->Preg(), get_spos());
+        } else if (value->node->Opcode() == air::core::OPC_LDC) {
+            fresh = container->New_ldc(value->node->Const(), get_spos());
+        } else {
+            return value;
+        }
+        return wrap_node(fresh, value->opcode_str);
+    }
+
     // Load value from a named variable (LDID)
     std::shared_ptr<Node> new_ldid(const std::string& var_name) {
+        require_not_expired();
         if (!(container && func_scope)) {
             throw std::runtime_error("new_ldid requires real container");
         }
@@ -1854,10 +2155,12 @@ public:
     
     // Check if we're inside a control flow block (loop or if body)
     bool in_control_flow_body() const {
+        require_not_expired();
         return !block_stack.empty();
     }
     
     std::shared_ptr<Node> new_intconst(int64_t val) {
+        require_not_expired();
         if (container && glob) {
             TYPE_PTR i64_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
             NODE_PTR n = container->New_intconst(i64_type, val, get_spos());
@@ -1870,6 +2173,7 @@ public:
 
     std::shared_ptr<Node> new_intconst_typed(int64_t val,
                                              const Type& requested_type) {
+        require_not_expired();
         TYPE_PTR type = require_local_type(requested_type,
                                            "new_intconst_typed");
         if (!type->Is_signed_int()) {
@@ -1888,6 +2192,7 @@ public:
     }
 
     std::shared_ptr<Node> new_floatconst(double val) {
+        require_not_expired();
         if (container && glob) {
             TYPE_PTR f64_type = glob->Prim_type(PRIMITIVE_TYPE::FLOAT_64);
             CONSTANT_PTR cst = glob->New_const(
@@ -1902,6 +2207,7 @@ public:
 
     std::shared_ptr<Node> new_floatconst_typed(
         double val, const Type& requested_type) {
+        require_not_expired();
         TYPE_PTR type = require_local_type(requested_type,
                                            "new_floatconst_typed");
         if (!type->Is_real_float()) {
@@ -1916,6 +2222,7 @@ public:
     
     std::shared_ptr<Node> new_zero() { return new_intconst(0); }
     std::shared_ptr<Node> new_zero(const Type& requested_type) {
+        require_not_expired();
         TYPE_PTR type = require_local_type(requested_type, "new_zero");
         if (type->Is_int()) {
             NODE_PTR n = container->New_intconst(type, 0, get_spos());
@@ -1928,6 +2235,7 @@ public:
 
     std::shared_ptr<Node> new_checked_cast(std::shared_ptr<Node> value,
                                            const Type& requested_type) {
+        require_not_expired();
         if (!value || !value->has_node || value->node == NODE_PTR() ||
             value->node->Container() != container) {
             throw std::runtime_error(
@@ -1956,6 +2264,7 @@ public:
     // Complex arrays remain float64 for Encode_dcmplx runtime path.
     // Used for constant-array plaintext encoding (no MASK attribute).
     std::shared_ptr<Node> new_array_const(py::list values) {
+        require_not_expired();
         if (!(container && glob)) {
             throw std::runtime_error("new_array_const requires real container");
         }
@@ -2043,6 +2352,7 @@ public:
     //   return LD(arr)
     std::shared_ptr<Node> new_air_array(const std::string& var_name,
                                         py::list values) {
+        require_not_expired();
         if (!(container && func_scope && glob)) {
             throw std::runtime_error("new_air_array requires real container");
         }
@@ -2115,6 +2425,7 @@ public:
     }
     
     std::shared_ptr<Node> new_ld(std::shared_ptr<Node> addr) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::LD");
         node->add_child(addr);
         nodes.push_back(node);
@@ -2122,6 +2433,7 @@ public:
     }
     
     std::shared_ptr<Node> new_st(std::shared_ptr<Node> val, std::shared_ptr<Node> addr) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::ST");
         node->add_child(val);
         node->add_child(addr);
@@ -2130,6 +2442,7 @@ public:
     }
     
     std::shared_ptr<Node> new_ild(std::shared_ptr<Node> base, std::shared_ptr<Node> idx) {
+        require_not_expired();
         // Try to create a real ILD when possible (array element load)
         if (!(container && base->has_node)) {
             throw std::runtime_error("new_ild requires real container and base");
@@ -2157,6 +2470,7 @@ public:
     
     std::shared_ptr<Node> new_ist(std::shared_ptr<Node> val, std::shared_ptr<Node> base, 
                                    std::shared_ptr<Node> idx) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::IST");
         node->add_child(val);
         node->add_child(base);
@@ -2166,6 +2480,7 @@ public:
     }
     
     std::shared_ptr<Node> new_array(std::shared_ptr<Node> base) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::ARRAY");
         node->add_child(base);
         nodes.push_back(node);
@@ -2195,6 +2510,7 @@ public:
     std::vector<ControlFlowFrame> cf_stack;
 
     TYPE_PTR signed_loop_type(int bit_width) const {
+        require_not_expired();
         if (!glob) return Null_ptr;
         if (bit_width == 32) {
             return glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
@@ -2208,6 +2524,7 @@ public:
 
     void require_loop_literal(int64_t value, int bit_width,
                               const char* operation) const {
+        require_not_expired();
         if (bit_width == 32 &&
             (value < std::numeric_limits<int32_t>::min() ||
              value > std::numeric_limits<int32_t>::max())) {
@@ -2219,6 +2536,7 @@ public:
 
     void require_loop_bound_type(NODE_PTR bound, TYPE_PTR loop_type,
                                  const char* operation) const {
+        require_not_expired();
         if (bound == NODE_PTR() || loop_type == Null_ptr) {
             throw std::runtime_error(
                 std::string(operation) + " requires a real AIR bound");
@@ -2246,6 +2564,7 @@ public:
     // Create a do_loop for range(start, end)
     std::shared_ptr<Node> new_loop_begin_range(int64_t start, int64_t end,
                                                int bit_width = 64) {
+        require_not_expired();
         require_loop_literal(start, bit_width, "range_dynamic start");
         require_loop_literal(end, bit_width, "range_dynamic end");
         ControlFlowFrame frame;
@@ -2281,6 +2600,7 @@ public:
     // Create a do_loop for range(constant_start, dynamic_end), with unit step.
     std::shared_ptr<Node> new_loop_begin_range_dynamic(
         int64_t start, std::shared_ptr<Node> end, int bit_width = 64) {
+        require_not_expired();
         require_loop_literal(start, bit_width, "range_dynamic start");
         ControlFlowFrame frame;
         frame.type = "loop";
@@ -2330,6 +2650,7 @@ public:
     // Create a do_loop for range(dynamic_start, constant_end), with unit step.
     std::shared_ptr<Node> new_loop_begin_range_dynamic_start(
         std::shared_ptr<Node> start, int64_t end, int bit_width = 64) {
+        require_not_expired();
         require_loop_literal(end, bit_width, "range_dynamic end");
         ControlFlowFrame frame;
         frame.type = "loop";
@@ -2376,6 +2697,7 @@ public:
     std::shared_ptr<Node> new_loop_begin_range_dynamic_bounds(
         std::shared_ptr<Node> start, std::shared_ptr<Node> end,
         int bit_width = 64) {
+        require_not_expired();
         ControlFlowFrame frame;
         frame.type = "loop";
         frame.loop_start = 0;
@@ -2427,6 +2749,7 @@ public:
     }
     
     std::shared_ptr<Node> new_loop_begin(std::shared_ptr<Node> iterable) {
+        require_not_expired();
         // Fallback for non-range iterables
         ControlFlowFrame frame;
         frame.type = "loop";
@@ -2460,6 +2783,7 @@ public:
     }
     
     std::shared_ptr<Node> new_loop_index(std::shared_ptr<Node> loop) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::LOOP_IV");
         node->add_child(loop);
         nodes.push_back(node);
@@ -2478,6 +2802,7 @@ public:
     }
     
     std::shared_ptr<Node> new_loop_end() {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::LOOP_END");
         nodes.push_back(node);
         
@@ -2524,6 +2849,7 @@ public:
     }
     
     std::shared_ptr<Node> new_if_begin(std::shared_ptr<Node> cond) {
+        require_not_expired();
         ControlFlowFrame frame;
         frame.type = "if";
         // Accept any valid condition node (not just relational ops)
@@ -2572,6 +2898,7 @@ public:
     }
     
     std::shared_ptr<Node> new_else() {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::ELSE");
         nodes.push_back(node);
         
@@ -2590,6 +2917,7 @@ public:
     }
     
     std::shared_ptr<Node> new_if_end() {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::IF_END");
         nodes.push_back(node);
         
@@ -2616,6 +2944,7 @@ public:
     }
     
     std::string get_control_flow_dump() const {
+        require_not_expired();
         // No longer needed - control flow is in actual AIR
         return "";
     }
@@ -2625,6 +2954,7 @@ public:
     // ═══════════════════════════════════════════════════════════════════════
     
     std::shared_ptr<Node> new_reduce_sum(std::shared_ptr<Node> input, py::object axis, bool keepdims) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "nn::core::REDUCE_SUM");
         node->add_child(input);
         nodes.push_back(node);
@@ -2632,6 +2962,7 @@ public:
     }
     
     std::shared_ptr<Node> new_reduce_max(std::shared_ptr<Node> input, py::object axis, bool keepdims) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "nn::core::REDUCE_MAX");
         node->add_child(input);
         nodes.push_back(node);
@@ -2639,6 +2970,7 @@ public:
     }
     
     std::shared_ptr<Node> new_reduce_min(std::shared_ptr<Node> input, py::object axis, bool keepdims) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "nn::core::REDUCE_MIN");
         node->add_child(input);
         nodes.push_back(node);
@@ -2646,6 +2978,7 @@ public:
     }
     
     std::shared_ptr<Node> new_reduce_prod(std::shared_ptr<Node> input, py::object axis, bool keepdims) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "nn::core::REDUCE_PROD");
         node->add_child(input);
         nodes.push_back(node);
@@ -2653,6 +2986,7 @@ public:
     }
     
     std::shared_ptr<Node> new_reduce_mean(std::shared_ptr<Node> input, py::object axis, bool keepdims) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "nn::core::REDUCE_MEAN");
         node->add_child(input);
         nodes.push_back(node);
@@ -2664,6 +2998,7 @@ public:
     // ═══════════════════════════════════════════════════════════════════════
     
     std::shared_ptr<Node> new_reshape(std::shared_ptr<Node> input, py::object shape) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "nn::core::RESHAPE");
         node->add_child(input);
         nodes.push_back(node);
@@ -2671,6 +3006,7 @@ public:
     }
     
     std::shared_ptr<Node> new_permute(std::shared_ptr<Node> input, py::object axes) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "nn::core::PERMUTE");
         node->add_child(input);
         nodes.push_back(node);
@@ -2678,6 +3014,7 @@ public:
     }
     
     std::shared_ptr<Node> new_transpose(std::shared_ptr<Node> input, int axis0, int axis1) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "nn::core::TRANSPOSE");
         node->add_child(input);
         nodes.push_back(node);
@@ -2689,6 +3026,7 @@ public:
     // ═══════════════════════════════════════════════════════════════════════
     
     std::shared_ptr<Node> new_exp(std::shared_ptr<Node> input) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::EXP");
         node->add_child(input);
         nodes.push_back(node);
@@ -2696,6 +3034,7 @@ public:
     }
     
     std::shared_ptr<Node> new_log(std::shared_ptr<Node> input) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::LOG");
         node->add_child(input);
         nodes.push_back(node);
@@ -2703,6 +3042,7 @@ public:
     }
     
     std::shared_ptr<Node> new_sqrt(std::shared_ptr<Node> input) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::SQRT");
         node->add_child(input);
         nodes.push_back(node);
@@ -2710,6 +3050,7 @@ public:
     }
     
     std::shared_ptr<Node> new_sin(std::shared_ptr<Node> input) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::SIN");
         node->add_child(input);
         nodes.push_back(node);
@@ -2717,6 +3058,7 @@ public:
     }
     
     std::shared_ptr<Node> new_cos(std::shared_ptr<Node> input) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::COS");
         node->add_child(input);
         nodes.push_back(node);
@@ -2724,6 +3066,7 @@ public:
     }
     
     std::shared_ptr<Node> new_tanh(std::shared_ptr<Node> input) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::TANH");
         node->add_child(input);
         nodes.push_back(node);
@@ -2731,6 +3074,7 @@ public:
     }
     
     std::shared_ptr<Node> new_neg(std::shared_ptr<Node> input) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::NEG");
         node->add_child(input);
         nodes.push_back(node);
@@ -2742,24 +3086,28 @@ public:
     // ═══════════════════════════════════════════════════════════════════════
     
     std::shared_ptr<Node> new_zeros(py::object shape, const std::string& dtype) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "nn::core::ZEROS");
         nodes.push_back(node);
         return node;
     }
     
     std::shared_ptr<Node> new_ones(py::object shape, const std::string& dtype) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "nn::core::ONES");
         nodes.push_back(node);
         return node;
     }
     
     std::shared_ptr<Node> new_full(py::object shape, double fill_value) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "nn::core::FULL");
         nodes.push_back(node);
         return node;
     }
     
     std::shared_ptr<Node> new_arange(int64_t size, const std::string& dtype) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "nn::core::ARANGE");
         nodes.push_back(node);
         return node;
@@ -2770,6 +3118,7 @@ public:
     // ═══════════════════════════════════════════════════════════════════════
     
     std::shared_ptr<Node> new_where(std::shared_ptr<Node> cond, std::shared_ptr<Node> true_val, std::shared_ptr<Node> false_val) {
+        require_not_expired();
         auto node = std::make_shared<Node>(++node_counter, "air::core::SELECT");
         node->add_child(cond);
         node->add_child(true_val);
@@ -2779,6 +3128,7 @@ public:
     }
     
     std::string dump() const {
+        require_not_expired();
         std::string s;
         for (const auto& node : nodes) {
             s += "  " + node->to_string() + "\n";
@@ -2818,6 +3168,7 @@ public:
         if (func_scope && glob && idx < formal_params.size()) {
             ADDR_DATUM_PTR formal = formal_params[idx];
             if (type.has_type) {
+                type.require_active();
                 if (type.type == Null_ptr || &type.type->Glob_scope() != glob) {
                     throw std::runtime_error(
                         "new_param type belongs to a different GLOB_SCOPE: " +
@@ -2832,7 +3183,9 @@ public:
             }
             NODE_PTR ld_node = func_scope->Container().New_ld(formal, 
                 glob->Unknown_simple_spos());
-            auto node = std::make_shared<Node>(ld_node, container.node_counter++, "PARAM");
+            auto node = std::make_shared<Node>(
+                ld_node, container.node_counter++, "PARAM",
+                container.callback_lifetime);
             params.push_back(node);
             return node;
         }
@@ -2843,6 +3196,27 @@ public:
         return node;
     }
     
+    void invalidate() {
+        container.expire_callback_scope();
+        for (const auto& param : params) {
+            if (param) param->invalidate();
+        }
+        for (const auto& node : container.nodes) {
+            if (node) node->invalidate();
+        }
+        params.clear();
+        formal_params.clear();
+        container.nodes.clear();
+        container.block_stack.clear();
+        container.var_map.clear();
+        container.cf_stack.clear();
+        container.container = nullptr;
+        container.func_scope = nullptr;
+        container.glob = nullptr;
+        func_scope = nullptr;
+        glob = nullptr;
+    }
+
     Container& get_container() { return container; }
     
     std::string dump() const {
@@ -2859,6 +3233,453 @@ public:
         return s;
     }
 };
+
+
+py::tuple py_i64_tuple(const std::vector<int64_t>& values) {
+    py::tuple result(values.size());
+    for (size_t idx = 0; idx < values.size(); ++idx) {
+        result[idx] = py::int_(values[idx]);
+    }
+    return result;
+}
+
+py::tuple py_i32_tuple(const std::vector<int32_t>& values) {
+    py::tuple result(values.size());
+    for (size_t idx = 0; idx < values.size(); ++idx) {
+        result[idx] = py::int_(values[idx]);
+    }
+    return result;
+}
+
+py::dict ranked_type_snapshot(
+    const nn::vector::VECTOR_KERNEL_RANKED_TYPE_PLAN& type) {
+    py::dict result;
+    result["element_type"] =
+        nn::vector::Vector_kernel_primitive_type_name(type._element_type);
+    result["shape"] = py_i64_tuple(type._shape);
+    return result;
+}
+
+const char* reduction_kind_name(
+    nn::vector::VECTOR_KERNEL_REDUCTION_KIND kind) {
+    using KIND = nn::vector::VECTOR_KERNEL_REDUCTION_KIND;
+    switch (kind) {
+    case KIND::POWER_OF_TWO: return "power-of-two";
+    case KIND::LINEAR: return "linear";
+    case KIND::COLLECTIVE_SINGLE_BLOCK: return "collective-single-block";
+    case KIND::COLLECTIVE_BLOCKS: return "collective-blocks";
+    }
+    throw std::runtime_error("unknown vector-kernel reduction kind");
+}
+
+const char* mask_policy_name(nn::vector::VECTOR_KERNEL_MASK_POLICY policy) {
+    using POLICY = nn::vector::VECTOR_KERNEL_MASK_POLICY;
+    switch (policy) {
+    case POLICY::NONE: return "none";
+    case POLICY::CLEAR_VALID_PREFIX: return "clear-valid-prefix";
+    case POLICY::COLLECTIVE_REDUCTION: return "collective-reduction";
+    }
+    throw std::runtime_error("unknown vector-kernel mask policy");
+}
+
+const char* slot_policy_name(nn::vector::VECTOR_KERNEL_SLOT_POLICY policy) {
+    using POLICY = nn::vector::VECTOR_KERNEL_SLOT_POLICY;
+    switch (policy) {
+    case POLICY::ABSENT_NATIVE_BASELINE: return "absent-native-baseline";
+    case POLICY::LOGICAL_OUTPUT_ELEMENTS: return "logical-output-elements";
+    case POLICY::EXPLICIT: return "explicit";
+    }
+    throw std::runtime_error("unknown vector-kernel slot policy");
+}
+
+const char* runtime_preparation_kind_name(
+    nn::vector::VECTOR_KERNEL_RUNTIME_PREPARATION_KIND kind) {
+    using KIND = nn::vector::VECTOR_KERNEL_RUNTIME_PREPARATION_KIND;
+    switch (kind) {
+    case KIND::PACKED_VECTOR: return "packed-vector";
+    case KIND::FLATTEN_PACKED_VECTOR: return "flatten-packed-vector";
+    case KIND::BLOCKING_ROTATIONS: return "blocking-rotations";
+    }
+    throw std::runtime_error("unknown vector-kernel runtime preparation kind");
+}
+
+py::object prepared_baseline_gemm_snapshot(
+    const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared) {
+    if (!std::holds_alternative<nn::vector::BASELINE_GEMM_PLAN>(
+            prepared.Plan())) {
+        throw std::runtime_error(
+            "Python destination bridge supports only baseline-gemm in M5");
+    }
+    const auto& plan =
+        std::get<nn::vector::BASELINE_GEMM_PLAN>(prepared.Plan());
+    const auto& common = plan._common;
+    py::dict data;
+    data["kind"] = "baseline-gemm";
+    data["provenance"] = prepared.Provenance();
+    data["specialization_key"] = prepared.Specialization_key();
+    data["helper_name"] = prepared.Helper_name();
+    data["height"] = plan._height;
+    data["width"] = plan._width;
+    data["input_duplications"] = plan._input_duplications;
+    data["result_type"] = ranked_type_snapshot(common._result_type);
+
+    py::list runtime_types;
+    for (const auto& type : common._runtime_vector_inputs) {
+        runtime_types.append(ranked_type_snapshot(type));
+    }
+    data["runtime_vector_inputs"] = py::tuple(runtime_types);
+
+    py::list loops;
+    for (const auto& loop : common._loops) {
+        py::dict item;
+        item["role"] = loop._role;
+        item["lower"] = loop._lower;
+        item["upper"] = loop._upper;
+        item["step"] = loop._step;
+        item["nesting_depth"] = loop._nesting_depth;
+        loops.append(std::move(item));
+    }
+    data["loops"] = py::tuple(loops);
+
+    py::list slices;
+    for (const auto& slice : common._slices) {
+        py::dict index;
+        index["iv_coefficients"] = py_i64_tuple(slice._index._iv_coefficients);
+        index["constant"] = slice._index._constant;
+        index["uses_sharding_offset"] = slice._index._uses_sharding_offset;
+        py::dict item;
+        item["role"] = slice._role;
+        item["index"] = std::move(index);
+        item["width"] = slice._width;
+        slices.append(std::move(item));
+    }
+    data["slices"] = py::tuple(slices);
+
+    py::list rotations;
+    for (const auto& rotation : common._rotations) {
+        py::dict item;
+        item["role"] = rotation._role;
+        item["candidates"] = py_i32_tuple(rotation._candidates);
+        rotations.append(std::move(item));
+    }
+    data["rotations"] = py::tuple(rotations);
+
+    py::list reductions;
+    for (const auto& reduction : common._reductions) {
+        py::dict item;
+        item["role"] = reduction._role;
+        item["kind"] = reduction_kind_name(reduction._kind);
+        item["factor"] = reduction._factor;
+        item["block_width"] = reduction._block_width;
+        item["padding"] = reduction._padding;
+        reductions.append(std::move(item));
+    }
+    data["reductions"] = py::tuple(reductions);
+
+    py::dict mask;
+    mask["policy"] = mask_policy_name(common._mask._policy);
+    mask["valid_length"] = common._mask._valid_length;
+    data["mask"] = std::move(mask);
+    py::dict slot;
+    slot["policy"] = slot_policy_name(common._slot._policy);
+    slot["value"] = common._slot._value;
+    data["slot"] = std::move(slot);
+
+    py::list constants;
+    for (const auto& constant : prepared.Constants()) {
+        py::dict item;
+        item["role"] = constant._role;
+        item["type"] = ranked_type_snapshot(constant._type);
+        item["content_hash"] = constant._content_hash;
+        item["bytes"] = py::bytes(
+            reinterpret_cast<const char*>(constant._bytes.data()),
+            constant._bytes.size());
+        constants.append(std::move(item));
+    }
+    data["constants"] = py::tuple(constants);
+
+    py::list runtime_preparations;
+    for (const auto& preparation : prepared.Runtime_preparations()) {
+        py::dict item;
+        item["role"] = preparation._role;
+        item["source_operand"] = preparation._source_operand;
+        item["kind"] = runtime_preparation_kind_name(preparation._kind);
+        item["result_type"] = ranked_type_snapshot(preparation._result_type);
+        item["logical_input_size"] = preparation._logical_input_size;
+        item["replications"] = preparation._replications;
+        item["blocking_width"] = preparation._blocking_width;
+        item["rotation_candidates"] =
+            py_i32_tuple(preparation._rotation_candidates);
+        item["outer_block_depth"] = preparation._outer_block_depth;
+        runtime_preparations.append(std::move(item));
+    }
+    data["runtime_preparations"] = py::tuple(runtime_preparations);
+
+    py::object freeze = py::module_::import(
+        "ace_edsl.edsl.vector_kernel_lowering").attr(
+            "_freeze_prepared_baseline_gemm_plan");
+    return freeze(std::move(data));
+}
+
+class VectorKernelTraceContext {
+public:
+    VectorKernelTraceContext(
+        FUNC_SCOPE& helper, NODE_PTR body,
+        const std::vector<nn::vector::VECTOR_KERNEL_TYPED_PAYLOAD>& constants,
+        const nn::vector::VECTOR_KERNEL_DESTINATION_ABI& abi,
+        const SPOS& spos)
+        : _active(true), _body(body), _result_type(abi._result_type) {
+        if (body == Null_ptr || !body->Is_block()) {
+            throw std::runtime_error(
+                "vector-kernel destination trace requires a helper body");
+        }
+        std::vector<ADDR_DATUM_PTR> formals;
+        formals.reserve(helper.Formal_cnt());
+        for (uint32_t idx = 0; idx < helper.Formal_cnt(); ++idx) {
+            formals.push_back(helper.Formal(idx));
+        }
+        _scope = std::make_shared<FuncScope>(
+            helper.Owning_func()->Name()->Char_str(), &helper,
+            &helper.Glob_scope(), formals, true);
+        _scope->container.mark_callback_scoped();
+        _scope->container.push_block(body);
+        for (size_t idx = 0; idx < abi._formal_types.size(); ++idx) {
+            _formals.push_back(_scope->new_param(
+                "packed_input_" + std::to_string(idx),
+                Type::from_air_type(
+                    abi._formal_types[idx],
+                    _scope->container.callback_lifetime)));
+        }
+        for (const auto& payload : constants) {
+            CONSTANT_PTR constant =
+                nn::vector::Materialize_prepared_vector_kernel_constant(
+                    helper.Glob_scope(), payload, spos);
+            NODE_PTR ldc = helper.Container().New_ldc(constant, spos);
+            _constants.emplace(
+                payload._role, _scope->container.wrap_node(
+                                   ldc, "air::core::LDC"));
+        }
+    }
+
+    ~VectorKernelTraceContext() { expire(); }
+
+    bool is_active() const { return _active; }
+
+    Container& container() {
+        require_active();
+        return _scope->container;
+    }
+
+    std::vector<std::shared_ptr<Node>> formals() const {
+        require_active();
+        return _formals;
+    }
+
+    py::tuple constant_roles() const {
+        require_active();
+        py::tuple roles(_constants.size());
+        size_t idx = 0;
+        for (const auto& item : _constants) roles[idx++] = item.first;
+        return roles;
+    }
+
+    std::shared_ptr<Node> constant(const std::string& role) const {
+        require_active();
+        auto iter = _constants.find(role);
+        if (iter == _constants.end()) {
+            throw py::key_error("unknown prepared constant role: " + role);
+        }
+        return iter->second;
+    }
+
+    Type result_type() const {
+        require_active();
+        return Type::from_air_type(
+            _result_type, _scope->container.callback_lifetime);
+    }
+
+    Type i32_type() const {
+        require_active();
+        return Type::from_air_type(
+            _scope->glob->Prim_type(PRIMITIVE_TYPE::INT_S32),
+            _scope->container.callback_lifetime);
+    }
+
+    std::shared_ptr<DESTINATION_LIFETIME> destination_lifetime() const {
+        require_active();
+        return _scope->container.callback_lifetime;
+    }
+
+    NODE_PTR take_result(const std::shared_ptr<Node>& result) {
+        require_active();
+        if (!result || !result->has_node || result->node == Null_ptr) {
+            throw std::runtime_error(
+                "vector-kernel recipe must return a real destination AIR node");
+        }
+        if (result->node->Container() != _scope->container.container) {
+            throw std::runtime_error(
+                "vector-kernel recipe returned a node from another AIR container");
+        }
+        if (!result->node->Has_rtype() ||
+            !result->node->Rtype()->Is_compatible_type(_result_type)) {
+            throw std::runtime_error(
+                "vector-kernel recipe result type does not match its prepared ABI");
+        }
+        if (_scope->container.cf_stack.size() != 0 ||
+            _scope->container.block_stack.size() != 1 ||
+            _scope->container.block_stack.back() != _body) {
+            throw std::runtime_error(
+                "vector-kernel recipe left unbalanced control-flow state");
+        }
+        NODE_PTR raw = result->node;
+        _scope->container.pop_block();
+        expire();
+        return raw;
+    }
+
+    void expire() {
+        if (!_active) return;
+        _active = false;
+        if (_scope) _scope->invalidate();
+        _formals.clear();
+        _constants.clear();
+    }
+
+private:
+    void require_active() const {
+        if (!_active || !_scope) {
+            throw std::runtime_error(
+                "vector-kernel destination trace context has expired");
+        }
+    }
+
+    bool _active;
+    NODE_PTR _body;
+    TYPE_PTR _result_type;
+    std::shared_ptr<FuncScope> _scope;
+    std::vector<std::shared_ptr<Node>> _formals;
+    std::map<std::string, std::shared_ptr<Node>> _constants;
+};
+
+nn::vector::VECTOR_KERNEL_PLAN_KIND bound_plan_kind(
+    const std::string& name) {
+    if (name == "baseline-gemm") {
+        return nn::vector::VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM;
+    }
+    throw std::invalid_argument(
+        "M5 Python recipe registry supports only baseline-gemm");
+}
+
+nn::vector::VECTOR_KERNEL_HELPER_SPEC make_python_plan_recipe(
+    py::function callback,
+    const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared,
+    const nn::vector::VECTOR_KERNEL_DESTINATION_ABI& abi) {
+    py::object snapshot = prepared_baseline_gemm_snapshot(prepared);
+    std::vector<nn::vector::VECTOR_KERNEL_TYPED_PAYLOAD> constants =
+        prepared.Constants();
+    nn::vector::VECTOR_KERNEL_HELPER_SPEC spec;
+    spec._formal_types = abi._formal_types;
+    spec._result_type = abi._result_type;
+    spec._build_body =
+        [callback = std::move(callback), snapshot = std::move(snapshot),
+         constants = std::move(constants), abi](
+            FUNC_SCOPE& helper, NODE_PTR body, const SPOS& spos) -> NODE_PTR {
+          auto trace = std::make_shared<VectorKernelTraceContext>(
+              helper, body, constants, abi, spos);
+          ACTIVE_BINDING_GLOB_GUARD active_glob(
+              &helper.Glob_scope(), trace->destination_lifetime());
+          try {
+              py::object returned = callback(trace, snapshot);
+              std::shared_ptr<Node> result =
+                  returned.cast<std::shared_ptr<Node>>();
+              return trace->take_result(result);
+          } catch (...) {
+              trace->expire();
+              throw;
+          }
+        };
+    return spec;
+}
+
+
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+const std::string M5_BASELINE_GEMM_HELPER_PREFIX =
+    "__ace_vkernel_baseline_gemm_";
+
+void collect_call_statements(NODE_PTR node, std::vector<STMT_PTR>& calls) {
+    if (node == Null_ptr) return;
+    if (node->Is_call()) calls.push_back(node->Stmt());
+    if (node->Is_block()) {
+        for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+             stmt = stmt->Next()) {
+            collect_call_statements(stmt->Node(), calls);
+        }
+        return;
+    }
+    for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
+        collect_call_statements(node->Child(idx), calls);
+    }
+}
+
+void collect_matching_ldp_nodes(NODE_PTR node, PREG_PTR preg,
+                                std::vector<NODE_PTR>& matches) {
+    if (node == Null_ptr) return;
+    if (node->Opcode() == air::core::OPC_LDP &&
+        node->Preg() != Null_ptr && preg != Null_ptr &&
+        node->Preg()->Defining_func_scope() == preg->Defining_func_scope() &&
+        node->Preg()->Id() == preg->Id()) {
+        matches.push_back(node);
+    }
+    if (node->Is_block()) {
+        for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+             stmt = stmt->Next()) {
+            collect_matching_ldp_nodes(stmt->Node(), preg, matches);
+        }
+        return;
+    }
+    for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
+        collect_matching_ldp_nodes(node->Child(idx), preg, matches);
+    }
+}
+
+NODE_PTR find_formal_load(NODE_PTR node, ADDR_DATUM_PTR formal) {
+    if (node == Null_ptr) return Null_ptr;
+    if (node->Opcode() == air::core::OPC_LD && node->Has_sym() &&
+        node->Addr_datum() == formal) {
+        return node;
+    }
+    if (node->Is_block()) {
+        for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+             stmt = stmt->Next()) {
+            NODE_PTR found = find_formal_load(stmt->Node(), formal);
+            if (found != Null_ptr) return found;
+        }
+        return Null_ptr;
+    }
+    for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
+        NODE_PTR found = find_formal_load(node->Child(idx), formal);
+        if (found != Null_ptr) return found;
+    }
+    return Null_ptr;
+}
+
+py::dict compare_normalized_vector_kernel_air_for_testing(
+    const std::string& native_air, const std::string& helper_air) {
+    const nn::vector::test::VECTOR_KERNEL_AIR_COMPARE_RESULT comparison =
+        nn::vector::test::Compare_normalized_vector_kernel_air(
+            native_air, helper_air);
+    py::dict result;
+    result["equal"] = comparison._equal;
+    result["message"] = comparison._message;
+    if (comparison._mismatch_offset == std::string::npos) {
+        result["mismatch_offset"] = py::none();
+    } else {
+        result["mismatch_offset"] = comparison._mismatch_offset;
+    }
+    return result;
+}
+
+#endif  // ACE_VECTOR_KERNEL_TEST_SUPPORT
 
 // Global scope - creates functions with proper signatures
 class GlobScope {
@@ -2943,6 +3764,7 @@ public:
 
             // Check for has_type
             if (t.has_type) {
+                t.require_active();
                 if (t.type == Null_ptr || &t.type->Glob_scope() != glob) {
                     throw std::runtime_error(
                         "function signature type belongs to a different GLOB_SCOPE");
@@ -4247,7 +5069,151 @@ public:
     
     bool has_native_ir() const { return glob != nullptr; }
     bool verify_ir() const { return glob != nullptr && glob->Verify_ir(); }
-    
+
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+    py::dict inspect_baseline_gemm_air_for_testing() const {
+        if (!glob || !glob->Verify_ir()) {
+            throw std::runtime_error(
+                "M5 AIR oracle requires a verified GLOB_SCOPE");
+        }
+
+        FUNC_SCOPE* caller = nullptr;
+        FUNC_SCOPE* helper = nullptr;
+        uint32_t function_count = 0;
+        for (GLOB_SCOPE::FUNC_SCOPE_ITER iter = glob->Begin_func_scope();
+             iter != glob->End_func_scope(); ++iter) {
+            ++function_count;
+            FUNC_SCOPE* scope = &(*iter);
+            const char* raw_name = scope->Owning_func()->Name()->Char_str();
+            const std::string name = raw_name == nullptr ? "" : raw_name;
+            if (name.compare(0, M5_BASELINE_GEMM_HELPER_PREFIX.size(),
+                             M5_BASELINE_GEMM_HELPER_PREFIX) == 0) {
+                if (helper != nullptr) {
+                    throw std::runtime_error(
+                        "M5 AIR oracle found multiple baseline-Gemm helpers");
+                }
+                helper = scope;
+            } else {
+                if (caller != nullptr) {
+                    throw std::runtime_error(
+                        "M5 AIR oracle requires one caller function");
+                }
+                caller = scope;
+            }
+        }
+        if (caller == nullptr) {
+            throw std::runtime_error("M5 AIR oracle found no caller function");
+        }
+
+        py::dict result;
+        if (helper != nullptr) {
+            NODE_PTR caller_entry = caller->Container().Entry_node();
+            std::vector<STMT_PTR> calls;
+            collect_call_statements(caller_entry, calls);
+            if (calls.size() != 1) {
+                throw std::runtime_error(
+                    "M5 AIR oracle requires one helper CALL");
+            }
+            NODE_PTR call = calls[0]->Node();
+            if (call->Num_arg() != 1 || caller->Formal_cnt() < 1) {
+                throw std::runtime_error(
+                    "M5 AIR oracle requires the one-input baseline-Gemm ABI");
+            }
+            NODE_PTR actual = call->Child(0);
+            if (actual->Opcode() != air::core::OPC_LD || !actual->Has_sym() ||
+                actual->Addr_datum() != caller->Formal(0)) {
+                throw std::runtime_error(
+                    "M5 helper CALL does not use the caller formal input");
+            }
+            std::vector<NODE_PTR> replacements;
+            collect_matching_ldp_nodes(caller_entry, call->Ret_preg(),
+                                       replacements);
+            if (replacements.size() != 1) {
+                throw std::runtime_error(
+                    "M5 AIR oracle requires one replacing CALL LDP");
+            }
+            const std::vector<NODE_PTR> expected_actuals{actual};
+            const nn::vector::test::VECTOR_KERNEL_AIR_COMPARE_RESULT bridge =
+                nn::vector::test::Check_vector_kernel_call_bridge(
+                    *caller, calls[0], expected_actuals, replacements[0],
+                    *helper);
+            result["kind"] = "helper";
+            result["normalized"] =
+                nn::vector::test::Normalize_vector_kernel_helper(*helper);
+            result["bridge_ok"] = bridge._equal;
+            result["bridge_message"] = bridge._message;
+            return result;
+        }
+
+        if (function_count != 1 || caller->Formal_cnt() < 1) {
+            throw std::runtime_error(
+                "M5 native AIR oracle requires one one-input function");
+        }
+        NODE_PTR body = caller->Container().Entry_node()->Last_child();
+        if (body == Null_ptr || !body->Is_block()) {
+            throw std::runtime_error("M5 native AIR oracle found no body");
+        }
+        STMT_PTR terminal = Null_ptr;
+        for (STMT_PTR stmt = body->Begin_stmt(); stmt != body->End_stmt();
+             stmt = stmt->Next()) {
+            terminal = stmt;
+        }
+        if (terminal == Null_ptr ||
+            terminal->Node()->Opcode() != air::core::OPC_RETV ||
+            terminal->Node()->Num_child() != 1) {
+            throw std::runtime_error(
+                "M5 native AIR oracle requires one terminal RETV");
+        }
+        NODE_PTR output_load = terminal->Node()->Child(0);
+        if (output_load->Opcode() != air::core::OPC_LD ||
+            !output_load->Has_sym()) {
+            throw std::runtime_error(
+                "M5 native AIR oracle RETV must load the caller output");
+        }
+        ADDR_DATUM_PTR output = output_load->Addr_datum();
+        STMT_PTR first_kernel = Null_ptr;
+        STMT_PTR output_store = Null_ptr;
+        for (STMT_PTR stmt = body->Begin_stmt(); stmt != terminal;
+             stmt = stmt->Next()) {
+            NODE_PTR node = stmt->Node();
+            if (node->Opcode() == air::core::OPC_ST && node->Has_sym() &&
+                node->Addr_datum() == output) {
+                output_store = stmt;
+                break;
+            }
+            if (first_kernel == Null_ptr &&
+                node->Opcode() != air::core::OPC_COMMENT &&
+                node->Opcode() != air::core::OPC_PRAGMA) {
+                first_kernel = stmt;
+            }
+        }
+        if (first_kernel == Null_ptr || output_store == Null_ptr ||
+            output_store->Node()->Num_child() != 1) {
+            throw std::runtime_error(
+                "M5 native AIR oracle could not isolate the kernel region");
+        }
+        NODE_PTR input = Null_ptr;
+        for (STMT_PTR stmt = first_kernel; stmt != output_store;
+             stmt = stmt->Next()) {
+            input = find_formal_load(stmt->Node(), caller->Formal(0));
+            if (input != Null_ptr) break;
+        }
+        if (input == Null_ptr) {
+            throw std::runtime_error(
+                "M5 native AIR oracle found no semantic input load");
+        }
+        NODE_PTR native_result = output_store->Node()->Child(0);
+        const nn::vector::test::VECTOR_KERNEL_NATIVE_AIR_VIEW native_view{
+            caller, {input}, first_kernel, output_store, native_result};
+        result["kind"] = "native";
+        result["normalized"] =
+            nn::vector::test::Normalize_native_vector_kernel(native_view);
+        result["bridge_ok"] = py::none();
+        result["bridge_message"] = "";
+        return result;
+    }
+#endif  // ACE_VECTOR_KERNEL_TEST_SUPPORT
+
 public:
     // For external access by run_ckks_driver wrapper
     std::unique_ptr<fhe::core::LOWER_CTX>& get_lower_ctx_ref() { ensure_lower_ctx(); return lower_ctx; }
@@ -4287,6 +5253,74 @@ public:
         }
         
         return false;
+    }
+
+    bool run_tensor2vector_with_recipes(
+        const std::vector<std::string>& skip_ops,
+        const std::string& plan_provider,
+        const std::string& kernel_impl,
+        const std::string& plan_kind,
+        const std::string& fallback, py::dict recipes,
+        bool mask_fuse, uint64_t max_slots) {
+        if (!glob) {
+            throw std::runtime_error(
+                "tensor2vector recipe lowering requires a real GLOB_SCOPE");
+        }
+        nn::vector::VECTOR_KERNEL_SELECTION_RESULT selection =
+            nn::vector::Parse_vector_kernel_selection(
+                plan_provider, kernel_impl, plan_kind, fallback);
+        if (!selection._selection.has_value()) {
+            throw std::invalid_argument(selection._diagnostic);
+        }
+
+        pyace::PythonLoweringBridge::instance().set_skip_ops(skip_ops);
+        nn::vector::Set_skip_lowering_ops(skip_ops);
+        fhe::sihe::Set_skip_lowering_ops(skip_ops);
+        fhe::ckks::Set_skip_lowering_ops(skip_ops);
+
+        nn::vector::VECTOR_KERNEL_LOWERING_REGISTRY registry;
+        for (auto item : recipes) {
+            const std::string key = py::cast<std::string>(item.first);
+            if (!PyCallable_Check(item.second.ptr())) {
+                throw py::type_error(
+                    "vector-kernel recipe for " + key + " is not callable");
+            }
+            py::function callback =
+                py::reinterpret_borrow<py::function>(item.second);
+            const nn::vector::VECTOR_KERNEL_PLAN_KIND kind =
+                bound_plan_kind(key);
+            const bool inserted = registry.Register(
+                kind,
+                [callback = std::move(callback)](
+                    const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared,
+                    const std::vector<NODE_PTR>&, GLOB_SCOPE&,
+                    const nn::vector::VECTOR_KERNEL_DESTINATION_ABI& abi) {
+                  return make_python_plan_recipe(callback, prepared, abi);
+                });
+            if (!inserted) {
+                throw std::invalid_argument(
+                    "duplicate vector-kernel recipe kind: " + key);
+            }
+        }
+
+        nn::vector::VECTOR_CTX ctx;
+        ctx.Set_vector_kernel_lowering_registry(&registry);
+        nn::vector::VECTOR_CONFIG config;
+        config._plan_provider = plan_provider;
+        config._kernel_impl = kernel_impl;
+        config._plan_kind = plan_kind;
+        config._fallback = fallback;
+        config._mask_fuse = mask_fuse;
+        config._max_slots = max_slots;
+        GLOB_SCOPE* new_glob =
+            nn::vector::Vector_driver(glob, ctx, nullptr, config);
+        if (!new_glob) {
+            throw std::runtime_error(
+                "Tensor-to-Vector recipe lowering returned no destination");
+        }
+        glob = new_glob;
+        s_active_binding_glob = glob;
+        return true;
     }
     
 private:
@@ -6119,12 +7153,19 @@ PYBIND11_MODULE(air_builder, m) {
         .def("new_stid", &Container::new_stid,
              py::arg("var_name"), py::arg("value"),
              "Store value to a named variable")
+        .def("new_vector_widening_stid",
+             &Container::new_vector_widening_stid,
+             py::arg("var_name"), py::arg("type"), py::arg("value"),
+             "Store a prepared packed Vector value into a validated wider local")
         .def("new_local", &Container::new_local,
              py::arg("var_name"), py::arg("type"),
              "Declare a named local with an explicit AIR type")
         .def("new_ldid", &Container::new_ldid,
              py::arg("var_name"),
              "Load value from a named variable")
+        .def("new_fresh_load", &Container::new_fresh_load,
+             py::arg("value"),
+             "Clone a destination-owned LD, LDP, or LDC expression")
         .def("in_control_flow_body", &Container::in_control_flow_body,
              "Check if inside a loop or if body")
         // Control flow
@@ -6194,6 +7235,25 @@ PYBIND11_MODULE(air_builder, m) {
         .def("dump", &FuncScope::dump)
         .def_readonly("name", &FuncScope::name);
     
+    py::class_<VectorKernelTraceContext,
+               std::shared_ptr<VectorKernelTraceContext>>(
+        m, "VectorKernelTraceContext")
+        .def_property_readonly("active",
+             &VectorKernelTraceContext::is_active)
+        .def_property_readonly("container",
+             &VectorKernelTraceContext::container,
+             py::return_value_policy::reference_internal)
+        .def_property_readonly("formals",
+             &VectorKernelTraceContext::formals)
+        .def_property_readonly("constant_roles",
+             &VectorKernelTraceContext::constant_roles)
+        .def("constant", &VectorKernelTraceContext::constant,
+             py::arg("role"))
+        .def_property_readonly("result_type",
+             &VectorKernelTraceContext::result_type)
+        .def_property_readonly("i32_type",
+             &VectorKernelTraceContext::i32_type);
+
     py::class_<GlobScope, std::shared_ptr<GlobScope>>(m, "GlobScope")
         .def(py::init<>())
         .def("register_file", &GlobScope::register_file,
@@ -6219,10 +7279,26 @@ PYBIND11_MODULE(air_builder, m) {
         .def("has_native_ir", &GlobScope::has_native_ir)
         .def("verify_ir", &GlobScope::verify_ir,
              "Run the native AIR verifier on this global scope")
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+        .def("_inspect_baseline_gemm_air_for_testing",
+             &GlobScope::inspect_baseline_gemm_air_for_testing,
+             "Normalize one native or Python-helper baseline Gemm from AIR objects")
+#endif
         // C++ pass integration
         .def("run_cpp_pass", &GlobScope::run_cpp_pass,
              py::arg("pass_name"), py::arg("skip_ops") = std::vector<std::string>{},
              "Run a C++ pass, optionally skipping specified ops")
+        .def("run_tensor2vector_with_recipes",
+             &GlobScope::run_tensor2vector_with_recipes,
+             py::arg("skip_ops") = std::vector<std::string>{},
+             py::arg("plan_provider") = "cpp",
+             py::arg("kernel_impl") = "native",
+             py::arg("plan_kind") = "auto",
+             py::arg("fallback") = "error",
+             py::arg("recipes") = py::dict(),
+             py::arg("mask_fuse") = false,
+             py::arg("max_slots") = 0,
+             "Run one Tensor-to-Vector pass with a synchronous per-pass recipe registry")
         .def("run_poly2c", &GlobScope::run_poly2c_pass_with_config,
              py::arg("output_file") = "",
              py::arg("data_file") = "",
@@ -6297,6 +7373,12 @@ PYBIND11_MODULE(air_builder, m) {
              "Get current SIHE parameters as a dict");
     
     m.def("create_glob_scope", &create_glob_scope);
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+    m.def("_compare_normalized_vector_kernel_air_for_testing",
+          &compare_normalized_vector_kernel_air_for_testing,
+          py::arg("native_air"), py::arg("helper_air"),
+          "Compare canonical kernel AIR produced by the C++ object normalizer");
+#endif
     
 #ifdef ACE_BINDINGS_ENABLED
     // FHE Compiler - Full Pipeline
