@@ -111,6 +111,7 @@ check_prerequisites() {
 }
 
 build_bindings() {
+    local VECTOR_KERNEL_TEST_SUPPORT="${1:-OFF}"
     info "Building shared bindings at ${BINDINGS_DIR}..."
     info "Using ACE install prefix: ${ACE_INSTALL_DIR}"
     
@@ -123,7 +124,8 @@ build_bindings() {
     cmake .. \
         -DACE_COMPILER_DIR="${ACE_COMPILER_DIR}" \
         -DACE_INSTALL_DIR="${ACE_INSTALL_DIR}" \
-        -Dpybind11_DIR="${PYBIND11_DIR}"
+        -Dpybind11_DIR="${PYBIND11_DIR}" \
+        -DACE_VECTOR_KERNEL_TEST_SUPPORT="${VECTOR_KERNEL_TEST_SUPPORT}"
     
     make -j$(nproc)
     
@@ -165,7 +167,7 @@ run_tests() {
     # Run pytest tests (quick ones only, skip slow codegen tests)
     if [ -d "tests" ]; then
         info "Running unit tests..."
-        if timeout "${PYTEST_TIMEOUT}" python3 -m pytest tests/test_domain_kernels.py tests/test_bootstrap_stage_ops.py tests/test_bootstrap_full.py tests/test_vector_kernel_core_types.py -v --tb=short 2>&1; then
+        if timeout "${PYTEST_TIMEOUT}" python3 -m pytest tests/test_domain_kernels.py tests/test_bootstrap_stage_ops.py tests/test_bootstrap_full.py tests/test_vector_kernel_core_types.py tests/test_vector_kernel_baseline_gemm.py -v --tb=short 2>&1; then
             info "Unit tests passed"
             PASSED=$((PASSED + 1))
         else
@@ -296,17 +298,23 @@ case "${1:-}" in
         install_package
         ;;
     "test")
+        check_prerequisites
+        build_bindings ON
         run_tests full
         ;;
     "test-quick")
+        check_prerequisites
+        build_bindings ON
         run_tests quick
         ;;
     "test-full")
+        check_prerequisites
+        build_bindings ON
         run_tests full
         ;;
     "all")
         check_prerequisites
-        build_bindings
+        build_bindings ON
         install_package
         run_tests full
         ;;

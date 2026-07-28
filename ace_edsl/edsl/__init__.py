@@ -72,6 +72,16 @@ from .pipeline import (
     compile_to_c,
     Pipeline,
     PipelineTarget,
+    VectorKernelLoweringConfig,
+)
+from .vector_kernel_lowering import (
+    PreparedBaselineGemmPlan,
+    vector_kernel_recipe,
+)
+from .vector_kernel_baseline_gemm import (
+    baseline_gemm_recipe,
+    baseline_gemm_vector_kernel,
+    configure_baseline_gemm_dsl,
 )
 
 # Export selective lowering registry
@@ -127,6 +137,12 @@ __all__ = [
     'AcePipeline',
     'Pipeline',
     'PipelineTarget',
+    'VectorKernelLoweringConfig',
+    'PreparedBaselineGemmPlan',
+    'vector_kernel_recipe',
+    'baseline_gemm_recipe',
+    'baseline_gemm_vector_kernel',
+    'configure_baseline_gemm_dsl',
     'FHEConfig',
     'PipelineResult',
     'compile_to_c',
