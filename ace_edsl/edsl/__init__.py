@@ -76,6 +76,7 @@ from .pipeline import (
     VectorKernelLoweringConfig,
 )
 from .vector_kernel_lowering import (
+    PreparedBaselineConvPlan,
     PreparedBaselineGemmPlan,
     vector_kernel_recipe,
 )
@@ -83,6 +84,11 @@ from .kernels.vector.baseline_gemm import (
     baseline_gemm_recipe,
     baseline_gemm_vector_kernel,
     configure_baseline_gemm_dsl,
+)
+from .kernels.vector.baseline_conv import (
+    baseline_conv_recipe,
+    baseline_conv_vector_kernel,
+    configure_baseline_conv_dsl,
 )
 
 # Export selective lowering registry
@@ -139,11 +145,15 @@ __all__ = [
     'Pipeline',
     'PipelineTarget',
     'VectorKernelLoweringConfig',
+    'PreparedBaselineConvPlan',
     'PreparedBaselineGemmPlan',
     'vector_kernel_recipe',
     'baseline_gemm_recipe',
     'baseline_gemm_vector_kernel',
     'configure_baseline_gemm_dsl',
+    'baseline_conv_recipe',
+    'baseline_conv_vector_kernel',
+    'configure_baseline_conv_dsl',
     'FHEConfig',
     'PipelineResult',
     'compile_to_c',

@@ -72,6 +72,11 @@ class VectorKernelLoweringConfig:
     max_slots: int = 0
 
 
+_BASELINE_VECTOR_KERNEL_RECIPE_KINDS = frozenset(
+    ("baseline-gemm", "baseline-conv")
+)
+
+
 @dataclass
 class PipelineResult:
     """Result of running the pipeline."""
@@ -219,8 +224,11 @@ class AcePipeline:
     def register_vector_kernel_recipe(
         self, plan_kind: str, recipe: Callable
     ) -> "AcePipeline":
-        if plan_kind != "baseline-gemm":
-            raise ValueError("M5 recipe registration supports baseline-gemm only")
+        if plan_kind not in _BASELINE_VECTOR_KERNEL_RECIPE_KINDS:
+            raise ValueError(
+                "vector-kernel recipe registration supports baseline-gemm "
+                "and baseline-conv only"
+            )
         if not callable(recipe):
             raise TypeError("vector-kernel recipe must be callable")
         if plan_kind in self.vector_kernel_recipes:
@@ -850,8 +858,11 @@ class Pipeline:
     def register_vector_kernel_recipe(
         self, plan_kind: str, recipe: Callable
     ) -> "Pipeline":
-        if plan_kind != "baseline-gemm":
-            raise ValueError("M5 recipe registration supports baseline-gemm only")
+        if plan_kind not in _BASELINE_VECTOR_KERNEL_RECIPE_KINDS:
+            raise ValueError(
+                "vector-kernel recipe registration supports baseline-gemm "
+                "and baseline-conv only"
+            )
         if not callable(recipe):
             raise TypeError("vector-kernel recipe must be callable")
         if plan_kind in self.vector_kernel_recipes:

@@ -173,6 +173,7 @@ run_tests() {
             tests/test_bootstrap_full.py \
             tests/test_vector_kernel_core_types.py \
             tests/test_vector_kernel_baseline_gemm.py \
+            tests/test_vector_kernel_baseline_conv.py \
             tests/test_function_inliner.py \
             tests/test_gemm_e2e_compare.py \
             -v --tb=short 2>&1; then

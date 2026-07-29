@@ -316,8 +316,10 @@ def test_vector_recipe_configuration_is_per_pipeline():
     assert second.vector_kernel_recipes == {}
     with pytest.raises(ValueError, match="duplicate"):
         first.register_vector_kernel_recipe("baseline-gemm", recipe)
-    with pytest.raises(ValueError, match="baseline-gemm only"):
-        second.register_vector_kernel_recipe("baseline-conv", recipe)
+    second.register_vector_kernel_recipe("baseline-conv", recipe)
+    assert second.vector_kernel_recipes == {"baseline-conv": recipe}
+    with pytest.raises(ValueError, match="baseline-gemm and baseline-conv only"):
+        second.register_vector_kernel_recipe("fast-conv", recipe)
     with pytest.raises(TypeError, match="must be callable"):
         second.register_vector_kernel_recipe("baseline-gemm", None)
 

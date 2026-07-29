@@ -53,6 +53,8 @@
 #include "nn/vector/tensor2vector_prepared_lowering.h"
 #ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
 #include "tensor2vector_air_normalizer.h"
+#include "nn/vector/tensor2vector_ctx.h"
+#include "nn/vector/vector_utils.h"
 #endif
 #include "nn/vector/config.h"
 #include "nn/vector/skip_lowering.h"  // For selective lowering registry
@@ -3359,24 +3361,15 @@ const char* runtime_preparation_kind_name(
     throw std::runtime_error("unknown vector-kernel runtime preparation kind");
 }
 
-py::object prepared_baseline_gemm_snapshot(
-    const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared) {
-    if (!std::holds_alternative<nn::vector::BASELINE_GEMM_PLAN>(
-            prepared.Plan())) {
-        throw std::runtime_error(
-            "Python destination bridge supports only baseline-gemm in M5");
-    }
-    const auto& plan =
-        std::get<nn::vector::BASELINE_GEMM_PLAN>(prepared.Plan());
-    const auto& common = plan._common;
+py::dict prepared_common_plan_snapshot(
+    const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared,
+    const nn::vector::VECTOR_KERNEL_COMMON_PLAN& common,
+    const char* kind) {
     py::dict data;
-    data["kind"] = "baseline-gemm";
+    data["kind"] = kind;
     data["provenance"] = prepared.Provenance();
     data["specialization_key"] = prepared.Specialization_key();
     data["helper_name"] = prepared.Helper_name();
-    data["height"] = plan._height;
-    data["width"] = plan._width;
-    data["input_duplications"] = plan._input_duplications;
     data["result_type"] = ranked_type_snapshot(common._result_type);
 
     py::list runtime_types;
@@ -3470,12 +3463,68 @@ py::object prepared_baseline_gemm_snapshot(
         runtime_preparations.append(std::move(item));
     }
     data["runtime_preparations"] = py::tuple(runtime_preparations);
+    return data;
+}
 
+py::object prepared_baseline_gemm_snapshot(
+    const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared) {
+    if (!std::holds_alternative<nn::vector::BASELINE_GEMM_PLAN>(
+            prepared.Plan())) {
+        throw std::runtime_error(
+            "baseline Gemm snapshot received another plan kind");
+    }
+    const auto& plan =
+        std::get<nn::vector::BASELINE_GEMM_PLAN>(prepared.Plan());
+    py::dict data = prepared_common_plan_snapshot(
+        prepared, plan._common, "baseline-gemm");
+    data["height"] = plan._height;
+    data["width"] = plan._width;
+    data["input_duplications"] = plan._input_duplications;
     py::object freeze = py::module_::import(
         "ace_edsl.edsl.vector_kernel_lowering").attr(
             "_freeze_prepared_baseline_gemm_plan");
     return freeze(std::move(data));
 }
+
+py::object prepared_baseline_conv_snapshot(
+    const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared) {
+    if (!std::holds_alternative<nn::vector::BASELINE_CONV_PLAN>(
+            prepared.Plan())) {
+        throw std::runtime_error(
+            "baseline Conv snapshot received another plan kind");
+    }
+    const auto& plan =
+        std::get<nn::vector::BASELINE_CONV_PLAN>(prepared.Plan());
+    py::dict data = prepared_common_plan_snapshot(
+        prepared, plan._common, "baseline-conv");
+    data["channel_in"] = plan._channel_in;
+    data["channel_out"] = plan._channel_out;
+    data["output_height"] = plan._output_height;
+    data["output_width"] = plan._output_width;
+    data["kernel_hw"] = plan._kernel_hw;
+    data["stride"] = plan._stride;
+    data["input_duplications"] = plan._input_duplications;
+    py::object freeze = py::module_::import(
+        "ace_edsl.edsl.vector_kernel_lowering").attr(
+            "_freeze_prepared_baseline_conv_plan");
+    return freeze(std::move(data));
+}
+
+py::object prepared_vector_kernel_snapshot(
+    const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared) {
+    if (std::holds_alternative<nn::vector::BASELINE_GEMM_PLAN>(
+            prepared.Plan())) {
+        return prepared_baseline_gemm_snapshot(prepared);
+    }
+    if (std::holds_alternative<nn::vector::BASELINE_CONV_PLAN>(
+            prepared.Plan())) {
+        return prepared_baseline_conv_snapshot(prepared);
+    }
+    throw std::runtime_error(
+        "Python destination bridge supports baseline-gemm and "
+        "baseline-conv only");
+}
+
 
 class VectorKernelTraceContext {
 public:
@@ -3622,24 +3671,68 @@ nn::vector::VECTOR_KERNEL_PLAN_KIND bound_plan_kind(
     if (name == "baseline-gemm") {
         return nn::vector::VECTOR_KERNEL_PLAN_KIND::BASELINE_GEMM;
     }
+    if (name == "baseline-conv") {
+        return nn::vector::VECTOR_KERNEL_PLAN_KIND::BASELINE_CONV;
+    }
     throw std::invalid_argument(
-        "M5 Python recipe registry supports only baseline-gemm");
+        "Python recipe registry supports baseline-gemm and baseline-conv only");
 }
+
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+struct BASELINE_CONV_ORACLE_RECORD {
+    std::vector<NODE_PTR> _expected_actuals;
+    std::string _native_air;
+};
+
+std::string normalize_prepared_baseline_conv_native_for_testing(
+    const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared);
+#endif
 
 nn::vector::VECTOR_KERNEL_HELPER_SPEC make_python_plan_recipe(
     py::function callback,
     const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared,
-    const nn::vector::VECTOR_KERNEL_DESTINATION_ABI& abi) {
-    py::object snapshot = prepared_baseline_gemm_snapshot(prepared);
+    const nn::vector::VECTOR_KERNEL_DESTINATION_ABI& abi
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+    , std::map<std::string, BASELINE_CONV_ORACLE_RECORD>* conv_oracles
+#endif
+    ) {
+    py::object snapshot = prepared_vector_kernel_snapshot(prepared);
     std::vector<nn::vector::VECTOR_KERNEL_TYPED_PAYLOAD> constants =
         prepared.Constants();
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+    std::shared_ptr<const nn::vector::PREPARED_VECTOR_KERNEL_PLAN>
+        native_plan;
+    std::string helper_name;
+    if (conv_oracles != nullptr) {
+        native_plan = std::make_shared<
+            const nn::vector::PREPARED_VECTOR_KERNEL_PLAN>(prepared);
+        helper_name = prepared.Helper_name();
+    }
+#endif
     nn::vector::VECTOR_KERNEL_HELPER_SPEC spec;
     spec._formal_types = abi._formal_types;
     spec._result_type = abi._result_type;
     spec._build_body =
         [callback = std::move(callback), snapshot = std::move(snapshot),
-         constants = std::move(constants), abi](
+         constants = std::move(constants), abi
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+         , native_plan = std::move(native_plan),
+         helper_name = std::move(helper_name), conv_oracles
+#endif
+         ](
             FUNC_SCOPE& helper, NODE_PTR body, const SPOS& spos) -> NODE_PTR {
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+          if (native_plan != nullptr) {
+              auto oracle = conv_oracles->find(helper_name);
+              if (oracle == conv_oracles->end()) {
+                  throw std::runtime_error(
+                      "baseline Conv native oracle lost its expected actuals");
+              }
+              oracle->second._native_air =
+                  normalize_prepared_baseline_conv_native_for_testing(
+                      *native_plan);
+          }
+#endif
           auto trace = std::make_shared<VectorKernelTraceContext>(
               helper, body, constants, abi, spos);
           ACTIVE_BINDING_GLOB_GUARD active_glob(
@@ -3659,8 +3752,72 @@ nn::vector::VECTOR_KERNEL_HELPER_SPEC make_python_plan_recipe(
 
 
 #ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
-const std::string M5_BASELINE_GEMM_HELPER_PREFIX =
+const std::string BASELINE_GEMM_HELPER_PREFIX =
     "__ace_vkernel_baseline_gemm_";
+const std::string BASELINE_CONV_HELPER_PREFIX =
+    "__ace_vkernel_baseline_conv_";
+
+std::string normalize_prepared_baseline_conv_native_for_testing(
+    const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared) {
+    if (!std::holds_alternative<nn::vector::BASELINE_CONV_PLAN>(
+            prepared.Plan())) {
+        throw std::runtime_error(
+            "baseline Conv native oracle received another plan kind");
+    }
+    const auto& plan =
+        std::get<nn::vector::BASELINE_CONV_PLAN>(prepared.Plan());
+    const auto& common = plan._common;
+    if (common._runtime_vector_inputs.size() != 1) {
+        throw std::runtime_error(
+            "baseline Conv native oracle requires one runtime input");
+    }
+
+    std::unique_ptr<GLOB_SCOPE> oracle =
+        std::make_unique<GLOB_SCOPE>(0, true);
+    const SPOS spos = oracle->Unknown_simple_spos();
+    TYPE_PTR input_type = nn::vector::New_array_type(
+        oracle.get(), "baseline_conv_native_input",
+        oracle->Prim_type(common._runtime_vector_inputs[0]._element_type),
+        common._runtime_vector_inputs[0]._shape, spos);
+    TYPE_PTR result_type = nn::vector::New_array_type(
+        oracle.get(), "baseline_conv_native_result",
+        oracle->Prim_type(common._result_type._element_type),
+        common._result_type._shape, spos);
+
+    STR_PTR name = oracle->New_str("baseline_conv_native_oracle");
+    FUNC_PTR function = oracle->New_func(name, spos);
+    function->Set_parent(oracle->Comp_env_id());
+    SIGNATURE_TYPE_PTR signature = oracle->New_sig_type();
+    oracle->New_ret_param(result_type, signature);
+    oracle->New_param(
+        oracle->New_str("packed_input"), input_type, signature, spos);
+    signature->Set_complete();
+    oracle->New_entry_point(signature, function, name, spos);
+
+    FUNC_SCOPE& scope = oracle->New_func_scope(function);
+    CONTAINER* container = &scope.Container();
+    STMT_PTR entry = container->New_func_entry(spos);
+    NODE_PTR body = entry->Node()->Last_child();
+    nn::vector::VECTOR_CTX vector_ctx;
+    vector_ctx.Update_slot(MAX_SLOT_ALLOWED);
+    nn::vector::VECTOR_CONFIG config;
+    config._max_slots = MAX_SLOT_ALLOWED;
+    nn::vector::TENSOR2VECTOR_CTX lowering_ctx(
+        container, vector_ctx, nullptr, config);
+    lowering_ctx.Set_cur_func_scope(&scope);
+    lowering_ctx.Push(body, body);
+    NODE_PTR input = container->New_ld(scope.Formal(0), spos);
+    NODE_PTR result = nn::vector::Emit_prepared_vector_kernel_native(
+        lowering_ctx, prepared, input, {}, spos);
+    container->Stmt_list().Append(container->New_retv(result, spos));
+    lowering_ctx.Pop(body, body);
+
+    if (!oracle->Verify_ir()) {
+        throw std::runtime_error(
+            "baseline Conv direct native oracle failed AIR verification");
+    }
+    return nn::vector::test::Normalize_vector_kernel_helper(scope);
+}
 
 void collect_call_statements(NODE_PTR node, std::vector<STMT_PTR>& calls) {
     if (node == Null_ptr) return;
@@ -3675,6 +3832,38 @@ void collect_call_statements(NODE_PTR node, std::vector<STMT_PTR>& calls) {
     for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
         collect_call_statements(node->Child(idx), calls);
     }
+}
+
+void collect_prepared_conv_input_stores(
+    NODE_PTR node, std::vector<STMT_PTR>& stores) {
+    if (node == Null_ptr) return;
+    if (node->Opcode() == air::core::OPC_STP && node->Has_preg() &&
+        node->Num_child() == 1 &&
+        node->Child(0)->Opcode() == nn::vector::OPC_RESHAPE) {
+        stores.push_back(node->Stmt());
+    }
+    if (node->Is_block()) {
+        for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+             stmt = stmt->Next()) {
+            collect_prepared_conv_input_stores(stmt->Node(), stores);
+        }
+        return;
+    }
+    for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
+        collect_prepared_conv_input_stores(node->Child(idx), stores);
+    }
+}
+
+bool statement_precedes_in_block(
+    NODE_PTR block, STMT_PTR before, STMT_PTR after) {
+    if (block == Null_ptr || !block->Is_block()) return false;
+    bool saw_before = false;
+    for (STMT_PTR stmt = block->Begin_stmt(); stmt != block->End_stmt();
+         stmt = stmt->Next()) {
+        if (stmt == before) saw_before = true;
+        if (stmt == after) return saw_before && stmt != before;
+    }
+    return false;
 }
 
 void collect_matching_ldp_nodes(NODE_PTR node, PREG_PTR preg,
@@ -3714,6 +3903,26 @@ NODE_PTR find_formal_load(NODE_PTR node, ADDR_DATUM_PTR formal) {
     }
     for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
         NODE_PTR found = find_formal_load(node->Child(idx), formal);
+        if (found != Null_ptr) return found;
+    }
+    return Null_ptr;
+}
+
+NODE_PTR find_preg_load(NODE_PTR node) {
+    if (node == Null_ptr) return Null_ptr;
+    if (node->Opcode() == air::core::OPC_LDP && node->Has_preg()) {
+        return node;
+    }
+    if (node->Is_block()) {
+        for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+             stmt = stmt->Next()) {
+            NODE_PTR found = find_preg_load(stmt->Node());
+            if (found != Null_ptr) return found;
+        }
+        return Null_ptr;
+    }
+    for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
+        NODE_PTR found = find_preg_load(node->Child(idx));
         if (found != Null_ptr) return found;
     }
     return Null_ptr;
@@ -5218,10 +5427,12 @@ public:
     }
 
 #ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
-    py::dict inspect_baseline_gemm_air_for_testing() const {
+    py::dict inspect_baseline_air_for_testing(
+        const std::string& helper_prefix,
+        bool has_prepared_input) const {
         if (!glob || !glob->Verify_ir()) {
             throw std::runtime_error(
-                "M5 AIR oracle requires a verified GLOB_SCOPE");
+                "baseline AIR oracle requires a verified GLOB_SCOPE");
         }
 
         FUNC_SCOPE* caller = nullptr;
@@ -5233,23 +5444,23 @@ public:
             FUNC_SCOPE* scope = &(*iter);
             const char* raw_name = scope->Owning_func()->Name()->Char_str();
             const std::string name = raw_name == nullptr ? "" : raw_name;
-            if (name.compare(0, M5_BASELINE_GEMM_HELPER_PREFIX.size(),
-                             M5_BASELINE_GEMM_HELPER_PREFIX) == 0) {
+            if (name.compare(0, helper_prefix.size(),
+                             helper_prefix) == 0) {
                 if (helper != nullptr) {
                     throw std::runtime_error(
-                        "M5 AIR oracle found multiple baseline-Gemm helpers");
+                        "baseline AIR oracle found multiple matching helpers");
                 }
                 helper = scope;
             } else {
                 if (caller != nullptr) {
                     throw std::runtime_error(
-                        "M5 AIR oracle requires one caller function");
+                        "baseline AIR oracle requires one caller function");
                 }
                 caller = scope;
             }
         }
         if (caller == nullptr) {
-            throw std::runtime_error("M5 AIR oracle found no caller function");
+            throw std::runtime_error("baseline AIR oracle found no caller function");
         }
 
         py::dict result;
@@ -5259,27 +5470,64 @@ public:
             collect_call_statements(caller_entry, calls);
             if (calls.size() != 1) {
                 throw std::runtime_error(
-                    "M5 AIR oracle requires one helper CALL");
+                    "baseline AIR oracle requires one helper CALL");
             }
             NODE_PTR call = calls[0]->Node();
             if (call->Num_arg() != 1 || caller->Formal_cnt() < 1) {
                 throw std::runtime_error(
-                    "M5 AIR oracle requires the one-input baseline-Gemm ABI");
+                    "baseline AIR oracle requires the one-input baseline helper ABI");
             }
             NODE_PTR actual = call->Child(0);
-            if (actual->Opcode() != air::core::OPC_LD || !actual->Has_sym() ||
-                actual->Addr_datum() != caller->Formal(0)) {
+            std::vector<NODE_PTR> expected_actuals;
+            std::string native_air;
+            bool prepared_input_ok = !has_prepared_input;
+            if (has_prepared_input) {
+                const char* raw_helper_name =
+                    helper->Owning_func()->Name()->Char_str();
+                const std::string helper_name =
+                    raw_helper_name == nullptr ? "" : raw_helper_name;
+                auto oracle = _baseline_conv_oracles.find(helper_name);
+                if (oracle == _baseline_conv_oracles.end()) {
+                    throw std::runtime_error(
+                        "baseline Conv helper has no retained native oracle");
+                }
+                expected_actuals = oracle->second._expected_actuals;
+                native_air = oracle->second._native_air;
+                std::vector<STMT_PTR> prepared_input_stores;
+                collect_prepared_conv_input_stores(
+                    caller_entry, prepared_input_stores);
+                if (expected_actuals.size() == 1 &&
+                    prepared_input_stores.size() == 1) {
+                    PREG_PTR prepared_preg =
+                        prepared_input_stores[0]->Node()->Preg();
+                    std::vector<NODE_PTR> prepared_loads;
+                    collect_matching_ldp_nodes(
+                        caller_entry, prepared_preg, prepared_loads);
+                    NODE_PTR caller_body = caller_entry->Last_child();
+                    prepared_input_ok =
+                        prepared_preg->Defining_func_scope() == caller &&
+                        prepared_preg->Type()->Is_compatible_type(
+                            helper->Formal(0)->Type()) &&
+                        prepared_loads.size() == 1 &&
+                        prepared_loads[0]->Id() == expected_actuals[0]->Id() &&
+                        statement_precedes_in_block(
+                            caller_body, prepared_input_stores[0], calls[0]);
+                }
+            } else if (actual->Opcode() != air::core::OPC_LD ||
+                       !actual->Has_sym() ||
+                       actual->Addr_datum() != caller->Formal(0)) {
                 throw std::runtime_error(
-                    "M5 helper CALL does not use the caller formal input");
+                    "baseline helper CALL does not use the caller formal input");
+            } else {
+                expected_actuals.push_back(actual);
             }
             std::vector<NODE_PTR> replacements;
             collect_matching_ldp_nodes(caller_entry, call->Ret_preg(),
                                        replacements);
             if (replacements.size() != 1) {
                 throw std::runtime_error(
-                    "M5 AIR oracle requires one replacing CALL LDP");
+                    "baseline AIR oracle requires one replacing CALL LDP");
             }
-            const std::vector<NODE_PTR> expected_actuals{actual};
             const nn::vector::test::VECTOR_KERNEL_AIR_COMPARE_RESULT bridge =
                 nn::vector::test::Check_vector_kernel_call_bridge(
                     *caller, calls[0], expected_actuals, replacements[0],
@@ -5289,16 +5537,19 @@ public:
                 nn::vector::test::Normalize_vector_kernel_helper(*helper);
             result["bridge_ok"] = bridge._equal;
             result["bridge_message"] = bridge._message;
+            result["prepared_input_ok"] = prepared_input_ok;
+            result["native_normalized"] =
+                has_prepared_input ? py::cast(native_air) : py::none();
             return result;
         }
 
         if (function_count != 1 || caller->Formal_cnt() < 1) {
             throw std::runtime_error(
-                "M5 native AIR oracle requires one one-input function");
+                "baseline native AIR oracle requires one one-input function");
         }
         NODE_PTR body = caller->Container().Entry_node()->Last_child();
         if (body == Null_ptr || !body->Is_block()) {
-            throw std::runtime_error("M5 native AIR oracle found no body");
+            throw std::runtime_error("baseline native AIR oracle found no body");
         }
         STMT_PTR terminal = Null_ptr;
         for (STMT_PTR stmt = body->Begin_stmt(); stmt != body->End_stmt();
@@ -5309,13 +5560,13 @@ public:
             terminal->Node()->Opcode() != air::core::OPC_RETV ||
             terminal->Node()->Num_child() != 1) {
             throw std::runtime_error(
-                "M5 native AIR oracle requires one terminal RETV");
+                "baseline native AIR oracle requires one terminal RETV");
         }
         NODE_PTR output_load = terminal->Node()->Child(0);
         if (output_load->Opcode() != air::core::OPC_LD ||
             !output_load->Has_sym()) {
             throw std::runtime_error(
-                "M5 native AIR oracle RETV must load the caller output");
+                "baseline native AIR oracle RETV must load the caller output");
         }
         ADDR_DATUM_PTR output = output_load->Addr_datum();
         STMT_PTR first_kernel = Null_ptr;
@@ -5329,25 +5580,30 @@ public:
                 break;
             }
             if (first_kernel == Null_ptr &&
-                node->Opcode() != air::core::OPC_COMMENT &&
-                node->Opcode() != air::core::OPC_PRAGMA) {
+                ((has_prepared_input &&
+                  node->Opcode() == air::core::OPC_ST) ||
+                 (!has_prepared_input &&
+                  node->Opcode() != air::core::OPC_COMMENT &&
+                  node->Opcode() != air::core::OPC_PRAGMA))) {
                 first_kernel = stmt;
             }
         }
         if (first_kernel == Null_ptr || output_store == Null_ptr ||
             output_store->Node()->Num_child() != 1) {
             throw std::runtime_error(
-                "M5 native AIR oracle could not isolate the kernel region");
+                "baseline native AIR oracle could not isolate the kernel region");
         }
         NODE_PTR input = Null_ptr;
         for (STMT_PTR stmt = first_kernel; stmt != output_store;
              stmt = stmt->Next()) {
-            input = find_formal_load(stmt->Node(), caller->Formal(0));
+            input = has_prepared_input
+                        ? find_preg_load(stmt->Node())
+                        : find_formal_load(stmt->Node(), caller->Formal(0));
             if (input != Null_ptr) break;
         }
         if (input == Null_ptr) {
             throw std::runtime_error(
-                "M5 native AIR oracle found no semantic input load");
+                "baseline native AIR oracle found no semantic input load");
         }
         NODE_PTR native_result = output_store->Node()->Child(0);
         const nn::vector::test::VECTOR_KERNEL_NATIVE_AIR_VIEW native_view{
@@ -5358,6 +5614,69 @@ public:
         result["bridge_ok"] = py::none();
         result["bridge_message"] = "";
         return result;
+    }
+
+    py::dict inspect_baseline_gemm_air_for_testing() const {
+        return inspect_baseline_air_for_testing(
+            BASELINE_GEMM_HELPER_PREFIX, false);
+    }
+
+    py::dict inspect_baseline_conv_air_for_testing() const {
+        return inspect_baseline_air_for_testing(
+            BASELINE_CONV_HELPER_PREFIX, true);
+    }
+
+    void mutate_baseline_conv_call_actual_for_testing() {
+        if (!glob || !glob->Verify_ir()) {
+            throw std::runtime_error(
+                "baseline Conv call mutation requires verified AIR");
+        }
+        FUNC_SCOPE* caller = nullptr;
+        FUNC_SCOPE* helper = nullptr;
+        for (GLOB_SCOPE::FUNC_SCOPE_ITER iter = glob->Begin_func_scope();
+             iter != glob->End_func_scope(); ++iter) {
+            FUNC_SCOPE* scope = &(*iter);
+            const char* raw_name = scope->Owning_func()->Name()->Char_str();
+            const std::string name = raw_name == nullptr ? "" : raw_name;
+            if (name.compare(0, BASELINE_CONV_HELPER_PREFIX.size(),
+                             BASELINE_CONV_HELPER_PREFIX) == 0) {
+                if (helper != nullptr) {
+                    throw std::runtime_error(
+                        "baseline Conv call mutation found multiple helpers");
+                }
+                helper = scope;
+            } else {
+                if (caller != nullptr) {
+                    throw std::runtime_error(
+                        "baseline Conv call mutation requires one caller");
+                }
+                caller = scope;
+            }
+        }
+        if (caller == nullptr || helper == nullptr) {
+            throw std::runtime_error(
+                "baseline Conv call mutation requires caller and helper");
+        }
+        std::vector<STMT_PTR> calls;
+        collect_call_statements(caller->Container().Entry_node(), calls);
+        if (calls.size() != 1 || calls[0]->Node()->Num_arg() != 1) {
+            throw std::runtime_error(
+                "baseline Conv call mutation requires one one-input CALL");
+        }
+
+        NODE_PTR call = calls[0]->Node();
+        NODE_PTR actual = call->Child(0);
+        PREG_PTR wrong_preg = caller->New_preg(actual->Rtype());
+        STMT_PTR wrong_store = caller->Container().New_stp(
+            caller->Container().New_zero(actual->Rtype(), actual->Spos()),
+            wrong_preg, actual->Spos());
+        STMT_LIST::Enclosing_list(calls[0]).Prepend(calls[0], wrong_store);
+        call->Set_child(
+            0, caller->Container().New_ldp(wrong_preg, actual->Spos()));
+        if (!glob->Verify_ir()) {
+            throw std::runtime_error(
+                "baseline Conv wrong-actual mutation produced invalid AIR");
+        }
     }
 
     void mutate_generated_vector_helper_for_testing(
@@ -5372,8 +5691,8 @@ public:
             FUNC_SCOPE* scope = &(*iter);
             const char* raw_name = scope->Owning_func()->Name()->Char_str();
             const std::string name = raw_name == nullptr ? "" : raw_name;
-            if (name.compare(0, M5_BASELINE_GEMM_HELPER_PREFIX.size(),
-                             M5_BASELINE_GEMM_HELPER_PREFIX) != 0) {
+            if (name.compare(0, BASELINE_GEMM_HELPER_PREFIX.size(),
+                             BASELINE_GEMM_HELPER_PREFIX) != 0) {
                 continue;
             }
             if (helper != nullptr) {
@@ -5472,6 +5791,9 @@ public:
         fhe::ckks::Set_skip_lowering_ops(skip_ops);
 
         nn::vector::VECTOR_KERNEL_LOWERING_REGISTRY registry;
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+        _baseline_conv_oracles.clear();
+#endif
         for (auto item : recipes) {
             const std::string key = py::cast<std::string>(item.first);
             if (!PyCallable_Check(item.second.ptr())) {
@@ -5484,11 +5806,27 @@ public:
                 bound_plan_kind(key);
             const bool inserted = registry.Register(
                 kind,
-                [callback = std::move(callback)](
+                [this, kind, callback = std::move(callback)](
                     const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared,
-                    const std::vector<NODE_PTR>&, GLOB_SCOPE&,
+                    const std::vector<NODE_PTR>& actuals, GLOB_SCOPE&,
                     const nn::vector::VECTOR_KERNEL_DESTINATION_ABI& abi) {
-                  return make_python_plan_recipe(callback, prepared, abi);
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+                  std::map<std::string, BASELINE_CONV_ORACLE_RECORD>*
+                      conv_oracles = nullptr;
+                  if (kind ==
+                      nn::vector::VECTOR_KERNEL_PLAN_KIND::BASELINE_CONV) {
+                    BASELINE_CONV_ORACLE_RECORD record{actuals, {}};
+                    _baseline_conv_oracles.try_emplace(
+                        prepared.Helper_name(), std::move(record));
+                    conv_oracles = &_baseline_conv_oracles;
+                  }
+#endif
+                  return make_python_plan_recipe(
+                      callback, prepared, abi
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+                      , conv_oracles
+#endif
+                      );
                 });
             if (!inserted) {
                 throw std::invalid_argument(
@@ -5517,6 +5855,10 @@ public:
     }
     
 private:
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+    std::map<std::string, BASELINE_CONV_ORACLE_RECORD>
+        _baseline_conv_oracles;
+#endif
     // Create the LOWER_CTX needed by FHE passes
     std::unique_ptr<fhe::core::LOWER_CTX> lower_ctx;
     bool fhe_types_registered = false;
@@ -7484,6 +7826,12 @@ PYBIND11_MODULE(air_builder, m) {
         .def("_inspect_baseline_gemm_air_for_testing",
              &GlobScope::inspect_baseline_gemm_air_for_testing,
              "Normalize one native or Python-helper baseline Gemm from AIR objects")
+        .def("_inspect_baseline_conv_air_for_testing",
+             &GlobScope::inspect_baseline_conv_air_for_testing,
+             "Normalize one native or Python-helper baseline Conv from AIR objects")
+        .def("_mutate_baseline_conv_call_actual_for_testing",
+             &GlobScope::mutate_baseline_conv_call_actual_for_testing,
+             "Replace the Conv helper actual with a valid same-typed wrong preg")
         .def("_mutate_generated_vector_helper_for_testing",
              &GlobScope::mutate_generated_vector_helper_for_testing,
              py::arg("mutation"),
