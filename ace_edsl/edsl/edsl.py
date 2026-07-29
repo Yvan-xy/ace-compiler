@@ -36,6 +36,7 @@ from ..base_dsl.utils.logger import log
 from ace_bindings import air_builder
 
 from .core.air_value import AIRValue, _wrap_air_value, to_air
+from .core.vector_array import VectorArray
 from .core.vector_value import VectorValue
 from .core.domain_registry import DOMAIN_PIPELINES
 from .core.type_mapping import python_type_to_air_type, is_plaintext_annotation
@@ -86,6 +87,7 @@ class AceEDSL(BaseDSL):
         )
         self.preprocessor.register_non_mutating_receiver_methods(
             VectorValue.NON_MUTATING_RECEIVER_METHODS
+            | VectorArray.NON_MUTATING_RECEIVER_METHODS
         )
         self.no_cache = True
         self.current_domain = None  # Set by decorator

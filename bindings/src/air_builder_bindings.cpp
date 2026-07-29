@@ -471,6 +471,23 @@ public:
                &type->Glob_scope() == &other.type->Glob_scope();
     }
 
+    int rank() const {
+        require_active();
+        if (!has_type || type == Null_ptr || !type->Is_array()) {
+            throw std::runtime_error("rank requires a ranked array type");
+        }
+        return static_cast<int>(type->Cast_to_arr()->Dim());
+    }
+
+    Type element_type() const {
+        require_active();
+        if (!has_type || type == Null_ptr || !type->Is_array()) {
+            throw std::runtime_error(
+                "element_type requires a ranked array type");
+        }
+        return from_air_type(type->Cast_to_arr()->Elem_type(), _lifetime);
+    }
+
     bool is_integer() const {
         require_active();
         return has_type && type->Is_int();
@@ -702,6 +719,9 @@ public:
     
     // Map variable names to their ADDR_DATUM for stores
     std::map<std::string, ADDR_DATUM_PTR> var_map;
+
+    // Named pseudo-registers used by reusable Vector epilogue helpers.
+    std::map<std::string, PREG_PTR> preg_map;
 
     bool callback_scoped;
     bool callback_expired;
@@ -2490,59 +2510,288 @@ public:
         return node;
     }
     
-    std::shared_ptr<Node> new_ild(std::shared_ptr<Node> base, std::shared_ptr<Node> idx) {
+    TYPE_PTR require_rank_one_array_base(
+        const std::shared_ptr<Node>& base, const char* operation,
+        bool mutable_vector_array) {
         require_not_expired();
-        if (!(container && base && base->has_node &&
-              base->node != NODE_PTR())) {
-            throw std::runtime_error("new_ild requires real container and base");
-        }
-        require_vector_operand(base, "new_ild");
-        TYPE_PTR idx_type = require_real_expression(idx, "new_ild");
-        if (idx->node->Domain() != air::core::CORE ||
-            !idx_type->Is_signed_int()) {
-            throw std::runtime_error(
-                "new_ild requires a Core signed integer index");
-        }
-        NODE_PTR base_node = base->node;
-        NODE_PTR base_addr = NODE_PTR();
-        if (base_node->Opcode() == air::core::OPC_LD) {
-            base_addr = container->New_lda(
-                base_node->Addr_datum(), air::base::POINTER_KIND::FLAT64, get_spos());
-        } else if (base_node->Opcode() == air::core::OPC_LDC) {
-            require_core_s32_operand(idx, "new_ild constant-array index");
-            base_addr = container->New_ldca(
-                base_node->Const(), air::base::POINTER_KIND::FLAT32,
-                get_spos());
+        require_real_expression(base, operation);
+        NODE_PTR raw = base->node;
+        TYPE_PTR array_type = Null_ptr;
+        const bool is_symbol =
+            raw->Opcode() == air::core::OPC_LD ||
+            raw->Opcode() == air::core::OPC_LDA;
+        const bool is_constant =
+            raw->Opcode() == air::core::OPC_LDC ||
+            raw->Opcode() == air::core::OPC_LDCA;
+        if (is_symbol) {
+            if (!raw->Has_sym()) {
+                throw std::runtime_error(
+                    std::string(operation) +
+                    " requires a symbol-backed array base");
+            }
+            array_type = get_compatible_type(raw->Addr_datum()->Type());
+        } else if (is_constant) {
+            if (!raw->Has_const_id()) {
+                throw std::runtime_error(
+                    std::string(operation) +
+                    " requires a constant-backed array base");
+            }
+            array_type = get_compatible_type(raw->Const()->Type());
         } else {
             throw std::runtime_error(
-                "new_ild only supports LD(array) or LDC(array) base");
+                std::string(operation) +
+                " only supports LD/LDA or LDC/LDCA array bases");
         }
-        NODE_PTR array = container->New_array(base_addr, 1, get_spos());
+        if (!array_type->Is_array() ||
+            array_type->Cast_to_arr()->Dim() != 1) {
+            throw std::runtime_error(
+                std::string(operation) +
+                " requires a rank-one outer array");
+        }
+        if (mutable_vector_array &&
+            (!is_symbol ||
+             !array_type->Cast_to_arr()->Elem_type()->Is_array())) {
+            throw std::runtime_error(
+                std::string(operation) +
+                " requires a mutable array of ranked vectors");
+        }
+        return array_type;
+    }
+
+    TYPE_PTR require_array_address(
+        const std::shared_ptr<Node>& address, const char* operation,
+        bool mutable_vector_array) {
+        require_not_expired();
+        TYPE_PTR pointer_type = require_real_expression(address, operation);
+        if (address->node->Opcode() != air::core::OPC_ARRAY ||
+            !pointer_type->Is_ptr() ||
+            pointer_type->Cast_to_ptr()->Ptr_kind() !=
+                air::base::POINTER_KIND::FLAT32 ||
+            pointer_type->Cast_to_ptr()->Domain_type_id().Is_null()) {
+            throw std::runtime_error(
+                std::string(operation) +
+                " requires a FLAT32 ARRAY address");
+        }
+        NODE_PTR base = address->node->Array_base();
+        if (mutable_vector_array &&
+            (base->Opcode() != air::core::OPC_LDA ||
+             !pointer_type->Cast_to_ptr()
+                  ->Domain_type()
+                  ->Base_type()
+                  ->Is_array())) {
+            throw std::runtime_error(
+                std::string(operation) +
+                " requires a mutable array-of-vector address");
+        }
+        return get_compatible_type(
+            pointer_type->Cast_to_ptr()->Domain_type()->Base_type());
+    }
+
+    std::shared_ptr<Node> new_index_const(int64_t value) {
+        require_not_expired();
+        if (!(container && glob)) {
+            throw std::runtime_error(
+                "new_index_const requires a real AIR container");
+        }
+        if (value < std::numeric_limits<int32_t>::min() ||
+            value > std::numeric_limits<int32_t>::max()) {
+            throw std::runtime_error(
+                "array index constant is out of signed i32 range");
+        }
+        TYPE_PTR i32_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
+        return wrap_node(
+            container->New_intconst(i32_type, value, get_spos()),
+            "air::core::INTCONST");
+    }
+
+    std::shared_ptr<Node> new_lda(std::shared_ptr<Node> base) {
+        require_not_expired();
+        require_rank_one_array_base(base, "new_lda", true);
+        if (base->node->Opcode() != air::core::OPC_LD) {
+            throw std::runtime_error(
+                "new_lda requires an LD of a mutable array of vectors");
+        }
+        NODE_PTR lda = container->New_lda(
+            base->node->Addr_datum(), air::base::POINTER_KIND::FLAT32,
+            get_spos());
+        auto result = wrap_node(lda, "air::core::LDA");
+        result->add_child(base);
+        return result;
+    }
+
+    std::shared_ptr<Node> new_array(std::shared_ptr<Node> base,
+                                    std::shared_ptr<Node> idx) {
+        require_not_expired();
+        require_core_s32_operand(idx, "new_array");
+        TYPE_PTR outer = require_rank_one_array_base(
+            base, "new_array", false);
+        NODE_PTR raw = base->node;
+        NODE_PTR address = NODE_PTR();
+        if (raw->Opcode() == air::core::OPC_LD) {
+            if (!outer->Cast_to_arr()->Elem_type()->Is_array()) {
+                throw std::runtime_error(
+                    "new_array mutable bases must contain ranked vectors");
+            }
+            address = container->New_lda(
+                raw->Addr_datum(), air::base::POINTER_KIND::FLAT32,
+                get_spos());
+        } else if (raw->Opcode() == air::core::OPC_LDA) {
+            if (!outer->Cast_to_arr()->Elem_type()->Is_array()) {
+                throw std::runtime_error(
+                    "new_array mutable bases must contain ranked vectors");
+            }
+            address = raw;
+        } else if (raw->Opcode() == air::core::OPC_LDC) {
+            address = container->New_ldca(
+                raw->Const(), air::base::POINTER_KIND::FLAT32, get_spos());
+        } else {
+            address = raw;
+        }
+        NODE_PTR array = container->New_array(address, 1, get_spos());
         container->Set_array_idx(array, 0, idx->node);
-        NODE_PTR ild = container->New_ild(array, get_spos());
-        auto node = wrap_node(ild, "air::core::ILD");
-        node->add_child(base);
-        node->add_child(idx);
-        return node;
+        auto result = wrap_node(array, "air::core::ARRAY");
+        result->add_child(base);
+        result->add_child(idx);
+        return result;
     }
-    
-    std::shared_ptr<Node> new_ist(std::shared_ptr<Node> val, std::shared_ptr<Node> base, 
-                                   std::shared_ptr<Node> idx) {
+
+    std::shared_ptr<Node> new_ild(std::shared_ptr<Node> address) {
         require_not_expired();
-        auto node = std::make_shared<Node>(++node_counter, "air::core::IST");
-        node->add_child(val);
-        node->add_child(base);
-        node->add_child(idx);
-        nodes.push_back(node);
-        return node;
+        require_array_address(address, "new_ild", false);
+        NODE_PTR ild = container->New_ild(address->node, get_spos());
+        auto result = wrap_node(ild, "air::core::ILD");
+        result->add_child(address);
+        return result;
     }
-    
-    std::shared_ptr<Node> new_array(std::shared_ptr<Node> base) {
+
+    std::shared_ptr<Node> new_ild(std::shared_ptr<Node> base,
+                                  std::shared_ptr<Node> idx) {
         require_not_expired();
-        auto node = std::make_shared<Node>(++node_counter, "air::core::ARRAY");
-        node->add_child(base);
-        nodes.push_back(node);
-        return node;
+        TYPE_PTR outer =
+            require_rank_one_array_base(base, "new_ild", false);
+        if (base->node->Opcode() == air::core::OPC_LD &&
+            !outer->Cast_to_arr()->Elem_type()->Is_array()) {
+            TYPE_PTR idx_type = require_real_expression(idx, "new_ild");
+            if (idx->node->Domain() != air::core::CORE ||
+                !idx_type->Is_signed_int()) {
+                throw std::runtime_error(
+                    "new_ild requires a Core signed integer index");
+            }
+            NODE_PTR base_address = container->New_lda(
+                base->node->Addr_datum(),
+                air::base::POINTER_KIND::FLAT64, get_spos());
+            NODE_PTR address =
+                container->New_array(base_address, 1, get_spos());
+            container->Set_array_idx(address, 0, idx->node);
+            NODE_PTR ild = container->New_ild(address, get_spos());
+            auto result = wrap_node(ild, "air::core::ILD");
+            result->add_child(base);
+            result->add_child(idx);
+            return result;
+        }
+        if (base->node->Opcode() == air::core::OPC_LDC ||
+            base->node->Opcode() == air::core::OPC_LDCA) {
+            require_core_s32_operand(
+                idx, "constant-array index");
+        }
+        return new_ild(new_array(std::move(base), std::move(idx)));
+    }
+
+    std::shared_ptr<Node> new_ist(std::shared_ptr<Node> address,
+                                  std::shared_ptr<Node> val) {
+        require_not_expired();
+        TYPE_PTR element =
+            require_array_address(address, "new_ist", true);
+        TYPE_PTR value_type = require_real_expression(val, "new_ist");
+        if (!Type::structurally_equal_air_types(element, value_type)) {
+            throw std::runtime_error(
+                "new_ist value type does not match array element type");
+        }
+        STMT_PTR stmt =
+            container->New_ist(address->node, val->node, get_spos());
+        append_stmt(stmt);
+        auto result = wrap_node(stmt->Node(), "air::core::IST");
+        result->add_child(address);
+        result->add_child(val);
+        return result;
+    }
+
+    std::shared_ptr<Node> new_ist(std::shared_ptr<Node> val,
+                                  std::shared_ptr<Node> base,
+                                  std::shared_ptr<Node> idx) {
+        require_not_expired();
+        TYPE_PTR outer =
+            require_rank_one_array_base(base, "new_ist", true);
+        TYPE_PTR value_type = require_real_expression(val, "new_ist");
+        if (!Type::structurally_equal_air_types(
+                outer->Cast_to_arr()->Elem_type(), value_type)) {
+            throw std::runtime_error(
+                "new_ist value type does not match array element type");
+        }
+        return new_ist(
+            new_array(std::move(base), std::move(idx)), std::move(val));
+    }
+
+    void new_preg(const std::string& name, const Type& requested_type) {
+        require_not_expired();
+        if (!(container && func_scope)) {
+            throw std::runtime_error("new_preg requires a real function scope");
+        }
+        TYPE_PTR type = require_local_type(requested_type, "new_preg");
+        auto found = preg_map.find(name);
+        if (found != preg_map.end()) {
+            if (!Type::structurally_equal_air_types(
+                    found->second->Type(), type)) {
+                throw std::runtime_error(
+                    "new_preg redeclaration has an incompatible type: " +
+                    name);
+            }
+            return;
+        }
+        preg_map.emplace(name, func_scope->New_preg(type));
+    }
+
+    std::shared_ptr<Node> new_ldp(const std::string& name) {
+        require_not_expired();
+        auto found = preg_map.find(name);
+        if (found == preg_map.end()) {
+            throw std::runtime_error("Unknown pseudo-register: " + name);
+        }
+        return wrap_node(
+            container->New_ldp(found->second, get_spos()),
+            "air::core::LDP");
+    }
+
+    std::shared_ptr<Node> new_stp(const std::string& name,
+                                  std::shared_ptr<Node> val) {
+        require_not_expired();
+        auto found = preg_map.find(name);
+        if (found == preg_map.end()) {
+            throw std::runtime_error("Unknown pseudo-register: " + name);
+        }
+        TYPE_PTR value_type = require_real_expression(val, "new_stp");
+        if (!Type::structurally_equal_air_types(
+                found->second->Type(), value_type)) {
+            throw std::runtime_error(
+                "new_stp value type does not match pseudo-register type");
+        }
+        STMT_PTR stmt =
+            container->New_stp(val->node, found->second, get_spos());
+        append_stmt(stmt);
+        auto result = wrap_node(stmt->Node(), "air::core::STP");
+        result->add_child(val);
+        return result;
+    }
+
+    std::shared_ptr<Node> new_comment(const std::string& text) {
+        require_not_expired();
+        if (!container) {
+            throw std::runtime_error(
+                "new_comment requires a real AIR container");
+        }
+        STMT_PTR stmt = container->New_comment(text.c_str(), get_spos());
+        append_stmt(stmt);
+        return wrap_node(stmt->Node(), "air::core::COMMENT");
     }
     
     // ═══════════════════════════════════════════════════════════════════════
@@ -3378,6 +3627,13 @@ py::dict prepared_common_plan_snapshot(
     }
     data["runtime_vector_inputs"] = py::tuple(runtime_types);
 
+    py::list runtime_scalar_types;
+    for (const auto& type : common._runtime_scalar_inputs) {
+        runtime_scalar_types.append(
+            nn::vector::Vector_kernel_primitive_type_name(type));
+    }
+    data["runtime_scalar_inputs"] = py::tuple(runtime_scalar_types);
+
     py::list loops;
     for (const auto& loop : common._loops) {
         py::dict item;
@@ -3463,6 +3719,17 @@ py::dict prepared_common_plan_snapshot(
         runtime_preparations.append(std::move(item));
     }
     data["runtime_preparations"] = py::tuple(runtime_preparations);
+    py::list scalar_preparations;
+    for (const auto& preparation : prepared.Scalar_preparations()) {
+        py::dict item;
+        item["role"] = preparation._role;
+        item["source_operand"] = preparation._source_operand;
+        item["type"] = nn::vector::Vector_kernel_primitive_type_name(
+            preparation._type);
+        item["scale"] = preparation._scale;
+        scalar_preparations.append(std::move(item));
+    }
+    data["scalar_preparations"] = py::tuple(scalar_preparations);
     return data;
 }
 
@@ -3510,6 +3777,82 @@ py::object prepared_baseline_conv_snapshot(
     return freeze(std::move(data));
 }
 
+py::object prepared_fast_gemm_snapshot(
+    const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared) {
+    if (!std::holds_alternative<nn::vector::FAST_GEMM_PLAN>(
+            prepared.Plan())) {
+        throw std::runtime_error(
+            "fast Gemm snapshot received another plan kind");
+    }
+    const auto& plan =
+        std::get<nn::vector::FAST_GEMM_PLAN>(prepared.Plan());
+    py::dict data = prepared_common_plan_snapshot(
+        prepared, plan._common, "fast-gemm");
+    data["n"] = plan._n;
+    data["k"] = plan._k;
+    data["np"] = plan._np;
+    data["kp"] = plan._kp;
+    data["nd"] = plan._nd;
+    data["kd"] = plan._kd;
+    data["block_size"] = plan._block_size;
+    data["blocks_per_partition"] = plan._blocks_per_partition;
+    data["packed_partitions"] = plan._packed_partitions;
+    data["shift"] = plan._shift;
+    data["shift_buffer"] = plan._shift_buffer;
+    data["grid_size"] = plan._grid_size;
+    data["input_replications"] = plan._input_replications;
+    py::object freeze = py::module_::import(
+        "ace_edsl.edsl.vector_kernel_lowering").attr(
+            "_freeze_prepared_fast_gemm_plan");
+    return freeze(std::move(data));
+}
+
+py::object prepared_fast_conv_snapshot(
+    const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared) {
+    if (!std::holds_alternative<nn::vector::FAST_CONV_PLAN>(
+            prepared.Plan())) {
+        throw std::runtime_error(
+            "fast Conv snapshot received another plan kind");
+    }
+    const auto& plan =
+        std::get<nn::vector::FAST_CONV_PLAN>(prepared.Plan());
+    py::dict data = prepared_common_plan_snapshot(
+        prepared, plan._common, "fast-conv");
+    data["channel_in"] = plan._channel_in;
+    data["channel_out"] = plan._channel_out;
+    data["output_height"] = plan._output_height;
+    data["output_width"] = plan._output_width;
+    data["kernel_hw"] = plan._kernel_hw;
+    data["group"] = plan._group;
+    data["stride"] = plan._stride;
+    data["input_size"] = plan._input_size;
+    data["output_size"] = plan._output_size;
+    data["num_slots"] = plan._num_slots;
+    data["num_grid"] = plan._num_grid;
+    data["num_block"] = plan._num_block;
+    data["width_block"] = plan._width_block;
+    data["width_block_data"] = plan._width_block_data;
+    data["width_block_pad"] = plan._width_block_pad;
+    data["position_block"] = plan._position_block;
+    data["capacity_block"] = plan._capacity_block;
+    data["input_duplications"] = plan._input_duplications;
+    data["blocking_outer_depth"] = plan._blocking_outer_depth;
+    data["cyclic_roll"] = plan._cyclic_roll;
+    if (plan._sharding_offset.has_value()) {
+        py::dict offset;
+        offset["type"] = nn::vector::Vector_kernel_primitive_type_name(
+            plan._sharding_offset->_type);
+        offset["scale"] = plan._sharding_offset->_scale;
+        data["sharding_offset"] = std::move(offset);
+    } else {
+        data["sharding_offset"] = py::none();
+    }
+    py::object freeze = py::module_::import(
+        "ace_edsl.edsl.vector_kernel_lowering").attr(
+            "_freeze_prepared_fast_conv_plan");
+    return freeze(std::move(data));
+}
+
 py::object prepared_vector_kernel_snapshot(
     const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared) {
     if (std::holds_alternative<nn::vector::BASELINE_GEMM_PLAN>(
@@ -3520,9 +3863,15 @@ py::object prepared_vector_kernel_snapshot(
             prepared.Plan())) {
         return prepared_baseline_conv_snapshot(prepared);
     }
-    throw std::runtime_error(
-        "Python destination bridge supports baseline-gemm and "
-        "baseline-conv only");
+    if (std::holds_alternative<nn::vector::FAST_GEMM_PLAN>(
+            prepared.Plan())) {
+        return prepared_fast_gemm_snapshot(prepared);
+    }
+    if (std::holds_alternative<nn::vector::FAST_CONV_PLAN>(
+            prepared.Plan())) {
+        return prepared_fast_conv_snapshot(prepared);
+    }
+    throw std::runtime_error("unsupported Python destination plan kind");
 }
 
 
@@ -3674,8 +4023,15 @@ nn::vector::VECTOR_KERNEL_PLAN_KIND bound_plan_kind(
     if (name == "baseline-conv") {
         return nn::vector::VECTOR_KERNEL_PLAN_KIND::BASELINE_CONV;
     }
+    if (name == "fast-gemm") {
+        return nn::vector::VECTOR_KERNEL_PLAN_KIND::FAST_GEMM;
+    }
+    if (name == "fast-conv") {
+        return nn::vector::VECTOR_KERNEL_PLAN_KIND::FAST_CONV;
+    }
     throw std::invalid_argument(
-        "Python recipe registry supports baseline-gemm and baseline-conv only");
+        "Python recipe registry supports baseline-gemm, baseline-conv, "
+        "fast-gemm, and fast-conv");
 }
 
 #ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
@@ -7589,6 +7945,8 @@ PYBIND11_MODULE(air_builder, m) {
         .def("bit_width", &Type::bit_width)
         .def("structurally_equal", &Type::structurally_equal)
         .def("same_scope", &Type::same_scope)
+        .def("rank", &Type::rank)
+        .def("element_type", &Type::element_type)
         .def("shape", &Type::get_shape)
         .def("__eq__", &Type::structurally_equal, py::is_operator())
         .def("__repr__", &Type::to_string);
@@ -7714,8 +8072,51 @@ PYBIND11_MODULE(air_builder, m) {
         // Memory operations
         .def("new_ld", &Container::new_ld)
         .def("new_st", &Container::new_st)
-        .def("new_ild", &Container::new_ild)
-        .def("new_ist", &Container::new_ist)
+        .def("new_lda", &Container::new_lda,
+             py::arg("base"),
+             "Take a FLAT32 address of a rank-one mutable array of vectors")
+        .def("new_array", &Container::new_array,
+             py::arg("base"), py::arg("index"),
+             "Create a typed rank-one ARRAY address with a Core s32 index")
+        .def("new_ild",
+             py::overload_cast<std::shared_ptr<Node>>(
+                 &Container::new_ild),
+             py::arg("address"),
+             "Load through a typed ARRAY address")
+        .def("new_ild",
+             py::overload_cast<std::shared_ptr<Node>,
+                               std::shared_ptr<Node>>(
+                 &Container::new_ild),
+             py::arg("base"), py::arg("index"),
+             "Index a rank-one array and load its element")
+        .def("new_ist",
+             py::overload_cast<std::shared_ptr<Node>,
+                               std::shared_ptr<Node>>(
+                 &Container::new_ist),
+             py::arg("address"), py::arg("value"),
+             "Store a matching vector through a mutable ARRAY address")
+        .def("new_ist",
+             py::overload_cast<std::shared_ptr<Node>,
+                               std::shared_ptr<Node>,
+                               std::shared_ptr<Node>>(
+                 &Container::new_ist),
+             py::arg("value"), py::arg("base"), py::arg("index"),
+             "Index a mutable array of vectors and store a matching element")
+        .def("new_index_const", &Container::new_index_const,
+             py::arg("value"),
+             "Create a signed Core i32 array index constant")
+        .def("new_preg", &Container::new_preg,
+             py::arg("name"), py::arg("type"),
+             "Declare a named, destination-owned pseudo-register")
+        .def("new_ldp", &Container::new_ldp,
+             py::arg("name"),
+             "Load a named pseudo-register")
+        .def("new_stp", &Container::new_stp,
+             py::arg("name"), py::arg("value"),
+             "Store a matching value to a named pseudo-register")
+        .def("new_comment", &Container::new_comment,
+             py::arg("text"),
+             "Append a Core comment statement")
         .def("new_intconst", &Container::new_intconst)
         .def("new_intconst_typed", &Container::new_intconst_typed,
              py::arg("value"), py::arg("type"),
@@ -7741,7 +8142,6 @@ PYBIND11_MODULE(air_builder, m) {
         .def("new_checked_cast", &Container::new_checked_cast,
              py::arg("value"), py::arg("type"),
              "Validate an explicit no-op cast; width conversions are unsupported")
-        .def("new_array", &Container::new_array)
         .def("new_retv", &Container::new_retv)
         .def("new_ret", &Container::new_ret)
         .def("new_stid", &Container::new_stid,

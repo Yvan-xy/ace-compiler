@@ -50,6 +50,7 @@ from .core.types import (
 
 # Export AIRValue for operator overloading
 from .core.air_value import AIRValue, to_air
+from .core.vector_array import VectorArray
 from .core.vector_value import VectorValue
 
 # Export domain-specific operations
@@ -78,6 +79,8 @@ from .pipeline import (
 from .vector_kernel_lowering import (
     PreparedBaselineConvPlan,
     PreparedBaselineGemmPlan,
+    PreparedFastConvPlan,
+    PreparedFastGemmPlan,
     vector_kernel_recipe,
 )
 from .kernels.vector.baseline_gemm import (
@@ -147,6 +150,8 @@ __all__ = [
     'VectorKernelLoweringConfig',
     'PreparedBaselineConvPlan',
     'PreparedBaselineGemmPlan',
+    'PreparedFastConvPlan',
+    'PreparedFastGemmPlan',
     'vector_kernel_recipe',
     'baseline_gemm_recipe',
     'baseline_gemm_vector_kernel',
@@ -201,6 +206,7 @@ __all__ = [
     'is_tensor_type',
     'is_scalar_type',
     'AIRValue',
+    'VectorArray',
     'VectorValue',
     'to_air',
     # Loop and control flow helpers (from base_dsl)

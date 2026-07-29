@@ -82,6 +82,20 @@ class RuntimePreparationPlan:
 
 
 @dataclass(frozen=True)
+class ScalarPreparationPlan:
+    role: str
+    source_operand: int
+    type: str
+    scale: int
+
+
+@dataclass(frozen=True)
+class ShardingOffsetPlan:
+    type: str
+    scale: int
+
+
+@dataclass(frozen=True)
 class PreparedBaselineGemmPlan:
     kind: str
     provenance: str
@@ -91,6 +105,7 @@ class PreparedBaselineGemmPlan:
     width: int
     input_duplications: int
     runtime_vector_inputs: Tuple[RankedTypePlan, ...]
+    runtime_scalar_inputs: Tuple[str, ...]
     result_type: RankedTypePlan
     loops: Tuple[LoopPlan, ...]
     slices: Tuple[SlicePlan, ...]
@@ -100,46 +115,7 @@ class PreparedBaselineGemmPlan:
     slot: SlotPlan
     constants: Tuple[ConstantPlan, ...]
     runtime_preparations: Tuple[RuntimePreparationPlan, ...]
-
-    def loop(self, role: str) -> LoopPlan:
-        return _unique_role(self.loops, role, "loop")
-
-    def slice(self, role: str) -> SlicePlan:
-        return _unique_role(self.slices, role, "slice")
-
-    def rotation(self, role: str) -> RotationPlan:
-        return _unique_role(self.rotations, role, "rotation")
-
-    def reduction(self, role: str) -> ReductionPlan:
-        return _unique_role(self.reductions, role, "reduction")
-
-    def constant(self, role: str) -> ConstantPlan:
-        return _unique_role(self.constants, role, "constant")
-
-
-@dataclass(frozen=True)
-class PreparedBaselineConvPlan:
-    kind: str
-    provenance: str
-    specialization_key: str
-    helper_name: str
-    channel_in: int
-    channel_out: int
-    output_height: int
-    output_width: int
-    kernel_hw: int
-    stride: int
-    input_duplications: int
-    runtime_vector_inputs: Tuple[RankedTypePlan, ...]
-    result_type: RankedTypePlan
-    loops: Tuple[LoopPlan, ...]
-    slices: Tuple[SlicePlan, ...]
-    rotations: Tuple[RotationPlan, ...]
-    reductions: Tuple[ReductionPlan, ...]
-    mask: MaskPlan
-    slot: SlotPlan
-    constants: Tuple[ConstantPlan, ...]
-    runtime_preparations: Tuple[RuntimePreparationPlan, ...]
+    scalar_preparations: Tuple[ScalarPreparationPlan, ...]
 
     def loop(self, role: str) -> LoopPlan:
         return _unique_role(self.loops, role, "loop")
@@ -159,6 +135,172 @@ class PreparedBaselineConvPlan:
     def runtime_preparation(self, role: str) -> RuntimePreparationPlan:
         return _unique_role(
             self.runtime_preparations, role, "runtime preparation"
+        )
+
+
+@dataclass(frozen=True)
+class PreparedBaselineConvPlan:
+    kind: str
+    provenance: str
+    specialization_key: str
+    helper_name: str
+    channel_in: int
+    channel_out: int
+    output_height: int
+    output_width: int
+    kernel_hw: int
+    stride: int
+    input_duplications: int
+    runtime_vector_inputs: Tuple[RankedTypePlan, ...]
+    runtime_scalar_inputs: Tuple[str, ...]
+    result_type: RankedTypePlan
+    loops: Tuple[LoopPlan, ...]
+    slices: Tuple[SlicePlan, ...]
+    rotations: Tuple[RotationPlan, ...]
+    reductions: Tuple[ReductionPlan, ...]
+    mask: MaskPlan
+    slot: SlotPlan
+    constants: Tuple[ConstantPlan, ...]
+    runtime_preparations: Tuple[RuntimePreparationPlan, ...]
+    scalar_preparations: Tuple[ScalarPreparationPlan, ...]
+
+    def loop(self, role: str) -> LoopPlan:
+        return _unique_role(self.loops, role, "loop")
+
+    def slice(self, role: str) -> SlicePlan:
+        return _unique_role(self.slices, role, "slice")
+
+    def rotation(self, role: str) -> RotationPlan:
+        return _unique_role(self.rotations, role, "rotation")
+
+    def reduction(self, role: str) -> ReductionPlan:
+        return _unique_role(self.reductions, role, "reduction")
+
+    def constant(self, role: str) -> ConstantPlan:
+        return _unique_role(self.constants, role, "constant")
+
+    def runtime_preparation(self, role: str) -> RuntimePreparationPlan:
+        return _unique_role(
+            self.runtime_preparations, role, "runtime preparation"
+        )
+
+
+@dataclass(frozen=True)
+class PreparedFastGemmPlan:
+    kind: str
+    provenance: str
+    specialization_key: str
+    helper_name: str
+    n: int
+    k: int
+    np: int
+    kp: int
+    nd: int
+    kd: int
+    block_size: int
+    blocks_per_partition: int
+    packed_partitions: int
+    shift: int
+    shift_buffer: int
+    grid_size: int
+    input_replications: int
+    runtime_vector_inputs: Tuple[RankedTypePlan, ...]
+    runtime_scalar_inputs: Tuple[str, ...]
+    result_type: RankedTypePlan
+    loops: Tuple[LoopPlan, ...]
+    slices: Tuple[SlicePlan, ...]
+    rotations: Tuple[RotationPlan, ...]
+    reductions: Tuple[ReductionPlan, ...]
+    mask: MaskPlan
+    slot: SlotPlan
+    constants: Tuple[ConstantPlan, ...]
+    runtime_preparations: Tuple[RuntimePreparationPlan, ...]
+    scalar_preparations: Tuple[ScalarPreparationPlan, ...]
+
+    def loop(self, role: str) -> LoopPlan:
+        return _unique_role(self.loops, role, "loop")
+
+    def slice(self, role: str) -> SlicePlan:
+        return _unique_role(self.slices, role, "slice")
+
+    def rotation(self, role: str) -> RotationPlan:
+        return _unique_role(self.rotations, role, "rotation")
+
+    def reduction(self, role: str) -> ReductionPlan:
+        return _unique_role(self.reductions, role, "reduction")
+
+    def constant(self, role: str) -> ConstantPlan:
+        return _unique_role(self.constants, role, "constant")
+
+    def runtime_preparation(self, role: str) -> RuntimePreparationPlan:
+        return _unique_role(
+            self.runtime_preparations, role, "runtime preparation"
+        )
+
+
+@dataclass(frozen=True)
+class PreparedFastConvPlan:
+    kind: str
+    provenance: str
+    specialization_key: str
+    helper_name: str
+    channel_in: int
+    channel_out: int
+    output_height: int
+    output_width: int
+    kernel_hw: int
+    group: int
+    stride: int
+    input_size: int
+    output_size: int
+    num_slots: int
+    num_grid: int
+    num_block: int
+    width_block: int
+    width_block_data: int
+    width_block_pad: int
+    position_block: int
+    capacity_block: int
+    input_duplications: int
+    blocking_outer_depth: int
+    cyclic_roll: bool
+    sharding_offset: ShardingOffsetPlan | None
+    runtime_vector_inputs: Tuple[RankedTypePlan, ...]
+    runtime_scalar_inputs: Tuple[str, ...]
+    result_type: RankedTypePlan
+    loops: Tuple[LoopPlan, ...]
+    slices: Tuple[SlicePlan, ...]
+    rotations: Tuple[RotationPlan, ...]
+    reductions: Tuple[ReductionPlan, ...]
+    mask: MaskPlan
+    slot: SlotPlan
+    constants: Tuple[ConstantPlan, ...]
+    runtime_preparations: Tuple[RuntimePreparationPlan, ...]
+    scalar_preparations: Tuple[ScalarPreparationPlan, ...]
+
+    def loop(self, role: str) -> LoopPlan:
+        return _unique_role(self.loops, role, "loop")
+
+    def slice(self, role: str) -> SlicePlan:
+        return _unique_role(self.slices, role, "slice")
+
+    def rotation(self, role: str) -> RotationPlan:
+        return _unique_role(self.rotations, role, "rotation")
+
+    def reduction(self, role: str) -> ReductionPlan:
+        return _unique_role(self.reductions, role, "reduction")
+
+    def constant(self, role: str) -> ConstantPlan:
+        return _unique_role(self.constants, role, "constant")
+
+    def runtime_preparation(self, role: str) -> RuntimePreparationPlan:
+        return _unique_role(
+            self.runtime_preparations, role, "runtime preparation"
+        )
+
+    def scalar_preparation(self, role: str) -> ScalarPreparationPlan:
+        return _unique_role(
+            self.scalar_preparations, role, "scalar preparation"
         )
 
 
@@ -182,6 +324,9 @@ def _freeze_common_plan_fields(data):
     return {
         "runtime_vector_inputs": tuple(
             _ranked_type(item) for item in data["runtime_vector_inputs"]
+        ),
+        "runtime_scalar_inputs": tuple(
+            str(item) for item in data["runtime_scalar_inputs"]
         ),
         "result_type": _ranked_type(data["result_type"]),
         "loops": tuple(LoopPlan(**dict(item)) for item in data["loops"]),
@@ -255,6 +400,15 @@ def _freeze_common_plan_fields(data):
             )
             for item in data["runtime_preparations"]
         ),
+        "scalar_preparations": tuple(
+            ScalarPreparationPlan(
+                role=str(item["role"]),
+                source_operand=int(item["source_operand"]),
+                type=str(item["type"]),
+                scale=int(item["scale"]),
+            )
+            for item in data["scalar_preparations"]
+        ),
     }
 
 
@@ -290,6 +444,73 @@ def _freeze_prepared_baseline_conv_plan(data) -> PreparedBaselineConvPlan:
         kernel_hw=int(data["kernel_hw"]),
         stride=int(data["stride"]),
         input_duplications=int(data["input_duplications"]),
+        **_freeze_common_plan_fields(data),
+    )
+
+
+def _freeze_prepared_fast_gemm_plan(data) -> PreparedFastGemmPlan:
+    # Copy a fast Gemm snapshot into an immutable owned value.
+    if data["kind"] != "fast-gemm":
+        raise ValueError("fast Gemm freezer received another plan kind")
+    return PreparedFastGemmPlan(
+        kind=str(data["kind"]),
+        provenance=str(data["provenance"]),
+        specialization_key=str(data["specialization_key"]),
+        helper_name=str(data["helper_name"]),
+        n=int(data["n"]),
+        k=int(data["k"]),
+        np=int(data["np"]),
+        kp=int(data["kp"]),
+        nd=int(data["nd"]),
+        kd=int(data["kd"]),
+        block_size=int(data["block_size"]),
+        blocks_per_partition=int(data["blocks_per_partition"]),
+        packed_partitions=int(data["packed_partitions"]),
+        shift=int(data["shift"]),
+        shift_buffer=int(data["shift_buffer"]),
+        grid_size=int(data["grid_size"]),
+        input_replications=int(data["input_replications"]),
+        **_freeze_common_plan_fields(data),
+    )
+
+
+def _freeze_prepared_fast_conv_plan(data) -> PreparedFastConvPlan:
+    # Copy a fast Conv snapshot into an immutable owned value.
+    if data["kind"] != "fast-conv":
+        raise ValueError("fast Conv freezer received another plan kind")
+    offset = data["sharding_offset"]
+    return PreparedFastConvPlan(
+        kind=str(data["kind"]),
+        provenance=str(data["provenance"]),
+        specialization_key=str(data["specialization_key"]),
+        helper_name=str(data["helper_name"]),
+        channel_in=int(data["channel_in"]),
+        channel_out=int(data["channel_out"]),
+        output_height=int(data["output_height"]),
+        output_width=int(data["output_width"]),
+        kernel_hw=int(data["kernel_hw"]),
+        group=int(data["group"]),
+        stride=int(data["stride"]),
+        input_size=int(data["input_size"]),
+        output_size=int(data["output_size"]),
+        num_slots=int(data["num_slots"]),
+        num_grid=int(data["num_grid"]),
+        num_block=int(data["num_block"]),
+        width_block=int(data["width_block"]),
+        width_block_data=int(data["width_block_data"]),
+        width_block_pad=int(data["width_block_pad"]),
+        position_block=int(data["position_block"]),
+        capacity_block=int(data["capacity_block"]),
+        input_duplications=int(data["input_duplications"]),
+        blocking_outer_depth=int(data["blocking_outer_depth"]),
+        cyclic_roll=bool(data["cyclic_roll"]),
+        sharding_offset=(
+            None
+            if offset is None
+            else ShardingOffsetPlan(
+                type=str(offset["type"]), scale=int(offset["scale"])
+            )
+        ),
         **_freeze_common_plan_fields(data),
     )
 
