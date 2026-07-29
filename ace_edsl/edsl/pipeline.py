@@ -414,6 +414,31 @@ class AcePipeline:
             
             # Stage 2: vector2sihe (skip if starting at fhe::sihe or later)
             if start_domain in ("nn::core", "nn::vector"):
+                # Temporary forced-baseline-GEMM E2E bridge. M13 replaces this
+                # binding-side delegation with the Python AIR inliner, and M15
+                # removes the tentative path.
+                if (
+                    self.vector_kernel_config is not None
+                    and self.vector_kernel_config.kernel_impl == "dsl"
+                    and self.vector_kernel_config.plan_kind == "baseline-gemm"
+                ):
+                    log("Running generated-helper function inliner...")
+                    from .passes.function_inliner import FunctionInlinerPass
+
+                    inline_result = FunctionInlinerPass.run(
+                        self.glob_scope, policy="always"
+                    )
+                    if not inline_result.success:
+                        result.error = "vector-kernel inliner failed: " + "; ".join(
+                            inline_result.diagnostics
+                        )
+                        return result
+                    result.stages_completed.append("vector_kernel_inline")
+                    if dump_stages:
+                        result.air_dumps["vector_kernel_inline"] = self.dump_air(
+                            "vector_kernel_inline"
+                        )
+
                 log("Running vector2sihe (nn::vector → fhe::sihe)...")
                 if not self.run_vector2sihe(skip_ops):
                     result.error = "vector2sihe failed"
@@ -979,6 +1004,48 @@ class Pipeline:
         # Run each phase
         try:
             for phase in phases:
+                # Temporary forced-baseline-GEMM E2E bridge. M13 replaces this
+                # binding-side delegation with the Python AIR inliner, and M15
+                # removes the tentative path.
+                if (
+                    phase == "vector2sihe"
+                    and self.vector_kernel_config is not None
+                    and self.vector_kernel_config.kernel_impl == "dsl"
+                    and self.vector_kernel_config.plan_kind == "baseline-gemm"
+                ):
+                    if self.verbose:
+                        print("[Pipeline] Running vector_kernel_inline...")
+                    from .passes.function_inliner import FunctionInlinerPass
+
+                    inline_start = time.time()
+                    inline_result = FunctionInlinerPass.run(self.glob, policy="always")
+                    inline_elapsed = time.time() - inline_start
+                    self.timings["vector_kernel_inline"] = inline_elapsed
+                    if not inline_result.success:
+                        result.success = False
+                        result.error = (
+                            "Phase vector_kernel_inline failed: "
+                            + "; ".join(inline_result.diagnostics)
+                        )
+                        if self.verbose:
+                            print(
+                                "  ✗ vector_kernel_inline failed "
+                                f"({inline_elapsed:.2f}s)"
+                            )
+                        return result
+                    result.stages_completed.append("vector_kernel_inline")
+                    if self.verbose:
+                        print(
+                            "  ✓ vector_kernel_inline "
+                            f"({inline_elapsed:.2f}s, "
+                            f"{inline_result.calls_inlined} calls)"
+                        )
+                    if self.dump_ir:
+                        self.phase_irs["vector_kernel_inline"] = self.glob.dump()
+                        self._save_ir("vector_kernel_inline")
+                    if self.on_phase_complete:
+                        self.on_phase_complete("vector_kernel_inline", self.glob.dump())
+
                 if self.verbose:
                     print(f"[Pipeline] Running {phase}...")
                 
