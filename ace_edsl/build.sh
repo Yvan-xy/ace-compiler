@@ -167,7 +167,15 @@ run_tests() {
     # Run pytest tests (quick ones only, skip slow codegen tests)
     if [ -d "tests" ]; then
         info "Running unit tests..."
-        if timeout "${PYTEST_TIMEOUT}" python3 -m pytest tests/test_domain_kernels.py tests/test_bootstrap_stage_ops.py tests/test_bootstrap_full.py tests/test_vector_kernel_core_types.py tests/test_vector_kernel_baseline_gemm.py -v --tb=short 2>&1; then
+        if timeout "${PYTEST_TIMEOUT}" python3 -m pytest \
+            tests/test_domain_kernels.py \
+            tests/test_bootstrap_stage_ops.py \
+            tests/test_bootstrap_full.py \
+            tests/test_vector_kernel_core_types.py \
+            tests/test_vector_kernel_baseline_gemm.py \
+            tests/test_function_inliner.py \
+            tests/test_gemm_e2e_compare.py \
+            -v --tb=short 2>&1; then
             info "Unit tests passed"
             PASSED=$((PASSED + 1))
         else
