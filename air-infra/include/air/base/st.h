@@ -549,6 +549,8 @@ public:
   CONSTANT_ITER End_const() const;
   FUNC_ITER     Begin_func() const;
   FUNC_ITER     End_func() const;
+  ENTRY_ITER    Begin_entry() const;
+  ENTRY_ITER    End_entry() const;
   ARB_ITER      Begin_arb() const;
   ARB_ITER      End_arb() const;
 

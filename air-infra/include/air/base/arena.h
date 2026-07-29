@@ -54,12 +54,18 @@ public:
 
   template <typename T>
   void Delete(const PTR_FROM_DATA<T>& ptr) {
+    AIR_ASSERT(ptr.Is_norm());
+    AIR_ASSERT(ptr.Id().Value() < _core.Size());
+    AIR_ASSERT(_core.Find(ptr.Id().Value()) == ptr.Addr());
     ptr.Addr()->~T();
     _core.Deallocate(ptr.Id().Value());
   }
 
   template <typename T>
   void Delete_array(const PTR_FROM_DATA<T>& ptr, size_t num_elem) {
+    AIR_ASSERT(ptr.Is_norm());
+    AIR_ASSERT(ptr.Id().Value() < _core.Size());
+    AIR_ASSERT(_core.Find(ptr.Id().Value()) == ptr.Addr());
     const size_t bytes = sizeof(T);
     for (T* elem = ptr.Addr() + num_elem - 1; num_elem > 0;
          --num_elem, --elem) {

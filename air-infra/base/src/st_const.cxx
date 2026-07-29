@@ -118,6 +118,26 @@ CONSTANT::Base_const_id() const {
 CONSTANT_PTR
 CONSTANT::Base_const() const { return Glob_scope().Constant(Base_const_id()); }
 
+ENTRY_ID
+CONSTANT::Entry_id() const {
+  AIR_ASSERT(Kind() == CONSTANT_KIND::ENTRY_PTR);
+  return _const->Entry_ptr_val();
+}
+
+ENTRY_PTR
+CONSTANT::Entry() const { return Glob_scope().Entry_point(Entry_id()); }
+
+ENTRY_ID
+CONSTANT::Func_desc_entry_id() const {
+  AIR_ASSERT(Kind() == CONSTANT_KIND::ENTRY_FUNC_DESC);
+  return _const->Func_desc_entry();
+}
+
+ENTRY_PTR
+CONSTANT::Func_desc_entry() const {
+  return Glob_scope().Entry_point(Func_desc_entry_id());
+}
+
 bool CONSTANT::Bool_val() const {
   AIR_ASSERT(Kind() == CONSTANT_KIND::BOOLEAN);
   return _const->Bool_val();

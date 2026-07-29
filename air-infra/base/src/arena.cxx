@@ -17,6 +17,13 @@ void* ARENA_ITEM_ARRAY::Allocate(size_t bytes, uint32_t* new_id) {
   return addr;
 }
 
+void ARENA_ITEM_ARRAY::Deallocate(uint32_t id) {
+  AIR_ASSERT(id < _id_array.size());
+  AIR_ASSERT(_id_array[id] != nullptr);
+  _id_array[id] = nullptr;
+  _sz_array[id] = 0;
+}
+
 uint32_t ARENA_ITEM_ARRAY::Compute_new_id(BYTE_PTR addr, size_t bytes) {
   size_t size = _id_array.size();
   AIR_ASSERT(size < UINT32_MAX);

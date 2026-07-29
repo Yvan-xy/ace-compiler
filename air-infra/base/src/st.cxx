@@ -1323,6 +1323,12 @@ GLOB_SCOPE::Begin_func() const { return FUNC_ITER(*this, FUNC_SEL()); }
 FUNC_ITER
 GLOB_SCOPE::End_func() const { return FUNC_ITER(); }
 
+ENTRY_ITER
+GLOB_SCOPE::Begin_entry() const { return ENTRY_ITER(*this, ENTRY_SEL()); }
+
+ENTRY_ITER
+GLOB_SCOPE::End_entry() const { return ENTRY_ITER(); }
+
 ARB_ITER
 GLOB_SCOPE::Begin_arb() const { return ARB_ITER(*this); }
 
@@ -1372,6 +1378,12 @@ void GLOB_SCOPE::Clone(GLOB_SCOPE& glob, bool clone_func_scope) {
       func->Set_undefined();
     }
   }
+}
+
+void GLOB_SCOPE::Delete_sym(SYM_PTR sym) {
+  AIR_ASSERT(sym != Null_ptr);
+  AIR_ASSERT(sym->_scope == this);
+  Main_table().Delete(sym->Data());
 }
 
 void GLOB_SCOPE::Init_targ_info(ENDIANNESS e, ARCHITECTURE a) {

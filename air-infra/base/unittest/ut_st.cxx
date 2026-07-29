@@ -18,6 +18,19 @@ using namespace air::core;
 using namespace air::util;
 using namespace testing;
 
+class TEST_ARCHIVE_ARENA
+    : public ARENA<sizeof(uint64_t), alignof(uint64_t), false> {
+  using BASE = ARENA<sizeof(uint64_t), alignof(uint64_t), false>;
+
+public:
+  TEST_ARCHIVE_ARENA(ARENA_ALLOCATOR* allocator, uint32_t kind,
+                     const char* name, bool opened)
+      : BASE(allocator, kind, name, opened) {}
+
+  using BASE::Archive;
+  using BASE::Recovery;
+};
+
 class TEST_GLOB_SCOPE : public ::testing::Test {
 protected:
   void SetUp() override { _glob = new GLOB_SCOPE(0, true); }
@@ -47,6 +60,7 @@ protected:
   void Run_test_new_var_sym();
   void Run_test_new_func_sym();
   void Run_test_new_entry_sym();
+  void Run_test_delete_func_symbols();
   void Run_test_clone();
   void Run_test_init_targ_info();
   void Run_test_unique_str_tab();
@@ -587,6 +601,57 @@ void TEST_GLOB_SCOPE::Run_test_new_entry_sym() {
   EXPECT_EQ(result, expected);
 }
 
+void TEST_GLOB_SCOPE::Run_test_delete_func_symbols() {
+  SPOS spos = _glob->Unknown_simple_spos();
+
+  FUNC_PTR deleted_func = _glob->New_func("deleted", spos);
+  deleted_func->Set_parent(_glob->Comp_env_id());
+  SIGNATURE_TYPE_PTR deleted_sig = _glob->New_sig_type();
+  deleted_sig->Set_complete();
+  ENTRY_PTR deleted_entry =
+      _glob->New_entry_point(deleted_sig, deleted_func, "deleted", spos);
+  const FUNC_ID  deleted_func_id  = deleted_func->Id();
+  const ENTRY_ID deleted_entry_id = deleted_entry->Id();
+
+  FUNC_PTR retained_func = _glob->New_func("retained", spos);
+  retained_func->Set_parent(_glob->Comp_env_id());
+  SIGNATURE_TYPE_PTR retained_sig = _glob->New_sig_type();
+  retained_sig->Set_complete();
+  _glob->New_entry_point(retained_sig, retained_func, "retained", spos);
+  _glob->Delete_sym(deleted_entry);
+  _glob->Delete_sym(deleted_func);
+
+  EXPECT_EQ(_glob->Sym(deleted_func_id), Null_ptr);
+  EXPECT_EQ(_glob->Sym(deleted_entry_id), Null_ptr);
+  std::vector<std::string> names;
+  for (FUNC_ITER iter = _glob->Begin_func(); iter != _glob->End_func(); ++iter) {
+    names.emplace_back((*iter)->Name()->Char_str());
+  }
+  EXPECT_EQ(names, std::vector<std::string>({"retained"}));
+  names.clear();
+  for (ENTRY_ITER iter = _glob->Begin_entry();
+       iter != _glob->End_entry(); ++iter) {
+    names.emplace_back((*iter)->Name()->Char_str());
+  }
+  EXPECT_EQ(names, std::vector<std::string>({"retained"}));
+
+  GLOB_SCOPE clone(1, true);
+  clone.Clone(*_glob);
+  EXPECT_EQ(clone.Sym(deleted_func_id), Null_ptr);
+  EXPECT_EQ(clone.Sym(deleted_entry_id), Null_ptr);
+  names.clear();
+  for (FUNC_ITER iter = clone.Begin_func(); iter != clone.End_func(); ++iter) {
+    names.emplace_back((*iter)->Name()->Char_str());
+  }
+  EXPECT_EQ(names, std::vector<std::string>({"retained"}));
+  names.clear();
+  for (ENTRY_ITER iter = clone.Begin_entry(); iter != clone.End_entry();
+       ++iter) {
+    names.emplace_back((*iter)->Name()->Char_str());
+  }
+  EXPECT_EQ(names, std::vector<std::string>({"retained"}));
+}
+
 void TEST_GLOB_SCOPE::Run_test_clone() {
   // Define a pointer type
   SPOS             spos  = _glob->Unknown_simple_spos();
@@ -787,6 +852,83 @@ TEST_F(TEST_GLOB_SCOPE, new_multi_dimen_array_type_vec) {
 TEST_F(TEST_GLOB_SCOPE, new_var_sym) { Run_test_new_var_sym(); }
 TEST_F(TEST_GLOB_SCOPE, new_func_sym) { Run_test_new_func_sym(); }
 TEST_F(TEST_GLOB_SCOPE, new_entry_sym) { Run_test_new_entry_sym(); }
+TEST_F(TEST_GLOB_SCOPE, delete_func_symbols) {
+  Run_test_delete_func_symbols();
+}
+TEST_F(TEST_GLOB_SCOPE, delete_rejects_local_symbol) {
+  SPOS spos = _glob->Unknown_simple_spos();
+  TYPE_PTR type = _glob->Prim_type(PRIMITIVE_TYPE::INT_U64);
+  ADDR_DATUM_PTR global = _glob->New_var(type, "global", spos);
+
+  FUNC_PTR func = _glob->New_func("local_owner", spos);
+  func->Set_parent(_glob->Comp_env_id());
+  FUNC_SCOPE& scope = _glob->New_func_scope(func);
+  ADDR_DATUM_PTR local = scope.New_var(type, "local", spos);
+
+  EXPECT_DEATH_IF_SUPPORTED(_glob->Delete_sym(local), "Assertion Failure");
+  EXPECT_NE(_glob->Sym(global->Id()), Null_ptr);
+}
+TEST_F(TEST_GLOB_SCOPE, arena_delete_rejects_foreign_pointer) {
+  ARENA_ALLOCATOR left_allocator;
+  ARENA_ALLOCATOR right_allocator;
+  TEST_ARCHIVE_ARENA left(&left_allocator, 1, "left", true);
+  TEST_ARCHIVE_ARENA right(&right_allocator, 2, "right", true);
+  auto left_item = left.Allocate<uint64_t>();
+  auto right_item = right.Allocate<uint64_t>();
+  *left_item.Addr() = 11;
+  *right_item.Addr() = 22;
+  ASSERT_EQ(left_item.Id(), right_item.Id());
+  ASSERT_NE(left_item.Addr(), right_item.Addr());
+
+  EXPECT_DEATH_IF_SUPPORTED(left.Delete(right_item), "Assertion Failure");
+  EXPECT_EQ(*left.Find(left_item.Id()).Addr(), 11);
+  EXPECT_EQ(*right.Find(right_item.Id()).Addr(), 22);
+}
+TEST_F(TEST_GLOB_SCOPE, arena_delete_array_rejects_foreign_pointer) {
+  ARENA_ALLOCATOR left_allocator;
+  ARENA_ALLOCATOR right_allocator;
+  TEST_ARCHIVE_ARENA left(&left_allocator, 1, "left", true);
+  TEST_ARCHIVE_ARENA right(&right_allocator, 2, "right", true);
+  auto left_items = left.Allocate_array<uint64_t>(2);
+  auto right_items = right.Allocate_array<uint64_t>(2);
+  left_items.Addr()[0] = 11;
+  left_items.Addr()[1] = 12;
+  right_items.Addr()[0] = 21;
+  right_items.Addr()[1] = 22;
+  ASSERT_EQ(left_items.Id(), right_items.Id());
+  ASSERT_NE(left_items.Addr(), right_items.Addr());
+
+  EXPECT_DEATH_IF_SUPPORTED(
+      left.Delete_array(right_items, 2), "Assertion Failure");
+  EXPECT_EQ(left.Find(left_items.Id()).Addr()[0], 11);
+  EXPECT_EQ(right.Find(right_items.Id()).Addr()[0], 21);
+}
+TEST_F(TEST_GLOB_SCOPE, sparse_arena_archive_recovery) {
+  ARENA_ALLOCATOR allocator;
+  TEST_ARCHIVE_ARENA source(&allocator, 1, "source", true);
+  auto first = source.Allocate<uint64_t>();
+  auto deleted = source.Allocate<uint64_t>();
+  auto retained = source.Allocate<uint64_t>();
+  *first.Addr() = 11;
+  *deleted.Addr() = 22;
+  *retained.Addr() = 33;
+  source.Delete(deleted);
+
+  const size_t archive_size = sizeof(uint32_t) +
+      source.Size() * sizeof(uint32_t) + source.Mem_size();
+  std::vector<char> archive(archive_size);
+  char* archive_end = source.Archive(archive.data());
+  EXPECT_EQ(archive_end, archive.data() + archive.size());
+
+  ARENA_ALLOCATOR recovery_allocator;
+  TEST_ARCHIVE_ARENA recovered(
+      &recovery_allocator, 2, "recovered", true);
+  char* recovery_end = recovered.Recovery(archive.data());
+  EXPECT_EQ(recovery_end, archive_end);
+  EXPECT_EQ(*recovered.Find(first.Id()).Addr(), 11);
+  EXPECT_EQ(recovered.Find(deleted.Id()).Addr(), nullptr);
+  EXPECT_EQ(*recovered.Find(retained.Id()).Addr(), 33);
+}
 TEST_F(TEST_GLOB_SCOPE, clone) { Run_test_clone(); }
 TEST_F(TEST_GLOB_SCOPE, init_targ_info) { Run_test_init_targ_info(); }
 TEST_F(TEST_GLOB_SCOPE, unique_str_tab) { Run_test_unique_str_tab(); }

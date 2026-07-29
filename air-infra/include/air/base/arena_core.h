@@ -9,6 +9,7 @@
 #ifndef AIR_BASE_ARENA_CORE_H
 #define AIR_BASE_ARENA_CORE_H
 
+#include <limits>
 #include <vector>
 
 #include "air/util/mem_allocator.h"
@@ -79,6 +80,11 @@ private:
     _id_array.clear();
     _sz_array.clear();
     for (size_t i = 0; i < o._id_array.size(); i++) {
+      if (o._id_array[i] == nullptr) {
+        _id_array.push_back(nullptr);
+        _sz_array.push_back(0);
+        continue;
+      }
       size_t   sz = o._sz_array[i];
       uint32_t new_id;
       BYTE_PTR addr = (BYTE_PTR)Allocate(sz, &new_id);
@@ -94,11 +100,20 @@ private:
     memcpy(pos, reinterpret_cast<BYTE_PTR>(&num), sizeof(uint32_t));
     pos += sizeof(uint32_t);
 
-    memcpy(pos, _sz_array.data(), num * sizeof(uint32_t));
-    pos += num * sizeof(uint32_t);
+    constexpr uint32_t tombstone = std::numeric_limits<uint32_t>::max();
+    for (uint32_t i = 0; i < num; ++i) {
+      AIR_ASSERT(_id_array[i] == nullptr || _sz_array[i] < tombstone);
+      uint32_t serialized_size =
+          _id_array[i] == nullptr ? tombstone
+                                  : static_cast<uint32_t>(_sz_array[i]);
+      memcpy(pos, reinterpret_cast<BYTE_PTR>(&serialized_size),
+             sizeof(uint32_t));
+      pos += sizeof(uint32_t);
+    }
 
     for (uint32_t i = 0; i < num; i++) {
       uint32_t sz = _sz_array[i];
+      if (_id_array[i] == nullptr) continue;
       memcpy(pos, _id_array[i], sz);
       pos += sz;
     }
@@ -113,15 +128,20 @@ private:
     uint32_t num = *reinterpret_cast<uint32_t*>(pos);
     pos += sizeof(uint32_t);
 
+    constexpr uint32_t tombstone = std::numeric_limits<uint32_t>::max();
+    std::vector<bool> deleted;
+    deleted.reserve(num);
     for (uint32_t i = 0; i < num; i++) {
-      uint32_t sz = *reinterpret_cast<uint32_t*>(pos);
-      _sz_array.push_back(sz);
+      uint32_t serialized_size = *reinterpret_cast<uint32_t*>(pos);
+      const bool is_deleted = serialized_size == tombstone;
+      _sz_array.push_back(is_deleted ? 0 : serialized_size);
+      deleted.push_back(is_deleted);
       pos += sizeof(uint32_t);
     }
 
     for (uint32_t i = 0; i < num; i++) {
       uint32_t sz = _sz_array[i];
-      _id_array.push_back(pos);
+      _id_array.push_back(deleted[i] ? nullptr : pos);
       pos += sz;
     }
 
@@ -133,11 +153,18 @@ private:
 
   BYTE_PTR Archive_offset(BYTE_PTR pos, uint32_t* sz) {
     uint32_t num = _id_array.size();
+    AIR_ASSERT(num == 0 || _id_array[0] != nullptr);
     memcpy(pos, reinterpret_cast<BYTE_PTR>(&num), sizeof(uint32_t));
     pos += sizeof(uint32_t);
 
     for (uint32_t i = 0; i < num; i++) {
-      *sz = (BYTE_PTR)_id_array[i] - _id_array[0];
+      if (_id_array[i] == nullptr) {
+        *sz = std::numeric_limits<uint32_t>::max();
+      } else {
+        const size_t offset = _id_array[i] - _id_array[0];
+        AIR_ASSERT(offset < std::numeric_limits<uint32_t>::max());
+        *sz = static_cast<uint32_t>(offset);
+      }
       memcpy(pos, reinterpret_cast<BYTE_PTR>(sz), sizeof(uint32_t));
       pos += sizeof(uint32_t);
     }
@@ -154,7 +181,8 @@ private:
     for (uint32_t i = 0; i < num; i++) {
       uint32_t sz = *reinterpret_cast<uint32_t*>(pos);
       pos += sizeof(uint32_t);
-      _id_array.push_back(addr + sz);
+      _id_array.push_back(
+          sz == std::numeric_limits<uint32_t>::max() ? nullptr : addr + sz);
     }
     AIR_ASSERT(num == _id_array.size());
     return pos;
