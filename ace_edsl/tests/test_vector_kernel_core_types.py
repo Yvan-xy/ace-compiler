@@ -641,3 +641,120 @@ def test_structural_types_typed_core_ops_locals_and_zero():
     assert not vector4.same_scope(other_vector4)
     assert receiver_vector4 == vector4
     assert receiver_vector4.same_scope(vector4)
+
+
+def test_constant_array_indexing_emits_real_ild_with_core_scalar_result():
+    glob = air_builder.create_glob_scope()
+    i32 = air_builder.Type.make_int(32)
+    i64 = air_builder.Type.make_int(64)
+    f32 = air_builder.Type.make_float(32)
+
+    function = glob.new_func_with_param_types(
+        "constant_array_indexing", f32, [i32, i64]
+    )
+    container = function.container()
+    index_param = function.new_param("index", i32)
+    wide_index_param = function.new_param("wide_index", i64)
+    rotations_node = container.new_array_const([-3.0, 0.0, 5.0])
+    rotations_type = rotations_node.rtype()
+    rotations = VectorValue(
+        rotations_node,
+        container,
+        shape=(3,),
+        air_type=rotations_type,
+    )
+    index = AIRValue(
+        index_param,
+        container,
+        domain="air::core",
+        air_type=i32,
+    )
+
+    selected = rotations[index]
+    assert isinstance(selected, AIRValue)
+    assert not isinstance(selected, VectorValue)
+    assert selected.domain == "air::core"
+    assert selected.shape is None
+    assert selected.air_type == f32
+
+    with pytest.raises(
+        RuntimeError,
+        match="constant-array index requires a Core signed i32 scalar",
+    ):
+        container.new_ild(rotations_node, wide_index_param)
+
+    foreign_function = glob.new_func_with_param_types(
+        "foreign_constant_array_index", i32, [i32]
+    )
+    foreign_index = foreign_function.new_param("index", i32)
+    with pytest.raises(RuntimeError, match="cannot mix AIR containers"):
+        container.new_ild(rotations_node, foreign_index)
+
+    container.new_retv(selected.value)
+    foreign_function.container().new_retv(foreign_index)
+    assert glob.verify_ir()
+    dump = glob.dump().upper()
+    assert "LDC" in dump
+    assert "LDCA" in dump
+    assert "ARRAY" in dump
+    assert "ILD" in dump
+
+
+def test_planned_packed_vector_store_is_explicit_and_type_checked():
+    glob = air_builder.create_glob_scope()
+    i32 = air_builder.Type.make_int(32)
+    f32 = air_builder.Type.make_float(32)
+    vector8 = air_builder.Type.make_array([8], f32)
+    vector16 = air_builder.Type.make_array([16], f32)
+    int_vector8 = air_builder.Type.make_array([8], i32)
+
+    function = glob.new_func_with_param_types(
+        "packed_vector_retyping", vector8, [vector16, i32]
+    )
+    container = function.container()
+    source = function.new_param("source", vector16)
+    scalar = function.new_param("scalar", i32)
+
+    packed = container.new_vector_packed_stid(
+        "packed_input", vector8, source
+    )
+    assert packed.rtype() == vector8
+
+    container.new_local("ordinary_store", vector8)
+    with pytest.raises(RuntimeError, match="incompatible with local"):
+        container.new_stid("ordinary_store", source)
+    with pytest.raises(RuntimeError, match="not a valid packed widening"):
+        container.new_vector_widening_stid(
+            "invalid_widening", vector8, source
+        )
+    with pytest.raises(RuntimeError, match="matching ranked element types"):
+        container.new_vector_packed_stid(
+            "integer_target", int_vector8, source
+        )
+    with pytest.raises(RuntimeError, match="ranked array operands"):
+        container.new_vector_packed_stid("scalar_source", vector8, scalar)
+    with pytest.raises(RuntimeError, match="local type mismatch"):
+        container.new_vector_packed_stid(
+            "packed_input", vector16, source
+        )
+
+    foreign_function = glob.new_func_with_param_types(
+        "foreign_packed_vector_source", vector16, [vector16]
+    )
+    foreign_source = foreign_function.new_param("source", vector16)
+    with pytest.raises(RuntimeError, match="cannot mix AIR containers"):
+        container.new_vector_packed_stid(
+            "foreign_source", vector8, foreign_source
+        )
+
+    container.new_retv(packed)
+    foreign_function.container().new_retv(foreign_source)
+    assert glob.verify_ir()
+
+    foreign_glob = air_builder.create_glob_scope()
+    foreign_f32 = air_builder.Type.make_float(32)
+    foreign_vector8 = air_builder.Type.make_array([8], foreign_f32)
+    with pytest.raises(RuntimeError, match="different GLOB_SCOPE"):
+        container.new_vector_packed_stid(
+            "foreign_type", foreign_vector8, source
+        )

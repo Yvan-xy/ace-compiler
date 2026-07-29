@@ -2119,6 +2119,52 @@ public:
                          "air::core::STID");
     }
 
+    // Store a planned packed Vector value into an explicitly typed local.
+    // Packed metakernels may intentionally reinterpret the logical ranked
+    // shape while preserving the element type; this is distinct from ordinary
+    // structurally typed stores and from widening-only duplication.
+    std::shared_ptr<Node> new_vector_packed_stid(
+        const std::string& var_name, const Type& requested_type,
+        std::shared_ptr<Node> val) {
+        require_not_expired();
+        if (!(container && func_scope) || !val || !val->has_node ||
+            val->node == NODE_PTR()) {
+            throw std::runtime_error(
+                "new_vector_packed_stid requires real container and value");
+        }
+        TYPE_PTR target = require_local_type(
+            requested_type, "new_vector_packed_stid");
+        TYPE_PTR source = require_vector_operand(
+            val, "new_vector_packed_stid");
+        if (!target->Is_array() ||
+            !Type::structurally_equal_air_types(
+                source->Cast_to_arr()->Elem_type(),
+                target->Cast_to_arr()->Elem_type())) {
+            throw std::runtime_error(
+                "new_vector_packed_stid requires matching ranked element types");
+        }
+
+        ADDR_DATUM_PTR var;
+        auto it = var_map.find(var_name);
+        if (it != var_map.end()) {
+            var = it->second;
+            if (!Type::structurally_equal_air_types(var->Type(), target)) {
+                throw std::runtime_error(
+                    "new_vector_packed_stid local type mismatch: " +
+                    var_name);
+            }
+        } else {
+            var = func_scope->New_var(
+                target, var_name.c_str(), val->node->Spos());
+            var_map[var_name] = var;
+        }
+        STMT_PTR stmt = container->New_st(
+            val->node, var, val->node->Spos());
+        append_stmt(stmt);
+        return wrap_node(container->New_ld(var, val->node->Spos()),
+                         "air::core::STID");
+    }
+
     std::shared_ptr<Node> new_fresh_load(std::shared_ptr<Node> value) {
         require_not_expired();
         if (!(container && value && value->has_node) ||
@@ -2444,29 +2490,38 @@ public:
     
     std::shared_ptr<Node> new_ild(std::shared_ptr<Node> base, std::shared_ptr<Node> idx) {
         require_not_expired();
-        // Try to create a real ILD when possible (array element load)
-        if (!(container && base->has_node)) {
+        if (!(container && base && base->has_node &&
+              base->node != NODE_PTR())) {
             throw std::runtime_error("new_ild requires real container and base");
         }
-        NODE_PTR base_node = base->node;
-        if (base_node->Opcode() == air::core::OPC_LD &&
-            base_node->Rtype()->Is_array()) {
-            if (!(idx && idx->has_node)) {
-                throw std::runtime_error("new_ild requires real index node");
-            }
-            // Build ARRAY(LDA(base_var), idx) then ILD(array). The SSA builder
-            // expects array loads/stores to use an address base rather than LD.
-            NODE_PTR base_addr = container->New_lda(
-                base_node->Addr_datum(), air::base::POINTER_KIND::FLAT64, get_spos());
-            NODE_PTR array = container->New_array(base_addr, 1, get_spos());
-            container->Set_array_idx(array, 0, idx->node);
-            NODE_PTR ild = container->New_ild(array, get_spos());
-            auto node = wrap_node(ild, "air::core::ILD");
-            node->add_child(base);
-            node->add_child(idx);
-            return node;
+        require_vector_operand(base, "new_ild");
+        TYPE_PTR idx_type = require_real_expression(idx, "new_ild");
+        if (idx->node->Domain() != air::core::CORE ||
+            !idx_type->Is_signed_int()) {
+            throw std::runtime_error(
+                "new_ild requires a Core signed integer index");
         }
-        throw std::runtime_error("new_ild only supports LD(array) base for now");
+        NODE_PTR base_node = base->node;
+        NODE_PTR base_addr = NODE_PTR();
+        if (base_node->Opcode() == air::core::OPC_LD) {
+            base_addr = container->New_lda(
+                base_node->Addr_datum(), air::base::POINTER_KIND::FLAT64, get_spos());
+        } else if (base_node->Opcode() == air::core::OPC_LDC) {
+            require_core_s32_operand(idx, "new_ild constant-array index");
+            base_addr = container->New_ldca(
+                base_node->Const(), air::base::POINTER_KIND::FLAT32,
+                get_spos());
+        } else {
+            throw std::runtime_error(
+                "new_ild only supports LD(array) or LDC(array) base");
+        }
+        NODE_PTR array = container->New_array(base_addr, 1, get_spos());
+        container->Set_array_idx(array, 0, idx->node);
+        NODE_PTR ild = container->New_ild(array, get_spos());
+        auto node = wrap_node(ild, "air::core::ILD");
+        node->add_child(base);
+        node->add_child(idx);
+        return node;
     }
     
     std::shared_ptr<Node> new_ist(std::shared_ptr<Node> val, std::shared_ptr<Node> base, 
@@ -7295,6 +7350,10 @@ PYBIND11_MODULE(air_builder, m) {
              &Container::new_vector_widening_stid,
              py::arg("var_name"), py::arg("type"), py::arg("value"),
              "Store a prepared packed Vector value into a validated wider local")
+        .def("new_vector_packed_stid",
+             &Container::new_vector_packed_stid,
+             py::arg("var_name"), py::arg("type"), py::arg("value"),
+             "Store a planned packed Vector value into an explicitly typed local")
         .def("new_local", &Container::new_local,
              py::arg("var_name"), py::arg("type"),
              "Declare a named local with an explicit AIR type")

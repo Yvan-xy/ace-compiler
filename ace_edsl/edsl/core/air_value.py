@@ -211,10 +211,17 @@ class AIRValue:
         result_shape = self._shape
         if result_type is not None and result_type.is_array():
             result_shape = tuple(result_type.shape())
+        elif result_type is not None and result_type.is_scalar():
+            result_shape = None
+        result_domain = (
+            "air::core"
+            if result_type is not None and result_type.is_scalar()
+            else self._domain
+        )
 
         if not AIRValue.FLAT_IR_MODE:
             return _wrap_air_value(
-                result_node, self._container, result_shape, self._domain,
+                result_node, self._container, result_shape, result_domain,
                 air_type=result_type,
             )
         
@@ -231,7 +238,7 @@ class AIRValue:
                     node=None,  # No cached node - will load on demand
                     container=self._container, 
                     shape=result_shape,
-                    domain=self._domain,
+                    domain=result_domain,
                     temp_name=temp_name,  # Store the name for fresh loads
                     air_type=result_type,
                 )
@@ -241,7 +248,7 @@ class AIRValue:
                     store_node,
                     self._container,
                     result_shape,
-                    self._domain,
+                    result_domain,
                     air_type=result_type,
                 )
         else:
@@ -250,7 +257,7 @@ class AIRValue:
                 result_node,
                 self._container,
                 result_shape,
-                self._domain,
+                result_domain,
                 air_type=result_type,
             )
     
