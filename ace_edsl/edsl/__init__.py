@@ -50,6 +50,7 @@ from .core.types import (
 
 # Export AIRValue for operator overloading
 from .core.air_value import AIRValue, to_air
+from .core.vector_value import VectorValue
 
 # Export domain-specific operations
 from .core import tensor_ops
@@ -78,7 +79,7 @@ from .vector_kernel_lowering import (
     PreparedBaselineGemmPlan,
     vector_kernel_recipe,
 )
-from .vector_kernel_baseline_gemm import (
+from .kernels.vector.baseline_gemm import (
     baseline_gemm_recipe,
     baseline_gemm_vector_kernel,
     configure_baseline_gemm_dsl,
@@ -190,6 +191,7 @@ __all__ = [
     'is_tensor_type',
     'is_scalar_type',
     'AIRValue',
+    'VectorValue',
     'to_air',
     # Loop and control flow helpers (from base_dsl)
     'range_dynamic',

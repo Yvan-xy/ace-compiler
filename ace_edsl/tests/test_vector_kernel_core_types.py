@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import ast
 import re
 
 import pytest
 
 from ace_bindings import air_builder
+from ace_edsl.base_dsl.ast_preprocessor import DSLPreprocessor
 from ace_edsl.base_dsl.ast_helpers import dynamic_expr
 from ace_edsl.edsl import AceEDSL, nn_kernel, range_dynamic, vector_kernel
 from ace_edsl.edsl.core.air_value import AIRValue
 from ace_edsl.edsl.core import vector_ops
 from ace_edsl.edsl.core.types import Int, Tensor, VectorTensor
+from ace_edsl.edsl.core.vector_value import VectorValue
 
 
 @vector_kernel
@@ -74,13 +77,11 @@ def _genuine_vector_primitives(
     shift: Int[32],
     start: Int[32],
 ) -> VectorTensor[float, 8]:
-    widened = vector_ops.vec_add(narrow, wide)
-    rolled = vector_ops.vec_roll(wide, shift, [-3, 0, 5])
-    sliced = vector_ops.vec_slice(rows, start, 8)
-    product = vector_ops.vec_mul(rolled, sliced)
-    return vector_ops.vec_set_slot(
-        vector_ops.vec_add(widened, product), 8
-    )
+    widened = narrow + wide
+    rolled = wide.roll(shift, candidates=[-3, 0, 5])
+    sliced = rows.slice(start, 8)
+    product = rolled * sliced
+    return (widened + product).with_slot(8)
 
 
 @vector_kernel
@@ -115,7 +116,52 @@ def _fresh_dsl():
     return AceEDSL._get_dsl()
 
 
+def test_vector_methods_are_receiver_functional_only_when_registered():
+    method_loop = ast.parse(
+        "for iv in range_dynamic(0, 4):\n"
+        "    output = value.roll(iv, candidates=[0])\n"
+    ).body[0]
+    mutating_loop = ast.parse(
+        "for iv in range_dynamic(0, 4):\n"
+        "    value.append(iv)\n"
+    ).body[0]
+    reassignment_loop = ast.parse(
+        "for iv in range_dynamic(0, 4):\n"
+        "    value = value + value.roll(iv, candidates=[0])\n"
+    ).body[0]
+
+    default = DSLPreprocessor()
+    used, carried, _ = default.analyze_region_variables(
+        method_loop, {"value"}
+    )
+    assert used == []
+    assert carried == ["value"]
+
+    functional = DSLPreprocessor()
+    functional.register_non_mutating_receiver_methods(
+        VectorValue.NON_MUTATING_RECEIVER_METHODS
+    )
+    used, carried, _ = functional.analyze_region_variables(
+        method_loop, {"value"}
+    )
+    assert used == ["value"]
+    assert carried == []
+    _, carried, _ = functional.analyze_region_variables(
+        mutating_loop, {"value"}
+    )
+    assert carried == ["value"]
+    _, carried, _ = functional.analyze_region_variables(
+        reassignment_loop, {"value"}
+    )
+    assert carried == ["value"]
+
+    functional.processed_functions.add(object())
+    with pytest.raises(RuntimeError, match="cannot change"):
+        functional.register_non_mutating_receiver_methods({"another_method"})
+
+
 def _assert_ranked_vector_result(result, shape):
+    assert isinstance(result, VectorValue)
     assert isinstance(result, AIRValue)
     assert result.domain == "nn::vector"
     assert tuple(result.shape) == tuple(shape)
@@ -266,11 +312,10 @@ def test_vector_wrappers_reject_invalid_domains_types_owners_and_metadata():
     vector_param = function.new_param("vector", vector4)
     index_param = function.new_param("index", i32)
     index64_param = function.new_param("index64", i64)
-    vector = AIRValue(
+    vector = VectorValue(
         vector_param,
         container,
         shape=(4,),
-        domain="nn::vector",
         air_type=vector4,
     )
     index = AIRValue(
@@ -285,6 +330,29 @@ def test_vector_wrappers_reject_invalid_domains_types_owners_and_metadata():
         domain="air::core",
         air_type=i64,
     )
+
+    assert isinstance(vector.view("nn::vector"), VectorValue)
+    assert isinstance(vector.zero_like(), VectorValue)
+    assert isinstance(vector.with_slot(4), VectorValue)
+    assert isinstance(vector.cast(vector4), VectorValue)
+    with pytest.raises(TypeError, match="ranked Vector AIR type"):
+        VectorValue(index_param, container, air_type=i32)
+    with pytest.raises(NotImplementedError, match="Vector subtraction"):
+        vector - vector
+    with pytest.raises(NotImplementedError, match="Vector subtraction"):
+        1 - vector
+    with pytest.raises(NotImplementedError, match="Vector negation"):
+        -vector
+    with pytest.raises(NotImplementedError, match="Vector division"):
+        vector / vector
+    with pytest.raises(NotImplementedError, match="Vector division"):
+        1 / vector
+    with pytest.raises(NotImplementedError, match="Vector division"):
+        vector // vector
+    with pytest.raises(NotImplementedError, match="Vector division"):
+        1 // vector
+    with pytest.raises(TypeError, match="nn::vector"):
+        vector + index
 
     with pytest.raises(TypeError, match="nn::vector"):
         vector_ops.vec_add(index, vector)
@@ -324,15 +392,16 @@ def test_vector_wrappers_reject_invalid_domains_types_owners_and_metadata():
     )
     foreign_param = foreign_function.new_param("vector", vector4)
     foreign_index_param = foreign_function.new_param("index", i32)
-    foreign_vector = AIRValue(
+    foreign_vector = VectorValue(
         foreign_param,
         foreign_function.container(),
         shape=(4,),
-        domain="nn::vector",
         air_type=vector4,
     )
     with pytest.raises(ValueError, match="cannot mix AIR containers"):
         vector_ops.vec_add(vector, foreign_vector)
+    with pytest.raises(ValueError, match="cannot mix AIR containers"):
+        vector * foreign_vector
     foreign_index = AIRValue(
         foreign_index_param,
         foreign_function.container(),

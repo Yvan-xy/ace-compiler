@@ -117,7 +117,7 @@ class AIRValue:
         active; ranked operands adopt the target kernel domain.
         """
         domain = "air::core" if self._is_core_scalar() else target_domain
-        return AIRValue(
+        return _wrap_air_value(
             self._node,
             self._container,
             self._shape,
@@ -136,7 +136,7 @@ class AIRValue:
         if not hasattr(self._container, "new_checked_cast"):
             raise NotImplementedError("Container does not support checked casts")
         cast_node = self._container.new_checked_cast(self.value, air_type)
-        return AIRValue(
+        return _wrap_air_value(
             cast_node,
             self._container,
             self._shape,
@@ -149,7 +149,7 @@ class AIRValue:
         if self._air_type is None:
             raise TypeError("zero_like requires AIR type metadata")
         zero = self._container.new_zero(self._air_type)
-        return AIRValue(
+        return _wrap_air_value(
             zero,
             self._container,
             self._shape,
@@ -175,7 +175,7 @@ class AIRValue:
             raise TypeError("Vector SLOT must be an integer")
         if slot <= 0 or slot >= (1 << 32):
             raise ValueError("Vector SLOT must be a positive u32 value")
-        return AIRValue(
+        return _wrap_air_value(
             self._node,
             self._container,
             self._shape,
@@ -213,7 +213,7 @@ class AIRValue:
             result_shape = tuple(result_type.shape())
 
         if not AIRValue.FLAT_IR_MODE:
-            return AIRValue(
+            return _wrap_air_value(
                 result_node, self._container, result_shape, self._domain,
                 air_type=result_type,
             )
@@ -227,7 +227,7 @@ class AIRValue:
             store_node = self._container.new_stid(temp_name, result_node)
             # Return AIRValue with temp_name - loads created on-demand in .value
             if hasattr(self._container, 'new_ldid'):
-                return AIRValue(
+                return _wrap_air_value(
                     node=None,  # No cached node - will load on demand
                     container=self._container, 
                     shape=result_shape,
@@ -237,7 +237,7 @@ class AIRValue:
                 )
             else:
                 # Fallback: use the store node directly
-                return AIRValue(
+                return _wrap_air_value(
                     store_node,
                     self._container,
                     result_shape,
@@ -246,7 +246,7 @@ class AIRValue:
                 )
         else:
             # Fallback: no flattening if stid not available
-            return AIRValue(
+            return _wrap_air_value(
                 result_node,
                 self._container,
                 result_shape,
@@ -1154,6 +1154,38 @@ class AIRValue:
         return self.__repr__()
 
 
+def _wrap_air_value(
+    node: Any,
+    container: Any,
+    shape: Optional[Tuple[int, ...]] = None,
+    domain: Optional[str] = None,
+    temp_name: Optional[str] = None,
+    air_type: Any = None,
+    vector_slot: Optional[int] = None,
+) -> AIRValue:
+    """Construct a domain facade without changing AIR object ownership."""
+    if domain == "nn::vector":
+        from .vector_value import VectorValue
+
+        return VectorValue(
+            node,
+            container,
+            shape=shape,
+            temp_name=temp_name,
+            air_type=air_type,
+            vector_slot=vector_slot,
+        )
+    return AIRValue(
+        node,
+        container,
+        shape=shape,
+        domain=domain,
+        temp_name=temp_name,
+        air_type=air_type,
+        vector_slot=vector_slot,
+    )
+
+
 def to_air(values: Sequence[Any]) -> AIRValue:
     """Convert a Python sequence of AIR values into an AIR array value.
 
@@ -1192,7 +1224,7 @@ def to_air(values: Sequence[Any]) -> AIRValue:
 
     temp_name = AIRValue._next_temp_name()
     container.new_air_array(temp_name, nodes)
-    return AIRValue(
+    return _wrap_air_value(
         node=None,
         container=container,
         shape=(len(values),),

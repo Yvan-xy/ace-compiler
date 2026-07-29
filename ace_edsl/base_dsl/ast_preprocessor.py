@@ -114,6 +114,18 @@ class DSLPreprocessor(ast.NodeTransformer):
         self.file_name = "<unknown filename>"
         self.function_depth = 0
         self.local_closures = set()
+        self._non_mutating_receiver_method_names = set()
+
+    def register_non_mutating_receiver_methods(self, method_names):
+        """Register functional receiver methods before preprocessing starts."""
+        if self.processed_functions:
+            raise RuntimeError(
+                "receiver method classification cannot change after preprocessing"
+            )
+        for method_name in method_names:
+            if not isinstance(method_name, str) or not method_name:
+                raise ValueError("receiver method names must be non-empty strings")
+            self._non_mutating_receiver_method_names.add(method_name)
 
     def _get_module_imports(self, decorated_func):
         """Extract imports from the module containing the decorated function"""
@@ -388,6 +400,9 @@ class DSLPreprocessor(ast.NodeTransformer):
         read_args = OrderedSet()
         write_args = OrderedSet()
         local_closure = self.local_closures
+        non_mutating_receiver_method_names = frozenset(
+            self._non_mutating_receiver_method_names
+        )
         file_name = self.file_name
         region_node = node
 
@@ -431,6 +446,7 @@ class DSLPreprocessor(ast.NodeTransformer):
 
             def visit_Call(self, node):
                 base_name = RegionAnalyzer.get_call_base(node.func)
+                function_name = RegionAnalyzer.get_function_name(node)
 
                 if isinstance(node.func, ast.Name):
                     func_name = node.func.id
@@ -445,7 +461,11 @@ class DSLPreprocessor(ast.NodeTransformer):
 
                 # Classes are mutable by default. Mark them as write. If they are
                 # dataclass(frozen=True), treat them as read in runtime.
-                if base_name is not None and base_name not in ("self"):
+                if (
+                    base_name is not None
+                    and base_name not in ("self")
+                    and function_name not in non_mutating_receiver_method_names
+                ):
                     write_args.add(base_name)
 
                 self.generic_visit(node)

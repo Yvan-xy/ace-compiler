@@ -162,7 +162,7 @@ def _generate_one(
     model_dir: Path,
 ) -> None:
     from ace_edsl.edsl.pipeline import Pipeline, PipelineTarget
-    from ace_edsl.edsl.vector_kernel_baseline_gemm import (
+    from ace_edsl.edsl.kernels.vector.baseline_gemm import (
         configure_baseline_gemm_dsl,
     )
 

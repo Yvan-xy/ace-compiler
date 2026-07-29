@@ -35,7 +35,8 @@ from ..base_dsl.utils.logger import log
 # Import AIR bindings
 from ace_bindings import air_builder
 
-from .core.air_value import AIRValue, to_air
+from .core.air_value import AIRValue, _wrap_air_value, to_air
+from .core.vector_value import VectorValue
 from .core.domain_registry import DOMAIN_PIPELINES
 from .core.type_mapping import python_type_to_air_type, is_plaintext_annotation
 from .domain_ast_decorators import (
@@ -82,6 +83,9 @@ class AceEDSL(BaseDSL):
             pass_sm_arch_name,
             device_compilation_only,
             preprocess=True  # Enable AST preprocessing (only part of BaseDSL we use)
+        )
+        self.preprocessor.register_non_mutating_receiver_methods(
+            VectorValue.NON_MUTATING_RECEIVER_METHODS
         )
         self.no_cache = True
         self.current_domain = None  # Set by decorator
@@ -178,7 +182,7 @@ class AceEDSL(BaseDSL):
         def wrap(node):
             air_type = node.rtype()
             shape = tuple(air_type.shape()) if air_type.is_array() else None
-            return AIRValue(
+            return _wrap_air_value(
                 node,
                 container,
                 shape=shape,
@@ -756,7 +760,7 @@ class AceEDSL(BaseDSL):
             
             # Wrap in AIRValue for operator overloading
             # Pass shape from instance if available
-            air_value = AIRValue(
+            air_value = _wrap_air_value(
                 param_node, 
                 container, 
                 shape=shape,

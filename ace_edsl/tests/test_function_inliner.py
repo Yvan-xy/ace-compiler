@@ -279,7 +279,7 @@ def _pass_dict(result):
 
 def _new_pipeline(model: Path, implementation: str, artifact_tag: str = "pass"):
     from ace_edsl.edsl.pipeline import Pipeline
-    from ace_edsl.edsl.vector_kernel_baseline_gemm import baseline_gemm_recipe
+    from ace_edsl.edsl.kernels.vector.baseline_gemm import baseline_gemm_recipe
 
     pipeline = Pipeline(
         "function-inliner-worker",

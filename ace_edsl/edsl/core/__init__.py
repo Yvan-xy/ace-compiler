@@ -9,11 +9,12 @@ from .types import (
     Scalar, Int, Float, is_scalar_type,
 )
 from .air_value import AIRValue, to_air
+from .vector_value import VectorValue
 
 __all__ = [
     'DOMAIN_PIPELINES',
     'Tensor', 'VectorTensor', 'MemRef', 'ComputeTensor',
     'Ciphertext', 'SiheCiphertext', 'CkksCiphertext', 'CkksPlaintext', 'Polynomial',
     'Scalar', 'Int', 'Float', 'is_scalar_type',
-    'AIRValue', 'to_air',
+    'AIRValue', 'VectorValue', 'to_air',
 ]

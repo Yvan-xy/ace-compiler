@@ -19,7 +19,7 @@ operations (new_loop_begin_range, new_loop_end). The loop body is executed
 from typing import Callable, Optional, Any, List
 from ..base_dsl.ast_helpers import executor
 from ..base_dsl.utils.logger import log
-from .core.air_value import AIRValue
+from .core.air_value import AIRValue, _wrap_air_value
 
 # Global container reference for loop operations
 # This is set by AceEDSL when generating AIR
@@ -227,7 +227,7 @@ def _loop_execute_range_dynamic(
                 container.new_stid(accum_name, arg.value)
             # Create AIRValue that loads from this variable on each .value access
             # (emulates scf.ForOp block_args — fresh value each iteration)
-            accum_air_values.append(AIRValue(
+            accum_air_values.append(_wrap_air_value(
                 node=None,
                 container=container,
                 shape=arg.shape,
@@ -316,7 +316,7 @@ def _loop_execute_range_dynamic(
                 if hasattr(container, "new_local"):
                     container.new_local(temp_name, metadata.air_type)
                 container.new_stid(temp_name, load_node)
-            carried_results.append(AIRValue(
+            carried_results.append(_wrap_air_value(
                 node=None,
                 container=container,
                 shape=metadata.shape,
@@ -491,7 +491,7 @@ def _if_execute_dynamic(
     merged_results = []
     for name, metadata in zip(temp_names, merge_metadata):
         if isinstance(metadata, AIRValue):
-            merged_results.append(AIRValue(
+            merged_results.append(_wrap_air_value(
                 node=None,
                 container=container,
                 shape=metadata.shape,
