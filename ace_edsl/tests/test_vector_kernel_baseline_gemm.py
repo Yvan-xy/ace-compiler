@@ -526,7 +526,7 @@ def _bridge_summary(dump: str):
     helper_body = dump[helper_markers[-1].start():]
     helper_lines = helper_body.splitlines()
     retv_indices = [index for index, line in enumerate(helper_lines)
-                    if line.lstrip().startswith("retv ID")]
+                    if line.lstrip().startswith("retv ")]
     assert retv_indices
     return_index = retv_indices[-1]
     value_index = return_index - 1

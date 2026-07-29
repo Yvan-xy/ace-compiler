@@ -261,6 +261,9 @@ FUNC_SCOPE* Materialize_helper(GLOB_SCOPE& glob,
                  "body builder must leave the terminal RETV to M1");
 
   STMT_PTR retv = helper_cntr.New_retv(result, spos);
+  const uint32_t generated_helper = 1;
+  retv->Node()->Set_attr(
+      VECTOR_KERNEL_GENERATED_HELPER_ATTR, &generated_helper, 1);
   STMT_LIST(body).Append(retv);
 
   HELPER_BODY_STATS completed;
@@ -333,6 +336,8 @@ std::optional<VECTOR_KERNEL_LOWERING_RESULT> Materialize_helper_and_call(
         helper_scope->Formal(idx)->Type()));
     caller_cntr->New_arg(call, idx, actuals[idx]);
   }
+  const uint32_t generated_call = 1;
+  call->Node()->Set_attr(VECTOR_KERNEL_GENERATED_CALL_ATTR, &generated_call, 1);
   ctx.Prepend(call);
 
   NODE_PTR replacement = caller_cntr->New_ldp(result_preg, spos);

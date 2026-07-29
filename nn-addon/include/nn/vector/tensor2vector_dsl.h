@@ -26,6 +26,13 @@ namespace vector {
 
 class TENSOR2VECTOR_CTX;
 
+// Structural marker carried by destination-owned generated helper calls.
+// Generated-helper inliners select this attribute rather than helper names.
+inline constexpr char VECTOR_KERNEL_GENERATED_CALL_ATTR[] =
+    "ace.vector_kernel.generated_call";
+inline constexpr char VECTOR_KERNEL_GENERATED_HELPER_ATTR[] =
+    "ace.vector_kernel.generated_helper";
+
 // A body builder is invoked only after the helper signature, entry point,
 // function scope, entry statement, and body block have been created in the
 // active Tensor-to-Vector destination GLOB_SCOPE. It must create every local,
