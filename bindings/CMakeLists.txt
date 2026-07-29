@@ -122,6 +122,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${ACE_BINDINGS_OUTPUT_DIR})
 # ═══════════════════════════════════════════════════════════════════════════════
 pybind11_add_module(air_builder 
     src/air_builder_bindings.cpp
+    src/air_function_inliner.cpp
     src/onnx_loader.cpp
 )
 target_include_directories(air_builder PRIVATE

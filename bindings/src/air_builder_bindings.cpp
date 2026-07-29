@@ -83,6 +83,7 @@
 
 // For ONNX model loading (separate compilation unit to avoid namespace conflicts)
 #include "onnx_loader.h"
+#include "air_function_inliner.h"
 #endif
 
 namespace py = pybind11;
@@ -5069,6 +5070,97 @@ public:
     
     bool has_native_ir() const { return glob != nullptr; }
     bool verify_ir() const { return glob != nullptr && glob->Verify_ir(); }
+    // Temporary baseline-GEMM E2E unblocker. M13 replaces this binding-side
+    // algorithm with the independent Python pass, and M15 removes this entry
+    // point after differential and downstream validation.
+
+    py::dict inline_generated_vector_kernel_helpers() {
+        py::dict output;
+        if (!glob) {
+            output["success"] = false;
+            output["changed"] = false;
+            output["calls_inlined"] = 0;
+            output["helpers_removed"] = 0;
+            output["diagnostic"] = "no AIR GLOB_SCOPE is available";
+            return output;
+        }
+
+        std::unique_ptr<GLOB_SCOPE> candidate;
+        ace::bindings::AIR_FUNCTION_INLINE_RESULT result;
+        try {
+            candidate.reset(ace::bindings::Clone_glob_with_code(*glob));
+            result = ace::bindings::Inline_tagged_leaf_helpers(
+                *candidate,
+                nn::vector::VECTOR_KERNEL_GENERATED_CALL_ATTR,
+                nn::vector::VECTOR_KERNEL_GENERATED_HELPER_ATTR);
+            if (result._success && result._changed) {
+                if (!candidate->Verify_ir()) {
+                    result._success = false;
+                    result._changed = false;
+                    result._diagnostic =
+                        "transactional inliner candidate does not verify";
+                } else {
+                    std::map<std::string, Type> candidate_types;
+                    for (const auto& item : types) {
+                        const Type& source_type = item.second;
+                        if (!source_type.has_type ||
+                            source_type.type == Null_ptr) {
+                            candidate_types.emplace(item.first, source_type);
+                            continue;
+                        }
+                        TYPE_PTR remapped_type = Null_ptr;
+                        if (source_type.type->Is_prim()) {
+                            remapped_type = candidate->Prim_type(
+                                source_type.type->Cast_to_prim()->Encoding());
+                        } else if (
+                            &source_type.type->Glob_scope() == glob) {
+                            remapped_type = candidate->Type(
+                                source_type.type->Id());
+                        }
+                        if (remapped_type == Null_ptr) {
+                            throw std::runtime_error(
+                                "cannot remap cached binding type during "
+                                "transactional inliner commit: " +
+                                item.first);
+                        }
+                        candidate_types.emplace(
+                            item.first,
+                            Type(remapped_type, source_type.name,
+                                 source_type.shape));
+                    }
+
+                    for (const auto& function : functions) {
+                        if (function) function->invalidate();
+                    }
+                    functions.clear();
+                    // GlobScope wrappers do not own prior native scopes. Keep
+                    // the old scope alive so externally copied Type wrappers
+                    // remain readable; they become foreign to the candidate
+                    // and existing scope checks reject their reuse. M15 removes
+                    // this transition-only clone/swap path.
+                    glob = candidate.release();
+                    types.swap(candidate_types);
+                    s_active_binding_glob = glob;
+                }
+            }
+        } catch (const std::exception& error) {
+            result._success = false;
+            result._changed = false;
+            result._diagnostic = error.what();
+        }
+        if (!result._success) {
+            result._changed = false;
+            result._calls_inlined = 0;
+            result._helpers_removed = 0;
+        }
+
+        output["success"] = result._success;
+        output["changed"] = result._changed;
+        output["calls_inlined"] = result._calls_inlined;
+        output["helpers_removed"] = result._helpers_removed;
+        output["diagnostic"] = result._diagnostic;
+        return output;
+    }
 
 #ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
     py::dict inspect_baseline_gemm_air_for_testing() const {
@@ -5211,6 +5303,52 @@ public:
         result["bridge_ok"] = py::none();
         result["bridge_message"] = "";
         return result;
+    }
+
+    void mutate_generated_vector_helper_for_testing(
+        const std::string& mutation) {
+        if (!glob || !glob->Verify_ir()) {
+            throw std::runtime_error(
+                "generated-helper mutation requires verified AIR");
+        }
+        FUNC_SCOPE* helper = nullptr;
+        for (GLOB_SCOPE::FUNC_SCOPE_ITER iter = glob->Begin_func_scope();
+             iter != glob->End_func_scope(); ++iter) {
+            FUNC_SCOPE* scope = &(*iter);
+            const char* raw_name = scope->Owning_func()->Name()->Char_str();
+            const std::string name = raw_name == nullptr ? "" : raw_name;
+            if (name.compare(0, M5_BASELINE_GEMM_HELPER_PREFIX.size(),
+                             M5_BASELINE_GEMM_HELPER_PREFIX) != 0) {
+                continue;
+            }
+            if (helper != nullptr) {
+                throw std::runtime_error(
+                    "generated-helper mutation requires one helper");
+            }
+            helper = scope;
+        }
+        if (helper == nullptr) {
+            throw std::runtime_error(
+                "generated-helper mutation found no helper");
+        }
+
+        FUNC_PTR helper_func = helper->Owning_func();
+        ENTRY_PTR helper_entry = helper_func->Entry_point();
+        if (mutation == "extra-entry") {
+            const std::string alias =
+                std::string(helper_func->Name()->Char_str()) + "_alias";
+            glob->New_entry_point(helper_entry->Type(), helper_func,
+                                  alias.c_str(), glob->Unknown_simple_spos());
+        } else if (mutation == "program-entry") {
+            helper_entry->Set_program_entry();
+        } else {
+            throw std::runtime_error(
+                "unsupported generated-helper test mutation: " + mutation);
+        }
+        if (!glob->Verify_ir()) {
+            throw std::runtime_error(
+                "generated-helper test mutation produced invalid AIR");
+        }
     }
 #endif  // ACE_VECTOR_KERNEL_TEST_SUPPORT
 
@@ -7279,10 +7417,18 @@ PYBIND11_MODULE(air_builder, m) {
         .def("has_native_ir", &GlobScope::has_native_ir)
         .def("verify_ir", &GlobScope::verify_ir,
              "Run the native AIR verifier on this global scope")
+        .def("inline_generated_vector_kernel_helpers",
+             &GlobScope::inline_generated_vector_kernel_helpers,
+             "Temporarily inline tagged same-module leaf helpers through the "
+             "binding-side E2E unblocker")
 #ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
         .def("_inspect_baseline_gemm_air_for_testing",
              &GlobScope::inspect_baseline_gemm_air_for_testing,
              "Normalize one native or Python-helper baseline Gemm from AIR objects")
+        .def("_mutate_generated_vector_helper_for_testing",
+             &GlobScope::mutate_generated_vector_helper_for_testing,
+             py::arg("mutation"),
+             "Apply a test-only generated-helper ownership mutation")
 #endif
         // C++ pass integration
         .def("run_cpp_pass", &GlobScope::run_cpp_pass,
