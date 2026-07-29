@@ -526,7 +526,7 @@ All builds, experiments, benchmarks, and tests must run inside
 | Gap | Missing capability | Milestone(s) that first fill it | Final validation milestone |
 | --- | --- | --- | --- |
 | G1 | Destination-module helper materialization and typed call/LDP bridge | M1 | M4/M7 |
-| G2 | Independent Python AIR inliner pass, pass hook, bindings, and cleanup | M13 | M14; no-inline FHE mode is follow-on work |
+| G2 | Independent Python AIR inliner pass, pass hook, bindings, and cleanup | M13 | M14/M15; no-inline FHE mode is follow-on work |
 | G3 | Lexical domain switching and Vector operand views | M2 | M3/M4 |
 | G4 | Typed Core scalar/index arithmetic and `SHL` | M2 | M5 |
 | G5 | Genuine Vector roll/slice/add/mul and `RNUM`/`SLOT` | M3 | M5/M6 |
@@ -1105,6 +1105,58 @@ Acceptance gate:
 Provides runtime closure for G11 and final production validation of G2, G9, and
 G10.
 
+### M15. Retire the tentative inliner after Python-inliner validation
+
+Begin M15 only after the independent Python inliner implemented in M13 passes
+its unit and negative tests and the M14 downstream matrix passes with the Python
+pass as the only selected production inliner. The tentative binding-side
+inliner may remain available through M13/M14 only as a transition aid and
+differential oracle; it is not a second production implementation.
+
+Before removing the tentative path, compare it with the Python pass on the
+supported generated-helper fixtures. Both paths must select the same tagged
+calls, preserve single evaluation and symbol ownership, remove the same dead
+helpers, produce normalized-equal post-inline AIR, and retain the same
+downstream rotation sets and deterministic runtime results.
+
+Then remove the tentative inliner implementation and all delegation to it,
+including:
+
+- the binding-side generated-helper inlining algorithm and its build-system
+  registration;
+- the `GlobScope.inline_generated_vector_kernel_helpers()` entry point and any
+  Python wrapper or pipeline branch that delegates inlining to it;
+- transition-only fallback, gating, diagnostics, and tests that exist solely
+  for the tentative path;
+- implementation support used only by the tentative algorithm and left unused
+  by the M13 Python pass.
+
+Retain the structural generated-helper/call metadata, the generic safe AIR
+traversal and mutation bindings required by M13, the Python
+`FunctionInlinerPass`, its pass hook, transactional verification, dead-helper
+cleanup, and their tests. If a generic primitive is currently colocated with
+the tentative implementation but is required by M13, move it to neutral AIR
+binding ownership rather than deleting or duplicating it.
+
+Acceptance gate:
+
+- the complete M13 unit, ownership, malformed-input, and transactional-failure
+  suite passes before and after removal;
+- the complete M14 provider/kernel matrix and downstream end-to-end suite passes
+  with the tentative entry point absent;
+- normalized post-inline AIR, rotation sets, generated C, and deterministic
+  outputs remain unchanged for the supported DSL kernels;
+- no production or test path calls, imports, links, or conditionally falls back
+  to the tentative inliner;
+- repository search finds no remaining tentative-inliner entry point,
+  implementation, build registration, or delegation shim;
+- `cpp + native + auto` remains unchanged, and DSL paths use only the M13 Python
+  inliner before Vector-to-SIHE.
+
+M15 is cleanup of the transition implementation only. It does not add
+preserved-call lowering, optional inlining policies, or another inliner
+algorithm. Completes the production cleanup portion of G2.
+
 ## Parallel Work and Merge Order
 
 ### Current Phase-A work
@@ -1144,12 +1196,15 @@ independent AIR inliner and downstream integration:
 M11 -> M12 (Python plan provider)
     -> M13 (Python AIR inliner)
     -> M14 (downstream integration)
+    -> M15 (retire tentative inliner)
 ```
 
 The M12 Python provider is ordinary compile-time planning code behind the M4
 data boundary, not an AIR pass. The M13 inliner remains a separate reusable DSL
 AIR-pass module. M14 owns its insertion into the compilation pipeline,
-full-pipeline validation, and controlled rollout.
+full-pipeline validation, and controlled rollout. M15 removes the tentative
+binding-side implementation only after the Python pass has independently
+satisfied those gates.
 
 ## Follow-on: Make Inlining Truly Optional
 
@@ -1221,6 +1276,8 @@ The full project is complete later when:
 - the independent Python `FunctionInlinerPass` and dead-helper cleanup are
   implemented with safe structural AIR bindings;
 - the pass runs after Tensor-to-Vector/Mv2v and before Vector-to-SIHE;
+- the tentative binding-side inliner and every delegation or fallback to it are
+  removed after Python-inliner correctness and downstream parity are confirmed;
 - no generated helper call or unreachable generated helper function reaches
   Vector-to-SIHE under the initial production policy;
 - all four kernels complete downstream lowering and C compilation;
