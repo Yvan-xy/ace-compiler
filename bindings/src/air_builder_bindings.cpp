@@ -3928,6 +3928,24 @@ NODE_PTR find_preg_load(NODE_PTR node) {
     return Null_ptr;
 }
 
+NODE_PTR find_opcode_node(NODE_PTR node, OPCODE opcode) {
+    if (node == Null_ptr) return Null_ptr;
+    if (node->Opcode() == opcode) return node;
+    if (node->Is_block()) {
+        for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+             stmt = stmt->Next()) {
+            NODE_PTR found = find_opcode_node(stmt->Node(), opcode);
+            if (found != Null_ptr) return found;
+        }
+        return Null_ptr;
+    }
+    for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
+        NODE_PTR found = find_opcode_node(node->Child(idx), opcode);
+        if (found != Null_ptr) return found;
+    }
+    return Null_ptr;
+}
+
 py::dict compare_normalized_vector_kernel_air_for_testing(
     const std::string& native_air, const std::string& helper_air) {
     const nn::vector::test::VECTOR_KERNEL_AIR_COMPARE_RESULT comparison =
@@ -5334,7 +5352,7 @@ public:
     
     bool has_native_ir() const { return glob != nullptr; }
     bool verify_ir() const { return glob != nullptr && glob->Verify_ir(); }
-    // Temporary baseline-GEMM E2E unblocker. M13 replaces this binding-side
+    // Temporary baseline-kernel E2E bridge. M13 replaces this binding-side
     // algorithm with the independent Python pass, and M15 removes this entry
     // point after differential and downstream validation.
 
@@ -5691,8 +5709,13 @@ public:
             FUNC_SCOPE* scope = &(*iter);
             const char* raw_name = scope->Owning_func()->Name()->Char_str();
             const std::string name = raw_name == nullptr ? "" : raw_name;
-            if (name.compare(0, BASELINE_GEMM_HELPER_PREFIX.size(),
-                             BASELINE_GEMM_HELPER_PREFIX) != 0) {
+            const bool baseline_gemm =
+                name.compare(0, BASELINE_GEMM_HELPER_PREFIX.size(),
+                             BASELINE_GEMM_HELPER_PREFIX) == 0;
+            const bool baseline_conv =
+                name.compare(0, BASELINE_CONV_HELPER_PREFIX.size(),
+                             BASELINE_CONV_HELPER_PREFIX) == 0;
+            if (!baseline_gemm && !baseline_conv) {
                 continue;
             }
             if (helper != nullptr) {
@@ -5715,6 +5738,42 @@ public:
                                   alias.c_str(), glob->Unknown_simple_spos());
         } else if (mutation == "program-entry") {
             helper_entry->Set_program_entry();
+        } else if (mutation == "array-non-pointer-rtype") {
+            NODE_PTR array = find_opcode_node(
+                helper->Container().Entry_node(), air::core::OPC_ARRAY);
+            if (array == Null_ptr || array->Array_dim() == 0 ||
+                !array->Array_idx(0)->Rtype()->Is_signed_int()) {
+                throw std::runtime_error(
+                    "array-rtype mutation found no suitable ARRAY");
+            }
+            array->Set_rtype(array->Array_idx(0)->Rtype());
+        } else if (mutation == "escaping-ldca") {
+            CONTAINER& container = helper->Container();
+            NODE_PTR body = container.Entry_node()->Body_blk();
+            NODE_PTR source = find_opcode_node(body, air::core::OPC_LDCA);
+            if (source == Null_ptr) {
+                throw std::runtime_error(
+                    "escaping-LDCA mutation found no constant address");
+            }
+            STMT_PTR terminal = Null_ptr;
+            for (STMT_PTR stmt = body->Begin_stmt(); stmt != body->End_stmt();
+                 stmt = stmt->Next()) {
+                if (stmt->Node()->Opcode() == air::core::OPC_RETV) {
+                    terminal = stmt;
+                    break;
+                }
+            }
+            if (terminal == Null_ptr) {
+                throw std::runtime_error(
+                    "escaping-LDCA mutation found no terminal return");
+            }
+            ADDR_DATUM_PTR pointer_local = helper->New_var(
+                source->Rtype(), "__escaping_constant_address",
+                source->Spos());
+            STMT_PTR store = container.New_st(
+                container.Clone_node_tree(source), pointer_local,
+                source->Spos());
+            STMT_LIST::Enclosing_list(terminal).Prepend(terminal, store);
         } else {
             throw std::runtime_error(
                 "unsupported generated-helper test mutation: " + mutation);

@@ -75,6 +75,17 @@ class VectorKernelLoweringConfig:
 _BASELINE_VECTOR_KERNEL_RECIPE_KINDS = frozenset(
     ("baseline-gemm", "baseline-conv")
 )
+_TENTATIVE_VECTOR_KERNEL_INLINE_PLAN_KINDS = frozenset(
+    ("auto", *_BASELINE_VECTOR_KERNEL_RECIPE_KINDS)
+)
+
+
+def _uses_tentative_vector_kernel_inliner(config):
+    return (
+        config is not None
+        and config.kernel_impl == "dsl"
+        and config.plan_kind in _TENTATIVE_VECTOR_KERNEL_INLINE_PLAN_KINDS
+    )
 
 
 @dataclass
@@ -422,13 +433,11 @@ class AcePipeline:
             
             # Stage 2: vector2sihe (skip if starting at fhe::sihe or later)
             if start_domain in ("nn::core", "nn::vector"):
-                # Temporary forced-baseline-GEMM E2E bridge. M13 replaces this
+                # Temporary baseline-kernel E2E bridge. M13 replaces this
                 # binding-side delegation with the Python AIR inliner, and M15
                 # removes the tentative path.
-                if (
-                    self.vector_kernel_config is not None
-                    and self.vector_kernel_config.kernel_impl == "dsl"
-                    and self.vector_kernel_config.plan_kind == "baseline-gemm"
+                if _uses_tentative_vector_kernel_inliner(
+                    self.vector_kernel_config
                 ):
                     log("Running generated-helper function inliner...")
                     from .passes.function_inliner import FunctionInlinerPass
@@ -1015,14 +1024,14 @@ class Pipeline:
         # Run each phase
         try:
             for phase in phases:
-                # Temporary forced-baseline-GEMM E2E bridge. M13 replaces this
+                # Temporary baseline-kernel E2E bridge. M13 replaces this
                 # binding-side delegation with the Python AIR inliner, and M15
                 # removes the tentative path.
                 if (
                     phase == "vector2sihe"
-                    and self.vector_kernel_config is not None
-                    and self.vector_kernel_config.kernel_impl == "dsl"
-                    and self.vector_kernel_config.plan_kind == "baseline-gemm"
+                    and _uses_tentative_vector_kernel_inliner(
+                        self.vector_kernel_config
+                    )
                 ):
                     if self.verbose:
                         print("[Pipeline] Running vector_kernel_inline...")

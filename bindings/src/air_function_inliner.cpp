@@ -123,8 +123,15 @@ bool Attribute_is_cloneable(ATTR_PTR attr) {
          attr->Value().size() == element_size * attr->Count();
 }
 
+enum class CLONE_USE {
+  VALUE,
+  INDIRECT_LOAD_ADDRESS,
+  CONSTANT_ARRAY_BASE,
+};
+
 bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
-                             bool allow_block, std::string* diagnostic) {
+                             bool allow_block, CLONE_USE use,
+                             std::string* diagnostic) {
   if (node == Null_ptr || node->Container() != &helper.Container()) {
     *diagnostic = "helper contains a foreign or null AIR node";
     return false;
@@ -140,7 +147,8 @@ bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
         *diagnostic = "helper contains a nested or nonterminal return";
         return false;
       }
-      if (!Validate_cloneable_node(stmt->Node(), helper, true, diagnostic))
+      if (!Validate_cloneable_node(stmt->Node(), helper, true,
+                                   CLONE_USE::VALUE, diagnostic))
         return false;
     }
     return true;
@@ -148,10 +156,54 @@ bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
 
   const OPCODE opcode = node->Opcode();
   if (node->Is_entry() || node->Is_call() || node->Is_intrn_call() ||
-      node->Is_intrn_op() || node->Has_added_chld() ||
-      opcode == air::core::OPC_LDA || opcode == air::core::OPC_LDCA) {
+      node->Is_intrn_op() ||
+      (node->Has_added_chld() && opcode != air::core::OPC_ARRAY) ||
+      opcode == air::core::OPC_LDA ||
+      (opcode == air::core::OPC_LDCA &&
+       use != CLONE_USE::CONSTANT_ARRAY_BASE)) {
     *diagnostic = "helper is not a supported leaf or has an escaping address";
     return false;
+  }
+  if (opcode == air::core::OPC_ARRAY) {
+    NODE_PTR base = node->Array_base();
+    if (use != CLONE_USE::INDIRECT_LOAD_ADDRESS || node->Array_dim() == 0 ||
+        base->Opcode() != air::core::OPC_LDCA ||
+        !base->Const()->Type()->Is_array() ||
+        base->Const()->Type()->Cast_to_arr()->Dim() != node->Array_dim() ||
+        !node->Rtype()->Is_ptr() ||
+        node->Rtype()->Cast_to_ptr()->Domain_type_id().Is_null() ||
+        node->Rtype()->Cast_to_ptr()->Ptr_kind() != POINTER_KIND::FLAT32 ||
+        !node->Rtype()->Cast_to_ptr()->Domain_type()->Base_type()->
+            Is_compatible_type(
+                base->Const()->Type()->Cast_to_arr()->Elem_type()->Base_type())) {
+      *diagnostic =
+          "helper contains an unsupported or escaping array address";
+      return false;
+    }
+    for (uint32_t dim = 0; dim < node->Array_dim(); ++dim) {
+      if (!node->Array_idx(dim)->Rtype()->Is_signed_int()) {
+        *diagnostic = "helper constant-array index must be a signed integer";
+        return false;
+      }
+    }
+  }
+  if (opcode == air::core::OPC_ILD && node->Num_child() == 1 &&
+      node->Child(0)->Opcode() == air::core::OPC_ARRAY) {
+    if (!node->Child(0)->Rtype()->Is_ptr() ||
+        node->Child(0)->Rtype()->Cast_to_ptr()->Domain_type_id().Is_null()) {
+      *diagnostic =
+          "helper contains an unsupported or escaping array address";
+      return false;
+    }
+    TYPE_PTR element =
+        node->Child(0)->Rtype()->Cast_to_ptr()->Domain_type()->Base_type();
+    if (!node->Has_access_type() ||
+        !node->Access_type()->Is_compatible_type(element) ||
+        !node->Rtype()->Is_compatible_type(element)) {
+      *diagnostic =
+          "helper constant-array load has incompatible element types";
+      return false;
+    }
   }
   if (META_INFO::Has_prop<OPR_PROP::ENTRY>(opcode) ||
       META_INFO::Has_prop<OPR_PROP::RET_VAR>(opcode) ||
@@ -211,7 +263,14 @@ bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
     }
   }
   for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
-    if (!Validate_cloneable_node(node->Child(idx), helper, true, diagnostic))
+    CLONE_USE child_use = CLONE_USE::VALUE;
+    if (opcode == air::core::OPC_ILD && idx == 0) {
+      child_use = CLONE_USE::INDIRECT_LOAD_ADDRESS;
+    } else if (opcode == air::core::OPC_ARRAY && idx == 0) {
+      child_use = CLONE_USE::CONSTANT_ARRAY_BASE;
+    }
+    if (!Validate_cloneable_node(node->Child(idx), helper, true, child_use,
+                                 diagnostic))
       return false;
   }
   return true;
@@ -314,11 +373,12 @@ bool Validate_call_site(const CALL_SITE& site, const char* helper_attribute,
         return false;
       }
       if (!Validate_cloneable_node(node->Child(0), *site._helper, false,
-                                   diagnostic))
+                                   CLONE_USE::VALUE, diagnostic))
         return false;
       continue;
     }
-    if (!Validate_cloneable_node(node, *site._helper, true, diagnostic))
+    if (!Validate_cloneable_node(node, *site._helper, true,
+                                 CLONE_USE::VALUE, diagnostic))
       return false;
   }
   if (returns != 1 || terminal == Null_ptr ||
@@ -514,8 +574,13 @@ private:
 
   NODE_PTR Clone_expression(NODE_PTR source) {
     AIR_ASSERT(!source->Is_root() && !source->Is_block());
+    const uint32_t added_children =
+        source->Opcode() == air::core::OPC_ARRAY ? source->Array_dim() : 0;
+    AIR_ASSERT(!source->Has_added_chld() ||
+               source->Opcode() == air::core::OPC_ARRAY);
     NODE_PTR destination = _container.New_cust_node(
-        source->Opcode(), source->Rtype(), source->Spos());
+        source->Opcode(), source->Rtype(), source->Spos(), added_children);
+    if (added_children != 0) destination->Set_num_arg(added_children);
     Copy_fields(destination, source);
     for (uint32_t idx = 0; idx < source->Num_child(); ++idx) {
       NODE_PTR child = source->Child(idx)->Is_block()

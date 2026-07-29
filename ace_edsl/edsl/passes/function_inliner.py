@@ -1,6 +1,6 @@
 """Temporary pass facade for binding-side generated-helper inlining.
 
-This baseline-GEMM E2E unblocker is not the independent Python AIR algorithm
+This baseline-kernel E2E bridge is not the independent Python AIR algorithm
 planned for M13. M13 replaces it, and M15 removes the tentative native path.
 """
 

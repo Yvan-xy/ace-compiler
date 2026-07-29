@@ -16,7 +16,7 @@
 
 namespace ace::bindings {
 
-// Temporary baseline-GEMM E2E unblocker. This binding-side algorithm is not
+// Temporary baseline-kernel E2E bridge. This binding-side algorithm is not
 // the independent Python inliner planned for M13 and is removed in M15 after
 // the Python pass has passed differential and downstream validation.
 

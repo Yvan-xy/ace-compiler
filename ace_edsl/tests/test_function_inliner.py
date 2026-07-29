@@ -20,6 +20,7 @@ _WORKER_FLAG = "--function-inliner-worker"
 _WORKER_TIMEOUT_SECONDS = 600
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HELPER_PREFIX = "__ace_vkernel_baseline_gemm_"
+_CONV_HELPER_PREFIX = "__ace_vkernel_baseline_conv_"
 
 
 def _write_gemm_model(path: Path, copies: int = 1):
@@ -54,6 +55,60 @@ def _write_gemm_model(path: Path, copies: int = 1):
     )
     graph = helper.make_graph(
         nodes, "function_inliner", [input_info], [output_info], [weight, bias]
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13)],
+        ir_version=8,
+    )
+    onnx.checker.check_model(model)
+    onnx.save(model, path)
+
+
+def _write_conv_model(path: Path):
+    channel_in = 4
+    channel_out = 2
+    height = 4
+    width = 4
+    kernel = 3
+    weight_values = (
+        np.arange(
+            channel_out * channel_in * kernel * kernel,
+            dtype=np.float32,
+        )
+        + 1.0
+    ) / 32.0
+    weight = numpy_helper.from_array(
+        weight_values.reshape(
+            channel_out, channel_in, kernel, kernel
+        ),
+        "weight",
+    )
+    bias = numpy_helper.from_array(
+        np.array([0.25, -0.5], dtype=np.float32), "bias"
+    )
+    input_info = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, channel_in, height, width]
+    )
+    output_info = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, channel_out, height, width]
+    )
+    conv = helper.make_node(
+        "Conv",
+        ["input", "weight", "bias"],
+        ["output"],
+        name="conv",
+        kernel_shape=[kernel, kernel],
+        pads=[1, 1, 1, 1],
+        strides=[1, 1],
+        group=1,
+    )
+    graph = helper.make_graph(
+        [conv],
+        "function_inliner_conv",
+        [input_info],
+        [output_info],
+        [weight, bias],
     )
     model = helper.make_model(
         graph,
@@ -159,6 +214,48 @@ def test_shared_helper_all_calls_inline_before_single_cleanup(tmp_path):
     assert result["after"]["arg_stores"] == 2
 
 
+def test_tentative_inliner_clones_conv_constant_array_access(tmp_path):
+    model = tmp_path / "conv_constant_array.onnx"
+    _write_conv_model(model)
+
+    result = _run_worker(model, "conv-always")
+
+    assert result["pipeline_success"]
+    assert result["before"]["verify"]
+    assert result["before"]["helper_calls"] == 1
+    assert result["before"]["helper_scopes"] == 1
+    assert result["before"]["ldcas"] == 1
+    assert result["before"]["arrays"] == 1
+    assert result["before"]["ilds"] == 1
+    assert result["before"]["loops"] == 2
+    assert result["pass"] == {
+        "success": True,
+        "changed": True,
+        "calls_inlined": 1,
+        "helpers_removed": 1,
+        "diagnostics": [],
+    }
+    assert result["after"]["verify"]
+    assert result["after"]["helper_calls"] == 0
+    assert result["after"]["helper_scopes"] == 0
+    assert result["after"]["helper_symbols"] == 0
+    assert result["after"]["arg_stores"] == 1
+    assert result["after"]["ldcas"] == result["before"]["ldcas"]
+    assert result["after"]["arrays"] == result["before"]["arrays"]
+    assert result["after"]["ilds"] == result["before"]["ilds"]
+    assert result["after"]["loops"] == result["before"]["loops"]
+    assert result["after"]["vector_ops"] == result["before"]["vector_ops"]
+    assert result["after"]["rotations"] == result["before"]["rotations"]
+    assert result["second"] == {
+        "success": True,
+        "changed": False,
+        "calls_inlined": 0,
+        "helpers_removed": 0,
+        "diagnostics": [],
+    }
+    assert result["second_dump_unchanged"]
+
+
 @pytest.mark.parametrize(
     "action,success,diagnostic",
     [
@@ -168,13 +265,18 @@ def test_shared_helper_all_calls_inline_before_single_cleanup(tmp_path):
         ("invalid-policy", False, "unsupported function-inliner policy"),
         ("extra-entry", False, "additional entry point"),
         ("program-entry", False, "one non-program entry point"),
+        ("conv-array-non-pointer-rtype", False, "array address"),
+        ("conv-escaping-ldca", False, "escaping address"),
     ],
 )
 def test_policy_and_predicate_failures_do_not_mutate(
     tmp_path, action, success, diagnostic
 ):
     model = tmp_path / f"{action}.onnx"
-    _write_gemm_model(model)
+    if action.startswith("conv-"):
+        _write_conv_model(model)
+    else:
+        _write_gemm_model(model)
 
     result = _run_worker(model, action)
 
@@ -203,6 +305,32 @@ def test_python_pass_rejects_missing_scope_or_binding():
     missing_binding = FunctionInlinerPass.run(object())
     assert not missing_binding.success
     assert "has no generated-helper inlining binding" in missing_binding.diagnostics[0]
+
+
+def test_tentative_pipeline_gate_is_limited_to_baseline_dsl_requests():
+    from ace_edsl.edsl.pipeline import (
+        VectorKernelLoweringConfig,
+        _uses_tentative_vector_kernel_inliner,
+    )
+
+    base = VectorKernelLoweringConfig(kernel_impl="dsl")
+    assert _uses_tentative_vector_kernel_inliner(base)
+    assert _uses_tentative_vector_kernel_inliner(
+        dataclasses.replace(base, plan_kind="baseline-gemm")
+    )
+    assert _uses_tentative_vector_kernel_inliner(
+        dataclasses.replace(base, plan_kind="baseline-conv")
+    )
+    assert not _uses_tentative_vector_kernel_inliner(None)
+    assert not _uses_tentative_vector_kernel_inliner(
+        dataclasses.replace(base, kernel_impl="native")
+    )
+    assert not _uses_tentative_vector_kernel_inliner(
+        dataclasses.replace(base, plan_kind="fast-gemm")
+    )
+    assert not _uses_tentative_vector_kernel_inliner(
+        dataclasses.replace(base, plan_kind="fast-conv")
+    )
 
 
 def test_pipeline_boundary_and_native_parity(tmp_path):
@@ -248,18 +376,75 @@ def test_pipeline_boundary_and_native_parity(tmp_path):
     assert not dsl_c["helper_in_c"]
 
 
-def _summary(glob):
+def test_baseline_conv_pipeline_boundary_and_native_parity(tmp_path):
+    model = tmp_path / "pipeline_conv.onnx"
+    _write_conv_model(model)
+
+    pre_inline = _run_worker(model, "conv-dsl-t2v")
+    dsl_vector = _run_worker(model, "conv-dsl-v2s")
+    dsl_auto_vector = _run_worker(model, "conv-dsl-auto-v2s")
+    native_vector = _run_worker(model, "conv-native-v2s")
+    dsl_ckks = _run_worker(model, "conv-dsl-s2c")
+    dsl_c = _run_worker(model, "conv-dsl-c")
+
+    assert pre_inline["success"]
+    assert pre_inline["stages"] == ["tensor2vector"]
+    assert pre_inline["summary"]["helper_calls"] == 1
+    assert pre_inline["summary"]["helper_scopes"] == 1
+
+    assert dsl_vector["success"], dsl_vector["error"]
+    assert dsl_auto_vector["success"], dsl_auto_vector["error"]
+    assert native_vector["success"], native_vector["error"]
+    assert dsl_vector["stages"] == [
+        "tensor2vector",
+        "vector_kernel_inline",
+        "vector2sihe",
+    ]
+    assert dsl_auto_vector["stages"] == dsl_vector["stages"]
+    assert native_vector["stages"] == ["tensor2vector", "vector2sihe"]
+    for candidate in (dsl_vector, dsl_auto_vector):
+        assert candidate["summary"]["helper_calls"] == 0
+        assert candidate["summary"]["helper_scopes"] == 0
+        assert candidate["summary"]["helper_symbols"] == 0
+        assert (
+            candidate["summary"]["sihe_ops"]
+            == native_vector["summary"]["sihe_ops"]
+        )
+        assert (
+            candidate["summary"]["rotations"]
+            == native_vector["summary"]["rotations"]
+        )
+        assert (
+            candidate["summary"]["loops"]
+            == native_vector["summary"]["loops"]
+        )
+
+    assert dsl_ckks["success"], dsl_ckks["error"]
+    assert dsl_ckks["stages"] == [
+        "tensor2vector",
+        "vector_kernel_inline",
+        "vector2sihe",
+        "sihe2ckks",
+    ]
+    assert dsl_ckks["summary"]["verify"]
+
+    assert dsl_c["success"], dsl_c["error"]
+    assert dsl_c["c_len"] > 0
+    assert not dsl_c["helper_in_c"]
+
+
+def _summary(glob, helper_prefix=_HELPER_PREFIX):
     dump = glob.dump()
     return {
         "verify": glob.verify_ir(),
         "helper_calls": len(
-            re.findall(rf'^\s+call "{_HELPER_PREFIX}', dump, re.MULTILINE)
+            re.findall(rf'^\s+call "{helper_prefix}', dump, re.MULTILINE)
         ),
         "helper_scopes": len(
-            re.findall(rf'^FUN\[[^\n]*"{_HELPER_PREFIX}', dump, re.MULTILINE)
+            re.findall(rf'^FUN\[[^\n]*"{helper_prefix}', dump, re.MULTILINE)
         ),
         "helper_symbols": len(
-            re.findall(rf'^  FUN\[[^\n]*"{_HELPER_PREFIX}', dump, re.MULTILINE)
+            re.findall(rf'^  FUN\[[^\n]*"{helper_prefix}', dump, re.MULTILINE)
         ),
         "arg_stores": len(
             re.findall(r'^\s+st "__ace_inline_[^"]+_arg_0"', dump, re.MULTILINE)
@@ -268,6 +453,9 @@ def _summary(glob):
         "sihe_ops": re.findall(r"^\s+SIHE\.([a-z_]+)", dump, re.MULTILINE),
         "rotations": re.findall(r"ATTR\[nums=([^\]]+)\]", dump),
         "loops": len(re.findall(r"^\s+do_loop ID", dump, re.MULTILINE)),
+        "ldcas": len(re.findall(r"^\s+ldca ", dump, re.MULTILINE)),
+        "arrays": len(re.findall(r"^\s+array ", dump, re.MULTILINE)),
+        "ilds": len(re.findall(r"^\s+ild ", dump, re.MULTILINE)),
     }
 
 
@@ -301,15 +489,62 @@ def _new_pipeline(model: Path, implementation: str, artifact_tag: str = "pass"):
     return pipeline
 
 
+def _new_conv_pipeline(
+    model: Path,
+    implementation: str,
+    artifact_tag: str = "conv-pass",
+    *,
+    auto_plan: bool = False,
+):
+    from ace_edsl.edsl.pipeline import Pipeline
+    from ace_edsl.edsl.kernels.vector.baseline_conv import baseline_conv_recipe
+
+    pipeline = Pipeline(
+        "function-inliner-conv-worker",
+        output_dir=str(model.parent / f"output-{artifact_tag}"),
+        dump_ir=False,
+        verbose=False,
+    ).load_onnx(str(model))
+    pipeline.configure_fhe(data_file=str(model.parent / f"{artifact_tag}.data.msg"))
+    pipeline.configure_vector_kernel_lowering(
+        plan_provider="cpp",
+        kernel_impl=implementation,
+        plan_kind="auto" if auto_plan else "baseline-conv",
+        fallback="error",
+        mask_fuse=False,
+        max_slots=128,
+    )
+    if implementation == "dsl":
+        pipeline.register_vector_kernel_recipe("baseline-conv", baseline_conv_recipe)
+    return pipeline
+
+
 def _worker_main():
     from ace_edsl.edsl.passes.function_inliner import FunctionInlinerPass
     from ace_edsl.edsl.pipeline import PipelineTarget
 
     model = Path(sys.argv[2])
-    action = sys.argv[3]
+    requested_action = sys.argv[3]
+    is_conv = requested_action.startswith("conv-")
+    action = requested_action.removeprefix("conv-") if is_conv else requested_action
+    helper_prefix = _CONV_HELPER_PREFIX if is_conv else _HELPER_PREFIX
     if action.startswith("dsl-") or action.startswith("native-"):
-        implementation, target_name = action.split("-", 1)
-        pipeline = _new_pipeline(model, implementation, action)
+        auto_plan = action.startswith("dsl-auto-")
+        if auto_plan:
+            implementation = "dsl"
+            target_name = action.removeprefix("dsl-auto-")
+        else:
+            implementation, target_name = action.split("-", 1)
+        pipeline = (
+            _new_conv_pipeline(
+                model,
+                implementation,
+                requested_action,
+                auto_plan=auto_plan,
+            )
+            if is_conv
+            else _new_pipeline(model, implementation, requested_action)
+        )
         targets = {
             "t2v": PipelineTarget.TENSOR2VECTOR,
             "v2s": PipelineTarget.VECTOR2SIHE,
@@ -324,15 +559,24 @@ def _worker_main():
         }
         if target_name == "c":
             payload["c_len"] = len(result.c_code or "")
-            payload["helper_in_c"] = _HELPER_PREFIX in (result.c_code or "")
+            payload["helper_in_c"] = helper_prefix in (result.c_code or "")
         else:
-            payload["summary"] = _summary(pipeline.glob)
+            payload["summary"] = _summary(pipeline.glob, helper_prefix)
         print(json.dumps(payload))
         return
 
-    pipeline = _new_pipeline(model, "dsl", action)
+    pipeline = (
+        _new_conv_pipeline(model, "dsl", requested_action)
+        if is_conv
+        else _new_pipeline(model, "dsl", requested_action)
+    )
     pipeline_result = pipeline.run(target=PipelineTarget.TENSOR2VECTOR)
-    if action in ("extra-entry", "program-entry"):
+    if action in (
+        "extra-entry",
+        "program-entry",
+        "array-non-pointer-rtype",
+        "escaping-ldca",
+    ):
         pipeline.glob._mutate_generated_vector_helper_for_testing(action)
     before_dump = pipeline.glob.dump()
     before_ptr = pipeline.glob.get_native_ptr()
@@ -359,7 +603,12 @@ def _worker_main():
         inline_result = FunctionInlinerPass.run(pipeline.glob, predicate=fail_predicate)
     elif action == "invalid-policy":
         inline_result = FunctionInlinerPass.run(pipeline.glob, policy="unsupported")
-    elif action in ("extra-entry", "program-entry"):
+    elif action in (
+        "extra-entry",
+        "program-entry",
+        "array-non-pointer-rtype",
+        "escaping-ldca",
+    ):
         inline_result = FunctionInlinerPass.run(pipeline.glob)
     else:
         raise ValueError(action)
@@ -372,8 +621,8 @@ def _worker_main():
     after_dump = pipeline.glob.dump()
     payload = {
         "pipeline_success": pipeline_result.success,
-        "before": _summary_from_dump(before_dump, True),
-        "after": _summary(pipeline.glob),
+        "before": _summary_from_dump(before_dump, True, helper_prefix),
+        "after": _summary(pipeline.glob, helper_prefix),
         "pass": _pass_dict(inline_result),
         "selection": selection,
         "dump_unchanged": before_dump == after_dump,
@@ -389,17 +638,17 @@ def _worker_main():
     print(json.dumps(payload))
 
 
-def _summary_from_dump(dump: str, verify: bool):
+def _summary_from_dump(dump: str, verify: bool, helper_prefix=_HELPER_PREFIX):
     return {
         "verify": verify,
         "helper_calls": len(
-            re.findall(rf'^\s+call "{_HELPER_PREFIX}', dump, re.MULTILINE)
+            re.findall(rf'^\s+call "{helper_prefix}', dump, re.MULTILINE)
         ),
         "helper_scopes": len(
-            re.findall(rf'^FUN\[[^\n]*"{_HELPER_PREFIX}', dump, re.MULTILINE)
+            re.findall(rf'^FUN\[[^\n]*"{helper_prefix}', dump, re.MULTILINE)
         ),
         "helper_symbols": len(
-            re.findall(rf'^  FUN\[[^\n]*"{_HELPER_PREFIX}', dump, re.MULTILINE)
+            re.findall(rf'^  FUN\[[^\n]*"{helper_prefix}', dump, re.MULTILINE)
         ),
         "arg_stores": len(
             re.findall(r'^\s+st "__ace_inline_[^"]+_arg_0"', dump, re.MULTILINE)
@@ -408,6 +657,9 @@ def _summary_from_dump(dump: str, verify: bool):
         "sihe_ops": re.findall(r"^\s+SIHE\.([a-z_]+)", dump, re.MULTILINE),
         "rotations": re.findall(r"ATTR\[nums=([^\]]+)\]", dump),
         "loops": len(re.findall(r"^\s+do_loop ID", dump, re.MULTILINE)),
+        "ldcas": len(re.findall(r"^\s+ldca ", dump, re.MULTILINE)),
+        "arrays": len(re.findall(r"^\s+array ", dump, re.MULTILINE)),
+        "ilds": len(re.findall(r"^\s+ild ", dump, re.MULTILINE)),
     }
 
 
