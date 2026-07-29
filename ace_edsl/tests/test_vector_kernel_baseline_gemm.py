@@ -146,6 +146,9 @@ def test_cpp_plan_dsl_baseline_gemm_matches_native_structure(
 
     assert native["success"] and dsl["success"]
     assert native["verify"] and dsl["verify"]
+    assert native["stages_completed"] == dsl["stages_completed"] == [
+        "tensor2vector"
+    ]
     assert not native["has_nn_gemm"] and not dsl["has_nn_gemm"]
     assert native["stats"] == dsl["stats"]
     for name in ("loops", "rolls", "slices", "adds", "muls", "shls"):
@@ -683,7 +686,7 @@ def _worker_main():
     if implementation != "default":
         kernel_impl = "native" if implementation == "native-auto" else implementation
         plan_kind = "auto" if implementation == "native-auto" else "baseline-gemm"
-        fallback = "cpp-native" if behavior == "raise" else "error"
+        fallback = "cpp-native" if behavior != "normal" else "error"
         pipeline.configure_vector_kernel_lowering(
             plan_provider="cpp",
             kernel_impl=kernel_impl,
@@ -840,6 +843,7 @@ def _worker_main():
         "success": True,
         "error": None,
         "verify": pipeline.glob.verify_ir(),
+        "stages_completed": result.stages_completed,
         "has_nn_gemm": bool(re.search(r"\bNN\.gemm\b", dump, re.IGNORECASE)),
         "stats": _stats(dump),
         "helper_count": len(helper_names),

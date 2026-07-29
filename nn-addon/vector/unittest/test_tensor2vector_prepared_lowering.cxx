@@ -1157,37 +1157,134 @@ TEST_F(Tensor2VectorPreparedLowering,
 }
 
 TEST_F(Tensor2VectorPreparedLowering,
-       MissingDslRecipeFallsBackToCppNativeBeforeLowering) {
-  SOURCE_KERNEL_IR source = Build_source_kernel(
-      SOURCE_KERNEL::GEMM, "prepared_missing_recipe_fallback", 607);
-  VECTOR_CTX vector_ctx;
-  VECTOR_CONFIG config;
-  config._plan_provider = "cpp";
-  config._kernel_impl = "dsl";
-  config._plan_kind = "baseline-gemm";
-  config._fallback = "cpp-native";
+       MissingProviderHasErrorOrDiagnosedCppNativeFallback) {
+  struct CASE {
+    SOURCE_KERNEL _kernel;
+    const char*   _plan_kind;
+  };
+  const CASE cases[] = {
+      {SOURCE_KERNEL::GEMM, "baseline-gemm"},
+      {SOURCE_KERNEL::CONV, "baseline-conv"},
+  };
 
-  testing::internal::CaptureStderr();
-  std::unique_ptr<GLOB_SCOPE> lowered = Lower(source, vector_ctx, config);
-  const std::string stderr_output = testing::internal::GetCapturedStderr();
+  uint32_t line = 607;
+  for (const CASE& test_case : cases) {
+    SCOPED_TRACE(test_case._plan_kind);
+    SOURCE_KERNEL_IR error_source = Build_source_kernel(
+        test_case._kernel, "missing_provider_error", line++);
+    VECTOR_CTX error_ctx;
+    VECTOR_CONFIG error_config;
+    error_config._plan_provider = "python";
+    error_config._kernel_impl = "dsl";
+    error_config._plan_kind = test_case._plan_kind;
+    error_config._fallback = "error";
+    EXPECT_DEATH(
+        {
+          std::unique_ptr<GLOB_SCOPE> lowered =
+              Lower(error_source, error_ctx, error_config);
+        },
+        "requested vector-kernel plan provider is unavailable");
 
-  ASSERT_NE(lowered, nullptr);
-  ASSERT_TRUE(lowered->Verify_ir());
-  const std::string expected_diagnostic =
-      "vector-kernel fallback: DSL recipe unavailable; using cpp/native\n";
-  ASSERT_GE(stderr_output.size(), expected_diagnostic.size());
-  EXPECT_EQ(stderr_output.substr(stderr_output.size() -
-                                 expected_diagnostic.size()),
-            expected_diagnostic);
-  EXPECT_EQ(stderr_output.find(expected_diagnostic),
-            stderr_output.rfind(expected_diagnostic));
+    SOURCE_KERNEL_IR fallback_source = Build_source_kernel(
+        test_case._kernel, "missing_provider_fallback", line++);
+    VECTOR_CTX fallback_ctx;
+    VECTOR_CONFIG fallback_config;
+    fallback_config._plan_provider = "python";
+    fallback_config._kernel_impl = "dsl";
+    fallback_config._plan_kind = test_case._plan_kind;
+    fallback_config._fallback = "cpp-native";
 
-  EXPECT_EQ(Function_count(*lowered), 1U);
-  const FUNC_SCOPE& caller =
-      lowered->Open_func_scope(source._function_id);
-  const AIR_COUNTS counts = Get_counts(caller);
-  EXPECT_EQ(counts._calls, 0U);
-  EXPECT_EQ(counts._nn_gemms, 0U);
-  EXPECT_EQ(counts._nn_convs, 0U);
-  EXPECT_GT(counts._vector_nodes, 0U);
+    testing::internal::CaptureStderr();
+    std::unique_ptr<GLOB_SCOPE> lowered =
+        Lower(fallback_source, fallback_ctx, fallback_config);
+    const std::string stderr_output =
+        testing::internal::GetCapturedStderr();
+
+    ASSERT_NE(lowered, nullptr);
+    ASSERT_TRUE(lowered->Verify_ir());
+    const std::string expected_diagnostic =
+        "vector-kernel fallback: requested provider unavailable; using "
+        "cpp/native\n";
+    ASSERT_GE(stderr_output.size(), expected_diagnostic.size());
+    EXPECT_EQ(stderr_output.substr(stderr_output.size() -
+                                   expected_diagnostic.size()),
+              expected_diagnostic);
+    EXPECT_EQ(stderr_output.find(expected_diagnostic),
+              stderr_output.rfind(expected_diagnostic));
+
+    EXPECT_EQ(Function_count(*lowered), 1U);
+    const FUNC_SCOPE& caller =
+        lowered->Open_func_scope(fallback_source._function_id);
+    const AIR_COUNTS counts = Get_counts(caller);
+    EXPECT_EQ(counts._calls, 0U);
+    EXPECT_EQ(counts._nn_gemms, 0U);
+    EXPECT_EQ(counts._nn_convs, 0U);
+    EXPECT_GT(counts._vector_nodes, 0U);
+  }
+}
+
+TEST_F(Tensor2VectorPreparedLowering,
+       MissingDslRecipeHasErrorOrDiagnosedCppNativeFallback) {
+  struct CASE {
+    SOURCE_KERNEL _kernel;
+    const char*   _plan_kind;
+  };
+  const CASE cases[] = {
+      {SOURCE_KERNEL::GEMM, "baseline-gemm"},
+      {SOURCE_KERNEL::CONV, "baseline-conv"},
+  };
+
+  uint32_t line = 617;
+  for (const CASE& test_case : cases) {
+    SCOPED_TRACE(test_case._plan_kind);
+    SOURCE_KERNEL_IR error_source = Build_source_kernel(
+        test_case._kernel, "missing_recipe_error", line++);
+    VECTOR_CTX error_ctx;
+    VECTOR_CONFIG error_config;
+    error_config._plan_provider = "cpp";
+    error_config._kernel_impl = "dsl";
+    error_config._plan_kind = test_case._plan_kind;
+    error_config._fallback = "error";
+    EXPECT_DEATH(
+        {
+          std::unique_ptr<GLOB_SCOPE> lowered =
+              Lower(error_source, error_ctx, error_config);
+        },
+        "no DSL recipe is registered for the validated plan kind");
+
+    SOURCE_KERNEL_IR fallback_source = Build_source_kernel(
+        test_case._kernel, "missing_recipe_fallback", line++);
+    VECTOR_CTX fallback_ctx;
+    VECTOR_CONFIG fallback_config;
+    fallback_config._plan_provider = "cpp";
+    fallback_config._kernel_impl = "dsl";
+    fallback_config._plan_kind = test_case._plan_kind;
+    fallback_config._fallback = "cpp-native";
+
+    testing::internal::CaptureStderr();
+    std::unique_ptr<GLOB_SCOPE> lowered =
+        Lower(fallback_source, fallback_ctx, fallback_config);
+    const std::string stderr_output =
+        testing::internal::GetCapturedStderr();
+
+    ASSERT_NE(lowered, nullptr);
+    ASSERT_TRUE(lowered->Verify_ir());
+    const std::string expected_diagnostic =
+        "vector-kernel fallback: DSL recipe unavailable; using cpp/native\n";
+    ASSERT_GE(stderr_output.size(), expected_diagnostic.size());
+    EXPECT_EQ(stderr_output.substr(stderr_output.size() -
+                                   expected_diagnostic.size()),
+              expected_diagnostic);
+    EXPECT_EQ(stderr_output.find(expected_diagnostic),
+              stderr_output.rfind(expected_diagnostic));
+
+    EXPECT_EQ(Function_count(*lowered), 1U);
+    const FUNC_SCOPE& caller =
+        lowered->Open_func_scope(fallback_source._function_id);
+    const AIR_COUNTS counts = Get_counts(caller);
+    EXPECT_EQ(counts._calls, 0U);
+    EXPECT_EQ(counts._nn_gemms, 0U);
+    EXPECT_EQ(counts._nn_convs, 0U);
+    EXPECT_GT(counts._vector_nodes, 0U);
+  }
 }

@@ -274,6 +274,19 @@ Cpp_result(const VECTOR_KERNEL_PLANNING_REQUEST &request) {
   return std::move(*call._result);
 }
 
+class ALTERNATE_PROVENANCE_PROVIDER final
+    : public VECTOR_KERNEL_PLAN_PROVIDER {
+public:
+  const char *Name() const override { return "alternate-conv-test"; }
+
+  VECTOR_KERNEL_PROVIDER_CALL_RESULT
+  Plan(const VECTOR_KERNEL_PLANNING_REQUEST &request) const override {
+    VECTOR_KERNEL_PROVIDER_RESULT result = Cpp_result(request);
+    result._provenance = Name();
+    return VECTOR_KERNEL_PROVIDER_CALL_RESULT::Success(std::move(result));
+  }
+};
+
 class FAIL_IF_CALLED_PROVIDER final : public VECTOR_KERNEL_PLAN_PROVIDER {
 public:
   const char *Name() const override { return "fail-if-called"; }
@@ -577,6 +590,45 @@ TEST(Tensor2VectorConvPlanning,
   ASSERT_TRUE(forced_fast_result.Ok()) << forced_fast_result._diagnostic;
   EXPECT_TRUE(Equal_vector_kernel_prepared_semantics(
       *fast_result._prepared, *forced_fast_result._prepared));
+}
+
+TEST(Tensor2VectorConvPlanning,
+     BaselineIdentityIgnoresProviderAndProvenance) {
+  const VECTOR_KERNEL_PLANNING_REQUEST request = Conv_request(
+      4, 2, 2, 1, 32,
+      VECTOR_KERNEL_REQUESTED_PLAN_KIND::BASELINE_CONV);
+  const VECTOR_KERNEL_RESOLUTION_RESULT cpp = Resolve(request);
+  ASSERT_TRUE(cpp.Ok()) << cpp._diagnostic;
+
+  ALTERNATE_PROVENANCE_PROVIDER alternate_provider;
+  VECTOR_KERNEL_PLAN_PROVIDER_REGISTRY registry;
+  ASSERT_TRUE(registry.Register(VECTOR_KERNEL_PLAN_PROVIDER_KIND::PYTHON,
+                                &alternate_provider));
+  const VECTOR_KERNEL_SELECTION selection{
+      VECTOR_KERNEL_PLAN_PROVIDER_KIND::PYTHON,
+      VECTOR_KERNEL_IMPLEMENTATION::DSL,
+      VECTOR_KERNEL_REQUESTED_PLAN_KIND::BASELINE_CONV,
+      VECTOR_KERNEL_FALLBACK_POLICY::ERROR};
+  const VECTOR_KERNEL_RESOLUTION_RESULT alternate =
+      Resolve_vector_kernel_plan(
+          request, selection, &registry,
+          [](VECTOR_KERNEL_PLAN_KIND kind) {
+            return kind == VECTOR_KERNEL_PLAN_KIND::BASELINE_CONV;
+          });
+  ASSERT_TRUE(alternate.Ok()) << alternate._diagnostic;
+
+  EXPECT_EQ(cpp._prepared->Provenance(), "cpp");
+  EXPECT_EQ(alternate._prepared->Provenance(), "alternate-conv-test");
+  EXPECT_EQ(alternate._resolved_provider,
+            VECTOR_KERNEL_PLAN_PROVIDER_KIND::PYTHON);
+  EXPECT_EQ(alternate._resolved_implementation,
+            VECTOR_KERNEL_IMPLEMENTATION::DSL);
+  EXPECT_EQ(cpp._prepared->Specialization_key(),
+            alternate._prepared->Specialization_key());
+  EXPECT_EQ(cpp._prepared->Helper_name(),
+            alternate._prepared->Helper_name());
+  EXPECT_TRUE(Equal_vector_kernel_prepared_semantics(
+      *cpp._prepared, *alternate._prepared));
 }
 
 TEST(Tensor2VectorConvPlanning,

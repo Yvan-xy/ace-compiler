@@ -293,6 +293,12 @@ def test_cpp_plan_dsl_baseline_conv_matches_native_air(tmp_path):
 
     assert native["success"] and dsl["success"] and dsl_auto["success"]
     assert native["verify"] and dsl["verify"] and dsl_auto["verify"]
+    assert (
+        native["stages_completed"]
+        == dsl["stages_completed"]
+        == dsl_auto["stages_completed"]
+        == ["tensor2vector"]
+    )
     assert not native["has_nn_conv"]
     assert not dsl["has_nn_conv"] and not dsl_auto["has_nn_conv"]
     assert (
@@ -347,8 +353,6 @@ def test_cpp_plan_dsl_baseline_conv_matches_native_air(tmp_path):
     assert dsl_auto["helper_formals"] == ["packed_input_0"]
     assert dsl["callback_count"] == 1
     assert dsl_auto["callback_count"] == 1
-    assert "vector2sihe" not in dsl["stages_completed"]
-    assert "vector2sihe" not in dsl_auto["stages_completed"]
 
     plan = dsl["plan"]
     assert plan == {
