@@ -104,7 +104,7 @@ def _duplicate_packed_input(
         for shift in duplication_candidates:
             duplicated = duplicated + packed_input.roll(
                 _core_i32(shift, packed_input.container, i32_type),
-                candidates=duplication_candidates,
+                candidates=(shift,),
             )
     container = packed_input.container
     container.new_local(local_name, packed_input.air_type)
@@ -244,7 +244,9 @@ def reduce_add_intra(value, reduction, rotation, i32_type, local_name):
     container.new_stid(local_name, value.value)
     if reduction.kind == "power-of-two":
         for iv in range_dynamic(0, len(candidates), 1):
-            shift = (1 << iv) * stride
+            shift = 1 << iv
+            if const_expr(stride != 1):
+                shift = shift * stride
             current = _local_vector(container, local_name, value.air_type)
             updated = current + current.roll(shift, candidates=candidates)
             container.new_stid(local_name, updated.value)

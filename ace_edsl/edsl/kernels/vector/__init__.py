@@ -7,12 +7,20 @@ from .fast_common import (
     reduce_add_intra,
     roll_cyclic,
 )
+from .fast_gemm import (
+    configure_fast_gemm_dsl,
+    fast_gemm_recipe,
+    fast_gemm_vector_kernel,
+)
 
 
 __all__ = [
     "blocking_rot",
     "clear_valid_data",
     "collective_reduce",
+    "configure_fast_gemm_dsl",
+    "fast_gemm_recipe",
+    "fast_gemm_vector_kernel",
     "reduce_add_intra",
     "roll_cyclic",
 ]

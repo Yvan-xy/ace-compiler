@@ -93,6 +93,11 @@ from .kernels.vector.baseline_conv import (
     baseline_conv_vector_kernel,
     configure_baseline_conv_dsl,
 )
+from .kernels.vector.fast_gemm import (
+    configure_fast_gemm_dsl,
+    fast_gemm_recipe,
+    fast_gemm_vector_kernel,
+)
 
 # Export selective lowering registry
 from .lowering_registry import (
@@ -159,6 +164,9 @@ __all__ = [
     'baseline_conv_recipe',
     'baseline_conv_vector_kernel',
     'configure_baseline_conv_dsl',
+    'fast_gemm_recipe',
+    'fast_gemm_vector_kernel',
+    'configure_fast_gemm_dsl',
     'FHEConfig',
     'PipelineResult',
     'compile_to_c',
