@@ -1310,7 +1310,8 @@ Build_fast_conv(const VECTOR_KERNEL_PLANNING_REQUEST &request,
     prepared_weight_shape = {problem._channel_in_kernel, problem._output_size};
   } else {
     int64_t offset = 0;
-    if (!Checked_mul(problem._channel_in, problem._kernel_hw, &offset)) {
+    if (!Checked_mul(problem._channel_in_kernel, problem._kernel_hw,
+                     &offset)) {
       return Failure("fast Conv block offset overflows");
     }
     offset /= num_block;

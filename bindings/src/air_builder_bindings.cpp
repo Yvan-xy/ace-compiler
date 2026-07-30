@@ -15,6 +15,7 @@
 #include <pybind11/functional.h>
 #include <pybind11/complex.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <memory>
@@ -4117,15 +4118,19 @@ const std::string BASELINE_CONV_HELPER_PREFIX =
     "__ace_vkernel_baseline_conv_";
 const std::string FAST_GEMM_HELPER_PREFIX =
     "__ace_vkernel_fast_gemm_";
+const std::string FAST_CONV_HELPER_PREFIX =
+    "__ace_vkernel_fast_conv_";
 
 std::string normalize_prepared_vector_kernel_native_for_testing(
     const nn::vector::PREPARED_VECTOR_KERNEL_PLAN& prepared) {
     const nn::vector::VECTOR_KERNEL_PLAN_KIND kind =
         nn::vector::Get_vector_kernel_plan_kind(prepared.Plan());
     if (kind != nn::vector::VECTOR_KERNEL_PLAN_KIND::BASELINE_CONV &&
-        kind != nn::vector::VECTOR_KERNEL_PLAN_KIND::FAST_GEMM) {
+        kind != nn::vector::VECTOR_KERNEL_PLAN_KIND::FAST_GEMM &&
+        kind != nn::vector::VECTOR_KERNEL_PLAN_KIND::FAST_CONV) {
         throw std::runtime_error(
-            "prepared native oracle supports baseline Conv and fast Gemm");
+            "prepared native oracle supports baseline Conv, fast Gemm, "
+            "and fast Conv");
     }
     const nn::vector::VECTOR_KERNEL_COMMON_PLAN& common = std::visit(
         [](const auto& plan)
@@ -4135,7 +4140,14 @@ std::string normalize_prepared_vector_kernel_native_for_testing(
         prepared.Plan());
     if (common._runtime_vector_inputs.size() != 1) {
         throw std::runtime_error(
-            "prepared native oracle requires one runtime input");
+            "prepared native oracle requires one runtime Vector input");
+    }
+    if (common._runtime_scalar_inputs.size() > 1 ||
+        (!common._runtime_scalar_inputs.empty() &&
+         common._runtime_scalar_inputs.front() !=
+             PRIMITIVE_TYPE::INT_S32)) {
+        throw std::runtime_error(
+            "prepared native oracle supports at most one Core s32 input");
     }
 
     std::unique_ptr<GLOB_SCOPE> oracle =
@@ -4157,6 +4169,12 @@ std::string normalize_prepared_vector_kernel_native_for_testing(
     oracle->New_ret_param(result_type, signature);
     oracle->New_param(
         oracle->New_str("packed_input"), input_type, signature, spos);
+    for (size_t idx = 0; idx < common._runtime_scalar_inputs.size(); ++idx) {
+        oracle->New_param(
+            oracle->New_str("weight_offset"),
+            oracle->Prim_type(common._runtime_scalar_inputs[idx]), signature,
+            spos);
+    }
     signature->Set_complete();
     oracle->New_entry_point(signature, function, name, spos);
 
@@ -4171,12 +4189,28 @@ std::string normalize_prepared_vector_kernel_native_for_testing(
     nn::vector::TENSOR2VECTOR_CTX lowering_ctx(
         container, vector_ctx, nullptr, config);
     lowering_ctx.Set_cur_func_scope(&scope);
-    lowering_ctx.Push(body, body);
+    uint32_t collapsed_outer_depth = 0;
+    for (const auto& preparation : prepared.Runtime_preparations()) {
+        collapsed_outer_depth = std::max(
+            collapsed_outer_depth, preparation._outer_block_depth);
+    }
+    // The direct oracle compares the logical helper body. Repeating the same
+    // block on the test-only lowering stack preserves native statement order
+    // while caller-side placement is checked separately by the bridge oracle.
+    for (uint32_t depth = 0; depth <= collapsed_outer_depth; ++depth) {
+        lowering_ctx.Push(body, body);
+    }
     NODE_PTR input = container->New_ld(scope.Formal(0), spos);
+    std::vector<NODE_PTR> scalar_actuals;
+    for (uint32_t idx = 1; idx < scope.Formal_cnt(); ++idx) {
+        scalar_actuals.push_back(container->New_ld(scope.Formal(idx), spos));
+    }
     NODE_PTR result = nn::vector::Emit_prepared_vector_kernel_native(
-        lowering_ctx, prepared, input, {}, spos);
+        lowering_ctx, prepared, input, scalar_actuals, spos);
     container->Stmt_list().Append(container->New_retv(result, spos));
-    lowering_ctx.Pop(body, body);
+    for (uint32_t depth = 0; depth <= collapsed_outer_depth; ++depth) {
+        lowering_ctx.Pop(body, body);
+    }
 
     if (!oracle->Verify_ir()) {
         throw std::runtime_error(
@@ -4228,6 +4262,48 @@ bool statement_precedes_in_block(
          stmt = stmt->Next()) {
         if (stmt == before) saw_before = true;
         if (stmt == after) return saw_before && stmt != before;
+    }
+    return false;
+}
+
+bool statement_tree_contains(NODE_PTR node, STMT_PTR target) {
+    if (node == Null_ptr || target == Null_ptr) return false;
+    if (node->Is_block()) {
+        for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+             stmt = stmt->Next()) {
+            if (stmt == target || statement_tree_contains(stmt->Node(), target))
+                return true;
+        }
+        return false;
+    }
+    for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
+        if (statement_tree_contains(node->Child(idx), target)) return true;
+    }
+    return false;
+}
+
+bool statement_precedes_in_tree(
+    NODE_PTR block, STMT_PTR before, STMT_PTR after) {
+    if (statement_precedes_in_block(block, before, after)) return true;
+    bool saw_before = false;
+    for (STMT_PTR stmt = block->Begin_stmt(); stmt != block->End_stmt();
+         stmt = stmt->Next()) {
+        const bool contains_before =
+            stmt == before || statement_tree_contains(stmt->Node(), before);
+        const bool contains_after =
+            stmt == after || statement_tree_contains(stmt->Node(), after);
+        if (contains_before && contains_after) {
+            for (uint32_t idx = 0; idx < stmt->Node()->Num_child(); ++idx) {
+                NODE_PTR child = stmt->Node()->Child(idx);
+                if (child->Is_block() &&
+                    statement_precedes_in_tree(child, before, after)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (contains_before) saw_before = true;
+        if (contains_after) return saw_before;
     }
     return false;
 }
@@ -5905,9 +5981,10 @@ public:
                     "vector-kernel AIR oracle requires one helper CALL");
             }
             NODE_PTR call = calls[0]->Node();
-            if (call->Num_arg() != 1 || caller->Formal_cnt() < 1) {
+            if (call->Num_arg() != helper->Formal_cnt() ||
+                call->Num_arg() == 0 || caller->Formal_cnt() < 1) {
                 throw std::runtime_error(
-                    "vector-kernel AIR oracle requires the one-input helper ABI");
+                    "vector-kernel AIR oracle requires the prepared helper ABI");
             }
             NODE_PTR actual = call->Child(0);
             std::vector<NODE_PTR> expected_actuals;
@@ -5930,7 +6007,7 @@ public:
                 std::vector<STMT_PTR> prepared_input_stores;
                 collect_prepared_conv_input_stores(
                     caller_entry, prepared_input_stores);
-                if (expected_actuals.size() == 1 &&
+                if (!expected_actuals.empty() &&
                     prepared_input_stores.size() == 1) {
                     PREG_PTR prepared_preg =
                         prepared_input_stores[0]->Node()->Preg();
@@ -5944,7 +6021,7 @@ public:
                             helper->Formal(0)->Type()) &&
                         prepared_loads.size() == 1 &&
                         prepared_loads[0]->Id() == expected_actuals[0]->Id() &&
-                        statement_precedes_in_block(
+                        statement_precedes_in_tree(
                             caller_body, prepared_input_stores[0], calls[0]);
                 }
             } else if (actual->Opcode() != air::core::OPC_LD ||
@@ -5973,7 +6050,9 @@ public:
             result["bridge_message"] = bridge._message;
             result["prepared_input_ok"] = prepared_input_ok;
             result["native_normalized"] =
-                native_oracles != nullptr ? py::cast(native_air) : py::none();
+                native_oracles != nullptr && !native_air.empty()
+                    ? py::cast(native_air)
+                    : py::none();
             return result;
         }
 
@@ -6014,14 +6093,14 @@ public:
                 break;
             }
             if (first_kernel == Null_ptr &&
-                ((preserve_leading_comments && node->Is_comment() &&
-                  std::string(node->Comment()).rfind(
-                      "BlockingRot replicate=", 0) == 0) ||
-                 (has_prepared_input &&
-                  node->Opcode() == air::core::OPC_ST) ||
-                 (!has_prepared_input &&
-                  node->Opcode() != air::core::OPC_COMMENT &&
-                  node->Opcode() != air::core::OPC_PRAGMA))) {
+                 (preserve_leading_comments
+                      ? (node->Is_comment() &&
+                         std::string(node->Comment()).rfind(
+                             "BlockingRot replicate=", 0) == 0)
+                      : (has_prepared_input
+                             ? node->Opcode() == air::core::OPC_ST
+                             : (node->Opcode() != air::core::OPC_COMMENT &&
+                                node->Opcode() != air::core::OPC_PRAGMA)))) {
                 first_kernel = stmt;
             }
         }
@@ -6067,6 +6146,11 @@ public:
     py::dict inspect_fast_gemm_air_for_testing() const {
         return inspect_vector_kernel_air_for_testing(
             FAST_GEMM_HELPER_PREFIX, &_fast_gemm_oracles, false, true);
+    }
+
+    py::dict inspect_fast_conv_air_for_testing() const {
+        return inspect_vector_kernel_air_for_testing(
+            FAST_CONV_HELPER_PREFIX, &_fast_conv_oracles, true, true);
     }
 
     void mutate_baseline_conv_call_actual_for_testing() {
@@ -6122,6 +6206,64 @@ public:
         }
     }
 
+    void mutate_fast_conv_call_actual_for_testing(uint32_t index) {
+        if (!glob || !glob->Verify_ir()) {
+            throw std::runtime_error(
+                "fast Conv call mutation requires verified AIR");
+        }
+        FUNC_SCOPE* caller = nullptr;
+        FUNC_SCOPE* helper = nullptr;
+        for (GLOB_SCOPE::FUNC_SCOPE_ITER iter = glob->Begin_func_scope();
+             iter != glob->End_func_scope(); ++iter) {
+            FUNC_SCOPE* scope = &(*iter);
+            const char* raw_name = scope->Owning_func()->Name()->Char_str();
+            const std::string name = raw_name == nullptr ? "" : raw_name;
+            if (name.compare(0, FAST_CONV_HELPER_PREFIX.size(),
+                             FAST_CONV_HELPER_PREFIX) == 0) {
+                if (helper != nullptr) {
+                    throw std::runtime_error(
+                        "fast Conv call mutation found multiple helpers");
+                }
+                helper = scope;
+            } else {
+                if (caller != nullptr) {
+                    throw std::runtime_error(
+                        "fast Conv call mutation requires one caller");
+                }
+                caller = scope;
+            }
+        }
+        if (caller == nullptr || helper == nullptr) {
+            throw std::runtime_error(
+                "fast Conv call mutation requires caller and helper");
+        }
+        std::vector<STMT_PTR> calls;
+        collect_call_statements(caller->Container().Entry_node(), calls);
+        if (calls.size() != 1 || index >= calls[0]->Node()->Num_arg()) {
+            throw std::runtime_error(
+                "fast Conv call mutation received an invalid actual index");
+        }
+
+        NODE_PTR call = calls[0]->Node();
+        NODE_PTR actual = call->Child(index);
+        PREG_PTR wrong_preg = caller->New_preg(actual->Rtype());
+        NODE_PTR wrong_value =
+            actual->Rtype()->Is_int()
+                ? caller->Container().New_intconst(actual->Rtype(), 0,
+                                                   actual->Spos())
+                : caller->Container().New_zero(actual->Rtype(),
+                                               actual->Spos());
+        STMT_PTR wrong_store = caller->Container().New_stp(
+            wrong_value, wrong_preg, actual->Spos());
+        STMT_LIST::Enclosing_list(calls[0]).Prepend(calls[0], wrong_store);
+        call->Set_child(
+            index, caller->Container().New_ldp(wrong_preg, actual->Spos()));
+        if (!glob->Verify_ir()) {
+            throw std::runtime_error(
+                "fast Conv wrong-actual mutation produced invalid AIR");
+        }
+    }
+
     void mutate_generated_vector_helper_for_testing(
         const std::string& mutation) {
         if (!glob || !glob->Verify_ir()) {
@@ -6143,7 +6285,11 @@ public:
             const bool fast_gemm =
                 name.compare(0, FAST_GEMM_HELPER_PREFIX.size(),
                              FAST_GEMM_HELPER_PREFIX) == 0;
-            if (!baseline_gemm && !baseline_conv && !fast_gemm) {
+            const bool fast_conv =
+                name.compare(0, FAST_CONV_HELPER_PREFIX.size(),
+                             FAST_CONV_HELPER_PREFIX) == 0;
+            if (!baseline_gemm && !baseline_conv && !fast_gemm &&
+                !fast_conv) {
                 continue;
             }
             if (helper != nullptr) {
@@ -6175,6 +6321,14 @@ public:
                     "array-rtype mutation found no suitable ARRAY");
             }
             array->Set_rtype(array->Array_idx(0)->Rtype());
+        } else if (mutation == "array-arity") {
+            NODE_PTR array = find_opcode_node(
+                helper->Container().Entry_node(), air::core::OPC_ARRAY);
+            if (array == Null_ptr || array->Num_arg() == 0) {
+                throw std::runtime_error(
+                    "array-arity mutation found no indexed ARRAY");
+            }
+            array->Set_num_arg(array->Num_arg() - 1);
         } else if (mutation == "escaping-ldca") {
             CONTAINER& container = helper->Container();
             NODE_PTR body = container.Entry_node()->Body_blk();
@@ -6343,6 +6497,136 @@ public:
             store->Set_child(
                 1, container.New_intconst(i32, 0, source->Spos()));
             store->Set_access_type(i32);
+        } else if (mutation == "pointer-local" ||
+                   mutation == "pointer-preg") {
+            NODE_PTR source = find_opcode_node(
+                helper->Container().Entry_node(), air::core::OPC_LDA);
+            if (source == Null_ptr || !source->Rtype()->Is_ptr()) {
+                throw std::runtime_error(
+                    "pointer declaration mutation found no LDA");
+            }
+            if (mutation == "pointer-local") {
+                helper->New_var(source->Rtype(),
+                                "__unsupported_pointer_local",
+                                source->Spos());
+            } else {
+                helper->New_preg(source->Rtype());
+            }
+        } else if (mutation == "pointer-global-load") {
+            CONTAINER& container = helper->Container();
+            NODE_PTR source = find_opcode_node(
+                container.Entry_node(), air::core::OPC_LDA);
+            if (source == Null_ptr || !source->Rtype()->Is_ptr()) {
+                throw std::runtime_error(
+                    "pointer global-load mutation found no LDA");
+            }
+            STMT_PTR terminal = container.Entry_node()->Body_blk()->End_stmt();
+            for (STMT_PTR stmt =
+                     container.Entry_node()->Body_blk()->Begin_stmt();
+                 stmt != container.Entry_node()->Body_blk()->End_stmt();
+                 stmt = stmt->Next()) {
+                if (stmt->Node()->Opcode() == air::core::OPC_RETV) {
+                    terminal = stmt;
+                    break;
+                }
+            }
+            if (terminal == container.Entry_node()->Body_blk()->End_stmt()) {
+                throw std::runtime_error(
+                    "pointer global-load mutation found no terminal return");
+            }
+            ADDR_DATUM_PTR global_pointer = glob->New_var(
+                source->Rtype(), "__unsupported_pointer_global",
+                source->Spos());
+            ADDR_DATUM_PTR local_pointer = helper->New_var(
+                source->Rtype(), "__unsupported_pointer_sink",
+                source->Spos());
+            STMT_PTR store = container.New_st(
+                container.New_ld(global_pointer, source->Spos()),
+                local_pointer, source->Spos());
+            STMT_LIST::Enclosing_list(terminal).Prepend(terminal, store);
+        } else if (mutation == "preg-load-type-mismatch") {
+            NODE_PTR load = find_opcode_node(
+                helper->Container().Entry_node(), air::core::OPC_LDP);
+            if (load == Null_ptr) {
+                throw std::runtime_error(
+                    "preg-load mutation found no LDP");
+            }
+            PREG_PTR wrong_preg = helper->New_preg(
+                glob->Prim_type(PRIMITIVE_TYPE::INT_S32));
+            load->Set_preg(wrong_preg);
+        } else if (mutation == "preg-store-type-mismatch") {
+            NODE_PTR store = find_opcode_node(
+                helper->Container().Entry_node(), air::core::OPC_STP);
+            if (store == Null_ptr || store->Num_child() != 1) {
+                throw std::runtime_error(
+                    "preg-store mutation found no STP");
+            }
+            store->Set_child(
+                0, helper->Container().New_intconst(
+                       PRIMITIVE_TYPE::INT_S32, 0, store->Spos()));
+        } else if (mutation == "unsupported-if") {
+            CONTAINER& container = helper->Container();
+            NODE_PTR body = container.Entry_node()->Body_blk();
+            NODE_PTR source_loop = find_opcode_node(
+                body, air::core::OPC_DO_LOOP);
+            if (source_loop == Null_ptr) {
+                throw std::runtime_error(
+                    "unsupported-if mutation found no loop condition");
+            }
+            STMT_PTR terminal = body->End_stmt();
+            for (STMT_PTR stmt = body->Begin_stmt();
+                 stmt != body->End_stmt(); stmt = stmt->Next()) {
+                if (stmt->Node()->Opcode() == air::core::OPC_RETV) {
+                    terminal = stmt;
+                    break;
+                }
+            }
+            if (terminal == body->End_stmt()) {
+                throw std::runtime_error(
+                    "unsupported-if mutation found no terminal return");
+            }
+            STMT_PTR branch = container.New_if_then_else(
+                container.Clone_node_tree(source_loop->Child(1)),
+                container.New_stmt_block(source_loop->Spos()),
+                container.New_stmt_block(source_loop->Spos()),
+                source_loop->Spos());
+            STMT_LIST::Enclosing_list(terminal).Prepend(terminal, branch);
+        } else if (mutation == "loop-iv-i64") {
+            CONTAINER& container = helper->Container();
+            NODE_PTR body = container.Entry_node()->Body_blk();
+            STMT_PTR terminal = body->End_stmt();
+            for (STMT_PTR stmt = body->Begin_stmt();
+                 stmt != body->End_stmt(); stmt = stmt->Next()) {
+                if (stmt->Node()->Opcode() == air::core::OPC_RETV) {
+                    terminal = stmt;
+                    break;
+                }
+            }
+            if (terminal == body->End_stmt()) {
+                throw std::runtime_error(
+                    "i64-loop mutation found no terminal return");
+            }
+            TYPE_PTR i64 = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+            ADDR_DATUM_PTR iv = helper->New_var(
+                i64, "__unsupported_i64_iv", terminal->Node()->Spos());
+            NODE_PTR init = container.New_intconst(
+                i64, 0, terminal->Node()->Spos());
+            NODE_PTR limit = container.New_intconst(
+                i64, 1, terminal->Node()->Spos());
+            NODE_PTR compare = container.New_bin_arith(
+                air::core::OPC_LT, i64,
+                container.New_ld(iv, terminal->Node()->Spos()), limit,
+                terminal->Node()->Spos());
+            NODE_PTR increment = container.New_bin_arith(
+                air::core::OPC_ADD, i64,
+                container.New_ld(iv, terminal->Node()->Spos()),
+                container.New_intconst(i64, 1, terminal->Node()->Spos()),
+                terminal->Node()->Spos());
+            STMT_PTR loop = container.New_do_loop(
+                iv, init, compare, increment,
+                container.New_stmt_block(terminal->Node()->Spos()),
+                terminal->Node()->Spos());
+            STMT_LIST::Enclosing_list(terminal).Prepend(terminal, loop);
         } else {
             throw std::runtime_error(
                 "unsupported generated-helper test mutation: " + mutation);
@@ -6401,7 +6685,8 @@ public:
         const std::string& kernel_impl,
         const std::string& plan_kind,
         const std::string& fallback, py::dict recipes,
-        bool mask_fuse, uint64_t max_slots) {
+        bool mask_fuse, uint64_t max_slots, bool conv_parallel,
+        bool sharding) {
         if (!glob) {
             throw std::runtime_error(
                 "tensor2vector recipe lowering requires a real GLOB_SCOPE");
@@ -6422,6 +6707,7 @@ public:
 #ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
         _baseline_conv_oracles.clear();
         _fast_gemm_oracles.clear();
+        _fast_conv_oracles.clear();
 #endif
         for (auto item : recipes) {
             const std::string key = py::cast<std::string>(item.first);
@@ -6447,6 +6733,9 @@ public:
                   } else if (kind ==
                              nn::vector::VECTOR_KERNEL_PLAN_KIND::FAST_GEMM) {
                     native_oracles = &_fast_gemm_oracles;
+                  } else if (kind ==
+                             nn::vector::VECTOR_KERNEL_PLAN_KIND::FAST_CONV) {
+                    native_oracles = &_fast_conv_oracles;
                   }
                   if (native_oracles != nullptr) {
                     PREPARED_VECTOR_KERNEL_ORACLE_RECORD record{actuals, {}};
@@ -6476,6 +6765,8 @@ public:
         config._fallback = fallback;
         config._mask_fuse = mask_fuse;
         config._max_slots = max_slots;
+        config._conv_parallel = conv_parallel;
+        config._sharding = sharding;
         GLOB_SCOPE* new_glob =
             nn::vector::Vector_driver(glob, ctx, nullptr, config);
         if (!new_glob) {
@@ -6491,6 +6782,7 @@ private:
 #ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
     PREPARED_VECTOR_KERNEL_ORACLES _baseline_conv_oracles;
     PREPARED_VECTOR_KERNEL_ORACLES _fast_gemm_oracles;
+    PREPARED_VECTOR_KERNEL_ORACLES _fast_conv_oracles;
 #endif
     // Create the LOWER_CTX needed by FHE passes
     std::unique_ptr<fhe::core::LOWER_CTX> lower_ctx;
@@ -8509,9 +8801,16 @@ PYBIND11_MODULE(air_builder, m) {
         .def("_inspect_fast_gemm_air_for_testing",
              &GlobScope::inspect_fast_gemm_air_for_testing,
              "Normalize one native or Python-helper fast Gemm from AIR objects")
+        .def("_inspect_fast_conv_air_for_testing",
+             &GlobScope::inspect_fast_conv_air_for_testing,
+             "Normalize one native or Python-helper fast Conv from AIR objects")
         .def("_mutate_baseline_conv_call_actual_for_testing",
              &GlobScope::mutate_baseline_conv_call_actual_for_testing,
              "Replace the Conv helper actual with a valid same-typed wrong preg")
+        .def("_mutate_fast_conv_call_actual_for_testing",
+             &GlobScope::mutate_fast_conv_call_actual_for_testing,
+             py::arg("index"),
+             "Replace one fast Conv helper actual with a same-typed wrong preg")
         .def("_mutate_generated_vector_helper_for_testing",
              &GlobScope::mutate_generated_vector_helper_for_testing,
              py::arg("mutation"),
@@ -8531,6 +8830,8 @@ PYBIND11_MODULE(air_builder, m) {
              py::arg("recipes") = py::dict(),
              py::arg("mask_fuse") = false,
              py::arg("max_slots") = 0,
+             py::arg("conv_parallel") = false,
+             py::arg("sharding") = false,
              "Run one Tensor-to-Vector pass with a synchronous per-pass recipe registry")
         .def("run_poly2c", &GlobScope::run_poly2c_pass_with_config,
              py::arg("output_file") = "",

@@ -113,16 +113,20 @@ VECTOR_KERNEL_ATTRIBUTE_RECORD Int64_attribute(std::string name,
 VECTOR_KERNEL_PLANNING_REQUEST
 Conv_request(int64_t channel_in, int64_t channel_out, int64_t height,
              int64_t kernel, int64_t slots,
-             VECTOR_KERNEL_REQUESTED_PLAN_KIND kind, bool sharded = false) {
+             VECTOR_KERNEL_REQUESTED_PLAN_KIND kind, bool sharded = false,
+             int64_t group = 1) {
+  const int64_t kernel_channel_in = group > 1 ? channel_in / group : channel_in;
   const VECTOR_KERNEL_RANKED_TYPE_PLAN input_type{
       PRIMITIVE_TYPE::FLOAT_32, {1, channel_in, height, height}};
   const VECTOR_KERNEL_RANKED_TYPE_PLAN weight_operand_type{
-      PRIMITIVE_TYPE::FLOAT_32, {channel_out, channel_in, kernel, kernel}};
+      PRIMITIVE_TYPE::FLOAT_32,
+      {channel_out, kernel_channel_in, kernel, kernel}};
   const VECTOR_KERNEL_RANKED_TYPE_PLAN bias_type{PRIMITIVE_TYPE::FLOAT_32,
                                                  {channel_out}};
 
   std::vector<VECTOR_KERNEL_ATTRIBUTE_RECORD> attributes;
-  attributes.push_back(Int32_attribute("group", {1}));
+  attributes.push_back(
+      Int32_attribute("group", {static_cast<int32_t>(group)}));
   attributes.push_back(Int32_attribute("strides", {1, 1}));
   attributes.push_back(Int32_attribute(
       "pads",
@@ -137,7 +141,7 @@ Conv_request(int64_t channel_in, int64_t channel_out, int64_t height,
   }
 
   const int64_t weight_count =
-      shard_count * channel_out * channel_in * kernel * kernel;
+      shard_count * channel_out * kernel_channel_in * kernel * kernel;
   std::vector<float> weight(static_cast<size_t>(weight_count));
   for (size_t idx = 0; idx < weight.size(); ++idx) {
     const int32_t signed_value = static_cast<int32_t>(idx % 17) - 8;
@@ -147,8 +151,8 @@ Conv_request(int64_t channel_in, int64_t channel_out, int64_t height,
   for (size_t idx = 0; idx < bias.size(); ++idx) {
     bias[idx] = static_cast<float>(idx) / 4.0F;
   }
-  std::vector<int64_t> source_weight_shape{channel_out, channel_in, kernel,
-                                           kernel};
+  std::vector<int64_t> source_weight_shape{
+      channel_out, kernel_channel_in, kernel, kernel};
   if (sharded)
     source_weight_shape.insert(source_weight_shape.begin(), 2);
 
@@ -987,6 +991,25 @@ TEST(Tensor2VectorConvPlanning,
   ASSERT_EQ(plan._common._slices.size(), 3U);
   EXPECT_EQ(plan._common._slices[1]._role, "cyclic-mask-left");
   EXPECT_EQ(plan._common._slices[2]._role, "cyclic-mask-right");
+}
+
+TEST(Tensor2VectorConvPlanning,
+     CppForcedFastDepthwiseUsesKernelChannelGridWithoutReduction) {
+  const VECTOR_KERNEL_PLANNING_REQUEST request = Conv_request(
+      4, 4, 4, 3, 128, VECTOR_KERNEL_REQUESTED_PLAN_KIND::FAST_CONV, false, 4);
+  Expect_deterministic(request, VECTOR_KERNEL_PLAN_KIND::FAST_CONV,
+                       {"weight", "bias", "rotation-table"});
+  const VECTOR_KERNEL_RESOLUTION_RESULT result = Resolve(request);
+  ASSERT_TRUE(result.Ok()) << result._diagnostic;
+  const FAST_CONV_PLAN &plan =
+      std::get<FAST_CONV_PLAN>(result._prepared->Plan());
+  EXPECT_EQ(plan._group, plan._channel_in);
+  EXPECT_EQ(plan._num_grid, 1);
+  EXPECT_FALSE(plan._cyclic_roll);
+  EXPECT_TRUE(plan._common._reductions.empty());
+  ASSERT_FALSE(result._prepared->Constants().empty());
+  EXPECT_EQ(result._prepared->Constants()[0]._type._shape,
+            (std::vector<int64_t>{9, 64}));
 }
 
 TEST(Tensor2VectorConvPlanning,

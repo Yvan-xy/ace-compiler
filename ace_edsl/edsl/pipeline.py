@@ -70,13 +70,15 @@ class VectorKernelLoweringConfig:
     fallback: str = "error"
     mask_fuse: bool = False
     max_slots: int = 0
+    conv_parallel: bool = False
+    sharding: bool = False
 
 
 _VECTOR_KERNEL_RECIPE_KINDS = frozenset(
     ("baseline-gemm", "baseline-conv", "fast-gemm", "fast-conv")
 )
 _TENTATIVE_VECTOR_KERNEL_INLINE_PLAN_KINDS = frozenset(
-    ("auto", "baseline-gemm", "baseline-conv", "fast-gemm")
+    ("auto", "baseline-gemm", "baseline-conv", "fast-gemm", "fast-conv")
 )
 
 
@@ -225,10 +227,12 @@ class AcePipeline:
         fallback: str = "error",
         mask_fuse: bool = False,
         max_slots: int = 0,
+        conv_parallel: bool = False,
+        sharding: bool = False,
     ) -> "AcePipeline":
         self.vector_kernel_config = VectorKernelLoweringConfig(
             plan_provider, kernel_impl, plan_kind, fallback, mask_fuse,
-            max_slots,
+            max_slots, conv_parallel, sharding,
         )
         return self
 
@@ -272,6 +276,7 @@ class AcePipeline:
                     config.plan_kind, config.fallback,
                     dict(self.vector_kernel_recipes),
                     config.mask_fuse, config.max_slots,
+                    config.conv_parallel, config.sharding,
                 )
             return True
         except Exception as e:
@@ -857,10 +862,12 @@ class Pipeline:
         fallback: str = "error",
         mask_fuse: bool = False,
         max_slots: int = 0,
+        conv_parallel: bool = False,
+        sharding: bool = False,
     ) -> "Pipeline":
         self.vector_kernel_config = VectorKernelLoweringConfig(
             plan_provider, kernel_impl, plan_kind, fallback, mask_fuse,
-            max_slots,
+            max_slots, conv_parallel, sharding,
         )
         return self
 
@@ -915,6 +922,7 @@ class Pipeline:
                 config.plan_kind, config.fallback,
                 dict(self.vector_kernel_recipes),
                 config.mask_fuse, config.max_slots,
+                config.conv_parallel, config.sharding,
             )
         
         elif phase == "vector2sihe":
