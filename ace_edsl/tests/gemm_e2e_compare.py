@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Compile, validate, and benchmark native/DSL baseline GEMM ONNX models."""
+"""Compile, validate, and benchmark selected GEMM lowering paths."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -25,6 +26,15 @@ MODEL_SLOTS = {
     "i1024_o4096": 4096,
 }
 IMPLEMENTATIONS = ("native", "dsl")
+THREE_WAY_IMPLEMENTATIONS = ("dsl-fast", "cpp-baseline", "metakernel-fast")
+ALL_IMPLEMENTATIONS = IMPLEMENTATIONS + THREE_WAY_IMPLEMENTATIONS
+SCALING_FACTOR_BITS = 56
+FIRST_PRIME_BITS = 60
+HAMMING_WEIGHT = 192
+FREE_POLY = True
+OMP_NUM_THREADS = 1
+ABS_ERROR_TOLERANCE = 0.0001
+REL_ERROR_TOLERANCE = 0.001
 DRIVER_END = """\
   Finalize_context();
 
@@ -155,6 +165,151 @@ def _validate_model_files(model_dir: Path, models: list[str]) -> None:
         )
 
 
+def _helper_records(ir: str, helper_prefix: str) -> tuple[int, int]:
+    definitions = len(
+        re.findall(rf'^FUN\[[^\n]*"{re.escape(helper_prefix)}', ir, re.MULTILINE)
+    )
+    calls = len(re.findall(rf'^\s+call "{re.escape(helper_prefix)}', ir, re.MULTILINE))
+    return definitions, calls
+
+
+def _rotation_numbers(ir: str) -> list[list[int]]:
+    values = []
+    for raw in re.findall(r"ATTR\[nums=([^]]+)\]", ir):
+        fields = raw.strip("()").split(",")
+        values.append([int(field) for field in fields if field])
+    return values
+
+
+def _expected_rotation_numbers(prepared: object) -> list[list[int]]:
+    values = []
+    for rotation in prepared.rotations:
+        candidates = list(rotation.candidates)
+        if rotation.role == "input-duplication":
+            values.extend([[candidate] for candidate in candidates])
+        else:
+            values.append(candidates)
+    return values
+
+
+def _path_evidence(
+    implementation: str,
+    phase_irs: dict[str, str],
+    prepared_plans: list[object],
+    *,
+    require_inlined: bool = True,
+) -> dict[str, object]:
+    tensor_ir = phase_irs.get("tensor2vector", "")
+    if not tensor_ir:
+        raise RuntimeError("path proof is missing Tensor-to-Vector IR")
+    if re.search(r"\bNN\.gemm\b", tensor_ir, re.IGNORECASE):
+        raise RuntimeError("Tensor-to-Vector path left an NN Gemm behind")
+
+    if implementation == "dsl-fast":
+        kernel_impl = "dsl"
+        requested_plan_kind = "fast-gemm"
+    elif implementation == "metakernel-fast":
+        kernel_impl = "native"
+        requested_plan_kind = "fast-gemm"
+    else:
+        kernel_impl = "dsl" if implementation == "dsl" else "native"
+        requested_plan_kind = "baseline-gemm"
+
+    evidence: dict[str, object] = {
+        "requested_implementation": implementation,
+        "requested_plan_provider": "cpp",
+        "requested_kernel_impl": kernel_impl,
+        "requested_plan_kind": requested_plan_kind,
+        "requested_fallback": "error",
+        "source_gemm_removed": True,
+        "fallback_used": False,
+        "fast_metakernel_comment": "IMRA Metakernel:" in tensor_ir,
+        "packed_partition_comment": "gemm result reduce->Ps=" in tensor_ir,
+        "kp_over_np_comment": "gemm result reduce->(kp/np)=" in tensor_ir,
+    }
+    if implementation == "dsl-fast":
+        if len(prepared_plans) != 1:
+            raise RuntimeError(
+                "DSL-fast path requires exactly one captured prepared plan"
+            )
+        prepared = prepared_plans[0]
+        if prepared.kind != "fast-gemm" or prepared.provenance != "cpp":
+            raise RuntimeError(
+                "explicit DSL-fast path did not receive the C++ fast-GEMM plan"
+            )
+        helper_name = prepared.helper_name
+        definitions, calls = _helper_records(tensor_ir, helper_name)
+        if definitions != 1 or calls != 1:
+            raise RuntimeError(
+                "DSL-fast path lacks one specialized helper and typed call"
+            )
+        if not all(
+            (
+                evidence["fast_metakernel_comment"],
+                evidence["packed_partition_comment"],
+                evidence["kp_over_np_comment"],
+            )
+        ):
+            raise RuntimeError("DSL-fast Tensor-to-Vector IR lacks fast markers")
+        rotation_numbers = _rotation_numbers(tensor_ir)
+        expected_rotation_numbers = _expected_rotation_numbers(prepared)
+        if rotation_numbers != expected_rotation_numbers:
+            raise RuntimeError(
+                "DSL-fast rotation attributes do not match the frozen plan"
+            )
+        inlined_ir = phase_irs.get("vector_kernel_inline", "")
+        post_definitions, post_calls = (
+            _helper_records(inlined_ir, helper_name) if inlined_ir else (None, None)
+        )
+        inline_success = bool(inlined_ir) and post_definitions == post_calls == 0
+        if require_inlined and not inline_success:
+            raise RuntimeError("DSL-fast helper or call survived the tentative inliner")
+        evidence.update(
+            {
+                "actual_plan_kind": prepared.kind,
+                "plan_provenance": prepared.provenance,
+                "specialization_key": prepared.specialization_key,
+                "helper_name": helper_name,
+                "prepared_callback_count": len(prepared_plans),
+                "pre_inline_helper_definitions": definitions,
+                "pre_inline_helper_calls": calls,
+                "inline_success": inline_success,
+                "post_inline_helper_definitions": post_definitions,
+                "post_inline_helper_calls": post_calls,
+                "post_inline_helper_name_occurrences": (
+                    inlined_ir.count(helper_name) if inlined_ir else None
+                ),
+                "constant_hashes": {
+                    item.role: item.content_hash for item in prepared.constants
+                },
+                "rotation_candidates": {
+                    item.role: list(item.candidates) for item in prepared.rotations
+                },
+                "rotation_rnums": rotation_numbers,
+                "result_type": [
+                    prepared.result_type.element_type,
+                    list(prepared.result_type.shape),
+                ],
+                "slot": [prepared.slot.policy, prepared.slot.value],
+            }
+        )
+    elif implementation == "metakernel-fast":
+        if not all(
+            (
+                evidence["fast_metakernel_comment"],
+                evidence["packed_partition_comment"],
+                evidence["kp_over_np_comment"],
+            )
+        ):
+            raise RuntimeError("forced native-fast IR lacks fast markers")
+        evidence["actual_plan_kind"] = "fast-gemm"
+    else:
+        if evidence["fast_metakernel_comment"]:
+            raise RuntimeError("baseline path unexpectedly selected fast Gemm")
+        evidence["actual_plan_kind"] = "baseline-gemm"
+    return evidence
+
+
 def _generate_one(
     model: str,
     implementation: str,
@@ -165,27 +320,36 @@ def _generate_one(
     from ace_edsl.edsl.kernels.vector.baseline_gemm import (
         configure_baseline_gemm_dsl,
     )
+    from ace_edsl.edsl.kernels.vector.fast_gemm import fast_gemm_recipe
 
     output_dir.mkdir(parents=True, exist_ok=True)
     os.chdir(output_dir)
+    phase_irs: dict[str, str] = {}
+
+    def capture_phase(phase: str, ir: str) -> None:
+        if phase in ("tensor2vector", "vector_kernel_inline"):
+            phase_irs[phase] = ir
+
     pipeline = (
         Pipeline(
             f"{model}_{implementation}",
             output_dir=str(output_dir / "ir"),
             dump_ir=model == "i64_o10",
             verbose=True,
+            on_phase_complete=capture_phase,
         )
         .load_onnx(str(model_dir / f"{model}.onnx"))
         .configure_fhe(
-            scaling_factor_bits=56,
-            first_prime_bits=60,
-            hamming_weight=192,
+            scaling_factor_bits=SCALING_FACTOR_BITS,
+            first_prime_bits=FIRST_PRIME_BITS,
+            hamming_weight=HAMMING_WEIGHT,
             data_file=f"{model}.weight",
-            free_poly=True,
+            free_poly=FREE_POLY,
         )
     )
     slots = MODEL_SLOTS[model]
-    if implementation == "native":
+    prepared_plans: list[object] = []
+    if implementation in ("native", "cpp-baseline"):
         pipeline.configure_vector_kernel_lowering(
             plan_provider="cpp",
             kernel_impl="native",
@@ -194,21 +358,69 @@ def _generate_one(
             mask_fuse=False,
             max_slots=slots,
         )
-    else:
+    elif implementation == "dsl":
         configure_baseline_gemm_dsl(
             pipeline,
             mask_fuse=False,
             max_slots=slots,
         )
+    elif implementation == "metakernel-fast":
+        pipeline.configure_vector_kernel_lowering(
+            plan_provider="cpp",
+            kernel_impl="native",
+            plan_kind="fast-gemm",
+            fallback="error",
+            mask_fuse=False,
+            max_slots=slots,
+        )
+    elif implementation == "dsl-fast":
+
+        def capture_recipe(trace, prepared):
+            prepared_plans.append(prepared)
+            return fast_gemm_recipe(trace, prepared)
+
+        pipeline.configure_vector_kernel_lowering(
+            plan_provider="cpp",
+            kernel_impl="dsl",
+            plan_kind="fast-gemm",
+            fallback="error",
+            mask_fuse=False,
+            max_slots=slots,
+        ).register_vector_kernel_recipe("fast-gemm", capture_recipe)
+    else:
+        raise ValueError(f"unsupported implementation: {implementation}")
 
     started = time.monotonic()
     result = pipeline.run(target=PipelineTarget.C)
     elapsed = time.monotonic() - started
     if not result.success:
+        for phase, ir in phase_irs.items():
+            (output_dir / f"{phase}.air").write_text(ir)
+        path_evidence = None
+        if implementation == "dsl-fast" and "tensor2vector" in phase_irs:
+            path_evidence = _path_evidence(
+                implementation,
+                phase_irs,
+                prepared_plans,
+                require_inlined=False,
+            )
+        failure = {
+            "success": False,
+            "model": model,
+            "implementation": implementation,
+            "error": result.error,
+            "stages": result.stages_completed,
+            "generation_seconds": elapsed,
+            "path_evidence": path_evidence,
+        }
+        (output_dir / "generation-failure.json").write_text(
+            json.dumps(failure, indent=2, sort_keys=True) + "\n"
+        )
         raise RuntimeError(result.error)
+    uses_inliner = implementation in ("dsl", "dsl-fast")
     expected_stages = [
         "tensor2vector",
-        *(["vector_kernel_inline"] if implementation == "dsl" else []),
+        *(["vector_kernel_inline"] if uses_inliner else []),
         "vector2sihe",
         "sihe2ckks",
         "ckks_driver",
@@ -221,8 +433,15 @@ def _generate_one(
             f"expected {expected_stages!r}"
         )
 
+    path_evidence = _path_evidence(implementation, phase_irs, prepared_plans)
+    for phase, ir in phase_irs.items():
+        (output_dir / f"{phase}.air").write_text(ir)
+
     generated_c = output_dir / f"{model}.generated.c"
     generated_c.write_text(result.c_code)
+    weight = output_dir / f"{model}.weight"
+    if not weight.is_file():
+        raise RuntimeError(f"compiler did not emit {weight.name}")
     metadata = {
         "model": model,
         "implementation": implementation,
@@ -231,8 +450,11 @@ def _generate_one(
         "generation_seconds": elapsed,
         "phase_seconds": pipeline.timings,
         "generated_c_bytes": generated_c.stat().st_size,
+        "generated_c_sha256": _sha256(generated_c),
+        "weight_sha256": _sha256(weight),
         "model_onnx_sha256": _sha256(model_dir / f"{model}.onnx"),
         "driver_sha256": _sha256(model_dir / f"{model}.c"),
+        "path_evidence": path_evidence,
     }
     (output_dir / "generation.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True, allow_nan=False) + "\n"
@@ -300,7 +522,7 @@ def _compile_runner(
     output_dir: Path,
     timeout: int,
     model_dir: Path,
-) -> Path:
+) -> tuple[Path, dict[str, object]]:
     driver = _write_validating_driver(model, output_dir, model_dir)
     generated = output_dir / f"{model}.generated.c"
     runner = output_dir / f"{model}.runner.cxx"
@@ -327,13 +549,25 @@ def _compile_runner(
         str(executable),
     ]
     print(f"[compile] {model} {output_dir.name}", flush=True)
+    started = time.monotonic()
     result = _run(command, cwd=output_dir, timeout=timeout)
+    elapsed = time.monotonic() - started
     (output_dir / "compile.log").write_text(result.stdout)
     if result.returncode != 0:
         raise RuntimeError(
             f"compile failed for {model} in {output_dir}\n{result.stdout}"
         )
-    return executable
+    metadata: dict[str, object] = {
+        "success": True,
+        "seconds": elapsed,
+        "command": command,
+        "runner_sha256": _sha256(runner),
+        "executable_bytes": executable.stat().st_size,
+    }
+    (output_dir / "compile.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    )
+    return executable, metadata
 
 
 def _parse_run(
@@ -389,11 +623,11 @@ def _run_one(
     env = os.environ.copy()
     env.update(
         {
-            "OMP_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": str(OMP_NUM_THREADS),
             "RTLIB_DISABLE_BOOTSTRAP_PRECOM": "1",
             "RTLIB_TIMING_OUTPUT": "stdout",
-            "ABS_ERROR": "0.0001",
-            "REL_ERROR": "0.001",
+            "ABS_ERROR": str(ABS_ERROR_TOLERANCE),
+            "REL_ERROR": str(REL_ERROR_TOLERANCE),
             "ACE_OUTPUT_FILE": str(output_path),
         }
     )
@@ -416,52 +650,90 @@ def _read_values(path: Path) -> list[float]:
 
 
 def _compare_outputs(
-    native_path: Path,
-    dsl_path: Path,
+    left_path: Path,
+    right_path: Path,
     *,
     tolerance: float,
+    left_name: str = "native",
+    right_name: str = "DSL",
 ) -> dict[str, object]:
     if not math.isfinite(tolerance) or tolerance < 0.0:
         raise ValueError(
             f"output tolerance must be finite and nonnegative: {tolerance}"
         )
-    native = _read_values(native_path)
-    dsl = _read_values(dsl_path)
-    if len(native) != len(dsl):
+    left_values = _read_values(left_path)
+    right_values = _read_values(right_path)
+    if len(left_values) != len(right_values):
         raise RuntimeError(
-            f"native/DSL output length mismatch: {len(native)} != {len(dsl)}"
+            f"{left_name}/{right_name} output length mismatch: "
+            f"{len(left_values)} != {len(right_values)}"
         )
-    if not native:
-        raise RuntimeError("native/DSL output files are empty")
-    for implementation, values in (("native", native), ("DSL", dsl)):
+    if not left_values:
+        raise RuntimeError(f"{left_name}/{right_name} output files are empty")
+    for implementation, values in (
+        (left_name, left_values),
+        (right_name, right_values),
+    ):
         for index, value in enumerate(values):
             if not math.isfinite(value):
                 raise RuntimeError(
                     f"{implementation} output is non-finite at index {index}: {value}"
                 )
-    differences = [abs(left - right) for left, right in zip(native, dsl)]
+    differences = [abs(left - right) for left, right in zip(left_values, right_values)]
     max_difference = max(differences, default=0.0)
     max_index = differences.index(max_difference) if differences else -1
     if not math.isfinite(max_difference) or max_difference > tolerance:
         raise RuntimeError(
-            f"native/DSL max absolute difference {max_difference} at "
-            f"index {max_index} exceeds {tolerance}"
+            f"{left_name}/{right_name} max absolute difference "
+            f"{max_difference} at index {max_index} exceeds {tolerance}"
         )
     return {
-        "length": len(native),
+        "length": len(left_values),
         "max_abs_difference": max_difference,
         "max_abs_difference_index": max_index,
         "tolerance": tolerance,
     }
 
 
+def _compare_output_set(
+    output_paths: dict[str, Path],
+    *,
+    tolerance: float,
+) -> dict[str, object]:
+    pairwise = {}
+    for left, right in itertools.combinations(output_paths, 2):
+        pairwise[f"{left}__{right}"] = _compare_outputs(
+            output_paths[left],
+            output_paths[right],
+            tolerance=tolerance,
+            left_name=left,
+            right_name=right,
+        )
+    if not pairwise:
+        raise RuntimeError("cross-output comparison requires two paths")
+    worst_name, worst = max(
+        pairwise.items(), key=lambda item: item[1]["max_abs_difference"]
+    )
+    return {
+        "pairs": pairwise,
+        "max_abs_difference": worst["max_abs_difference"],
+        "max_abs_difference_index": worst["max_abs_difference_index"],
+        "max_abs_difference_pair": worst_name,
+        "length": worst["length"],
+        "tolerance": tolerance,
+    }
+
+
+def _balanced_order(implementations: tuple[str, ...], sample: int) -> tuple[str, ...]:
+    cycle, offset = divmod(sample, len(implementations))
+    base = implementations if cycle % 2 == 0 else tuple(reversed(implementations))
+    return base[offset:] + base[:offset]
+
+
 def _summarize_timings(
     timings: dict[str, list[float]],
 ) -> dict[str, object]:
-    native_median = statistics.median(timings["native"])
-    dsl_median = statistics.median(timings["dsl"])
-    ratio = dsl_median / native_median
-    return {
+    summary: dict[str, object] = {
         implementation: {
             "seconds": values,
             "median_seconds": statistics.median(values),
@@ -469,10 +741,24 @@ def _summarize_timings(
             "max_seconds": max(values),
         }
         for implementation, values in timings.items()
-    } | {
-        "dsl_over_native_ratio": ratio,
-        "dsl_gap_percent": (ratio - 1.0) * 100.0,
     }
+    comparisons = {}
+    for left, right in itertools.combinations(timings, 2):
+        left_median = summary[left]["median_seconds"]
+        right_median = summary[right]["median_seconds"]
+        ratio = left_median / right_median
+        comparisons[f"{left}_over_{right}"] = {
+            "runtime_ratio": ratio,
+            "gap_percent": (ratio - 1.0) * 100.0,
+            "right_speedup_vs_left": ratio,
+            "left_speedup_vs_right": 1.0 / ratio,
+        }
+    summary["comparisons"] = comparisons
+    if "native" in timings and "dsl" in timings:
+        ratio = summary["dsl"]["median_seconds"] / summary["native"]["median_seconds"]
+        summary["dsl_over_native_ratio"] = ratio
+        summary["dsl_gap_percent"] = (ratio - 1.0) * 100.0
+    return summary
 
 
 def _benchmark_model(
@@ -484,25 +770,37 @@ def _benchmark_model(
     timeout: int,
     cross_tolerance: float,
     model_dir: Path,
+    implementations: tuple[str, ...] = IMPLEMENTATIONS,
 ) -> dict[str, object]:
     model_root = root / model
     generation = {}
+    compilation = {}
     executables = {}
-    for implementation in IMPLEMENTATIONS:
+    for implementation in implementations:
         output_dir = model_root / implementation
         output_dir.mkdir(parents=True, exist_ok=True)
         generation[implementation] = _generate_subprocess(
             script, model, implementation, output_dir, timeout, model_dir
         )
-        executables[implementation] = _compile_runner(
+        executable, compile_metadata = _compile_runner(
             model, output_dir, timeout, model_dir
         )
+        executables[implementation] = executable
+        compilation[implementation] = compile_metadata
+
+    for field in ("model_onnx_sha256", "driver_sha256"):
+        hashes = {metadata[field] for metadata in generation.values()}
+        if len(hashes) != 1:
+            raise RuntimeError(f"{model} implementations disagree on {field}: {hashes}")
 
     validation_samples: dict[str, list[dict[str, object]]] = {
-        implementation: [] for implementation in IMPLEMENTATIONS
+        implementation: [] for implementation in implementations
     }
+    warmup_orders = []
     for warmup in range(warmups):
-        for implementation in IMPLEMENTATIONS:
+        order = _balanced_order(implementations, warmup)
+        warmup_orders.append(list(order))
+        for implementation in order:
             print(
                 f"[warmup {warmup + 1}/{warmups}] {model} {implementation}",
                 flush=True,
@@ -522,10 +820,12 @@ def _benchmark_model(
                 flush=True,
             )
 
-    timings = {implementation: [] for implementation in IMPLEMENTATIONS}
+    timings = {implementation: [] for implementation in implementations}
     output_comparisons = []
+    measured_orders = []
     for run in range(runs):
-        order = IMPLEMENTATIONS if run % 2 == 0 else tuple(reversed(IMPLEMENTATIONS))
+        order = _balanced_order(implementations, run)
+        measured_orders.append(list(order))
         for implementation in order:
             print(
                 f"[run {run + 1}/{runs}] {model} {implementation}",
@@ -546,9 +846,11 @@ def _benchmark_model(
                 f"[run] PASS {model} {implementation}: MAIN_GRAPH={timing:.6f}s",
                 flush=True,
             )
-        output_comparison = _compare_outputs(
-            model_root / "native" / f"run-{run}.txt",
-            model_root / "dsl" / f"run-{run}.txt",
+        output_comparison = _compare_output_set(
+            {
+                implementation: model_root / implementation / f"run-{run}.txt"
+                for implementation in implementations
+            },
             tolerance=cross_tolerance,
         )
         output_comparison["sample"] = f"measured-run-{run + 1}"
@@ -563,6 +865,7 @@ def _benchmark_model(
         "length": worst_output["length"],
         "max_abs_difference": worst_output["max_abs_difference"],
         "max_abs_difference_index": worst_output["max_abs_difference_index"],
+        "max_abs_difference_pair": worst_output["max_abs_difference_pair"],
         "max_abs_difference_sample": worst_output["sample"],
         "tolerance": cross_tolerance,
     }
@@ -579,20 +882,31 @@ def _benchmark_model(
     summary = {
         "model": model,
         "max_slots": MODEL_SLOTS[model],
+        "implementations": list(implementations),
         "generation": generation,
+        "compilation": compilation,
         "validation": validation,
-        "native_dsl_output": output_comparison,
+        "cross_output": output_comparison,
         "performance": performance,
+        "run_order": {
+            "warmups": warmup_orders,
+            "measured": measured_orders,
+        },
+        "unsupported": [],
+        "fallbacks": [],
     }
+    if implementations == IMPLEMENTATIONS:
+        summary["native_dsl_output"] = output_comparison
     (model_root / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n"
     )
+    medians = "; ".join(
+        f"{implementation}={performance[implementation]['median_seconds']:.6f}s"
+        for implementation in implementations
+    )
     print(
         f"[model] PASS {model}: output max_abs_difference="
-        f"{output_comparison['max_abs_difference']:.6g}; "
-        f"native median={performance['native']['median_seconds']:.6f}s; "
-        f"DSL median={performance['dsl']['median_seconds']:.6f}s; "
-        f"gap={performance['dsl_gap_percent']:+.2f}%",
+        f"{output_comparison['max_abs_difference']:.6g}; {medians}",
         flush=True,
     )
     return summary
@@ -605,6 +919,12 @@ def _parse_arguments() -> argparse.Namespace:
         nargs="+",
         choices=tuple(MODEL_SLOTS),
         default=list(MODEL_SLOTS),
+    )
+    parser.add_argument(
+        "--implementations",
+        nargs="+",
+        choices=ALL_IMPLEMENTATIONS,
+        default=list(IMPLEMENTATIONS),
     )
     parser.add_argument(
         "--model-dir",
@@ -624,6 +944,14 @@ def _parse_arguments() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     arguments = parser.parse_args()
+    if len(set(arguments.implementations)) != len(arguments.implementations):
+        parser.error("--implementations must not contain duplicates")
+    selected = tuple(arguments.implementations)
+    if selected != IMPLEMENTATIONS and set(selected) != set(THREE_WAY_IMPLEMENTATIONS):
+        parser.error(
+            "--implementations must select the default native/DSL pair or "
+            "all three fast-comparison paths"
+        )
     if arguments.warmups < 0 or arguments.runs < 1:
         parser.error("--warmups must be nonnegative and --runs must be positive")
     if arguments.timeout < 1:
@@ -637,7 +965,7 @@ def main() -> int:
     arguments = _parse_arguments()
     if arguments.internal_generate is not None:
         model, implementation, output_dir, model_dir = arguments.internal_generate
-        if model not in MODEL_SLOTS or implementation not in IMPLEMENTATIONS:
+        if model not in MODEL_SLOTS or implementation not in ALL_IMPLEMENTATIONS:
             raise ValueError((model, implementation))
         resolved_model_dir = Path(model_dir).resolve()
         _validate_model_files(resolved_model_dir, [model])
@@ -666,20 +994,43 @@ def main() -> int:
                 arguments.timeout,
                 arguments.cross_tolerance,
                 model_dir,
+                tuple(arguments.implementations),
             )
         )
     aggregate = {
         "settings": {
             "models": arguments.models,
+            "implementations": arguments.implementations,
             "model_dir": str(model_dir),
             "warmups": arguments.warmups,
             "runs": arguments.runs,
             "timeout_seconds": arguments.timeout,
             "cross_tolerance": arguments.cross_tolerance,
-            "omp_num_threads": 1,
-            "rtlib_disable_bootstrap_precom": 1,
+            "compiler_settings": {
+                "scaling_factor_bits": SCALING_FACTOR_BITS,
+                "first_prime_bits": FIRST_PRIME_BITS,
+                "hamming_weight": HAMMING_WEIGHT,
+                "free_poly": FREE_POLY,
+                "mask_fuse": False,
+                "plan_provider": "cpp",
+                "fallback": "error",
+                "cxx_optimization": "-O3",
+                "cxx_openmp": True,
+            },
+            "runtime_settings": {
+                "omp_num_threads": OMP_NUM_THREADS,
+                "rtlib_disable_bootstrap_precom": 1,
+                "abs_error_tolerance": ABS_ERROR_TOLERANCE,
+                "rel_error_tolerance": REL_ERROR_TOLERANCE,
+            },
+            "input_identity": (
+                "model and driver SHA-256 values are checked equal across "
+                "implementations for each model"
+            ),
         },
         "models": summaries,
+        "unsupported": [],
+        "fallbacks": [],
     }
     (root / "summary.json").write_text(
         json.dumps(aggregate, indent=2, sort_keys=True, allow_nan=False) + "\n"
