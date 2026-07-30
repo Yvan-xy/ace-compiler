@@ -22,6 +22,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HELPER_PREFIX = "__ace_vkernel_baseline_gemm_"
 _CONV_HELPER_PREFIX = "__ace_vkernel_baseline_conv_"
 _FAST_GEMM_HELPER_PREFIX = "__ace_vkernel_fast_gemm_"
+_FAST_CONV_HELPER_PREFIX = "__ace_vkernel_fast_conv_"
 
 
 def _write_gemm_model(
@@ -111,6 +112,53 @@ def _write_conv_model(path: Path):
     graph = helper.make_graph(
         [conv],
         "function_inliner_conv",
+        [input_info],
+        [output_info],
+        [weight, bias],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13)],
+        ir_version=8,
+    )
+    onnx.checker.check_model(model)
+    onnx.save(model, path)
+
+
+def _write_fast_conv_model(path: Path, *, sharded: bool = False):
+    channel_in = 1 if sharded else 2
+    channel_out = 2 if sharded else 4
+    height = 12 if sharded else 2
+    kernel = 3
+    weight_shape = (channel_out, channel_in, kernel, kernel)
+    weight_values = (
+        np.arange(np.prod(weight_shape), dtype=np.float32) + 1.0
+    ) / 32.0
+    weight = numpy_helper.from_array(
+        weight_values.reshape(weight_shape), "weight"
+    )
+    bias = numpy_helper.from_array(
+        np.arange(channel_out, dtype=np.float32) / 8.0, "bias"
+    )
+    input_info = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, channel_in, height, height]
+    )
+    output_info = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, channel_out, height, height]
+    )
+    conv = helper.make_node(
+        "Conv",
+        ["input", "weight", "bias"],
+        ["output"],
+        name="fast_conv",
+        kernel_shape=[kernel, kernel],
+        pads=[1, 1, 1, 1],
+        strides=[1, 1],
+        group=1,
+    )
+    graph = helper.make_graph(
+        [conv],
+        "function_inliner_fast_conv",
         [input_info],
         [output_info],
         [weight, bias],
@@ -301,6 +349,85 @@ def test_fast_gemm_shared_helper_clones_distinct_array_locals(tmp_path):
     assert sorted(result["after"]["vector_ops"]) == sorted(expected_vector_ops)
 
 
+def test_fast_conv_complete_helper_inlines_transactionally(tmp_path):
+    model = tmp_path / "fast_conv.onnx"
+    _write_fast_conv_model(model)
+
+    result = _run_worker(model, "fast-conv-always")
+
+    assert result["pipeline_success"]
+    assert result["before"]["verify"]
+    assert result["before"]["helper_calls"] == 1
+    assert result["before"]["helper_scopes"] == 1
+    assert result["before"]["mutable_array_names"] == ["__blocked_input"]
+    assert result["before"]["loops"] == 3
+    assert result["before"]["ists"] == 1
+    assert result["before"]["ilds"] == 2
+    assert result["pass"] == {
+        "success": True,
+        "changed": True,
+        "calls_inlined": 1,
+        "helpers_removed": 1,
+        "diagnostics": [],
+    }
+    assert result["after"]["verify"]
+    assert result["after"]["helper_calls"] == 0
+    assert result["after"]["helper_scopes"] == 0
+    assert result["after"]["helper_symbols"] == 0
+    assert result["after"]["arg_stores"] == 1
+    assert len(result["after"]["mutable_array_names"]) == 1
+    assert re.fullmatch(
+        r"__ace_inline_[0-9]+___blocked_input",
+        result["after"]["mutable_array_names"][0],
+    )
+    for field in (
+        "ldas",
+        "arrays",
+        "ists",
+        "ilds",
+        "loops",
+        "vector_ops",
+        "rotations",
+        "slots",
+        "comments",
+        "preg_loads",
+    ):
+        assert result["after"][field] == result["before"][field]
+    assert (
+        result["after"]["preg_stores"]
+        == result["before"]["preg_stores"] + 1
+    )
+    assert result["second"] == {
+        "success": True,
+        "changed": False,
+        "calls_inlined": 0,
+        "helpers_removed": 0,
+        "diagnostics": [],
+    }
+    assert result["second_dump_unchanged"]
+
+
+def test_sharded_fast_conv_inliner_fails_closed_without_mutation(tmp_path):
+    model = tmp_path / "sharded_fast_conv.onnx"
+    _write_fast_conv_model(model, sharded=True)
+
+    result = _run_worker(model, "fast-conv-sharded-always")
+
+    assert result["pipeline_success"]
+    assert result["before"]["verify"]
+    assert result["before"]["helper_calls"] == 1
+    assert not result["pass"]["success"]
+    assert not result["pass"]["changed"]
+    assert result["pass"]["calls_inlined"] == 0
+    assert result["pass"]["helpers_removed"] == 0
+    assert "does not support scalar formals" in "; ".join(
+        result["pass"]["diagnostics"]
+    )
+    assert result["dump_unchanged"]
+    assert result["native_ptr_stable"]
+    assert result["after"]["verify"]
+
+
 def test_tentative_inliner_clones_conv_constant_array_access(tmp_path):
     model = tmp_path / "conv_constant_array.onnx"
     _write_conv_model(model)
@@ -380,13 +507,31 @@ def test_tentative_inliner_clones_conv_constant_array_access(tmp_path):
         ),
         ("fast-mutable-array-non-pointer-rtype", False, "array address"),
         ("fast-constant-array-store", False, "constant array address"),
+        ("fast-array-arity", False, "array address"),
+        ("fast-pointer-local", False, "pointer type"),
+        ("fast-pointer-preg", False, "pointer type"),
+        ("fast-pointer-global-load", False, "pointer-valued expression"),
+        (
+            "fast-conv-preg-load-type-mismatch",
+            False,
+            "preg load has an incompatible",
+        ),
+        (
+            "fast-conv-preg-store-type-mismatch",
+            False,
+            "preg store has an incompatible",
+        ),
+        ("fast-unsupported-if", False, "unsupported block control flow"),
+        ("fast-loop-iv-i64", False, "helper-owned Core s32 IV"),
     ],
 )
 def test_policy_and_predicate_failures_do_not_mutate(
     tmp_path, action, success, diagnostic
 ):
     model = tmp_path / f"{action}.onnx"
-    if action.startswith("conv-"):
+    if action.startswith("fast-conv-"):
+        _write_fast_conv_model(model)
+    elif action.startswith("conv-"):
         _write_conv_model(model)
     elif action.startswith("fast-"):
         _write_gemm_model(model, height=4, width=4)
@@ -443,7 +588,7 @@ def test_tentative_pipeline_gate_is_limited_to_supported_dsl_requests():
     assert _uses_tentative_vector_kernel_inliner(
         dataclasses.replace(base, plan_kind="fast-gemm")
     )
-    assert not _uses_tentative_vector_kernel_inliner(
+    assert _uses_tentative_vector_kernel_inliner(
         dataclasses.replace(base, plan_kind="fast-conv")
     )
 
@@ -606,6 +751,59 @@ def test_baseline_conv_pipeline_boundary_and_native_parity(tmp_path):
     assert not dsl_c["helper_in_c"]
 
 
+def test_fast_conv_pipeline_boundary_and_native_parity(tmp_path):
+    model = tmp_path / "pipeline_fast_conv.onnx"
+    _write_fast_conv_model(model)
+
+    pre_inline = _run_worker(model, "fast-conv-dsl-t2v")
+    dsl_vector = _run_worker(model, "fast-conv-dsl-v2s")
+    native_vector = _run_worker(model, "fast-conv-native-v2s")
+    dsl_ckks = _run_worker(model, "fast-conv-dsl-s2c")
+    dsl_c = _run_worker(model, "fast-conv-dsl-c")
+
+    assert pre_inline["success"], pre_inline["error"]
+    assert pre_inline["stages"] == ["tensor2vector"]
+    assert pre_inline["summary"]["helper_calls"] == 1
+    assert pre_inline["summary"]["helper_scopes"] == 1
+
+    assert dsl_vector["success"], dsl_vector["error"]
+    assert native_vector["success"], native_vector["error"]
+    assert dsl_vector["stages"] == [
+        "tensor2vector",
+        "vector_kernel_inline",
+        "vector2sihe",
+    ]
+    assert native_vector["stages"] == ["tensor2vector", "vector2sihe"]
+    assert dsl_vector["summary"]["helper_calls"] == 0
+    assert dsl_vector["summary"]["helper_scopes"] == 0
+    assert dsl_vector["summary"]["helper_symbols"] == 0
+    assert (
+        dsl_vector["summary"]["sihe_ops"]
+        == native_vector["summary"]["sihe_ops"]
+    )
+    assert (
+        dsl_vector["summary"]["rotations"]
+        == native_vector["summary"]["rotations"]
+    )
+    assert (
+        dsl_vector["summary"]["loops"]
+        == native_vector["summary"]["loops"]
+    )
+
+    assert dsl_ckks["success"], dsl_ckks["error"]
+    assert dsl_ckks["stages"] == [
+        "tensor2vector",
+        "vector_kernel_inline",
+        "vector2sihe",
+        "sihe2ckks",
+    ]
+    assert dsl_ckks["summary"]["verify"]
+
+    assert dsl_c["success"], dsl_c["error"]
+    assert dsl_c["c_len"] > 0
+    assert not dsl_c["helper_in_c"]
+
+
 def _summary(glob, helper_prefix=_HELPER_PREFIX):
     dump = glob.dump()
     return {
@@ -631,6 +829,8 @@ def _summary(glob, helper_prefix=_HELPER_PREFIX):
         "arrays": len(re.findall(r"^\s+array ", dump, re.MULTILINE)),
         "ilds": len(re.findall(r"^\s+ild ", dump, re.MULTILINE)),
         "ists": len(re.findall(r"^\s+ist ", dump, re.MULTILINE)),
+        "preg_stores": len(re.findall(r"^\s+stp ", dump, re.MULTILINE)),
+        "preg_loads": len(re.findall(r"^\s+ldp ", dump, re.MULTILINE)),
         "slots": re.findall(r"ATTR\[slot=([^]\s]+)\]", dump),
         "comments": re.findall(r'^\s+comment "([^"]*)"', dump, re.MULTILINE),
         "mutable_array_names": sorted(
@@ -735,15 +935,52 @@ def _new_conv_pipeline(
     return pipeline
 
 
+def _new_fast_conv_pipeline(
+    model: Path,
+    implementation: str,
+    artifact_tag: str = "fast-conv-pass",
+    *,
+    sharding: bool = False,
+):
+    from ace_edsl.edsl.pipeline import Pipeline
+    from ace_edsl.edsl.kernels.vector.fast_conv import fast_conv_recipe
+
+    pipeline = Pipeline(
+        "function-inliner-fast-conv-worker",
+        output_dir=str(model.parent / f"output-{artifact_tag}"),
+        dump_ir=False,
+        verbose=False,
+    ).load_onnx(str(model))
+    pipeline.configure_fhe(
+        data_file=str(model.parent / f"{artifact_tag}.data.msg")
+    )
+    pipeline.configure_vector_kernel_lowering(
+        plan_provider="cpp",
+        kernel_impl=implementation,
+        plan_kind="fast-conv",
+        fallback="error",
+        mask_fuse=False,
+        max_slots=128,
+        sharding=sharding,
+    )
+    if implementation == "dsl":
+        pipeline.register_vector_kernel_recipe("fast-conv", fast_conv_recipe)
+    return pipeline
+
+
 def _worker_main():
     from ace_edsl.edsl.passes.function_inliner import FunctionInlinerPass
     from ace_edsl.edsl.pipeline import PipelineTarget
 
     model = Path(sys.argv[2])
     requested_action = sys.argv[3]
+    is_fast_conv = requested_action.startswith("fast-conv-")
     is_conv = requested_action.startswith("conv-")
-    is_fast_gemm = requested_action.startswith("fast-")
-    if is_conv:
+    is_fast_gemm = requested_action.startswith("fast-") and not is_fast_conv
+    if is_fast_conv:
+        action = requested_action.removeprefix("fast-conv-")
+        helper_prefix = _FAST_CONV_HELPER_PREFIX
+    elif is_conv:
         action = requested_action.removeprefix("conv-")
         helper_prefix = _CONV_HELPER_PREFIX
     elif is_fast_gemm:
@@ -752,6 +989,9 @@ def _worker_main():
     else:
         action = requested_action
         helper_prefix = _HELPER_PREFIX
+    sharded_fast_conv = is_fast_conv and action.startswith("sharded-")
+    if sharded_fast_conv:
+        action = action.removeprefix("sharded-")
     if action.startswith("dsl-") or action.startswith("native-"):
         auto_plan = action.startswith("dsl-auto-")
         if auto_plan:
@@ -759,7 +999,14 @@ def _worker_main():
             target_name = action.removeprefix("dsl-auto-")
         else:
             implementation, target_name = action.split("-", 1)
-        if is_conv:
+        if is_fast_conv:
+            pipeline = _new_fast_conv_pipeline(
+                model,
+                implementation,
+                requested_action,
+                sharding=sharded_fast_conv,
+            )
+        elif is_conv:
             pipeline = _new_conv_pipeline(
                 model,
                 implementation,
@@ -795,7 +1042,14 @@ def _worker_main():
         print(json.dumps(payload))
         return
 
-    if is_conv:
+    if is_fast_conv:
+        pipeline = _new_fast_conv_pipeline(
+            model,
+            "dsl",
+            requested_action,
+            sharding=sharded_fast_conv,
+        )
+    elif is_conv:
         pipeline = _new_conv_pipeline(model, "dsl", requested_action)
     elif is_fast_gemm:
         pipeline = _new_fast_gemm_pipeline(model, "dsl", requested_action)
@@ -817,6 +1071,14 @@ def _worker_main():
         "mutable-array-store-type-mismatch",
         "mutable-array-non-pointer-rtype",
         "constant-array-store",
+        "array-arity",
+        "pointer-local",
+        "pointer-preg",
+        "pointer-global-load",
+        "preg-load-type-mismatch",
+        "preg-store-type-mismatch",
+        "unsupported-if",
+        "loop-iv-i64",
     ):
         pipeline.glob._mutate_generated_vector_helper_for_testing(action)
     before_dump = pipeline.glob.dump()
@@ -859,13 +1121,22 @@ def _worker_main():
         "mutable-array-store-type-mismatch",
         "mutable-array-non-pointer-rtype",
         "constant-array-store",
+        "array-arity",
+        "pointer-local",
+        "pointer-preg",
+        "pointer-global-load",
+        "preg-load-type-mismatch",
+        "preg-store-type-mismatch",
+        "unsupported-if",
+        "loop-iv-i64",
     ):
         inline_result = FunctionInlinerPass.run(pipeline.glob)
     else:
         raise ValueError(action)
 
+    committed = action == "always" and inline_result.success
     cached_type_usable = None
-    if action == "always":
+    if committed:
         cached_type_usable = bool(pipeline.glob.new_array_type([2], "f32"))
     stale_type_readable = cached_type.is_float()
     stale_type_is_foreign = not cached_type.same_scope(pipeline.glob.get_type("f32"))
@@ -879,7 +1150,7 @@ def _worker_main():
         "dump_unchanged": before_dump == after_dump,
         "native_ptr_stable": before_ptr == pipeline.glob.get_native_ptr(),
     }
-    if action == "always":
+    if committed:
         payload["cached_type_usable"] = cached_type_usable
         payload["stale_type_readable"] = stale_type_readable
         payload["stale_type_is_foreign"] = stale_type_is_foreign
@@ -913,6 +1184,8 @@ def _summary_from_dump(dump: str, verify: bool, helper_prefix=_HELPER_PREFIX):
         "arrays": len(re.findall(r"^\s+array ", dump, re.MULTILINE)),
         "ilds": len(re.findall(r"^\s+ild ", dump, re.MULTILINE)),
         "ists": len(re.findall(r"^\s+ist ", dump, re.MULTILINE)),
+        "preg_stores": len(re.findall(r"^\s+stp ", dump, re.MULTILINE)),
+        "preg_loads": len(re.findall(r"^\s+ldp ", dump, re.MULTILINE)),
         "slots": re.findall(r"ATTR\[slot=([^]\s]+)\]", dump),
         "comments": re.findall(r'^\s+comment "([^"]*)"', dump, re.MULTILINE),
         "mutable_array_names": sorted(

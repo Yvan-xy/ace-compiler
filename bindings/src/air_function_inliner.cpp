@@ -10,6 +10,7 @@
 
 #include <cstring>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -205,7 +206,8 @@ bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
     NODE_PTR base = node->Array_base();
     const bool load_address = use == CLONE_USE::INDIRECT_LOAD_ADDRESS;
     const bool store_address = use == CLONE_USE::INDIRECT_STORE_ADDRESS;
-    if ((!load_address && !store_address) || node->Array_dim() == 0) {
+    if ((!load_address && !store_address) || node->Array_dim() == 0 ||
+        node->Num_child() != node->Array_dim() + 1) {
       *diagnostic =
           "helper contains an unsupported or escaping array address";
       return false;
@@ -317,6 +319,13 @@ bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
     *diagnostic = "helper result type belongs to another GLOB_SCOPE";
     return false;
   }
+  if (node->Has_rtype() && node->Rtype()->Is_ptr() &&
+      opcode != air::core::OPC_LDCA && opcode != air::core::OPC_LDA &&
+      opcode != air::core::OPC_ARRAY) {
+    *diagnostic =
+        "helper contains an unsupported pointer-valued expression";
+    return false;
+  }
   if (node->Has_sym()) {
     ADDR_DATUM_PTR datum = node->Addr_datum();
     if (datum->Scope_level() != 0 &&
@@ -331,13 +340,38 @@ bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
       return false;
     }
   }
-  if (node->Has_preg() && node->Preg()->Defining_func_scope() != &helper) {
-    *diagnostic = "helper references another function's preg";
-    return false;
+  if (node->Has_preg()) {
+    PREG_PTR preg = node->Preg();
+    if (preg->Defining_func_scope() != &helper) {
+      *diagnostic = "helper references another function's preg";
+      return false;
+    }
+    if (preg->Type()->Is_ptr()) {
+      *diagnostic = "helper contains a pointer-valued preg";
+      return false;
+    }
+    if (opcode == air::core::OPC_STP &&
+        (node->Num_child() != 1 ||
+         !Is_exact_type(node->Child(0)->Rtype(), preg->Type()))) {
+      *diagnostic = "helper preg store has an incompatible value type";
+      return false;
+    }
+    if (opcode == air::core::OPC_LDP &&
+        (node->Num_child() != 0 ||
+         !Is_exact_type(node->Rtype(), preg->Type()))) {
+      *diagnostic = "helper preg load has an incompatible result type";
+      return false;
+    }
   }
   if (node->Is_do_loop()) {
-    if (node->Iv()->Defining_func_scope() != &helper) {
-      *diagnostic = "helper loop IV belongs to another function";
+    if (node->Num_child() != 4 || !node->Child(3)->Is_block() ||
+        node->Child(3)->Parent_stmt() != node->Stmt() ||
+        node->Iv()->Defining_func_scope() != &helper ||
+        !node->Iv()->Type()->Is_prim() ||
+        node->Iv()->Type()->Cast_to_prim()->Encoding() !=
+            PRIMITIVE_TYPE::INT_S32) {
+      *diagnostic =
+          "helper loop requires a helper-owned Core s32 IV and body";
       return false;
     }
   }
@@ -373,6 +407,10 @@ bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
       child_use = node->Child(0)->Opcode() == air::core::OPC_LDA
                       ? CLONE_USE::MUTABLE_LOCAL_ARRAY_BASE
                       : CLONE_USE::CONSTANT_ARRAY_BASE;
+    }
+    if (node->Child(idx)->Is_block() && !node->Is_do_loop()) {
+      *diagnostic = "helper contains unsupported block control flow";
+      return false;
     }
     if (!Validate_cloneable_node(node->Child(idx), helper, true, child_use,
                                  diagnostic))
@@ -451,14 +489,28 @@ bool Validate_call_site(const CALL_SITE& site, const char* helper_attribute,
   }
   for (uint32_t idx = 0; idx < call->Num_arg(); ++idx) {
     NODE_PTR actual = call->Child(idx);
-    if (actual->Container() != &site._caller->Container() ||
+    ADDR_DATUM_PTR formal = site._helper->Formal(idx);
+    if (!formal->Type()->Is_array()) {
+      *diagnostic =
+          "temporary call-site inliner does not support scalar formals or "
+          "their caller-side preparation placement";
+      return false;
+    }
+    if (formal->Defining_func_scope() != site._helper ||
+        formal->Type()->Is_ptr() ||
+        actual->Container() != &site._caller->Container() ||
         !actual->Has_rtype() ||
-        !actual->Rtype()->Is_compatible_type(site._helper->Formal(idx)->Type())) {
+        !actual->Rtype()->Is_compatible_type(formal->Type())) {
       *diagnostic = "generated-helper actual/formal type or ownership mismatch";
       return false;
     }
   }
 
+  if (call->Ret_preg()->Defining_func_scope() != site._caller ||
+      call->Ret_preg()->Type()->Is_ptr()) {
+    *diagnostic = "generated-helper result preg has invalid ownership or type";
+    return false;
+  }
   NODE_PTR entry = site._helper->Container().Entry_node();
   if (entry == Null_ptr || !entry->Is_entry() || !entry->Body_blk()->Is_block()) {
     *diagnostic = "generated helper has no valid function body";
@@ -511,6 +563,24 @@ bool Validate_call_site(const CALL_SITE& site, const char* helper_attribute,
           terminal->Node()->Child(0)->Rtype())) {
     *diagnostic = "generated-helper return type does not match its call preg";
     return false;
+  }
+  for (VAR_ITER iter = site._helper->Begin_var();
+       iter != site._helper->End_var(); ++iter) {
+    ADDR_DATUM_PTR local = *iter;
+    if (local->Defining_func_scope() != site._helper ||
+        local->Type()->Is_ptr()) {
+      *diagnostic = "helper local has invalid ownership or pointer type";
+      return false;
+    }
+  }
+  for (PREG_ITER iter = site._helper->Begin_preg();
+       iter != site._helper->End_preg(); ++iter) {
+    PREG_PTR preg = *iter;
+    if (preg->Defining_func_scope() != site._helper ||
+        preg->Type()->Is_ptr()) {
+      *diagnostic = "helper preg has invalid ownership or pointer type";
+      return false;
+    }
   }
   return true;
 }

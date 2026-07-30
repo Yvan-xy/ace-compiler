@@ -12,6 +12,7 @@ import pytest
 
 from ace_edsl.tests.gemm_e2e_compare import (
     IMPLEMENTATIONS,
+    MODEL_SLOTS,
     THREE_WAY_IMPLEMENTATIONS,
     _balanced_order,
     _compare_output_set,
@@ -254,6 +255,19 @@ def test_implementation_cli_preserves_default_and_accepts_exact_three_way(
     )
     selected = _parse_arguments()
     assert tuple(selected.implementations) == THREE_WAY_IMPLEMENTATIONS
+
+
+def test_new_4096_by_10_model_cli_uses_4096_slots(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gemm_e2e_compare.py", "--models", "gemmh10w4096"],
+    )
+
+    selected = _parse_arguments()
+
+    assert selected.models == ["gemmh10w4096"]
+    assert MODEL_SLOTS["gemmh10w4096"] == 4096
 
 
 @pytest.mark.parametrize(

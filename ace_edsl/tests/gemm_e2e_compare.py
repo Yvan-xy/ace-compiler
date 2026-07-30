@@ -23,6 +23,7 @@ MODEL_SLOTS = {
     "i64_o10": 128,
     "i512_o10": 512,
     "i4096_o10": 4096,
+    "gemmh10w4096": 4096,
     "i1024_o4096": 4096,
 }
 IMPLEMENTATIONS = ("native", "dsl")
