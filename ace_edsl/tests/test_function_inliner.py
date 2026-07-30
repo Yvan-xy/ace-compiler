@@ -21,11 +21,16 @@ _WORKER_TIMEOUT_SECONDS = 600
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HELPER_PREFIX = "__ace_vkernel_baseline_gemm_"
 _CONV_HELPER_PREFIX = "__ace_vkernel_baseline_conv_"
+_FAST_GEMM_HELPER_PREFIX = "__ace_vkernel_fast_gemm_"
 
 
-def _write_gemm_model(path: Path, copies: int = 1):
-    height = 2
-    width = 8
+def _write_gemm_model(
+    path: Path,
+    copies: int = 1,
+    *,
+    height: int = 2,
+    width: int = 8,
+):
     values = (np.arange(height * width, dtype=np.float32) + 1.0) / 8.0
     weight = numpy_helper.from_array(values.reshape(height, width), "weight")
     bias = numpy_helper.from_array(np.arange(height, dtype=np.float32) / 4.0, "bias")
@@ -214,6 +219,88 @@ def test_shared_helper_all_calls_inline_before_single_cleanup(tmp_path):
     assert result["after"]["arg_stores"] == 2
 
 
+def test_fast_gemm_mutable_vector_array_inlines_and_is_idempotent(tmp_path):
+    model = tmp_path / "fast_gemm.onnx"
+    _write_gemm_model(model, height=4, width=4)
+
+    result = _run_worker(model, "fast-always")
+
+    assert result["pipeline_success"]
+    assert result["before"]["verify"]
+    assert result["before"]["helper_calls"] == 1
+    assert result["before"]["helper_scopes"] == 1
+    assert result["before"]["mutable_array_names"] == ["__blocked_input"]
+    assert result["before"]["ldas"] == 2
+    assert result["before"]["ists"] == 1
+    assert result["before"]["ilds"] == 2
+    assert result["pass"] == {
+        "success": True,
+        "changed": True,
+        "calls_inlined": 1,
+        "helpers_removed": 1,
+        "diagnostics": [],
+    }
+    assert result["after"]["verify"]
+    assert result["after"]["helper_calls"] == 0
+    assert result["after"]["helper_scopes"] == 0
+    assert result["after"]["helper_symbols"] == 0
+    assert len(result["after"]["mutable_array_names"]) == 1
+    assert re.fullmatch(
+        r"__ace_inline_[0-9]+___blocked_input",
+        result["after"]["mutable_array_names"][0],
+    )
+    for field in (
+        "ldas",
+        "arrays",
+        "ists",
+        "ilds",
+        "loops",
+        "vector_ops",
+        "rotations",
+        "slots",
+        "comments",
+    ):
+        assert result["after"][field] == result["before"][field]
+    assert result["second"] == {
+        "success": True,
+        "changed": False,
+        "calls_inlined": 0,
+        "helpers_removed": 0,
+        "diagnostics": [],
+    }
+    assert result["second_dump_unchanged"]
+
+
+def test_fast_gemm_shared_helper_clones_distinct_array_locals(tmp_path):
+    model = tmp_path / "shared_fast_gemm.onnx"
+    _write_gemm_model(model, copies=2, height=4, width=4)
+
+    result = _run_worker(model, "fast-always")
+
+    assert result["before"]["verify"]
+    assert result["before"]["helper_calls"] == 2
+    assert result["before"]["helper_scopes"] == 1
+    assert result["before"]["mutable_array_names"] == ["__blocked_input"]
+    assert result["pass"]["success"]
+    assert result["pass"]["calls_inlined"] == 2
+    assert result["pass"]["helpers_removed"] == 1
+    assert result["after"]["verify"]
+    assert result["after"]["helper_calls"] == 0
+    assert result["after"]["helper_scopes"] == 0
+    assert result["after"]["helper_symbols"] == 0
+    assert len(result["after"]["mutable_array_names"]) == 2
+    assert len(set(result["after"]["mutable_array_names"])) == 2
+    assert all(
+        re.fullmatch(r"__ace_inline_[0-9]+___blocked_input", name)
+        for name in result["after"]["mutable_array_names"]
+    )
+    for field in ("ldas", "arrays", "ists", "ilds"):
+        assert result["after"][field] == 2 * result["before"][field]
+    expected_vector_ops = 2 * result["before"]["vector_ops"]
+    expected_vector_ops.remove("add")  # The caller-side combine Add is not cloned.
+    assert sorted(result["after"]["vector_ops"]) == sorted(expected_vector_ops)
+
+
 def test_tentative_inliner_clones_conv_constant_array_access(tmp_path):
     model = tmp_path / "conv_constant_array.onnx"
     _write_conv_model(model)
@@ -267,6 +354,32 @@ def test_tentative_inliner_clones_conv_constant_array_access(tmp_path):
         ("program-entry", False, "one non-program entry point"),
         ("conv-array-non-pointer-rtype", False, "array address"),
         ("conv-escaping-ldca", False, "escaping address"),
+        ("fast-mutable-array-escape", False, "escaping mutable array"),
+        ("fast-mutable-array-global-base", False, "mutable array address"),
+        ("fast-mutable-array-flat64-base", False, "mutable array address"),
+        ("fast-mutable-array-index-i64", False, "Core signed i32"),
+        (
+            "fast-mutable-array-load-non-array-address",
+            False,
+            "indirect load requires an indexed array address",
+        ),
+        (
+            "fast-mutable-array-store-non-array-address",
+            False,
+            "indirect store requires an indexed array address",
+        ),
+        (
+            "fast-mutable-array-load-type-mismatch",
+            False,
+            "array load has incompatible",
+        ),
+        (
+            "fast-mutable-array-store-type-mismatch",
+            False,
+            "mutable-array store has incompatible",
+        ),
+        ("fast-mutable-array-non-pointer-rtype", False, "array address"),
+        ("fast-constant-array-store", False, "constant array address"),
     ],
 )
 def test_policy_and_predicate_failures_do_not_mutate(
@@ -275,6 +388,8 @@ def test_policy_and_predicate_failures_do_not_mutate(
     model = tmp_path / f"{action}.onnx"
     if action.startswith("conv-"):
         _write_conv_model(model)
+    elif action.startswith("fast-"):
+        _write_gemm_model(model, height=4, width=4)
     else:
         _write_gemm_model(model)
 
@@ -307,7 +422,7 @@ def test_python_pass_rejects_missing_scope_or_binding():
     assert "has no generated-helper inlining binding" in missing_binding.diagnostics[0]
 
 
-def test_tentative_pipeline_gate_is_limited_to_baseline_dsl_requests():
+def test_tentative_pipeline_gate_is_limited_to_supported_dsl_requests():
     from ace_edsl.edsl.pipeline import (
         VectorKernelLoweringConfig,
         _uses_tentative_vector_kernel_inliner,
@@ -325,7 +440,7 @@ def test_tentative_pipeline_gate_is_limited_to_baseline_dsl_requests():
     assert not _uses_tentative_vector_kernel_inliner(
         dataclasses.replace(base, kernel_impl="native")
     )
-    assert not _uses_tentative_vector_kernel_inliner(
+    assert _uses_tentative_vector_kernel_inliner(
         dataclasses.replace(base, plan_kind="fast-gemm")
     )
     assert not _uses_tentative_vector_kernel_inliner(
@@ -358,6 +473,64 @@ def test_pipeline_boundary_and_native_parity(tmp_path):
     assert dsl_vector["summary"]["helper_calls"] == 0
     assert dsl_vector["summary"]["helper_scopes"] == 0
     assert dsl_vector["summary"]["helper_symbols"] == 0
+    assert dsl_vector["summary"]["sihe_ops"] == native_vector["summary"]["sihe_ops"]
+    assert dsl_vector["summary"]["rotations"] == native_vector["summary"]["rotations"]
+    assert dsl_vector["summary"]["loops"] == native_vector["summary"]["loops"]
+
+    assert dsl_ckks["success"], dsl_ckks["error"]
+    assert dsl_ckks["stages"] == [
+        "tensor2vector",
+        "vector_kernel_inline",
+        "vector2sihe",
+        "sihe2ckks",
+    ]
+    assert dsl_ckks["summary"]["verify"]
+
+    assert dsl_c["success"], dsl_c["error"]
+    assert dsl_c["c_len"] > 0
+    assert not dsl_c["helper_in_c"]
+
+
+def test_fast_gemm_pipeline_boundary_and_native_parity(tmp_path):
+    model = tmp_path / "pipeline_fast_gemm.onnx"
+    _write_gemm_model(model, height=4, width=4)
+
+    pre_inline = _run_worker(model, "fast-dsl-t2v")
+    auto_pre_inline = _run_worker(model, "fast-dsl-auto-t2v")
+    dsl_vector = _run_worker(model, "fast-dsl-v2s")
+    auto_dsl_vector = _run_worker(model, "fast-dsl-auto-v2s")
+    native_vector = _run_worker(model, "fast-native-v2s")
+    dsl_ckks = _run_worker(model, "fast-dsl-s2c")
+    dsl_c = _run_worker(model, "fast-dsl-c")
+
+    assert pre_inline["success"]
+    assert pre_inline["stages"] == ["tensor2vector"]
+    assert pre_inline["summary"]["helper_calls"] == 1
+    assert pre_inline["summary"]["helper_scopes"] == 1
+    assert auto_pre_inline["success"], auto_pre_inline["error"]
+    assert auto_pre_inline["stages"] == ["tensor2vector"]
+    assert auto_pre_inline["summary"]["helper_calls"] == 1
+    assert auto_pre_inline["summary"]["helper_scopes"] == 1
+
+    assert dsl_vector["success"], dsl_vector["error"]
+    assert auto_dsl_vector["success"], auto_dsl_vector["error"]
+    assert native_vector["success"], native_vector["error"]
+    assert dsl_vector["stages"] == [
+        "tensor2vector",
+        "vector_kernel_inline",
+        "vector2sihe",
+    ]
+    assert native_vector["stages"] == ["tensor2vector", "vector2sihe"]
+    assert dsl_vector["summary"]["helper_calls"] == 0
+    assert dsl_vector["summary"]["helper_scopes"] == 0
+    assert dsl_vector["summary"]["helper_symbols"] == 0
+    assert auto_dsl_vector["stages"] == dsl_vector["stages"]
+    assert auto_dsl_vector["summary"]["helper_calls"] == 0
+    assert auto_dsl_vector["summary"]["helper_scopes"] == 0
+    assert auto_dsl_vector["summary"]["helper_symbols"] == 0
+    assert auto_dsl_vector["summary"]["sihe_ops"] == dsl_vector["summary"]["sihe_ops"]
+    assert auto_dsl_vector["summary"]["rotations"] == dsl_vector["summary"]["rotations"]
+    assert auto_dsl_vector["summary"]["loops"] == dsl_vector["summary"]["loops"]
     assert dsl_vector["summary"]["sihe_ops"] == native_vector["summary"]["sihe_ops"]
     assert dsl_vector["summary"]["rotations"] == native_vector["summary"]["rotations"]
     assert dsl_vector["summary"]["loops"] == native_vector["summary"]["loops"]
@@ -454,8 +627,21 @@ def _summary(glob, helper_prefix=_HELPER_PREFIX):
         "rotations": re.findall(r"ATTR\[nums=([^\]]+)\]", dump),
         "loops": len(re.findall(r"^\s+do_loop ID", dump, re.MULTILINE)),
         "ldcas": len(re.findall(r"^\s+ldca ", dump, re.MULTILINE)),
+        "ldas": len(re.findall(r"^\s+lda ", dump, re.MULTILINE)),
         "arrays": len(re.findall(r"^\s+array ", dump, re.MULTILINE)),
         "ilds": len(re.findall(r"^\s+ild ", dump, re.MULTILINE)),
+        "ists": len(re.findall(r"^\s+ist ", dump, re.MULTILINE)),
+        "slots": re.findall(r"ATTR\[slot=([^]\s]+)\]", dump),
+        "comments": re.findall(r'^\s+comment "([^"]*)"', dump, re.MULTILINE),
+        "mutable_array_names": sorted(
+            set(
+                re.findall(
+                    r'^\s+lda "([^"]*__blocked_input)"',
+                    dump,
+                    re.MULTILINE,
+                )
+            )
+        ),
     }
 
 
@@ -486,6 +672,36 @@ def _new_pipeline(model: Path, implementation: str, artifact_tag: str = "pass"):
     )
     if implementation == "dsl":
         pipeline.register_vector_kernel_recipe("baseline-gemm", baseline_gemm_recipe)
+    return pipeline
+
+
+def _new_fast_gemm_pipeline(
+    model: Path,
+    implementation: str,
+    artifact_tag: str = "fast-pass",
+    *,
+    auto_plan: bool = False,
+):
+    from ace_edsl.edsl.pipeline import Pipeline
+    from ace_edsl.edsl.kernels.vector.fast_gemm import fast_gemm_recipe
+
+    pipeline = Pipeline(
+        "function-inliner-fast-gemm-worker",
+        output_dir=str(model.parent / f"output-{artifact_tag}"),
+        dump_ir=False,
+        verbose=False,
+    ).load_onnx(str(model))
+    pipeline.configure_fhe(data_file=str(model.parent / f"{artifact_tag}.data.msg"))
+    pipeline.configure_vector_kernel_lowering(
+        plan_provider="cpp",
+        kernel_impl=implementation,
+        plan_kind="auto" if auto_plan else "fast-gemm",
+        fallback="error",
+        mask_fuse=False,
+        max_slots=128,
+    )
+    if implementation == "dsl":
+        pipeline.register_vector_kernel_recipe("fast-gemm", fast_gemm_recipe)
     return pipeline
 
 
@@ -526,8 +742,16 @@ def _worker_main():
     model = Path(sys.argv[2])
     requested_action = sys.argv[3]
     is_conv = requested_action.startswith("conv-")
-    action = requested_action.removeprefix("conv-") if is_conv else requested_action
-    helper_prefix = _CONV_HELPER_PREFIX if is_conv else _HELPER_PREFIX
+    is_fast_gemm = requested_action.startswith("fast-")
+    if is_conv:
+        action = requested_action.removeprefix("conv-")
+        helper_prefix = _CONV_HELPER_PREFIX
+    elif is_fast_gemm:
+        action = requested_action.removeprefix("fast-")
+        helper_prefix = _FAST_GEMM_HELPER_PREFIX
+    else:
+        action = requested_action
+        helper_prefix = _HELPER_PREFIX
     if action.startswith("dsl-") or action.startswith("native-"):
         auto_plan = action.startswith("dsl-auto-")
         if auto_plan:
@@ -535,16 +759,22 @@ def _worker_main():
             target_name = action.removeprefix("dsl-auto-")
         else:
             implementation, target_name = action.split("-", 1)
-        pipeline = (
-            _new_conv_pipeline(
+        if is_conv:
+            pipeline = _new_conv_pipeline(
                 model,
                 implementation,
                 requested_action,
                 auto_plan=auto_plan,
             )
-            if is_conv
-            else _new_pipeline(model, implementation, requested_action)
-        )
+        elif is_fast_gemm:
+            pipeline = _new_fast_gemm_pipeline(
+                model,
+                implementation,
+                requested_action,
+                auto_plan=auto_plan,
+            )
+        else:
+            pipeline = _new_pipeline(model, implementation, requested_action)
         targets = {
             "t2v": PipelineTarget.TENSOR2VECTOR,
             "v2s": PipelineTarget.VECTOR2SIHE,
@@ -565,17 +795,28 @@ def _worker_main():
         print(json.dumps(payload))
         return
 
-    pipeline = (
-        _new_conv_pipeline(model, "dsl", requested_action)
-        if is_conv
-        else _new_pipeline(model, "dsl", requested_action)
-    )
+    if is_conv:
+        pipeline = _new_conv_pipeline(model, "dsl", requested_action)
+    elif is_fast_gemm:
+        pipeline = _new_fast_gemm_pipeline(model, "dsl", requested_action)
+    else:
+        pipeline = _new_pipeline(model, "dsl", requested_action)
     pipeline_result = pipeline.run(target=PipelineTarget.TENSOR2VECTOR)
     if action in (
         "extra-entry",
         "program-entry",
         "array-non-pointer-rtype",
         "escaping-ldca",
+        "mutable-array-escape",
+        "mutable-array-global-base",
+        "mutable-array-flat64-base",
+        "mutable-array-index-i64",
+        "mutable-array-load-non-array-address",
+        "mutable-array-store-non-array-address",
+        "mutable-array-load-type-mismatch",
+        "mutable-array-store-type-mismatch",
+        "mutable-array-non-pointer-rtype",
+        "constant-array-store",
     ):
         pipeline.glob._mutate_generated_vector_helper_for_testing(action)
     before_dump = pipeline.glob.dump()
@@ -608,6 +849,16 @@ def _worker_main():
         "program-entry",
         "array-non-pointer-rtype",
         "escaping-ldca",
+        "mutable-array-escape",
+        "mutable-array-global-base",
+        "mutable-array-flat64-base",
+        "mutable-array-index-i64",
+        "mutable-array-load-non-array-address",
+        "mutable-array-store-non-array-address",
+        "mutable-array-load-type-mismatch",
+        "mutable-array-store-type-mismatch",
+        "mutable-array-non-pointer-rtype",
+        "constant-array-store",
     ):
         inline_result = FunctionInlinerPass.run(pipeline.glob)
     else:
@@ -658,8 +909,21 @@ def _summary_from_dump(dump: str, verify: bool, helper_prefix=_HELPER_PREFIX):
         "rotations": re.findall(r"ATTR\[nums=([^\]]+)\]", dump),
         "loops": len(re.findall(r"^\s+do_loop ID", dump, re.MULTILINE)),
         "ldcas": len(re.findall(r"^\s+ldca ", dump, re.MULTILINE)),
+        "ldas": len(re.findall(r"^\s+lda ", dump, re.MULTILINE)),
         "arrays": len(re.findall(r"^\s+array ", dump, re.MULTILINE)),
         "ilds": len(re.findall(r"^\s+ild ", dump, re.MULTILINE)),
+        "ists": len(re.findall(r"^\s+ist ", dump, re.MULTILINE)),
+        "slots": re.findall(r"ATTR\[slot=([^]\s]+)\]", dump),
+        "comments": re.findall(r'^\s+comment "([^"]*)"', dump, re.MULTILINE),
+        "mutable_array_names": sorted(
+            set(
+                re.findall(
+                    r'^\s+lda "([^"]*__blocked_input)"',
+                    dump,
+                    re.MULTILINE,
+                )
+            )
+        ),
     }
 
 

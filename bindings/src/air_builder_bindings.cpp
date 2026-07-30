@@ -4312,6 +4312,52 @@ NODE_PTR find_opcode_node(NODE_PTR node, OPCODE opcode) {
     return Null_ptr;
 }
 
+NODE_PTR find_array_with_base(NODE_PTR node, OPCODE base_opcode) {
+    if (node == Null_ptr) return Null_ptr;
+    if (node->Opcode() == air::core::OPC_ARRAY &&
+        node->Array_base()->Opcode() == base_opcode) {
+        return node;
+    }
+    if (node->Is_block()) {
+        for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+             stmt = stmt->Next()) {
+            NODE_PTR found = find_array_with_base(stmt->Node(), base_opcode);
+            if (found != Null_ptr) return found;
+        }
+        return Null_ptr;
+    }
+    for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
+        NODE_PTR found = find_array_with_base(node->Child(idx), base_opcode);
+        if (found != Null_ptr) return found;
+    }
+    return Null_ptr;
+}
+
+NODE_PTR find_indirect_array_access(NODE_PTR node, OPCODE access_opcode,
+                                    OPCODE base_opcode) {
+    if (node == Null_ptr) return Null_ptr;
+    if (node->Opcode() == access_opcode && node->Num_child() > 0 &&
+        node->Child(0)->Opcode() == air::core::OPC_ARRAY &&
+        node->Child(0)->Array_base()->Opcode() == base_opcode) {
+        return node;
+    }
+    if (node->Is_block()) {
+        for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+             stmt = stmt->Next()) {
+            NODE_PTR found = find_indirect_array_access(
+                stmt->Node(), access_opcode, base_opcode);
+            if (found != Null_ptr) return found;
+        }
+        return Null_ptr;
+    }
+    for (uint32_t idx = 0; idx < node->Num_child(); ++idx) {
+        NODE_PTR found = find_indirect_array_access(
+            node->Child(idx), access_opcode, base_opcode);
+        if (found != Null_ptr) return found;
+    }
+    return Null_ptr;
+}
+
 py::dict compare_normalized_vector_kernel_air_for_testing(
     const std::string& native_air, const std::string& helper_air) {
     const nn::vector::test::VECTOR_KERNEL_AIR_COMPARE_RESULT comparison =
@@ -6094,7 +6140,10 @@ public:
             const bool baseline_conv =
                 name.compare(0, BASELINE_CONV_HELPER_PREFIX.size(),
                              BASELINE_CONV_HELPER_PREFIX) == 0;
-            if (!baseline_gemm && !baseline_conv) {
+            const bool fast_gemm =
+                name.compare(0, FAST_GEMM_HELPER_PREFIX.size(),
+                             FAST_GEMM_HELPER_PREFIX) == 0;
+            if (!baseline_gemm && !baseline_conv && !fast_gemm) {
                 continue;
             }
             if (helper != nullptr) {
@@ -6153,6 +6202,147 @@ public:
                 container.Clone_node_tree(source), pointer_local,
                 source->Spos());
             STMT_LIST::Enclosing_list(terminal).Prepend(terminal, store);
+        } else if (mutation == "mutable-array-escape") {
+            CONTAINER& container = helper->Container();
+            NODE_PTR body = container.Entry_node()->Body_blk();
+            NODE_PTR array = find_array_with_base(
+                body, air::core::OPC_LDA);
+            if (array == Null_ptr) {
+                throw std::runtime_error(
+                    "mutable-array escape mutation found no LDA-backed ARRAY");
+            }
+            NODE_PTR source = array->Array_base();
+            STMT_PTR terminal = Null_ptr;
+            for (STMT_PTR stmt = body->Begin_stmt(); stmt != body->End_stmt();
+                 stmt = stmt->Next()) {
+                if (stmt->Node()->Opcode() == air::core::OPC_RETV) {
+                    terminal = stmt;
+                    break;
+                }
+            }
+            if (terminal == Null_ptr) {
+                throw std::runtime_error(
+                    "mutable-array escape mutation found no terminal return");
+            }
+            ADDR_DATUM_PTR pointer_local = helper->New_var(
+                source->Rtype(), "__escaping_mutable_array_address",
+                source->Spos());
+            STMT_PTR store = container.New_st(
+                container.Clone_node_tree(source), pointer_local,
+                source->Spos());
+            STMT_LIST::Enclosing_list(terminal).Prepend(terminal, store);
+        } else if (mutation == "mutable-array-global-base") {
+            NODE_PTR array = find_array_with_base(
+                helper->Container().Entry_node(), air::core::OPC_LDA);
+            if (array == Null_ptr) {
+                throw std::runtime_error(
+                    "mutable-array global mutation found no LDA-backed ARRAY");
+            }
+            NODE_PTR source = array->Array_base();
+            ADDR_DATUM_PTR global_array = glob->New_var(
+                source->Addr_datum()->Type(),
+                "__unsupported_global_mutable_array", source->Spos());
+            source->Set_addr_datum(global_array);
+        } else if (mutation == "mutable-array-flat64-base") {
+            CONTAINER& container = helper->Container();
+            NODE_PTR array = find_array_with_base(
+                container.Entry_node(), air::core::OPC_LDA);
+            if (array == Null_ptr) {
+                throw std::runtime_error(
+                    "mutable-array pointer mutation found no LDA-backed ARRAY");
+            }
+            NODE_PTR source = array->Array_base();
+            array->Set_child(
+                0, container.New_lda(source->Addr_datum(),
+                                     POINTER_KIND::FLAT64, source->Spos()));
+        } else if (mutation == "mutable-array-index-i64") {
+            CONTAINER& container = helper->Container();
+            NODE_PTR array = find_array_with_base(
+                container.Entry_node(), air::core::OPC_LDA);
+            if (array == Null_ptr || array->Array_dim() != 1) {
+                throw std::runtime_error(
+                    "mutable-array index mutation found no rank-one ARRAY");
+            }
+            container.Set_array_idx(
+                array, 0,
+                container.New_intconst(PRIMITIVE_TYPE::INT_S64, 0,
+                                       array->Spos()));
+        } else if (mutation == "mutable-array-non-pointer-rtype") {
+            NODE_PTR array = find_array_with_base(
+                helper->Container().Entry_node(), air::core::OPC_LDA);
+            if (array == Null_ptr || array->Array_dim() != 1) {
+                throw std::runtime_error(
+                    "mutable-array rtype mutation found no rank-one ARRAY");
+            }
+            array->Set_rtype(array->Array_idx(0)->Rtype());
+        } else if (mutation == "mutable-array-load-non-array-address") {
+            CONTAINER& container = helper->Container();
+            NODE_PTR load = find_indirect_array_access(
+                container.Entry_node(), air::core::OPC_ILD,
+                air::core::OPC_LDA);
+            if (load == Null_ptr) {
+                throw std::runtime_error(
+                    "mutable-array load mutation found no LDA-backed ILD");
+            }
+            NODE_PTR address = load->Child(0);
+            ADDR_DATUM_PTR pointer_local = helper->New_var(
+                address->Rtype(), "__unsupported_indirect_load_address",
+                address->Spos());
+            load->Set_child(
+                0, container.New_ld(pointer_local, address->Spos()));
+        } else if (mutation == "mutable-array-store-non-array-address") {
+            CONTAINER& container = helper->Container();
+            NODE_PTR store = find_indirect_array_access(
+                container.Entry_node(), air::core::OPC_IST,
+                air::core::OPC_LDA);
+            if (store == Null_ptr) {
+                throw std::runtime_error(
+                    "mutable-array store mutation found no LDA-backed IST");
+            }
+            NODE_PTR address = store->Child(0);
+            ADDR_DATUM_PTR pointer_local = helper->New_var(
+                address->Rtype(), "__unsupported_indirect_store_address",
+                address->Spos());
+            store->Set_child(
+                0, container.New_ld(pointer_local, address->Spos()));
+        } else if (mutation == "mutable-array-load-type-mismatch") {
+            NODE_PTR load = find_indirect_array_access(
+                helper->Container().Entry_node(), air::core::OPC_ILD,
+                air::core::OPC_LDA);
+            if (load == Null_ptr) {
+                throw std::runtime_error(
+                    "mutable-array load mutation found no LDA-backed ILD");
+            }
+            load->Set_access_type(
+                glob->Prim_type(PRIMITIVE_TYPE::INT_S32));
+        } else if (mutation == "mutable-array-store-type-mismatch") {
+            NODE_PTR store = find_indirect_array_access(
+                helper->Container().Entry_node(), air::core::OPC_IST,
+                air::core::OPC_LDA);
+            if (store == Null_ptr) {
+                throw std::runtime_error(
+                    "mutable-array store mutation found no LDA-backed IST");
+            }
+            store->Set_access_type(
+                glob->Prim_type(PRIMITIVE_TYPE::INT_S32));
+        } else if (mutation == "constant-array-store") {
+            CONTAINER& container = helper->Container();
+            NODE_PTR body = container.Entry_node()->Body_blk();
+            NODE_PTR source = find_opcode_node(body, air::core::OPC_LDCA);
+            NODE_PTR store = find_opcode_node(body, air::core::OPC_IST);
+            if (source == Null_ptr || store == Null_ptr) {
+                throw std::runtime_error(
+                    "constant-array store mutation found no LDCA or IST");
+            }
+            NODE_PTR address = container.New_array(
+                container.Clone_node_tree(source), 1, source->Spos());
+            TYPE_PTR i32 = glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
+            container.Set_array_idx(
+                address, 0, container.New_intconst(i32, 0, source->Spos()));
+            store->Set_child(0, address);
+            store->Set_child(
+                1, container.New_intconst(i32, 0, source->Spos()));
+            store->Set_access_type(i32);
         } else {
             throw std::runtime_error(
                 "unsupported generated-helper test mutation: " + mutation);

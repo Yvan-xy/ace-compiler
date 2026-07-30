@@ -126,8 +126,36 @@ bool Attribute_is_cloneable(ATTR_PTR attr) {
 enum class CLONE_USE {
   VALUE,
   INDIRECT_LOAD_ADDRESS,
+  INDIRECT_STORE_ADDRESS,
   CONSTANT_ARRAY_BASE,
+  MUTABLE_LOCAL_ARRAY_BASE,
 };
+
+bool Is_exact_type(TYPE_PTR actual, TYPE_PTR expected) {
+  return actual != Null_ptr && expected != Null_ptr &&
+         &actual->Glob_scope() == &expected->Glob_scope() &&
+         actual->Id() == expected->Id();
+}
+
+bool Is_flat32_pointer_to(TYPE_PTR type, TYPE_PTR domain) {
+  return type != Null_ptr && type->Is_ptr() &&
+         type->Cast_to_ptr()->Ptr_kind() == POINTER_KIND::FLAT32 &&
+         !type->Cast_to_ptr()->Domain_type_id().Is_null() &&
+         Is_exact_type(type->Cast_to_ptr()->Domain_type()->Base_type(),
+                       domain);
+}
+
+bool Is_helper_mutable_vector_array(ADDR_DATUM_PTR datum,
+                                    FUNC_SCOPE& helper) {
+  if (datum == Null_ptr || !datum->Is_var() || datum->Scope_level() == 0 ||
+      datum->Defining_func_scope() != &helper || !datum->Type()->Is_array()) {
+    return false;
+  }
+  ARRAY_TYPE_PTR outer = datum->Type()->Cast_to_arr();
+  TYPE_PTR element = outer->Elem_type();
+  return outer->Dim() == 1 && element->Is_array() &&
+         element->Cast_to_arr()->Dim() > 0;
+}
 
 bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
                              bool allow_block, CLONE_USE use,
@@ -158,37 +186,80 @@ bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
   if (node->Is_entry() || node->Is_call() || node->Is_intrn_call() ||
       node->Is_intrn_op() ||
       (node->Has_added_chld() && opcode != air::core::OPC_ARRAY) ||
-      opcode == air::core::OPC_LDA ||
       (opcode == air::core::OPC_LDCA &&
        use != CLONE_USE::CONSTANT_ARRAY_BASE)) {
     *diagnostic = "helper is not a supported leaf or has an escaping address";
     return false;
   }
+  if (opcode == air::core::OPC_LDA) {
+    ADDR_DATUM_PTR datum = node->Addr_datum();
+    if (use != CLONE_USE::MUTABLE_LOCAL_ARRAY_BASE ||
+        !Is_helper_mutable_vector_array(datum, helper) ||
+        !Is_flat32_pointer_to(node->Rtype(), datum->Type())) {
+      *diagnostic =
+          "helper contains an unsupported or escaping mutable array address";
+      return false;
+    }
+  }
   if (opcode == air::core::OPC_ARRAY) {
     NODE_PTR base = node->Array_base();
-    if (use != CLONE_USE::INDIRECT_LOAD_ADDRESS || node->Array_dim() == 0 ||
-        base->Opcode() != air::core::OPC_LDCA ||
-        !base->Const()->Type()->Is_array() ||
-        base->Const()->Type()->Cast_to_arr()->Dim() != node->Array_dim() ||
-        !node->Rtype()->Is_ptr() ||
-        node->Rtype()->Cast_to_ptr()->Domain_type_id().Is_null() ||
-        node->Rtype()->Cast_to_ptr()->Ptr_kind() != POINTER_KIND::FLAT32 ||
-        !node->Rtype()->Cast_to_ptr()->Domain_type()->Base_type()->
-            Is_compatible_type(
-                base->Const()->Type()->Cast_to_arr()->Elem_type()->Base_type())) {
+    const bool load_address = use == CLONE_USE::INDIRECT_LOAD_ADDRESS;
+    const bool store_address = use == CLONE_USE::INDIRECT_STORE_ADDRESS;
+    if ((!load_address && !store_address) || node->Array_dim() == 0) {
+      *diagnostic =
+          "helper contains an unsupported or escaping array address";
+      return false;
+    }
+    if (base->Opcode() == air::core::OPC_LDCA) {
+      if (!load_address || !base->Has_const_id() ||
+          !base->Const()->Type()->Is_array() ||
+          base->Const()->Type()->Cast_to_arr()->Dim() != node->Array_dim() ||
+          !Is_flat32_pointer_to(
+              node->Rtype(),
+              base->Const()->Type()->Cast_to_arr()->Elem_type()->Base_type())) {
+        *diagnostic =
+            "helper contains an unsupported or escaping constant array address";
+        return false;
+      }
+    } else if (base->Opcode() == air::core::OPC_LDA) {
+      if (!base->Has_sym() ||
+          !Is_helper_mutable_vector_array(base->Addr_datum(), helper) ||
+          node->Array_dim() != 1 ||
+          !Is_flat32_pointer_to(
+              node->Rtype(),
+              base->Addr_datum()->Type()->Cast_to_arr()->Elem_type())) {
+        *diagnostic =
+            "helper contains an unsupported or escaping mutable array address";
+        return false;
+      }
+    } else {
       *diagnostic =
           "helper contains an unsupported or escaping array address";
       return false;
     }
     for (uint32_t dim = 0; dim < node->Array_dim(); ++dim) {
-      if (!node->Array_idx(dim)->Rtype()->Is_signed_int()) {
-        *diagnostic = "helper constant-array index must be a signed integer";
+      NODE_PTR index = node->Array_idx(dim);
+      const bool mutable_index = base->Opcode() == air::core::OPC_LDA;
+      if (!index->Rtype()->Is_signed_int() ||
+          (mutable_index &&
+           (index->Domain() != air::core::CORE ||
+            !index->Rtype()->Is_prim() ||
+            index->Rtype()->Cast_to_prim()->Encoding() !=
+                PRIMITIVE_TYPE::INT_S32))) {
+        *diagnostic = mutable_index
+                          ? "helper mutable-array index must be a Core signed i32"
+                          : "helper constant-array index must be a signed integer";
         return false;
       }
     }
   }
-  if (opcode == air::core::OPC_ILD && node->Num_child() == 1 &&
-      node->Child(0)->Opcode() == air::core::OPC_ARRAY) {
+  if (opcode == air::core::OPC_ILD) {
+    if (node->Num_child() != 1 ||
+        node->Child(0)->Opcode() != air::core::OPC_ARRAY) {
+      *diagnostic =
+          "helper indirect load requires an indexed array address";
+      return false;
+    }
     if (!node->Child(0)->Rtype()->Is_ptr() ||
         node->Child(0)->Rtype()->Cast_to_ptr()->Domain_type_id().Is_null()) {
       *diagnostic =
@@ -198,10 +269,34 @@ bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
     TYPE_PTR element =
         node->Child(0)->Rtype()->Cast_to_ptr()->Domain_type()->Base_type();
     if (!node->Has_access_type() ||
-        !node->Access_type()->Is_compatible_type(element) ||
-        !node->Rtype()->Is_compatible_type(element)) {
+        !Is_exact_type(node->Access_type(), element) ||
+        !Is_exact_type(node->Rtype(), element)) {
       *diagnostic =
-          "helper constant-array load has incompatible element types";
+          "helper array load has incompatible element types";
+      return false;
+    }
+  }
+  if (opcode == air::core::OPC_IST) {
+    if (node->Num_child() != 2 ||
+        node->Child(0)->Opcode() != air::core::OPC_ARRAY) {
+      *diagnostic =
+          "helper indirect store requires an indexed array address";
+      return false;
+    }
+    NODE_PTR address = node->Child(0);
+    if (!address->Rtype()->Is_ptr() ||
+        address->Rtype()->Cast_to_ptr()->Domain_type_id().Is_null()) {
+      *diagnostic =
+          "helper contains an unsupported or escaping array address";
+      return false;
+    }
+    TYPE_PTR element =
+        address->Rtype()->Cast_to_ptr()->Domain_type()->Base_type();
+    if (!node->Has_access_type() ||
+        !Is_exact_type(node->Access_type(), element) ||
+        !Is_exact_type(node->Child(1)->Rtype(), element)) {
+      *diagnostic =
+          "helper mutable-array store has incompatible element types";
       return false;
     }
   }
@@ -227,6 +322,12 @@ bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
     if (datum->Scope_level() != 0 &&
         datum->Defining_func_scope() != &helper) {
       *diagnostic = "helper references another function's local symbol";
+      return false;
+    }
+    if (opcode != air::core::OPC_LDA &&
+        Is_helper_mutable_vector_array(datum, helper)) {
+      *diagnostic =
+          "helper mutable vector array is used outside an indexed address";
       return false;
     }
   }
@@ -266,8 +367,12 @@ bool Validate_cloneable_node(NODE_PTR node, FUNC_SCOPE& helper,
     CLONE_USE child_use = CLONE_USE::VALUE;
     if (opcode == air::core::OPC_ILD && idx == 0) {
       child_use = CLONE_USE::INDIRECT_LOAD_ADDRESS;
+    } else if (opcode == air::core::OPC_IST && idx == 0) {
+      child_use = CLONE_USE::INDIRECT_STORE_ADDRESS;
     } else if (opcode == air::core::OPC_ARRAY && idx == 0) {
-      child_use = CLONE_USE::CONSTANT_ARRAY_BASE;
+      child_use = node->Child(0)->Opcode() == air::core::OPC_LDA
+                      ? CLONE_USE::MUTABLE_LOCAL_ARRAY_BASE
+                      : CLONE_USE::CONSTANT_ARRAY_BASE;
     }
     if (!Validate_cloneable_node(node->Child(idx), helper, true, child_use,
                                  diagnostic))

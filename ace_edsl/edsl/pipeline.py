@@ -76,7 +76,7 @@ _VECTOR_KERNEL_RECIPE_KINDS = frozenset(
     ("baseline-gemm", "baseline-conv", "fast-gemm", "fast-conv")
 )
 _TENTATIVE_VECTOR_KERNEL_INLINE_PLAN_KINDS = frozenset(
-    ("auto", "baseline-gemm", "baseline-conv")
+    ("auto", "baseline-gemm", "baseline-conv", "fast-gemm")
 )
 
 
