@@ -113,7 +113,8 @@ struct SYM_ATTR {
     struct {
       uint32_t _kind : 4;
       uint32_t _program_entry : 1;
-      uint32_t _reserved : 27;
+      uint32_t _callable : 1;
+      uint32_t _reserved : 26;
     } _entry;
     // thunk
     struct {
@@ -164,6 +165,7 @@ public:
   bool Is_modified() const;
   bool Is_func_defined() const;
   bool Is_entry_prg_entry() const;
+  bool Is_entry_callable() const;
   bool Has_implicit_ref() const;
 
   void Set_first_aux_entry(AUX_ID id) { _first_aux_entry = id; }
@@ -184,6 +186,7 @@ public:
   void Set_func_defined(bool def = true);
   void Set_tmp_host_func(FUNC_ID id);
   void Set_entry_prg_entry();
+  void Set_entry_callable(bool callable);
   void Set_implicit_ref();
 
 private:

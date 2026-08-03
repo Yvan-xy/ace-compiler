@@ -134,6 +134,11 @@ bool SYM_DATA::Is_entry_prg_entry() const {
   return _attr._u._entry._program_entry;
 }
 
+bool SYM_DATA::Is_entry_callable() const {
+  AIR_ASSERT(Kind() == SYMBOL_CLASS::ENTRY);
+  return _attr._u._entry._callable;
+}
+
 bool SYM_DATA::Has_implicit_ref() const {
   AIR_ASSERT((Kind() == SYMBOL_CLASS::VAR) || (Kind() == SYMBOL_CLASS::FORMAL));
   return (_attr._u._addr_datum._ref_implic != 0);
@@ -147,6 +152,11 @@ void SYM_DATA::Set_addr_datum_type(TYPE_ID id) {
 void SYM_DATA::Set_entry_prg_entry() {
   AIR_ASSERT(Kind() == SYMBOL_CLASS::ENTRY);
   _attr._u._entry._program_entry = 1;
+}
+
+void SYM_DATA::Set_entry_callable(bool callable) {
+  AIR_ASSERT(Kind() == SYMBOL_CLASS::ENTRY);
+  _attr._u._entry._callable = callable;
 }
 
 PACKET_ID

@@ -34,12 +34,6 @@ AIR_FUNCTION_INLINE_RESULT Inline_tagged_leaf_helpers(
     air::base::GLOB_SCOPE& glob, const char* call_attribute,
     const char* helper_attribute);
 
-// Clone global/function tables and every function body. Global table IDs are
-// preserved; cloned body node and statement IDs may change. The returned scope
-// is independently owned by the caller, which must invalidate body wrappers.
-air::base::GLOB_SCOPE* Clone_glob_with_code(
-    air::base::GLOB_SCOPE& source);
-
 }  // namespace ace::bindings
 
 #endif  // ACE_BINDINGS_AIR_FUNCTION_INLINER_H

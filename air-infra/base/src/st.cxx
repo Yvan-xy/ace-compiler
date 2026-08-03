@@ -1251,6 +1251,7 @@ ENTRY_PTR
 GLOB_SCOPE::New_global_entry_point(CONST_TYPE_PTR type, CONST_FUNC_PTR func,
                                    CONST_STR_PTR name, const SPOS& spos) {
   ENTRY_PTR entry = New_entry_point(type, func, name, spos);
+  entry->Set_callable();
   // entry->Add_linker_id(name->Id());
   return entry;
 }

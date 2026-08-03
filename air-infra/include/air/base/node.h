@@ -128,6 +128,9 @@ public:
   ATTR_ITER Begin_attr() const;
   ATTR_ITER End_attr() const;
   void      Copy_attr(CONST_NODE_PTR node);
+  void Set_attr_bytes(const char* key, std::string_view value,
+                      PRIMITIVE_TYPE type, uint32_t count);
+  void Deep_copy_attr(CONST_NODE_PTR source);
   DECLATR_ATTR_ACCESS_API(Attr_id(), (SCOPE_BASE*)Func_scope())
 
   bool Is_root() const;

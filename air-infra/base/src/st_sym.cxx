@@ -478,6 +478,10 @@ ENTRY::Owning_func() const { return Glob_scope().Func(Owning_func_id()); }
 
 bool ENTRY::Is_program_entry() const { return _sym->Is_entry_prg_entry(); }
 
+bool ENTRY::Is_internal() const { return !_sym->Is_entry_callable(); }
+
+bool ENTRY::Is_callable() const { return _sym->Is_entry_callable(); }
+
 bool ENTRY::Has_retv() const {
   SIGNATURE_TYPE_PTR sig = Type()->Base_type()->Cast_to_sig();
   return sig->Has_non_void_ret();
@@ -493,6 +497,10 @@ void ENTRY::Set_owning_func(FUNC_ID func) {
 }
 
 void ENTRY::Set_program_entry() { _sym->Set_entry_prg_entry(); }
+
+void ENTRY::Set_internal() { _sym->Set_entry_callable(false); }
+
+void ENTRY::Set_callable() { _sym->Set_entry_callable(true); }
 
 //=============================================================================
 // class PREG member functions

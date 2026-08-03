@@ -16,6 +16,7 @@
 #include <pybind11/complex.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -27,6 +28,8 @@
 #include <optional>
 #include <set>
 #include <complex>
+#include <unordered_map>
+#include <unordered_set>
 
 #ifdef ACE_BINDINGS_ENABLED
 // Real ACE AIR includes
@@ -88,6 +91,7 @@
 
 // For ONNX model loading (separate compilation unit to avoid namespace conflicts)
 #include "onnx_loader.h"
+#include "air_scope_transaction.h"
 #include "air_function_inliner.h"
 #include "vector_kernel_plan_provider.h"
 #endif
@@ -112,25 +116,41 @@ public:
     explicit DESTINATION_LIFETIME(GLOB_SCOPE* owner) : _owner(owner) {
         if (owner == nullptr) {
             throw std::runtime_error(
-                "vector-kernel destination lifetime requires an owner");
+                "AIR destination lifetime requires an owner");
         }
     }
 
     bool owns(const GLOB_SCOPE* glob) const { return glob == _owner; }
 
-    void expire() { _active = false; }
+    void expire() {
+        _active = false;
+        _transaction_active = false;
+    }
+
+    void set_transaction_active(bool active) {
+        if (!_active) {
+            throw std::runtime_error("AIR destination scope has expired");
+        }
+        _transaction_active = active;
+    }
 
     void require_active(const char* object_kind) const {
         if (!_active) {
             throw std::runtime_error(
-                std::string("vector-kernel destination ") + object_kind +
+                std::string("AIR destination ") + object_kind +
                 " has expired");
+        }
+        if (_transaction_active) {
+            throw std::runtime_error(
+                std::string("AIR destination ") + object_kind +
+                " is locked by an active AIR pass transaction");
         }
     }
 
 private:
     GLOB_SCOPE* _owner;
     bool _active = true;
+    bool _transaction_active = false;
 };
 
 static std::shared_ptr<DESTINATION_LIFETIME> s_active_binding_lifetime;
@@ -368,7 +388,10 @@ public:
 
     static Type make_array(const std::vector<int>& shape, Type elem) {
         ensure_air_initialized();
-        return make_array_in_glob(active_binding_glob(), shape, elem);
+        GLOB_SCOPE* glob = active_binding_glob();
+        if (auto lifetime = destination_lifetime_for_glob(glob))
+            lifetime->require_active("type");
+        return make_array_in_glob(glob, shape, elem);
     }
 
     static Type make_ciphertext(const std::string& domain = "sihe") {
@@ -392,6 +415,8 @@ public:
             throw std::runtime_error(
                 "polynomial type creation requires an active GLOB_SCOPE");
         }
+        if (auto lifetime = destination_lifetime_for_glob(glob))
+            lifetime->require_active("type");
         SPOS spos = glob->Unknown_simple_spos();
         TYPE_PTR elem_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
         std::vector<int64_t> dims = {static_cast<int64_t>(degree)};
@@ -568,9 +593,18 @@ public:
           _lifetime(destination_lifetime_for_glob(
               s_active_binding_glob, std::move(lifetime))) {}
 
-    std::string name() const { return "%" + std::to_string(id); }
-    std::string opcode_name() const { return opcode_str; }
-    bool is_valid() const { return has_node; }
+    std::string name() const {
+        require_active();
+        return "%" + std::to_string(id);
+    }
+    std::string opcode_name() const {
+        require_active();
+        return opcode_str;
+    }
+    bool is_valid() const {
+        require_active();
+        return has_node;
+    }
 
     void invalidate() {
         node = NODE_PTR();
@@ -611,6 +645,7 @@ public:
     void add_child(std::shared_ptr<Node> child) { children.push_back(child); }
 
     std::string to_string() const {
+        require_active();
         std::string s = name() + " = " + opcode_str + "(";
         for (size_t i = 0; i < children.size(); i++) {
             if (i > 0) s += ", ";
@@ -756,9 +791,12 @@ public:
     Container()
         : container(nullptr), func_scope(nullptr), glob(nullptr),
           node_counter(0), callback_scoped(false), callback_expired(false) {}
-    Container(CONTAINER* c, FUNC_SCOPE* fs, GLOB_SCOPE* g)
+    Container(CONTAINER* c, FUNC_SCOPE* fs, GLOB_SCOPE* g,
+              std::shared_ptr<DESTINATION_LIFETIME> lifetime = nullptr)
         : container(c), func_scope(fs), glob(g), node_counter(0),
-          callback_scoped(false), callback_expired(false) {}
+          callback_scoped(false), callback_expired(false),
+          callback_lifetime(destination_lifetime_for_glob(
+              g, std::move(lifetime))) {}
 
     void mark_callback_scoped() {
         callback_scoped = true;
@@ -774,6 +812,8 @@ public:
     }
 
     void require_not_expired() const {
+        if (callback_lifetime)
+            callback_lifetime->require_active("container");
         if (callback_expired) {
             throw std::runtime_error(
                 "vector-kernel destination container has expired");
@@ -3851,13 +3891,16 @@ public:
     
     FuncScope(const std::string& n, FUNC_SCOPE* fs, GLOB_SCOPE* g,
               const std::vector<ADDR_DATUM_PTR>& formals,
-              bool strict_types = false)
+              bool strict_types = false,
+              std::shared_ptr<DESTINATION_LIFETIME> lifetime = nullptr)
         : name(n), func_scope(fs), glob(g),
-          container(&fs->Container(), fs, g), formal_params(formals),
+          container(&fs->Container(), fs, g, std::move(lifetime)),
+          formal_params(formals),
           strict_param_types(strict_types) {}
     
     // Get parameter - loads from formal that was set up during function creation
     std::shared_ptr<Node> new_param(const std::string& param_name, Type type) {
+        container.require_not_expired();
         uint32_t idx = static_cast<uint32_t>(params.size());
         
         if (func_scope && glob && idx < formal_params.size()) {
@@ -3912,9 +3955,18 @@ public:
         glob = nullptr;
     }
 
-    Container& get_container() { return container; }
+    Container& get_container() {
+        container.require_not_expired();
+        return container;
+    }
+
+    std::string get_name() const {
+        container.require_not_expired();
+        return name;
+    }
     
     std::string dump() const {
+        container.require_not_expired();
         std::string s = "func " + name + "(";
         for (size_t i = 0; i < params.size(); i++) {
             if (i > 0) s += ", ";
@@ -4841,6 +4893,58 @@ py::dict compare_normalized_vector_kernel_air_for_testing(
 
 // Global scope - creates functions with proper signatures
 class GlobScope {
+private:
+    std::unique_ptr<GLOB_SCOPE> _owned_glob;
+    std::shared_ptr<DESTINATION_LIFETIME> _scope_lifetime;
+    uint64_t _module_serial;
+    uint64_t _air_pass_revision = 0;
+    uint64_t _air_pass_generation = 0;
+    uint64_t _air_pass_transaction_serial = 0;
+    bool _air_pass_transaction_active = false;
+
+    static uint64_t next_module_serial() {
+        static std::atomic<uint64_t> serial{1};
+        return serial.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    static std::unique_ptr<GLOB_SCOPE> new_initialized_scope() {
+        ensure_air_initialized();
+        return std::make_unique<GLOB_SCOPE>(0, true);
+    }
+
+    std::map<std::string, Type> standard_types_for(
+        GLOB_SCOPE* destination,
+        const std::shared_ptr<DESTINATION_LIFETIME>& lifetime) const {
+        std::map<std::string, Type> result;
+        result.emplace("void", Type::make_void());
+        result.emplace("i32", Type(
+            destination->Prim_type(PRIMITIVE_TYPE::INT_S32), "i32", lifetime));
+        result.emplace("i64", Type(
+            destination->Prim_type(PRIMITIVE_TYPE::INT_S64), "i64", lifetime));
+        result.emplace("f32", Type(
+            destination->Prim_type(PRIMITIVE_TYPE::FLOAT_32), "f32", lifetime));
+        result.emplace("f64", Type(
+            destination->Prim_type(PRIMITIVE_TYPE::FLOAT_64), "f64", lifetime));
+        return result;
+    }
+
+    void expire_bound_children(bool clear_test_oracles = true) {
+        if (_scope_lifetime) _scope_lifetime->expire();
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+        if (clear_test_oracles) {
+            _baseline_conv_oracles.clear();
+            _fast_gemm_oracles.clear();
+            _fast_conv_oracles.clear();
+        }
+#else
+        (void)clear_test_oracles;
+#endif
+        for (const auto& function : functions) {
+            if (function) function->invalidate();
+        }
+        functions.clear();
+    }
+
 public:
     GLOB_SCOPE* glob;
     std::vector<std::shared_ptr<FuncScope>> functions;
@@ -4848,20 +4952,126 @@ public:
     std::map<std::string, uint32_t> file_ids;  // Registered source files
     uint32_t next_file_id = 1;
     
-    GlobScope() {
-        ensure_air_initialized();
-        glob = new GLOB_SCOPE(0, true);
+    GlobScope()
+        : _owned_glob(new_initialized_scope()),
+          _module_serial(next_module_serial()), glob(_owned_glob.get()) {
+        _scope_lifetime = std::make_shared<DESTINATION_LIFETIME>(glob);
         s_active_binding_glob = glob;
-        types["void"] = Type::make_void();
-        types["i32"] = Type::make_int(32);
-        types["i64"] = Type::make_int(64);
-        types["f32"] = Type::make_float(32);
-        types["f64"] = Type::make_float(64);
+        s_active_binding_lifetime = _scope_lifetime;
+        types = standard_types_for(glob, _scope_lifetime);
     }
 
     ~GlobScope() {
-        if (lower_ctx) {
+        expire_bound_children();
+        if (s_active_binding_glob == glob) {
+            s_active_binding_glob = nullptr;
+            s_active_binding_lifetime.reset();
         }
+    }
+
+    uint64_t air_pass_module_id() const { return _module_serial; }
+    uint64_t air_pass_revision() const { return _air_pass_revision; }
+    uint64_t air_pass_generation() const { return _air_pass_generation; }
+
+    uint64_t next_air_pass_transaction_generation() {
+        constexpr uint64_t candidate_namespace = uint64_t{1} << 63;
+        return candidate_namespace | ++_air_pass_transaction_serial;
+    }
+
+    void install_owned_scope(std::unique_ptr<GLOB_SCOPE> destination,
+                             bool advance_revision = true,
+                             bool identity_preserving = false,
+                             bool preserve_test_oracles = false) {
+        if (!destination) {
+            throw std::invalid_argument("cannot install a null AIR GLOB_SCOPE");
+        }
+        auto lifetime = std::make_shared<DESTINATION_LIFETIME>(destination.get());
+        auto replacement_types = standard_types_for(destination.get(), lifetime);
+        expire_bound_children(!preserve_test_oracles);
+        _owned_glob = std::move(destination);
+        glob = _owned_glob.get();
+        _scope_lifetime = std::move(lifetime);
+        types.swap(replacement_types);
+        s_active_binding_glob = glob;
+        s_active_binding_lifetime = _scope_lifetime;
+        ++_air_pass_generation;
+        if (advance_revision) ++_air_pass_revision;
+        if (!identity_preserving) {
+            fhe_types_registered = false;
+            cipher_types_initialized = false;
+        }
+    }
+
+    void install_identity_preserving_scope(
+        std::unique_ptr<GLOB_SCOPE> destination,
+        bool advance_revision = true) {
+        install_owned_scope(
+            std::move(destination), advance_revision, true);
+    }
+
+    void install_non_owning_source_clone(GLOB_SCOPE& source,
+                                         bool advance_revision = false) {
+        install_owned_scope(
+            ace::bindings::Clone_air_scope_with_code(source), advance_revision);
+    }
+
+    GLOB_SCOPE* release_owned_scope_for_consuming_driver() {
+        expire_bound_children();
+        types.clear();
+        if (s_active_binding_glob == glob) {
+            s_active_binding_glob = nullptr;
+            s_active_binding_lifetime.reset();
+        }
+        _scope_lifetime.reset();
+        GLOB_SCOPE* source = _owned_glob.release();
+        glob = nullptr;
+        return source;
+    }
+
+    void invalidate_air_pass_views(bool advance_revision = false) {
+        require_no_air_pass_transaction("AIR view invalidation");
+        if (!glob) {
+            throw std::runtime_error("cannot invalidate views without AIR");
+        }
+        auto lifetime = std::make_shared<DESTINATION_LIFETIME>(glob);
+        auto replacement_types = standard_types_for(glob, lifetime);
+        expire_bound_children();
+        _scope_lifetime = std::move(lifetime);
+        types.swap(replacement_types);
+        s_active_binding_glob = glob;
+        s_active_binding_lifetime = _scope_lifetime;
+        ++_air_pass_generation;
+        if (advance_revision) ++_air_pass_revision;
+    }
+
+    bool air_pass_transaction_active() const {
+        return _air_pass_transaction_active;
+    }
+
+    void set_air_pass_transaction_active(bool active) {
+        _air_pass_transaction_active = active;
+        if (_scope_lifetime) _scope_lifetime->set_transaction_active(active);
+    }
+
+    void require_no_air_pass_transaction(const char* operation) const {
+        if (_air_pass_transaction_active) {
+            throw std::runtime_error(
+                std::string(operation) +
+                " is not permitted while an AIR pass transaction is active");
+        }
+    }
+
+    bool lower_context_references_function(uint64_t function_id) const {
+        if (!lower_ctx) return false;
+        for (uint32_t index = 0;
+             index < static_cast<uint32_t>(fhe::core::FHE_FUNC_END);
+             ++index) {
+            const auto kind = static_cast<fhe::core::FHE_FUNC>(index);
+            if (lower_ctx->Get_func_info(kind).Get_func_id().Value() ==
+                function_id)
+                return true;
+        }
+        return false;
     }
 
     // Register a source file and return its ID for SPOS creation
@@ -4870,6 +5080,7 @@ public:
         if (it != file_ids.end()) {
             return it->second;
         }
+        require_no_air_pass_transaction("source-file registration");
         uint32_t id = next_file_id++;
         file_ids[filename] = id;
         // Also register with the underlying glob if available
@@ -4898,6 +5109,8 @@ public:
         const std::string& name,
         const Type& ret_type,
         const std::vector<Type>& param_types) {
+
+        require_no_air_pass_transaction("function authoring");
 
         SPOS spos = glob->Unknown_simple_spos();
         STR_PTR func_str = glob->New_str(name.c_str());
@@ -4960,8 +5173,8 @@ public:
             formals.push_back(func_scope->Formal(static_cast<uint32_t>(i)));
         }
 
-        auto fs = std::make_shared<FuncScope>(name, func_scope, glob, formals,
-                                              true);
+        auto fs = std::make_shared<FuncScope>(
+            name, func_scope, glob, formals, true, _scope_lifetime);
         functions.push_back(fs);
         return fs;
     }
@@ -4971,6 +5184,7 @@ public:
                                                    int num_params,
                                                    const std::vector<int>& param_shape,
                                                    const std::string& type_name) {
+        require_no_air_pass_transaction("function authoring");
         SPOS spos = glob->Unknown_simple_spos();
         STR_PTR func_str = glob->New_str(name.c_str());
         FUNC_PTR func = glob->New_func(func_str, spos);
@@ -5036,7 +5250,8 @@ public:
             formals.push_back(func_scope->Formal(i));
         }
         
-        auto fs = std::make_shared<FuncScope>(name, func_scope, glob, formals);
+        auto fs = std::make_shared<FuncScope>(
+            name, func_scope, glob, formals, false, _scope_lifetime);
         functions.push_back(fs);
         return fs;
     }
@@ -5052,6 +5267,7 @@ public:
     }
     
     Type new_array_type(const std::vector<int>& shape, const std::string& elem = "f32") {
+        require_no_air_pass_transaction("type authoring");
         return Type::make_array_in_glob(glob, shape, get_type(elem));
     }
     
@@ -5084,6 +5300,7 @@ public:
     // Inline a lowering body into the glob scope
     // This works with REAL AIR when glob is available
     bool inline_lowering(const std::string& op_pattern, const std::string& lowering_ir) {
+        require_no_air_pass_transaction("inline lowering");
         if (!glob) {
             return false;  // No real IR to inline into
         }
@@ -5736,8 +5953,7 @@ public:
         // ═══════════════════════════════════════════════════════════════════
         // Step 4: Update glob to point to new transformed glob
         // ═══════════════════════════════════════════════════════════════════
-        glob = new_glob;
-        s_active_binding_glob = glob;
+        install_owned_scope(std::unique_ptr<GLOB_SCOPE>(new_glob));
         
         return replaced;
     }
@@ -5851,6 +6067,7 @@ public:
     // High-level interface: inline from GlobScope with op pattern matching
     // Supports multiple domains: nn::core, nn::vector, fhe::sihe, fhe::ckks
     bool inline_lowering_from_scope(GlobScope* lowering_glob, const std::string& op_pattern) {
+        require_no_air_pass_transaction("inline lowering");
         if (!glob || !lowering_glob) return false;
         
         auto [target_domain, target_op] = parse_op_pattern(op_pattern);
@@ -5871,6 +6088,7 @@ public:
     //
     // Returns number of replaced nodes.
     int rewrite_ckks_extended_ops(bool verbose = false) {
+        require_no_air_pass_transaction("CKKS rewrite");
         if (!glob) return 0;
 
         int replaced = 0;
@@ -6232,6 +6450,7 @@ public:
     // differential and downstream validation.
 
     py::dict inline_generated_vector_kernel_helpers() {
+        require_no_air_pass_transaction("tentative native inliner");
         py::dict output;
         if (!glob) {
             output["success"] = false;
@@ -6245,7 +6464,7 @@ public:
         std::unique_ptr<GLOB_SCOPE> candidate;
         ace::bindings::AIR_FUNCTION_INLINE_RESULT result;
         try {
-            candidate.reset(ace::bindings::Clone_glob_with_code(*glob));
+            candidate = ace::bindings::Clone_air_scope_with_code(*glob);
             result = ace::bindings::Inline_tagged_leaf_helpers(
                 *candidate,
                 nn::vector::VECTOR_KERNEL_GENERATED_CALL_ATTR,
@@ -6257,47 +6476,7 @@ public:
                     result._diagnostic =
                         "transactional inliner candidate does not verify";
                 } else {
-                    std::map<std::string, Type> candidate_types;
-                    for (const auto& item : types) {
-                        const Type& source_type = item.second;
-                        if (!source_type.has_type ||
-                            source_type.type == Null_ptr) {
-                            candidate_types.emplace(item.first, source_type);
-                            continue;
-                        }
-                        TYPE_PTR remapped_type = Null_ptr;
-                        if (source_type.type->Is_prim()) {
-                            remapped_type = candidate->Prim_type(
-                                source_type.type->Cast_to_prim()->Encoding());
-                        } else if (
-                            &source_type.type->Glob_scope() == glob) {
-                            remapped_type = candidate->Type(
-                                source_type.type->Id());
-                        }
-                        if (remapped_type == Null_ptr) {
-                            throw std::runtime_error(
-                                "cannot remap cached binding type during "
-                                "transactional inliner commit: " +
-                                item.first);
-                        }
-                        candidate_types.emplace(
-                            item.first,
-                            Type(remapped_type, source_type.name,
-                                 source_type.shape));
-                    }
-
-                    for (const auto& function : functions) {
-                        if (function) function->invalidate();
-                    }
-                    functions.clear();
-                    // GlobScope wrappers do not own prior native scopes. Keep
-                    // the old scope alive so externally copied Type wrappers
-                    // remain readable; they become foreign to the candidate
-                    // and existing scope checks reject their reuse. M16 removes
-                    // this transition-only clone/swap path.
-                    glob = candidate.release();
-                    types.swap(candidate_types);
-                    s_active_binding_glob = glob;
+                    install_identity_preserving_scope(std::move(candidate));
                 }
             }
         } catch (const std::exception& error) {
@@ -6541,6 +6720,7 @@ public:
     }
 
     void mutate_baseline_conv_call_actual_for_testing() {
+        require_no_air_pass_transaction("test AIR mutation");
         if (!glob || !glob->Verify_ir()) {
             throw std::runtime_error(
                 "baseline Conv call mutation requires verified AIR");
@@ -6594,6 +6774,7 @@ public:
     }
 
     void mutate_fast_conv_call_actual_for_testing(uint32_t index) {
+        require_no_air_pass_transaction("test AIR mutation");
         if (!glob || !glob->Verify_ir()) {
             throw std::runtime_error(
                 "fast Conv call mutation requires verified AIR");
@@ -6653,6 +6834,7 @@ public:
 
     void mutate_generated_vector_helper_for_testing(
         const std::string& mutation) {
+        require_no_air_pass_transaction("test AIR mutation");
         if (!glob || !glob->Verify_ir()) {
             throw std::runtime_error(
                 "generated-helper mutation requires verified AIR");
@@ -7014,6 +7196,20 @@ public:
                 container.New_stmt_block(terminal->Node()->Spos()),
                 terminal->Node()->Spos());
             STMT_LIST::Enclosing_list(terminal).Prepend(terminal, loop);
+        } else if (mutation == "null-result-preg") {
+            std::vector<STMT_PTR> calls;
+            for (GLOB_SCOPE::FUNC_SCOPE_ITER iter = glob->Begin_func_scope();
+                 iter != glob->End_func_scope(); ++iter) {
+                if (&*iter != helper)
+                    collect_call_statements(
+                        (*iter).Container().Entry_node(), calls);
+            }
+            if (calls.size() != 1 ||
+                calls[0]->Node()->Entry_id() != helper_entry->Id()) {
+                throw std::runtime_error(
+                    "null-result mutation found no unique helper call");
+            }
+            calls[0]->Node()->Set_ret_preg(PREG_PTR());
         } else {
             throw std::runtime_error(
                 "unsupported generated-helper test mutation: " + mutation);
@@ -7035,6 +7231,7 @@ public:
     // C++ pass integration
     bool run_cpp_pass(const std::string& pass_name, 
                       const std::vector<std::string>& skip_ops = {}) {
+        require_no_air_pass_transaction("native lowering");
         if (!glob) return false;
         
         // Register skip ops with ALL registries:
@@ -7075,6 +7272,7 @@ public:
         bool mask_fuse, uint64_t max_slots, bool conv_parallel,
         bool sharding,
         py::object python_plan_provider) {
+        require_no_air_pass_transaction("Tensor-to-Vector lowering");
         if (!glob) {
             throw std::runtime_error(
                 "tensor2vector recipe lowering requires a real GLOB_SCOPE");
@@ -7177,8 +7375,12 @@ public:
             throw std::runtime_error(
                 "Tensor-to-Vector recipe lowering returned no destination");
         }
-        glob = new_glob;
-        s_active_binding_glob = glob;
+        // Test-only prepared oracles are produced against this exact
+        // destination while the recipe callback runs. Keep those destination-
+        // owned records across wrapper installation; all other scope swaps,
+        // including AIR transactions, clear them.
+        install_owned_scope(
+            std::unique_ptr<GLOB_SCOPE>(new_glob), true, false, true);
         return true;
     }
     
@@ -7327,8 +7529,11 @@ private:
             GLOB_SCOPE* new_glob = nn::vector::Vector_driver(glob, ctx, nullptr, config);
             
             if (new_glob) {
-                glob = new_glob;
-                s_active_binding_glob = glob;
+                if (new_glob == glob) {
+                    invalidate_air_pass_views(true);
+                } else {
+                    install_owned_scope(std::unique_ptr<GLOB_SCOPE>(new_glob));
+                }
                 return true;
             }
         } catch (const std::exception& e) {
@@ -7385,10 +7590,11 @@ private:
                 cfg._relu_base_poly_type = sihe_relu_base_poly_type;
             }
             
-            GLOB_SCOPE* new_glob = fhe::sihe::Sihe_driver(glob, lower_ctx.get(), nullptr, cfg);
-            if (new_glob && new_glob != glob) {
-                glob = new_glob;
-                s_active_binding_glob = glob;
+            GLOB_SCOPE* source = release_owned_scope_for_consuming_driver();
+            GLOB_SCOPE* new_glob = fhe::sihe::Sihe_driver(
+                source, lower_ctx.get(), nullptr, cfg);
+            if (new_glob) {
+                install_owned_scope(std::unique_ptr<GLOB_SCOPE>(new_glob));
                 
                 // After lowering, find the existing CIPHERTEXT/PLAINTEXT types in the cloned glob
                 // and update lower_ctx to use their IDs (don't create new types!)
@@ -7457,10 +7663,11 @@ private:
         try {
             fhe::ckks::CKKS_CONFIG cfg;
             air::driver::DRIVER_CTX driver_ctx;
-            GLOB_SCOPE* ckks_glob = fhe::ckks::Ckks_driver(glob, lower_ctx.get(), &driver_ctx, &cfg);
+            GLOB_SCOPE* source = release_owned_scope_for_consuming_driver();
+            GLOB_SCOPE* ckks_glob = fhe::ckks::Ckks_driver(
+                source, lower_ctx.get(), &driver_ctx, &cfg);
             if (ckks_glob) {
-                glob = ckks_glob;
-                s_active_binding_glob = glob;
+                install_owned_scope(std::unique_ptr<GLOB_SCOPE>(ckks_glob));
                 return true;
             }
             // Driver may return null if scale analysis fails
@@ -7721,6 +7928,7 @@ public:
         const std::string& constant_name_prefix = "",
         const std::string& pt_from_msg_name = "Pt_from_msg",
         const std::string& raise_mod_level_func = "") {
+        require_no_air_pass_transaction("Poly-to-C lowering");
         if (!glob) {
             return false;
         }
@@ -7765,7 +7973,9 @@ public:
             fhe::poly::POLY2C_DRIVER poly2c(output, *lower_ctx, p2c_config);
             // Flatten non-core expressions so CKKS ops are lowered into temporaries
             // before IR2C emits C code.
-            glob = poly2c.Flatten(glob);
+            GLOB_SCOPE* source = release_owned_scope_for_consuming_driver();
+            install_owned_scope(
+                std::unique_ptr<GLOB_SCOPE>(poly2c.Flatten(source)));
             
             // Select visitor:
             //   enable_poly=true  -> POLY2C_VISITOR (poly-level C code)
@@ -7908,6 +8118,1459 @@ public:
     fhe::core::LOWER_CTX* get_lower_ctx() { return lower_ctx.get(); }
 };
 
+namespace {
+
+py::tuple air_object_key(const char* kind, std::optional<uint64_t> owner,
+                         uint64_t native_id) {
+    py::tuple key(3);
+    key[0] = py::str(kind);
+    key[1] = owner ? py::cast(*owner) : py::none();
+    key[2] = py::int_(native_id);
+    return key;
+}
+
+struct AIR_OBJECT_KEY {
+    std::string kind;
+    std::optional<uint64_t> owner;
+    uint64_t native_id;
+
+    bool operator==(const AIR_OBJECT_KEY& other) const {
+        return kind == other.kind && owner == other.owner &&
+               native_id == other.native_id;
+    }
+
+    bool operator<(const AIR_OBJECT_KEY& other) const {
+        return std::tie(kind, owner, native_id) <
+               std::tie(other.kind, other.owner, other.native_id);
+    }
+};
+
+AIR_OBJECT_KEY parse_air_object_key(const py::handle& value) {
+    py::tuple key = py::cast<py::tuple>(value);
+    if (key.size() != 3) {
+        throw std::invalid_argument("AIR object key must have three fields");
+    }
+    AIR_OBJECT_KEY parsed;
+    parsed.kind = py::cast<std::string>(key[0]);
+    if (!key[1].is_none()) parsed.owner = py::cast<uint64_t>(key[1]);
+    parsed.native_id = py::cast<uint64_t>(key[2]);
+    return parsed;
+}
+
+py::dict source_position_snapshot(const SPOS& spos) {
+    py::dict result;
+    result["file_id"] = spos.File();
+    result["line"] = spos.Line();
+    result["column"] = spos.Col();
+    result["count"] = spos.Count();
+    result["statement_begin"] = spos.Is_stmt_beg();
+    result["basic_block_begin"] = spos.Is_bb_beg();
+    return result;
+}
+
+const char* primitive_type_name(PRIMITIVE_TYPE type) {
+    switch (type) {
+    case PRIMITIVE_TYPE::INT_S8: return "i8";
+    case PRIMITIVE_TYPE::INT_S16: return "i16";
+    case PRIMITIVE_TYPE::INT_S32: return "i32";
+    case PRIMITIVE_TYPE::INT_S64: return "i64";
+    case PRIMITIVE_TYPE::INT_U8: return "u8";
+    case PRIMITIVE_TYPE::INT_U16: return "u16";
+    case PRIMITIVE_TYPE::INT_U32: return "u32";
+    case PRIMITIVE_TYPE::INT_U64: return "u64";
+    case PRIMITIVE_TYPE::FLOAT_32: return "f32";
+    case PRIMITIVE_TYPE::FLOAT_64: return "f64";
+    case PRIMITIVE_TYPE::FLOAT_80: return "f80";
+    case PRIMITIVE_TYPE::FLOAT_128: return "f128";
+    case PRIMITIVE_TYPE::COMPLEX_32: return "c32";
+    case PRIMITIVE_TYPE::COMPLEX_64: return "c64";
+    case PRIMITIVE_TYPE::COMPLEX_80: return "c80";
+    case PRIMITIVE_TYPE::COMPLEX_128: return "c128";
+    case PRIMITIVE_TYPE::VOID: return "void";
+    case PRIMITIVE_TYPE::BOOL: return "bool";
+    case PRIMITIVE_TYPE::END: break;
+    }
+    return "unknown";
+}
+
+py::tuple attribute_snapshot(NODE_PTR node) {
+    if (!META_INFO::Has_prop<OPR_PROP::ATTR>(node->Opcode())) return py::tuple();
+    py::list attributes;
+    for (ATTR_ITER iter = node->Begin_attr(); iter != node->End_attr(); ++iter) {
+        ATTR_PTR attribute = *iter;
+        py::dict item;
+        item["key"] = attribute->Key();
+        item["element_type"] = attribute->Count() == 0
+                                   ? "string"
+                                   : primitive_type_name(attribute->Type());
+        item["count"] = attribute->Count();
+        std::string_view payload = attribute->Value();
+        item["payload"] = py::bytes(payload.data(), payload.size());
+        attributes.append(std::move(item));
+    }
+    return py::tuple(attributes);
+}
+
+template <typename T>
+void sort_by_native_id(std::vector<T>* values) {
+    std::sort(values->begin(), values->end(), [](const T& lhs, const T& rhs) {
+        return lhs->Id().Value() < rhs->Id().Value();
+    });
+}
+
+class AIR_PASS_SNAPSHOT_BUILDER {
+public:
+    AIR_PASS_SNAPSHOT_BUILDER(GLOB_SCOPE& glob, uint64_t revision,
+                              uint64_t module_id)
+        : _glob(glob), _revision(revision), _module_id(module_id) {}
+
+    py::dict Build() {
+        py::dict module;
+        py::tuple module_key =
+            air_object_key("module", std::nullopt, _module_id);
+        module["key"] = module_key;
+        Add_object(std::move(module));
+        Add_types();
+        Add_constants();
+        Add_global_symbols();
+        Add_entries();
+        Add_functions();
+        py::dict result;
+        result["revision"] = _revision;
+        result["native_pointer"] =
+            reinterpret_cast<uintptr_t>(&_glob);
+        result["module"] = module_key;
+        result["types"] = py::tuple(_types);
+        result["constants"] = py::tuple(_constants);
+        result["symbols"] = py::tuple(_symbols);
+        result["entries"] = py::tuple(_entries);
+        result["functions"] = py::tuple(_functions);
+        result["objects"] = py::tuple(_objects);
+        result["structural_order"] = py::tuple(_structural_order);
+        return result;
+    }
+
+private:
+    std::optional<uint64_t> Datum_owner(ADDR_DATUM_PTR datum) const {
+        FUNC_SCOPE* owner = datum->Defining_func_scope();
+        return owner == nullptr
+                   ? std::nullopt
+                   : std::optional<uint64_t>(owner->Id().Value());
+    }
+
+    void Add_object(py::dict record) {
+        _structural_order.append(record["key"]);
+        _objects.append(std::move(record));
+    }
+
+    void Add_types() {
+        std::vector<TYPE_PTR> values;
+        for (TYPE_ITER iter = _glob.Begin_type(); iter != _glob.End_type(); ++iter)
+            values.push_back(*iter);
+        sort_by_native_id(&values);
+        for (TYPE_PTR type : values) {
+            py::dict item;
+            py::tuple key = air_object_key("type", std::nullopt,
+                                           type->Id().Value());
+            item["key"] = key;
+            item["name"] = type->Name() == Null_ptr
+                               ? ""
+                               : type->Name()->Char_str();
+            item["type_kind"] = type->Type_kind_name();
+            item["source_position"] = source_position_snapshot(type->Spos());
+            _types.append(key);
+            Add_object(std::move(item));
+        }
+    }
+
+    void Add_constants() {
+        std::vector<CONSTANT_PTR> values;
+        for (CONSTANT_ITER iter = _glob.Begin_const(); iter != _glob.End_const();
+             ++iter)
+            values.push_back(*iter);
+        sort_by_native_id(&values);
+        for (CONSTANT_PTR constant : values) {
+            py::dict item;
+            py::tuple key = air_object_key("constant", std::nullopt,
+                                           constant->Id().Value());
+            item["key"] = key;
+            item["constant_kind"] = constant->Const_kind_name();
+            TYPE_ID type_id = constant->Type_id();
+            if (!type_id.Is_null())
+                item["type"] = air_object_key("type", std::nullopt,
+                                               type_id.Value());
+            if (constant->Kind() == CONSTANT_KIND::ENTRY_PTR) {
+                item["referenced_entry"] = air_object_key(
+                    "entry", std::nullopt, constant->Entry_id().Value());
+            } else if (constant->Kind() == CONSTANT_KIND::ENTRY_FUNC_DESC) {
+                item["referenced_entry"] = air_object_key(
+                    "entry", std::nullopt,
+                    constant->Func_desc_entry_id().Value());
+            }
+            _constants.append(key);
+            Add_object(std::move(item));
+        }
+    }
+
+    void Add_global_symbols() {
+        std::vector<ADDR_DATUM_PTR> values;
+        for (DATUM_ITER iter(_glob, ADDR_DATUM_SEL()); iter != DATUM_ITER();
+             ++iter)
+            values.push_back(*iter);
+        sort_by_native_id(&values);
+        for (ADDR_DATUM_PTR datum : values) {
+            py::dict item;
+            py::tuple key = air_object_key(
+                "symbol", std::nullopt, datum->Id().Value());
+            item["key"] = key;
+            item["name"] = datum->Name() == Null_ptr
+                               ? ""
+                               : datum->Name()->Char_str();
+            item["type"] = air_object_key(
+                "type", std::nullopt, datum->Type_id().Value());
+            item["address_taken"] =
+                datum->Is_addr_passed() || datum->Is_addr_saved();
+            item["source_position"] = source_position_snapshot(datum->Spos());
+            _symbols.append(key);
+            Add_object(std::move(item));
+        }
+    }
+
+    void Add_entries() {
+        std::vector<ENTRY_PTR> values;
+        for (ENTRY_ITER iter = _glob.Begin_entry(); iter != _glob.End_entry();
+             ++iter)
+            values.push_back(*iter);
+        sort_by_native_id(&values);
+        for (ENTRY_PTR entry : values) {
+            py::dict item;
+            py::tuple key = air_object_key("entry", std::nullopt,
+                                           entry->Id().Value());
+            item["key"] = key;
+            item["name"] = entry->Name() == Null_ptr
+                               ? ""
+                               : entry->Name()->Char_str();
+            item["owning_function"] = air_object_key(
+                "function", std::nullopt, entry->Owning_func_id().Value());
+            item["program_entry"] = entry->Is_program_entry();
+            item["exported"] =
+                entry->Is_program_entry() || entry->Is_callable();
+            item["source_position"] = source_position_snapshot(entry->Spos());
+            _entry_keys[entry->Owning_func_id().Value()].push_back(key);
+            _entries.append(key);
+            Add_object(std::move(item));
+        }
+    }
+
+    void Add_datum(FUNC_SCOPE& function, ADDR_DATUM_PTR datum,
+                   const char* kind, py::list* category) {
+        Add_datum(std::optional<uint64_t>(function.Id().Value()),
+                  datum, kind, category);
+    }
+
+    void Add_datum(std::optional<uint64_t> owner, ADDR_DATUM_PTR datum,
+                   const char* kind, py::list* category) {
+        const uint64_t id = datum->Id().Value();
+        py::tuple key = air_object_key(kind, owner, id);
+        py::dict item;
+        item["key"] = key;
+        item["name"] = datum->Name() == Null_ptr
+                           ? ""
+                           : datum->Name()->Char_str();
+        item["type"] = air_object_key("type", std::nullopt,
+                                      datum->Type_id().Value());
+        item["address_taken"] = datum->Is_addr_passed() || datum->Is_addr_saved();
+        item["source_position"] = source_position_snapshot(datum->Spos());
+        category->append(key);
+        Add_object(std::move(item));
+    }
+
+    void Add_datum_alias(FUNC_SCOPE& function, ADDR_DATUM_PTR datum,
+                         const char* kind, py::list* category) {
+        Add_datum(function, datum, kind, category);
+    }
+
+    void Add_node(FUNC_SCOPE& function, NODE_PTR node,
+                  const py::object& parent_statement) {
+        const uint64_t owner = function.Id().Value();
+        if (node->Is_block()) {
+            Add_block(function, node, parent_statement);
+            return;
+        }
+        const auto identity = std::make_pair(owner, node->Id().Value());
+        if (!_seen_nodes.insert(identity).second) return;
+        py::dict item;
+        py::tuple key = air_object_key("node", owner, node->Id().Value());
+        item["key"] = key;
+        item["opcode"] = node->Name();
+        item["source_position"] = source_position_snapshot(node->Spos());
+        item["attributes"] = attribute_snapshot(node);
+        if (node->Has_rtype())
+            item["result_type"] = air_object_key(
+                "type", std::nullopt, node->Rtype_id().Value());
+        if (!parent_statement.is_none()) item["parent_statement"] = parent_statement;
+
+        py::list children;
+        for (uint32_t index = 0; index < node->Num_child(); ++index) {
+            NODE_PTR child = node->Child(index);
+            children.append(air_object_key(
+                child->Is_block() ? "block" : "node", owner,
+                child->Id().Value()));
+        }
+        item["children"] = py::tuple(children);
+
+        const bool is_direct_call = node->Opcode() == air::core::OPC_CALL;
+        if (is_direct_call) {
+            item["call_target"] = air_object_key(
+                "entry", std::nullopt, node->Entry_id().Value());
+        }
+        item["indirect_call"] =
+            META_INFO::Has_prop<OPR_PROP::CALL>(node->Opcode()) &&
+            !is_direct_call;
+        if (node->Is_call()) {
+            py::list arguments;
+            for (uint32_t index = 0;
+                 index < std::min(node->Num_arg(), node->Num_child()); ++index)
+                arguments.append(children[index]);
+            item["arguments"] = py::tuple(arguments);
+        }
+        if (node->Has_ret_var() && !node->Ret_preg_id().Is_null()) {
+            item["result_preg"] = air_object_key(
+                "preg", owner, node->Ret_preg_id().Value());
+        }
+        if (node->Is_ret() && node->Num_child() != 0)
+            item["return_value"] = children[0];
+        if (node->Has_sym()) {
+            ADDR_DATUM_PTR datum = node->Addr_datum();
+            item["symbol"] = air_object_key(
+                "symbol", Datum_owner(datum), datum->Id().Value());
+        }
+        if (node->Is_do_loop()) {
+            ADDR_DATUM_PTR iv = node->Iv();
+            item["iv"] = air_object_key(
+                "iv", Datum_owner(iv), iv->Id().Value());
+        }
+        if (node->Has_preg())
+            item["preg"] = air_object_key(
+                "preg", owner, node->Preg_id().Value());
+        if (node->Has_const_id())
+            item["constant"] = air_object_key(
+                "constant", std::nullopt, node->Const_id().Value());
+        Add_object(std::move(item));
+
+        for (uint32_t index = 0; index < node->Num_child(); ++index)
+            Add_node(function, node->Child(index), parent_statement);
+    }
+
+    void Add_block(FUNC_SCOPE& function, NODE_PTR block,
+                   const py::object& parent_statement) {
+        const uint64_t owner = function.Id().Value();
+        const auto identity = std::make_pair(owner, block->Id().Value());
+        if (!_seen_blocks.insert(identity).second) return;
+        py::dict item;
+        py::tuple key = air_object_key("block", owner, block->Id().Value());
+        item["key"] = key;
+        item["source_position"] = source_position_snapshot(block->Spos());
+        if (!parent_statement.is_none()) item["parent_statement"] = parent_statement;
+        py::list statements;
+        for (STMT_PTR statement = block->Begin_stmt();
+             statement != block->End_stmt(); statement = statement->Next()) {
+            py::tuple statement_key = air_object_key(
+                "statement", owner, statement->Id().Value());
+            statements.append(statement_key);
+        }
+        item["statements"] = py::tuple(statements);
+        _function_blocks.append(key);
+        Add_object(std::move(item));
+
+        for (STMT_PTR statement = block->Begin_stmt();
+             statement != block->End_stmt(); statement = statement->Next()) {
+            py::tuple statement_key = air_object_key(
+                "statement", owner, statement->Id().Value());
+            py::dict statement_item;
+            statement_item["key"] = statement_key;
+            statement_item["node"] = air_object_key(
+                "node", owner, statement->Node()->Id().Value());
+            statement_item["parent_block"] = key;
+            statement_item["source_position"] =
+                source_position_snapshot(statement->Spos());
+            Add_object(std::move(statement_item));
+            Add_node(function, statement->Node(), statement_key);
+        }
+    }
+
+    void Collect_ivs(
+        NODE_PTR node,
+        std::map<AIR_OBJECT_KEY, ADDR_DATUM_PTR>* ivs) {
+        if (node->Is_block()) {
+            for (STMT_PTR statement = node->Begin_stmt();
+                 statement != node->End_stmt();
+                 statement = statement->Next())
+                Collect_ivs(statement->Node(), ivs);
+            return;
+        }
+        if (node->Is_do_loop()) {
+            ADDR_DATUM_PTR iv = node->Iv();
+            ivs->emplace(
+                AIR_OBJECT_KEY{"iv", Datum_owner(iv), iv->Id().Value()}, iv);
+        }
+        for (uint32_t index = 0; index < node->Num_child(); ++index)
+            Collect_ivs(node->Child(index), ivs);
+    }
+
+    void Add_functions() {
+        std::vector<FUNC_SCOPE*> values;
+        for (GLOB_SCOPE::FUNC_SCOPE_ITER iter = _glob.Begin_func_scope();
+             iter != _glob.End_func_scope(); ++iter)
+            values.push_back(&*iter);
+        std::sort(values.begin(), values.end(), [](FUNC_SCOPE* lhs, FUNC_SCOPE* rhs) {
+            return lhs->Id().Value() < rhs->Id().Value();
+        });
+        for (FUNC_SCOPE* function : values) {
+            const uint64_t owner = function->Id().Value();
+            STMT_PTR entry_statement = function->Container().Entry_stmt();
+            NODE_PTR entry = entry_statement->Node();
+            std::map<AIR_OBJECT_KEY, ADDR_DATUM_PTR> iv_values;
+            Collect_ivs(entry, &iv_values);
+            py::list formals;
+            py::list locals;
+            py::list symbols;
+            py::list ivs;
+            std::vector<ADDR_DATUM_PTR> datum_values;
+            for (DATUM_ITER iter = function->Begin_addr_datum();
+                 iter != function->End_addr_datum(); ++iter)
+                datum_values.push_back(*iter);
+            sort_by_native_id(&datum_values);
+            for (ADDR_DATUM_PTR datum : datum_values) {
+                Add_datum(*function, datum,
+                          datum->Is_formal() ? "formal" : "local",
+                          datum->Is_formal() ? &formals : &locals);
+                Add_datum_alias(*function, datum, "symbol", &symbols);
+            }
+            std::vector<std::pair<AIR_OBJECT_KEY, ADDR_DATUM_PTR>>
+                ordered_ivs(iv_values.begin(), iv_values.end());
+            std::sort(
+                ordered_ivs.begin(), ordered_ivs.end(),
+                [](const auto& lhs, const auto& rhs) {
+                    return std::tie(lhs.first.native_id, lhs.first.owner) <
+                           std::tie(rhs.first.native_id, rhs.first.owner);
+                });
+            for (const auto& [identity, datum] : ordered_ivs) {
+                py::tuple key = air_object_key(
+                    "iv", identity.owner, identity.native_id);
+                ivs.append(key);
+                if (_seen_iv_aliases.insert(identity).second) {
+                    py::list ignored;
+                    Add_datum(identity.owner, datum, "iv", &ignored);
+                }
+            }
+
+            py::list pregs;
+            std::vector<PREG_PTR> preg_values;
+            for (PREG_ITER iter = function->Begin_preg();
+                 iter != function->End_preg(); ++iter)
+                preg_values.push_back(*iter);
+            sort_by_native_id(&preg_values);
+            for (PREG_PTR preg : preg_values) {
+                py::dict item;
+                py::tuple key = air_object_key("preg", owner,
+                                               preg->Id().Value());
+                item["key"] = key;
+                item["type"] = air_object_key(
+                    "type", std::nullopt, preg->Type_id().Value());
+                if (!preg->Home_sym_id().Is_null()) {
+                    SYM_PTR home = preg->Home_sym();
+                    FUNC_SCOPE* home_owner = home->Defining_func_scope();
+                    item["home_symbol"] = air_object_key(
+                        "symbol",
+                        home_owner == nullptr
+                            ? std::nullopt
+                            : std::optional<uint64_t>(home_owner->Id().Value()),
+                        preg->Home_sym_id().Value());
+                }
+                pregs.append(key);
+                Add_object(std::move(item));
+            }
+
+            _function_blocks = py::list();
+            py::tuple entry_statement_key = air_object_key(
+                "statement", owner, entry_statement->Id().Value());
+            py::dict entry_statement_item;
+            entry_statement_item["key"] = entry_statement_key;
+            entry_statement_item["node"] = air_object_key(
+                "node", owner, entry_statement->Node()->Id().Value());
+            entry_statement_item["source_position"] =
+                source_position_snapshot(entry_statement->Spos());
+            Add_object(std::move(entry_statement_item));
+            Add_node(*function, entry, entry_statement_key);
+
+            py::dict item;
+            py::tuple key = air_object_key("function", std::nullopt, owner);
+            item["key"] = key;
+            item["name"] = function->Owning_func()->Name() == Null_ptr
+                               ? ""
+                               : function->Owning_func()->Name()->Char_str();
+            item["entries"] = py::tuple(py::cast(_entry_keys[owner]));
+            item["formals"] = py::tuple(formals);
+            item["locals"] = py::tuple(locals);
+            item["symbols"] = py::tuple(symbols);
+            item["pregs"] = py::tuple(pregs);
+            item["ivs"] = py::tuple(ivs);
+            item["blocks"] = py::tuple(_function_blocks);
+            item["entry_statement"] = entry_statement_key;
+            if (entry->Is_entry()) {
+                item["entry_block"] = air_object_key(
+                    "block", owner, entry->Body_blk_id().Value());
+            }
+            item["source_position"] =
+                source_position_snapshot(function->Owning_func()->Begin_spos());
+            _functions.append(key);
+            Add_object(std::move(item));
+        }
+    }
+
+    GLOB_SCOPE& _glob;
+    uint64_t _revision;
+    uint64_t _module_id;
+    py::list _types;
+    py::list _constants;
+    py::list _symbols;
+    py::list _entries;
+    py::list _functions;
+    py::list _objects;
+    py::list _structural_order;
+    py::list _function_blocks;
+    std::map<uint64_t, std::vector<py::tuple>> _entry_keys;
+    std::set<std::pair<uint64_t, uint64_t>> _seen_nodes;
+    std::set<std::pair<uint64_t, uint64_t>> _seen_blocks;
+    std::set<AIR_OBJECT_KEY> _seen_iv_aliases;
+};
+
+FUNC_SCOPE& require_function(GLOB_SCOPE& glob, uint64_t id) {
+    for (GLOB_SCOPE::FUNC_SCOPE_ITER iter = glob.Begin_func_scope();
+         iter != glob.End_func_scope(); ++iter) {
+        if ((*iter).Id().Value() == id) return *iter;
+    }
+    throw std::invalid_argument("unknown AIR function ID " + std::to_string(id));
+}
+
+NODE_PTR require_node(GLOB_SCOPE& glob, const AIR_OBJECT_KEY& key,
+                      bool allow_block = false) {
+    if (!key.owner || (key.kind != "node" &&
+                       !(allow_block && key.kind == "block")))
+        throw std::invalid_argument("AIR operation requires a node key");
+    FUNC_SCOPE& function = require_function(glob, *key.owner);
+    NODE_PTR node = function.Container().Node(NODE_ID(key.native_id));
+    if (node == Null_ptr || (key.kind == "block") != node->Is_block())
+        throw std::invalid_argument("AIR node key has the wrong kind");
+    return node;
+}
+
+STMT_PTR require_statement(GLOB_SCOPE& glob, const AIR_OBJECT_KEY& key) {
+    if (!key.owner || key.kind != "statement")
+        throw std::invalid_argument("AIR operation requires a statement key");
+    FUNC_SCOPE& function = require_function(glob, *key.owner);
+    STMT_PTR statement = function.Container().Stmt(STMT_ID(key.native_id));
+    if (statement == Null_ptr)
+        throw std::invalid_argument("unknown AIR statement ID");
+    auto contains_statement = [&](auto&& self, NODE_PTR node) -> bool {
+        if (node->Is_block()) {
+            for (STMT_PTR current = node->Begin_stmt();
+                 current != node->End_stmt(); current = current->Next()) {
+                if (current == statement || self(self, current->Node()))
+                    return true;
+            }
+            return false;
+        }
+        for (uint32_t index = 0; index < node->Num_child(); ++index) {
+            if (self(self, node->Child(index))) return true;
+        }
+        return false;
+    };
+    if (function.Container().Entry_stmt() != statement &&
+        !contains_statement(contains_statement,
+                            function.Container().Entry_node())) {
+        throw std::invalid_argument(
+            "AIR statement is detached or no longer live");
+    }
+    return statement;
+}
+
+ADDR_DATUM_PTR require_datum(FUNC_SCOPE& function, uint64_t id) {
+    ADDR_DATUM_PTR datum = function.Addr_datum(ADDR_DATUM_ID(id));
+    if (datum == Null_ptr)
+        throw std::invalid_argument("unknown AIR datum ID");
+    return datum;
+}
+
+PREG_PTR require_preg(FUNC_SCOPE& function, uint64_t id) {
+    PREG_PTR preg = function.Preg(PREG_ID(id));
+    if (preg == Null_ptr)
+        throw std::invalid_argument("unknown AIR preg ID");
+    return preg;
+}
+
+ADDR_DATUM_PTR require_datum_key(GLOB_SCOPE& glob,
+                                 const AIR_OBJECT_KEY& key) {
+    if (key.kind != "formal" && key.kind != "local" &&
+        key.kind != "symbol" && key.kind != "iv")
+        throw std::invalid_argument("AIR operation requires a datum key");
+    ADDR_DATUM_PTR datum;
+    if (key.owner) {
+        FUNC_SCOPE& function = require_function(glob, *key.owner);
+        datum = function.Addr_datum(ADDR_DATUM_ID(key.native_id));
+        if (datum == Null_ptr || datum->Defining_func_scope() == nullptr ||
+            datum->Defining_func_scope()->Id().Value() != *key.owner)
+            throw std::invalid_argument(
+                "AIR datum key has the wrong owning function");
+    } else {
+        ADDR_DATUM_ID id(key.native_id);
+        if (id.Is_local())
+            throw std::invalid_argument(
+                "function-owned AIR datum requires an owner");
+        datum = glob.Addr_datum(id);
+        if (datum == Null_ptr || datum->Defining_func_scope() != nullptr)
+            throw std::invalid_argument("unknown global AIR datum ID");
+    }
+    if ((key.kind == "formal") != datum->Is_formal() &&
+        key.kind != "symbol" && key.kind != "iv")
+        throw std::invalid_argument("AIR datum key has the wrong kind");
+    return datum;
+}
+
+bool compatible_type(TYPE_PTR lhs, TYPE_PTR rhs) {
+    if (lhs == Null_ptr || rhs == Null_ptr ||
+        &lhs->Glob_scope() != &rhs->Glob_scope())
+        return false;
+    if (lhs->Id() == rhs->Id()) return true;
+    if (lhs->Kind() != rhs->Kind()) return false;
+    switch (lhs->Kind()) {
+    case TYPE_TRAIT::PRIMITIVE:
+    case TYPE_TRAIT::ARRAY:
+    case TYPE_TRAIT::POINTER:
+    case TYPE_TRAIT::RECORD:
+        return lhs->Is_compatible_type(rhs);
+    case TYPE_TRAIT::VA_LIST:
+        return lhs->Cast_to<TYPE_TRAIT::VA_LIST>()->Is_compatible_type(
+            rhs->Cast_to<TYPE_TRAIT::VA_LIST>());
+    default:
+        return false;
+    }
+}
+
+void require_compatible_type(TYPE_PTR expected, TYPE_PTR actual,
+                             const char* operation) {
+    if (!compatible_type(expected, actual))
+        throw std::invalid_argument(
+            std::string(operation) + " has an incompatible AIR type");
+}
+
+bool compatible_signature(TYPE_PTR lhs, TYPE_PTR rhs) {
+    if (lhs == Null_ptr || rhs == Null_ptr)
+        return false;
+    lhs = lhs->Base_type();
+    rhs = rhs->Base_type();
+    if (!lhs->Is_signature() || !rhs->Is_signature()) return false;
+    if (lhs->Id() == rhs->Id()) return true;
+    SIGNATURE_TYPE_PTR left = lhs->Cast_to_sig();
+    SIGNATURE_TYPE_PTR right = rhs->Cast_to_sig();
+    if (left->Num_param() != right->Num_param()) return false;
+    PARAM_ITER left_param = left->Begin_param();
+    PARAM_ITER right_param = right->Begin_param();
+    while (left_param != left->End_param() &&
+           right_param != right->End_param()) {
+        PARAM_PTR left_value = *left_param;
+        PARAM_PTR right_value = *right_param;
+        if (left_value->Kind() != right_value->Kind() ||
+            left_value->Is_ret() != right_value->Is_ret() ||
+            left_value->Is_this() != right_value->Is_this() ||
+            left_value->Is_ellips() != right_value->Is_ellips() ||
+            !compatible_type(left_value->Type(), right_value->Type()))
+            return false;
+        ++left_param;
+        ++right_param;
+    }
+    return left_param == left->End_param() &&
+           right_param == right->End_param();
+}
+
+void repair_nested_block_parents(NODE_PTR node, STMT_PTR owning_statement) {
+    for (uint32_t index = 0; index < node->Num_child(); ++index) {
+        NODE_PTR child = node->Child(index);
+        if (child->Is_block()) child->Set_parent_stmt(owning_statement);
+        repair_nested_block_parents(child, owning_statement);
+    }
+}
+
+std::pair<PRIMITIVE_TYPE, size_t> attribute_type(
+    const std::string& name) {
+    static const std::map<std::string, std::pair<PRIMITIVE_TYPE, size_t>>
+        types = {
+            {"bool", {PRIMITIVE_TYPE::BOOL, 1}},
+            {"i8", {PRIMITIVE_TYPE::INT_S8, 1}},
+            {"i16", {PRIMITIVE_TYPE::INT_S16, 2}},
+            {"i32", {PRIMITIVE_TYPE::INT_S32, 4}},
+            {"i64", {PRIMITIVE_TYPE::INT_S64, 8}},
+            {"u8", {PRIMITIVE_TYPE::INT_U8, 1}},
+            {"u16", {PRIMITIVE_TYPE::INT_U16, 2}},
+            {"u32", {PRIMITIVE_TYPE::INT_U32, 4}},
+            {"u64", {PRIMITIVE_TYPE::INT_U64, 8}},
+            {"f32", {PRIMITIVE_TYPE::FLOAT_32, 4}},
+            {"f64", {PRIMITIVE_TYPE::FLOAT_64, 8}},
+            {"f80", {PRIMITIVE_TYPE::FLOAT_80, 16}},
+            {"f128", {PRIMITIVE_TYPE::FLOAT_128, 16}},
+            {"c32", {PRIMITIVE_TYPE::COMPLEX_32, 8}},
+            {"c64", {PRIMITIVE_TYPE::COMPLEX_64, 16}},
+            {"c80", {PRIMITIVE_TYPE::COMPLEX_80, 32}},
+            {"c128", {PRIMITIVE_TYPE::COMPLEX_128, 32}},
+        };
+    auto found = types.find(name);
+    if (found == types.end())
+        throw std::invalid_argument(
+            "unsupported AIR attribute element type: " + name);
+    return found->second;
+}
+
+}  // namespace
+
+class AIRPassTransaction {
+public:
+    explicit AIRPassTransaction(std::shared_ptr<GlobScope> owner)
+        : _owner(std::move(owner)) {
+        if (!_owner || !_owner->glob)
+            throw std::invalid_argument(
+                "AIR pass transaction requires a live GLOB_SCOPE");
+        if (_owner->air_pass_transaction_active())
+            throw std::runtime_error("an AIR pass transaction is already active");
+        _generation = _owner->next_air_pass_transaction_generation();
+        _candidate = ace::bindings::Clone_air_scope_with_code(*_owner->glob);
+        Build_remap();
+        _owner->set_air_pass_transaction_active(true);
+        _active = true;
+    }
+
+    ~AIRPassTransaction() { Rollback(); }
+
+    bool active() const { return _active; }
+    bool dirty() const { return _dirty; }
+    uint64_t air_pass_generation() const { return _generation; }
+
+    py::dict air_pass_snapshot() const {
+        Require_active();
+        return AIR_PASS_SNAPSHOT_BUILDER(
+            *_candidate, _owner->air_pass_revision(),
+            _owner->air_pass_module_id()).Build();
+    }
+
+    py::tuple source_to_candidate() const {
+        Require_active();
+        py::tuple result(_remap.size());
+        for (size_t index = 0; index < _remap.size(); ++index) {
+            py::tuple pair(2);
+            pair[0] = _remap[index].first;
+            pair[1] = _remap[index].second;
+            result[index] = std::move(pair);
+        }
+        return result;
+    }
+
+    uint64_t remap_native_id(const std::string& kind,
+                             const py::object& owner,
+                             uint64_t native_id) const {
+        Require_active();
+        AIR_OBJECT_KEY requested{kind,
+            owner.is_none() ? std::optional<uint64_t>()
+                            : std::optional<uint64_t>(py::cast<uint64_t>(owner)),
+            native_id};
+        for (const auto& pair : _remap) {
+            AIR_OBJECT_KEY source = parse_air_object_key(pair.first);
+            if (source == requested)
+                return parse_air_object_key(pair.second).native_id;
+        }
+        throw std::invalid_argument("unmapped or wrong-kind AIR ID");
+    }
+
+    py::tuple create_local(uint64_t function_id, const std::string& name,
+                           uint64_t type_id) {
+        Require_active();
+        if (name.empty()) throw std::invalid_argument("local name must not be empty");
+        FUNC_SCOPE& function = require_function(*_candidate, function_id);
+        TYPE_PTR type = _candidate->Type(TYPE_ID(type_id));
+        if (type == Null_ptr) throw std::invalid_argument("unknown AIR type ID");
+        ADDR_DATUM_PTR local = function.New_var(
+            type, name.c_str(), _candidate->Unknown_simple_spos());
+        _dirty = true;
+        return air_object_key("local", function_id, local->Id().Value());
+    }
+
+    py::tuple create_preg(uint64_t function_id, uint64_t type_id) {
+        Require_active();
+        FUNC_SCOPE& function = require_function(*_candidate, function_id);
+        TYPE_PTR type = _candidate->Type(TYPE_ID(type_id));
+        if (type == Null_ptr) throw std::invalid_argument("unknown AIR type ID");
+        PREG_PTR preg = function.New_preg(type);
+        _dirty = true;
+        return air_object_key("preg", function_id, preg->Id().Value());
+    }
+
+    py::tuple clone_local(uint64_t destination_function_id,
+                          uint64_t source_function_id,
+                          uint64_t source_datum_id,
+                          bool as_iv) {
+        Require_active();
+        FUNC_SCOPE& source =
+            require_function(*_candidate, source_function_id);
+        FUNC_SCOPE& destination =
+            require_function(*_candidate, destination_function_id);
+        ADDR_DATUM_PTR datum = require_datum(source, source_datum_id);
+        if (datum->Is_formal())
+            throw std::invalid_argument("formal parameters cannot be cloned as locals");
+        ADDR_DATUM_PTR clone = destination.New_var(
+            datum->Type(),
+            datum->Name() == Null_ptr ? "" : datum->Name()->Char_str(),
+            datum->Spos());
+        (void)as_iv;
+        _dirty = true;
+        return air_object_key("local", destination_function_id,
+                              clone->Id().Value());
+    }
+
+    py::tuple clone_preg(uint64_t destination_function_id,
+                         uint64_t source_function_id,
+                         uint64_t source_preg_id) {
+        Require_active();
+        FUNC_SCOPE& source =
+            require_function(*_candidate, source_function_id);
+        FUNC_SCOPE& destination =
+            require_function(*_candidate, destination_function_id);
+        PREG_PTR preg = require_preg(source, source_preg_id);
+        SYM_PTR home = Null_ptr;
+        if (!preg->Home_sym_id().Is_null()) {
+            home = preg->Home_sym();
+            FUNC_SCOPE* home_owner = home->Defining_func_scope();
+            if (home_owner != nullptr && &source != &destination) {
+                throw std::invalid_argument(
+                    "cross-function preg cloning requires an explicit home-symbol remap");
+            }
+        }
+        PREG_PTR clone = destination.New_preg(preg->Type());
+        if (home != Null_ptr) clone->Set_home_sym(home->Id());
+        _dirty = true;
+        return air_object_key("preg", destination_function_id,
+                              clone->Id().Value());
+    }
+
+    py::tuple insert_statement(const py::tuple& target_key,
+                               const py::tuple& template_key,
+                               bool after) {
+        Require_active();
+        AIR_OBJECT_KEY target_identity = parse_air_object_key(target_key);
+        AIR_OBJECT_KEY template_identity = parse_air_object_key(template_key);
+        if (target_identity.owner != template_identity.owner)
+            throw std::invalid_argument(
+                "statement cloning across function scopes is not permitted");
+        STMT_PTR target = require_statement(*_candidate, target_identity);
+        STMT_PTR source = require_statement(*_candidate, template_identity);
+        STMT_PTR clone = target->Container()->Clone_stmt_tree(source);
+        clone->Set_parent_node(target->Parent_node());
+        repair_nested_block_parents(clone->Node(), clone);
+        STMT_LIST list = STMT_LIST::Enclosing_list(target);
+        if (after) list.Append(target, clone);
+        else list.Prepend(target, clone);
+        _dirty = true;
+        return air_object_key("statement", *target_identity.owner,
+                              clone->Id().Value());
+    }
+
+    py::tuple clone_mapped_statement(
+        const py::tuple& target_key, const py::tuple& source_key, bool after,
+        const py::tuple& formal_map, const py::tuple& local_map,
+        const py::tuple& preg_map, const py::tuple& iv_map) {
+        Require_active();
+        AIR_OBJECT_KEY target_identity = parse_air_object_key(target_key);
+        AIR_OBJECT_KEY source_identity = parse_air_object_key(source_key);
+        STMT_PTR target = require_statement(*_candidate, target_identity);
+        STMT_PTR source = require_statement(*_candidate, source_identity);
+        FUNC_SCOPE& source_function =
+            require_function(*_candidate, *source_identity.owner);
+        FUNC_SCOPE& destination_function =
+            require_function(*_candidate, *target_identity.owner);
+
+        std::unordered_map<uint64_t, NODE_PTR> formals;
+        for (py::handle raw : formal_map) {
+            py::tuple pair = py::cast<py::tuple>(raw);
+            if (pair.size() != 2)
+                throw std::invalid_argument("formal map entries must be pairs");
+            uint64_t source_id = py::cast<uint64_t>(pair[0]);
+            ADDR_DATUM_PTR formal = require_datum(source_function, source_id);
+            if (!formal->Is_formal())
+                throw std::invalid_argument("formal map key is not a formal");
+            NODE_PTR actual = require_node(
+                *_candidate, parse_air_object_key(pair[1]));
+            if (actual->Func_scope() != &destination_function ||
+                actual->Is_root())
+                throw std::invalid_argument(
+                    "formal map value must be a destination expression");
+            if (!actual->Has_rtype())
+                throw std::invalid_argument(
+                    "formal map value must have a result type");
+            require_compatible_type(
+                formal->Type(), actual->Rtype(), "formal mapping");
+            if (!formals.emplace(source_id, actual).second)
+                throw std::invalid_argument("duplicate formal map key");
+        }
+
+        auto parse_datum_map = [&](const py::tuple& raw_map,
+                                   const char* operation) {
+            std::unordered_map<uint64_t, uint64_t> result;
+            for (py::handle raw : raw_map) {
+                py::tuple pair = py::cast<py::tuple>(raw);
+                if (pair.size() != 2)
+                    throw std::invalid_argument("datum map entries must be pairs");
+                uint64_t source_id = py::cast<uint64_t>(pair[0]);
+                uint64_t destination_id = py::cast<uint64_t>(pair[1]);
+                ADDR_DATUM_PTR source_datum =
+                    require_datum(source_function, source_id);
+                if (source_datum->Is_formal())
+                    throw std::invalid_argument("local/IV map key is a formal");
+                ADDR_DATUM_PTR destination_datum =
+                    require_datum(destination_function, destination_id);
+                if (destination_datum->Is_formal())
+                    throw std::invalid_argument(
+                        "local/IV map value cannot be a formal");
+                require_compatible_type(
+                    source_datum->Type(), destination_datum->Type(), operation);
+                if (!result.emplace(source_id, destination_id).second)
+                    throw std::invalid_argument("duplicate datum map key");
+            }
+            return result;
+        };
+        auto locals = parse_datum_map(local_map, "local mapping");
+        auto ivs = parse_datum_map(iv_map, "IV mapping");
+        std::set<uint64_t> structural_ivs;
+        std::function<void(NODE_PTR)> collect_ivs = [&](NODE_PTR node) {
+            if (node->Is_block()) {
+                for (STMT_PTR statement = node->Begin_stmt();
+                     statement != node->End_stmt();
+                     statement = statement->Next())
+                    collect_ivs(statement->Node());
+                return;
+            }
+            if (node->Is_do_loop())
+                structural_ivs.insert(node->Iv_id().Value());
+            for (uint32_t index = 0; index < node->Num_child(); ++index)
+                collect_ivs(node->Child(index));
+        };
+        collect_ivs(source->Node());
+        for (const auto& [source_id, destination_id] : ivs) {
+            if (structural_ivs.count(source_id) == 0)
+                throw std::invalid_argument(
+                    "IV mapping key is not a structural loop IV");
+            auto local = locals.find(source_id);
+            if (local != locals.end() && local->second != destination_id)
+                throw std::invalid_argument(
+                    "local and IV mappings disagree for one source datum");
+        }
+        std::unordered_map<uint64_t, uint64_t> pregs;
+        for (py::handle raw : preg_map) {
+            py::tuple pair = py::cast<py::tuple>(raw);
+            if (pair.size() != 2)
+                throw std::invalid_argument("preg map entries must be pairs");
+            uint64_t source_id = py::cast<uint64_t>(pair[0]);
+            uint64_t destination_id = py::cast<uint64_t>(pair[1]);
+            PREG_PTR source_preg = require_preg(source_function, source_id);
+            PREG_PTR destination_preg =
+                require_preg(destination_function, destination_id);
+            require_compatible_type(
+                source_preg->Type(), destination_preg->Type(), "preg mapping");
+            if (!pregs.emplace(source_id, destination_id).second)
+                throw std::invalid_argument("duplicate preg map key");
+        }
+
+        const bool same_function =
+            source_identity.owner == target_identity.owner;
+        auto mapped_datum = [&](ADDR_DATUM_PTR datum) -> ADDR_DATUM_PTR {
+            if (same_function) return datum;
+            if (datum->Defining_func_scope() == nullptr)
+                return _candidate->Addr_datum(datum->Id());
+            if (datum->Is_formal()) {
+                throw std::invalid_argument(
+                    "formal references must be replaced by expression mappings");
+            }
+            auto found = locals.find(datum->Id().Value());
+            if (found == locals.end())
+                throw std::invalid_argument("missing explicit local mapping");
+            return require_datum(destination_function, found->second);
+        };
+        auto mapped_preg = [&](PREG_PTR preg) -> PREG_PTR {
+            if (same_function) return preg;
+            auto found = pregs.find(preg->Id().Value());
+            if (found == pregs.end())
+                throw std::invalid_argument("missing explicit preg mapping");
+            return require_preg(destination_function, found->second);
+        };
+
+        std::function<NODE_PTR(NODE_PTR, NODE_PTR)> remap_node;
+        remap_node = [&](NODE_PTR original, NODE_PTR clone) -> NODE_PTR {
+            if (original->Is_block()) {
+                STMT_PTR original_statement = original->Begin_stmt();
+                STMT_PTR clone_statement = clone->Begin_stmt();
+                while (original_statement != original->End_stmt()) {
+                    NODE_PTR remapped = remap_node(
+                        original_statement->Node(), clone_statement->Node());
+                    if (remapped != clone_statement->Node())
+                        throw std::invalid_argument(
+                            "a formal load cannot replace a statement root");
+                    original_statement = original_statement->Next();
+                    clone_statement = clone_statement->Next();
+                }
+                return clone;
+            }
+            if (!same_function &&
+                META_INFO::Has_prop<OPR_PROP::ATTR>(original->Opcode()))
+                clone->Deep_copy_attr(original);
+            if (!same_function && original->Has_sym() &&
+                original->Addr_datum()->Is_formal()) {
+                if (!original->Is_ld())
+                    throw std::invalid_argument(
+                        "formal mapping supports value loads only");
+                auto found = formals.find(original->Addr_datum_id().Value());
+                if (found == formals.end())
+                    throw std::invalid_argument("missing explicit formal mapping");
+                return destination_function.Container().Clone_node_tree(
+                    found->second);
+            }
+            if (original->Has_sym())
+                clone->Set_addr_datum(mapped_datum(original->Addr_datum()));
+            if (original->Has_preg())
+                clone->Set_preg(mapped_preg(original->Preg()));
+            if (original->Has_ret_var() &&
+                !original->Ret_preg_id().Is_null())
+                clone->Set_ret_preg(mapped_preg(original->Ret_preg()));
+            if (original->Is_do_loop()) {
+                if (same_function) {
+                    clone->Set_iv(original->Iv());
+                } else if (original->Iv()->Defining_func_scope() == nullptr) {
+                    clone->Set_iv(_candidate->Addr_datum(original->Iv_id()));
+                } else {
+                    auto found = ivs.find(original->Iv_id().Value());
+                    if (found == ivs.end())
+                        throw std::invalid_argument("missing explicit IV mapping");
+                    clone->Set_iv(require_datum(destination_function,
+                                                found->second));
+                }
+            }
+            for (uint32_t index = 0; index < original->Num_child(); ++index) {
+                NODE_PTR child = remap_node(original->Child(index),
+                                            clone->Child(index));
+                clone->Set_child(index, child);
+            }
+            return clone;
+        };
+
+        STMT_PTR clone = target->Container()->Clone_stmt_tree(source);
+        NODE_PTR remapped_root = remap_node(source->Node(), clone->Node());
+        if (remapped_root != clone->Node())
+            throw std::invalid_argument(
+                "a formal load cannot replace a statement root");
+        clone->Set_parent_node(target->Parent_node());
+        repair_nested_block_parents(clone->Node(), clone);
+        STMT_LIST list = STMT_LIST::Enclosing_list(target);
+        if (after) list.Append(target, clone);
+        else list.Prepend(target, clone);
+        _dirty = true;
+        return air_object_key("statement", *target_identity.owner,
+                              clone->Id().Value());
+    }
+
+    py::tuple replace_statement(const py::tuple& target_key,
+                                const py::tuple& template_key) {
+        py::tuple replacement = insert_statement(target_key, template_key, false);
+        erase_statement(target_key);
+        return replacement;
+    }
+
+    void erase_statement(const py::tuple& key) {
+        Require_active();
+        STMT_PTR statement = require_statement(
+            *_candidate, parse_air_object_key(key));
+        STMT_LIST::Enclosing_list(statement).Remove(statement);
+        _dirty = true;
+    }
+
+    void set_node_child(const py::tuple& node_key, uint32_t index,
+                        const py::tuple& child_key) {
+        NODE_PTR node = Mutable_node(node_key);
+        NODE_PTR child = require_node(
+            *_candidate, parse_air_object_key(child_key), true);
+        if (node->Func_scope() != child->Func_scope())
+            throw std::invalid_argument("AIR child belongs to another function scope");
+        if (index >= node->Num_child())
+            throw std::out_of_range("AIR child index is out of range");
+        NODE_PTR previous = node->Child(index);
+        if (previous->Is_block() || child->Is_block())
+            throw std::invalid_argument(
+                "block operands cannot be replaced through set_node_child");
+        if (child->Is_root() || !previous->Has_rtype() || !child->Has_rtype())
+            throw std::invalid_argument(
+                "AIR child replacement requires expression operands");
+        require_compatible_type(
+            previous->Rtype(), child->Rtype(), "child replacement");
+        NODE_PTR replacement = node->Container()->Clone_node_tree(child);
+        node->Set_child(index, replacement);
+        _dirty = true;
+    }
+
+    void set_node_source_position(const py::tuple& node_key,
+                                  uint64_t file, uint64_t line,
+                                  uint64_t column, uint64_t count,
+                                  bool statement_begin,
+                                  bool basic_block_begin) {
+        if (file > UINT16_MAX || line > 0xFFFFFFU || column > 0xFFFU ||
+            count > 0x3FFU)
+            throw std::out_of_range("AIR source position component is out of range");
+        SPOS position(file, line, column, count);
+        position.Set_stmt_beg(statement_begin);
+        position.Set_bb_beg(basic_block_begin);
+        Mutable_node(node_key)->Set_spos(position);
+        _dirty = true;
+    }
+
+    void set_node_attribute(const py::tuple& node_key,
+                            const std::string& key,
+                            const std::string& element_type,
+                            uint32_t count,
+                            const py::bytes& bytes) {
+        NODE_PTR node = Mutable_node(node_key);
+        if (!META_INFO::Has_prop<OPR_PROP::ATTR>(node->Opcode()))
+            throw std::invalid_argument("AIR opcode does not support attributes");
+        if (key.empty()) throw std::invalid_argument("attribute key must not be empty");
+        std::string payload = bytes;
+        if (element_type == "string") {
+            if (count != 0 || payload.find('\0') != std::string::npos)
+                throw std::invalid_argument("string attributes require count zero and no NUL bytes");
+            node->Set_attr_bytes(
+                key.c_str(), payload, PRIMITIVE_TYPE::INT_S8, 0);
+        } else {
+            auto [type, width] = attribute_type(element_type);
+            if (count == 0 || payload.size() != width * count)
+                throw std::invalid_argument(
+                    "attribute byte length does not match type/count");
+            node->Set_attr_bytes(key.c_str(), payload, type, count);
+        }
+        _dirty = true;
+    }
+
+    void set_node_entry(const py::tuple& node_key, uint64_t entry_id) {
+        NODE_PTR node = Mutable_node(node_key);
+        if (node->Opcode() != air::core::OPC_CALL)
+            throw std::invalid_argument("call target edit requires a direct call");
+        ENTRY_PTR entry = _candidate->Entry_point(ENTRY_ID(entry_id));
+        if (entry == Null_ptr) throw std::invalid_argument("unknown AIR entry ID");
+        if (!compatible_signature(node->Entry()->Type(), entry->Type()))
+            throw std::invalid_argument(
+                "call target has an incompatible AIR signature");
+        node->Set_entry(entry);
+        _dirty = true;
+    }
+
+    void set_node_result_preg(const py::tuple& node_key, uint64_t preg_id) {
+        NODE_PTR node = Mutable_node(node_key);
+        if (!node->Has_ret_var())
+            throw std::invalid_argument(
+                "result-preg edit requires an opcode with a result preg");
+        AIR_OBJECT_KEY identity = parse_air_object_key(node_key);
+        FUNC_SCOPE& function = require_function(*_candidate, *identity.owner);
+        PREG_PTR preg = function.Preg(PREG_ID(preg_id));
+        if (preg == Null_ptr) throw std::invalid_argument("unknown AIR preg ID");
+        TYPE_PTR expected = Null_ptr;
+        if (!node->Ret_preg_id().Is_null()) {
+            expected = node->Ret_preg()->Type();
+        } else if (node->Opcode() == air::core::OPC_CALL) {
+            SIGNATURE_TYPE_PTR signature =
+                node->Entry()->Type()->Base_type()->Cast_to_sig();
+            if (signature->Has_non_void_ret())
+                expected = signature->Ret_param()->Type();
+        }
+        if (expected == Null_ptr)
+            throw std::invalid_argument(
+                "cannot determine the AIR result type for result-preg edit");
+        require_compatible_type(
+            expected, preg->Type(), "result-preg replacement");
+        node->Set_ret_preg(preg);
+        _dirty = true;
+    }
+
+    void set_node_symbol(const py::tuple& node_key,
+                         const py::tuple& datum_key) {
+        NODE_PTR node = Mutable_node(node_key);
+        if (!node->Has_sym())
+            throw std::invalid_argument(
+                "symbol edit requires an opcode with a symbol operand");
+        ADDR_DATUM_PTR datum = require_datum_key(
+            *_candidate, parse_air_object_key(datum_key));
+        require_compatible_type(
+            node->Addr_datum()->Type(), datum->Type(), "symbol replacement");
+        node->Set_addr_datum(datum);
+        _dirty = true;
+    }
+
+    void set_node_iv(const py::tuple& node_key,
+                     const py::tuple& datum_key) {
+        NODE_PTR node = Mutable_node(node_key);
+        if (!node->Is_do_loop())
+            throw std::invalid_argument("IV edit requires a do-loop node");
+        ADDR_DATUM_PTR datum = require_datum_key(
+            *_candidate, parse_air_object_key(datum_key));
+        if (datum->Is_formal())
+            throw std::invalid_argument("a do-loop IV cannot be a formal");
+        require_compatible_type(
+            node->Iv()->Type(), datum->Type(), "IV replacement");
+        node->Set_iv(datum);
+        _dirty = true;
+    }
+
+    void set_node_result_type(const py::tuple& node_key, uint64_t type_id) {
+        NODE_PTR node = Mutable_node(node_key);
+        if (!node->Has_rtype())
+            throw std::invalid_argument(
+                "result-type edit requires an opcode with a result type");
+        TYPE_PTR type = _candidate->Type(TYPE_ID(type_id));
+        if (type == Null_ptr) throw std::invalid_argument("unknown AIR type ID");
+        require_compatible_type(
+            node->Rtype(), type, "result-type replacement");
+        node->Set_rtype(type);
+        _dirty = true;
+    }
+
+    void remove_function(uint64_t function_id) {
+        Require_active();
+        if (_owner->lower_context_references_function(function_id))
+            throw std::invalid_argument(
+                "cannot remove a function referenced by the lower context");
+        FUNC_SCOPE& function = require_function(*_candidate, function_id);
+        std::vector<ENTRY_PTR> entries;
+        for (ENTRY_ITER iter = _candidate->Begin_entry();
+             iter != _candidate->End_entry(); ++iter) {
+            ENTRY_PTR entry = *iter;
+            if (entry->Owning_func_id().Value() == function_id) {
+                if (entry->Is_program_entry())
+                    throw std::invalid_argument("cannot remove a program-entry function");
+                if (entry->Is_callable())
+                    throw std::invalid_argument("cannot remove an exported AIR function");
+                entries.push_back(entry);
+            }
+        }
+        std::unordered_set<uint64_t> entry_ids;
+        for (ENTRY_PTR entry : entries) entry_ids.insert(entry->Id().Value());
+        py::dict snapshot = air_pass_snapshot();
+        for (py::handle raw : snapshot["objects"]) {
+            py::dict object = py::cast<py::dict>(raw);
+            AIR_OBJECT_KEY object_key = parse_air_object_key(object["key"]);
+            if (object.contains("indirect_call") &&
+                py::cast<bool>(object["indirect_call"]) &&
+                object_key.owner != function_id)
+                throw std::invalid_argument(
+                    "cannot remove a function in a module with an indirect call");
+            if (object.contains("call_target")) {
+                AIR_OBJECT_KEY target = parse_air_object_key(object["call_target"]);
+                if (entry_ids.count(target.native_id) != 0 &&
+                    object_key.owner != function_id)
+                    throw std::invalid_argument("cannot remove a referenced AIR function");
+            }
+        }
+        for (py::handle raw : snapshot["constants"]) {
+            AIR_OBJECT_KEY constant_key = parse_air_object_key(raw);
+            CONSTANT_PTR constant = _candidate->Constant(
+                CONSTANT_ID(constant_key.native_id));
+            if ((constant->Kind() == CONSTANT_KIND::ENTRY_PTR &&
+                 entry_ids.count(constant->Entry_id().Value()) != 0) ||
+                (constant->Kind() == CONSTANT_KIND::ENTRY_FUNC_DESC &&
+                 entry_ids.count(constant->Func_desc_entry_id().Value()) != 0))
+                throw std::invalid_argument(
+                    "cannot remove a function referenced by a global constant");
+        }
+        FUNC_PTR symbol = function.Owning_func();
+        symbol->Set_undefined();
+        _candidate->Delete_func_scope(&function);
+        for (ENTRY_PTR entry : entries) _candidate->Delete_sym(entry);
+        _candidate->Delete_sym(symbol);
+        _dirty = true;
+    }
+
+    bool verify() const {
+        Require_active();
+        return
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+            !_forced_verification_failure &&
+#endif
+            _candidate->Verify_ir();
+    }
+
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+    void force_verification_failure_for_testing() {
+        Require_active();
+        _forced_verification_failure = true;
+        _dirty = true;
+    }
+#endif
+
+    bool Commit() {
+        Require_active();
+        if (!_dirty) throw std::runtime_error("cannot commit a clean AIR transaction");
+        if (!verify()) {
+            Rollback();
+            return false;
+        }
+        _owner->install_identity_preserving_scope(std::move(_candidate));
+        _owner->set_air_pass_transaction_active(false);
+        _active = false;
+        ++_generation;
+        return true;
+    }
+
+    void Rollback() {
+        if (!_active) return;
+        _candidate.reset();
+        _owner->set_air_pass_transaction_active(false);
+        _active = false;
+        ++_generation;
+    }
+
+private:
+    void Require_active() const {
+        if (!_active || !_candidate)
+            throw std::runtime_error("AIR pass transaction is inactive");
+    }
+
+    NODE_PTR Mutable_node(const py::tuple& key) {
+        Require_active();
+        return require_node(*_candidate, parse_air_object_key(key));
+    }
+
+    void Add_mapping(const AIR_OBJECT_KEY& source,
+                     const AIR_OBJECT_KEY& candidate) {
+        auto [iter, inserted] = _mapped.emplace(source, candidate);
+        // Clone_stmt_tree may duplicate a shared source expression at multiple
+        // operand positions.  Stable source IDs map to the first lexical/
+        // operand-index candidate occurrence deterministically; every source
+        // object still has exactly one checked lookup target.
+        (void)iter;
+        (void)inserted;
+    }
+
+    void Map_node(NODE_PTR source, NODE_PTR candidate, uint64_t owner) {
+        if (source == Null_ptr || candidate == Null_ptr ||
+            source->Is_block() != candidate->Is_block()) {
+            throw std::runtime_error("AIR clone node/block shape mismatch");
+        }
+        const char* kind = source->Is_block() ? "block" : "node";
+        Add_mapping(
+            AIR_OBJECT_KEY{kind, owner, source->Id().Value()},
+            AIR_OBJECT_KEY{kind, owner, candidate->Id().Value()});
+        if (source->Is_block()) {
+            STMT_PTR source_statement = source->Begin_stmt();
+            STMT_PTR candidate_statement = candidate->Begin_stmt();
+            while (source_statement != source->End_stmt() &&
+                   candidate_statement != candidate->End_stmt()) {
+                Map_statement(source_statement, candidate_statement, owner);
+                source_statement = source_statement->Next();
+                candidate_statement = candidate_statement->Next();
+            }
+            if (source_statement != source->End_stmt() ||
+                candidate_statement != candidate->End_stmt()) {
+                throw std::runtime_error(
+                    "AIR clone changed a block's lexical statement count");
+            }
+            return;
+        }
+        if (source->Opcode() != candidate->Opcode() ||
+            source->Num_child() != candidate->Num_child()) {
+            throw std::runtime_error(
+                "AIR clone changed an opcode or operand count");
+        }
+        for (uint32_t index = 0; index < source->Num_child(); ++index)
+            Map_node(source->Child(index), candidate->Child(index), owner);
+    }
+
+    void Map_statement(STMT_PTR source, STMT_PTR candidate, uint64_t owner) {
+        if (source == Null_ptr || candidate == Null_ptr) {
+            throw std::runtime_error("AIR clone statement mismatch");
+        }
+        Add_mapping(
+            AIR_OBJECT_KEY{"statement", owner, source->Id().Value()},
+            AIR_OBJECT_KEY{"statement", owner, candidate->Id().Value()});
+        Map_node(source->Node(), candidate->Node(), owner);
+    }
+
+    void Build_remap() {
+        py::dict source_snapshot = AIR_PASS_SNAPSHOT_BUILDER(
+            *_owner->glob, _owner->air_pass_revision(),
+            _owner->air_pass_module_id()).Build();
+        py::dict candidate_snapshot = AIR_PASS_SNAPSHOT_BUILDER(
+            *_candidate, _owner->air_pass_revision(),
+            _owner->air_pass_module_id()).Build();
+
+        std::set<AIR_OBJECT_KEY> candidate_objects;
+        for (py::handle raw : candidate_snapshot["objects"])
+            candidate_objects.insert(
+                parse_air_object_key(py::cast<py::dict>(raw)["key"]));
+        for (py::handle raw : source_snapshot["objects"]) {
+            AIR_OBJECT_KEY source =
+                parse_air_object_key(py::cast<py::dict>(raw)["key"]);
+            if (source.kind == "node" || source.kind == "block" ||
+                source.kind == "statement")
+                continue;
+            if (candidate_objects.count(source) == 0) {
+                throw std::runtime_error(
+                    "AIR clone omitted identity object " + source.kind +
+                    " " + std::to_string(source.native_id));
+            }
+            Add_mapping(source, source);
+        }
+
+        for (GLOB_SCOPE::FUNC_SCOPE_ITER iter = _owner->glob->Begin_func_scope();
+             iter != _owner->glob->End_func_scope(); ++iter) {
+            FUNC_SCOPE& source_function = *iter;
+            const uint64_t owner = source_function.Id().Value();
+            FUNC_SCOPE& candidate_function =
+                require_function(*_candidate, owner);
+            Map_statement(source_function.Container().Entry_stmt(),
+                          candidate_function.Container().Entry_stmt(), owner);
+        }
+
+        py::tuple source_order =
+            py::cast<py::tuple>(source_snapshot["structural_order"]);
+        _remap.reserve(source_order.size());
+        for (py::handle raw : source_order) {
+            py::tuple source_tuple = py::cast<py::tuple>(raw);
+            AIR_OBJECT_KEY source = parse_air_object_key(source_tuple);
+            auto found = _mapped.find(source);
+            if (found == _mapped.end()) {
+                throw std::runtime_error(
+                    "AIR clone produced an incomplete ID map for " +
+                    source.kind + " " + std::to_string(source.native_id));
+            }
+            _remap.emplace_back(
+                source_tuple,
+                air_object_key(found->second.kind.c_str(),
+                               found->second.owner,
+                               found->second.native_id));
+        }
+    }
+
+    std::shared_ptr<GlobScope> _owner;
+    std::unique_ptr<GLOB_SCOPE> _candidate;
+    std::vector<std::pair<py::tuple, py::tuple>> _remap;
+    std::map<AIR_OBJECT_KEY, AIR_OBJECT_KEY> _mapped;
+    uint64_t _generation;
+    bool _active = false;
+    bool _dirty = false;
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+    bool _forced_verification_failure = false;
+#endif
+};
+
 std::shared_ptr<GlobScope> create_glob_scope() {
     auto result = std::make_shared<GlobScope>();
     return result;
@@ -7920,6 +9583,8 @@ std::shared_ptr<GlobScope> create_glob_scope() {
 class FheCompiler {
 public:
     GLOB_SCOPE* glob = nullptr;
+    std::weak_ptr<GlobScope> binding_owner;
+    bool has_binding_owner = false;
     std::unique_ptr<fhe::core::LOWER_CTX> lower_ctx;
     bool initialized = false;
     bool poly_disabled = false;
@@ -7927,6 +9592,19 @@ public:
     
     FheCompiler() {
         lower_ctx = std::make_unique<fhe::core::LOWER_CTX>();
+    }
+
+    void bind_owner(const std::shared_ptr<GlobScope>& owner) {
+        binding_owner = owner;
+        has_binding_owner = true;
+    }
+
+    void require_no_air_pass_transaction(const char* operation) const {
+        if (!has_binding_owner) return;
+        auto owner = binding_owner.lock();
+        if (!owner)
+            throw std::runtime_error("FHE compiler AIR scope has expired");
+        owner->require_no_air_pass_transaction(operation);
     }
     
     // Initialize with glob scope from a compiled kernel
@@ -8147,6 +9825,7 @@ py::dict run_ckks_driver(std::shared_ptr<GlobScope> glob) {
         result["message"] = "Invalid glob scope";
         return result;
     }
+    glob->require_no_air_pass_transaction("CKKS lowering");
     
     if (debug_f) {
         fprintf(debug_f, "[DEBUG] About to get lower_ctx\n");
@@ -8694,8 +10373,12 @@ py::dict run_ckks_driver(std::shared_ptr<GlobScope> glob) {
             // Each FHE operation result is stored to a temp variable via new_stid(),
             // so retv always has a load (domain=0) as its child, not a CKKS operation.
             
-            glob->glob = ckks_glob;
-            s_active_binding_glob = ckks_glob;
+            if (ckks_glob == glob->glob) {
+                glob->invalidate_air_pass_views(true);
+            } else {
+                glob->install_owned_scope(
+                    std::unique_ptr<GLOB_SCOPE>(ckks_glob));
+            }
             result["success"] = true;
             result["message"] = "CKKS lowering successful";
             
@@ -8733,8 +10416,7 @@ py::dict load_onnx_model(const std::string& onnx_path) {
         if (load_result.success && load_result.glob) {
             // Create a Python GlobScope wrapper
             auto py_glob = std::make_shared<GlobScope>();
-            py_glob->glob = load_result.glob;
-            s_active_binding_glob = load_result.glob;
+            py_glob->install_non_owning_source_clone(*load_result.glob);
             
             result["success"] = true;
             result["message"] = load_result.message;
@@ -8764,6 +10446,7 @@ py::dict run_poly_driver(std::shared_ptr<GlobScope> glob) {
         result["message"] = "Invalid glob scope";
         return result;
     }
+    glob->require_no_air_pass_transaction("Poly lowering");
     
     glob->prep_fhe_types();
     fhe::core::LOWER_CTX* lower_ctx = glob->get_lower_ctx();
@@ -8781,11 +10464,12 @@ py::dict run_poly_driver(std::shared_ptr<GlobScope> glob) {
         // of SET_COEFFS so IR2C emits Coeffs(...) correctly.
         fhe::poly::POLY_DRIVER poly_driver;
         air::driver::DRIVER_CTX driver_ctx;
+        GLOB_SCOPE* source = glob->release_owned_scope_for_consuming_driver();
         GLOB_SCOPE* new_glob =
-            poly_driver.Run(config, glob->glob, *lower_ctx, &driver_ctx);
+            poly_driver.Run(config, source, *lower_ctx, &driver_ctx);
         if (new_glob) {
-            glob->glob = new_glob;
-            s_active_binding_glob = new_glob;
+            glob->install_owned_scope(
+                std::unique_ptr<GLOB_SCOPE>(new_glob));
             auto& ctx_param = lower_ctx->Get_ctx_param();
             // poly_driver.Run() may reset lower_ctx's ctx_param to defaults
             // (e.g. scaling_factor_bit_num reverts to 40, security_level to
@@ -9164,10 +10848,11 @@ PYBIND11_MODULE(air_builder, m) {
     
     py::class_<FuncScope, std::shared_ptr<FuncScope>>(m, "FuncScope")
         .def(py::init<const std::string&>())
-        .def("new_param", &FuncScope::new_param)
-        .def("container", &FuncScope::get_container, py::return_value_policy::reference)
+        .def("new_param", &FuncScope::new_param, py::keep_alive<0, 1>())
+        .def("container", &FuncScope::get_container,
+             py::return_value_policy::reference_internal)
         .def("dump", &FuncScope::dump)
-        .def_readonly("name", &FuncScope::name);
+        .def_property_readonly("name", &FuncScope::get_name);
     
     py::class_<VectorKernelTraceContext,
                std::shared_ptr<VectorKernelTraceContext>>(
@@ -9188,21 +10873,108 @@ PYBIND11_MODULE(air_builder, m) {
         .def_property_readonly("i32_type",
              &VectorKernelTraceContext::i32_type);
 
+    py::class_<AIRPassTransaction, std::shared_ptr<AIRPassTransaction>>(
+        m, "AIRPassTransaction")
+        .def_property_readonly("active", &AIRPassTransaction::active)
+        .def_property_readonly("dirty", &AIRPassTransaction::dirty)
+        .def_property_readonly("air_pass_generation",
+                               &AIRPassTransaction::air_pass_generation)
+        .def_property_readonly("source_to_candidate",
+                               &AIRPassTransaction::source_to_candidate)
+        .def("air_pass_snapshot", &AIRPassTransaction::air_pass_snapshot)
+        .def("remap_native_id", &AIRPassTransaction::remap_native_id,
+             py::arg("kind"), py::arg("owner"), py::arg("native_id"))
+        .def("create_local", &AIRPassTransaction::create_local,
+             py::arg("function_id"), py::arg("name"), py::arg("type_id"))
+        .def("create_preg", &AIRPassTransaction::create_preg,
+             py::arg("function_id"), py::arg("type_id"))
+        .def("clone_local", &AIRPassTransaction::clone_local,
+             py::arg("destination_function_id"),
+             py::arg("source_function_id"), py::arg("source_datum_id"),
+             py::arg("as_iv") = false)
+        .def("clone_preg", &AIRPassTransaction::clone_preg,
+             py::arg("destination_function_id"),
+             py::arg("source_function_id"), py::arg("source_preg_id"))
+        .def("insert_statement", &AIRPassTransaction::insert_statement,
+             py::arg("target"), py::arg("template"), py::arg("after"))
+        .def("clone_mapped_statement",
+             &AIRPassTransaction::clone_mapped_statement,
+             py::arg("target"), py::arg("source"), py::arg("after"),
+             py::arg("formal_map"), py::arg("local_map"),
+             py::arg("preg_map"), py::arg("iv_map"))
+        .def("replace_statement", &AIRPassTransaction::replace_statement,
+             py::arg("target"), py::arg("template"))
+        .def("erase_statement", &AIRPassTransaction::erase_statement,
+             py::arg("statement"))
+        .def("set_node_child", &AIRPassTransaction::set_node_child,
+             py::arg("node"), py::arg("index"), py::arg("child"))
+        .def("set_node_source_position",
+             &AIRPassTransaction::set_node_source_position,
+             py::arg("node"), py::arg("file_id"), py::arg("line"),
+             py::arg("column"), py::arg("count"),
+             py::arg("statement_begin"), py::arg("basic_block_begin"))
+        .def("set_node_attribute", &AIRPassTransaction::set_node_attribute,
+             py::arg("node"), py::arg("key"), py::arg("element_type"),
+             py::arg("count"), py::arg("payload"))
+        .def("set_node_entry", &AIRPassTransaction::set_node_entry,
+             py::arg("node"), py::arg("entry_id"))
+        .def("set_node_result_preg",
+             &AIRPassTransaction::set_node_result_preg,
+             py::arg("node"), py::arg("preg_id"))
+        .def("set_node_symbol", &AIRPassTransaction::set_node_symbol,
+             py::arg("node"), py::arg("datum_id"))
+        .def("set_node_iv", &AIRPassTransaction::set_node_iv,
+             py::arg("node"), py::arg("datum_id"))
+        .def("set_node_result_type",
+             &AIRPassTransaction::set_node_result_type,
+             py::arg("node"), py::arg("type_id"))
+        .def("remove_function", &AIRPassTransaction::remove_function,
+             py::arg("function_id"))
+        .def("verify", &AIRPassTransaction::verify)
+#ifdef ACE_VECTOR_KERNEL_TEST_SUPPORT
+        .def("force_verification_failure_for_testing",
+             &AIRPassTransaction::force_verification_failure_for_testing)
+#endif
+        .def("commit", &AIRPassTransaction::Commit)
+        .def("rollback", &AIRPassTransaction::Rollback);
+
     py::class_<GlobScope, std::shared_ptr<GlobScope>>(m, "GlobScope")
         .def(py::init<>())
+        .def_property_readonly("air_pass_module_id",
+             &GlobScope::air_pass_module_id)
+        .def_property_readonly("air_pass_revision",
+             &GlobScope::air_pass_revision)
+        .def_property_readonly("air_pass_generation",
+             &GlobScope::air_pass_generation)
+        .def("air_pass_snapshot", [](GlobScope& scope) {
+            if (!scope.glob) throw std::runtime_error("no AIR GLOB_SCOPE");
+            return AIR_PASS_SNAPSHOT_BUILDER(
+                *scope.glob, scope.air_pass_revision(),
+                scope.air_pass_module_id()).Build();
+        })
+        .def("begin_air_pass_transaction",
+             [](const std::shared_ptr<GlobScope>& scope) {
+                 return std::make_shared<AIRPassTransaction>(scope);
+             })
+        .def("invalidate_air_pass_views",
+             &GlobScope::invalidate_air_pass_views,
+             py::arg("advance_revision") = false)
         .def("register_file", &GlobScope::register_file,
              py::arg("filename"),
              "Register a source file and return its ID for source location tracking")
         .def("get_file_id", &GlobScope::get_file_id,
              py::arg("filename"),
              "Get file ID for a registered file (0 if not registered)")
-        .def("new_func", &GlobScope::new_func)
+        .def("new_func", &GlobScope::new_func, py::keep_alive<0, 1>())
         .def("new_func_with_params", &GlobScope::new_func_with_params,
-             py::arg("name"), py::arg("num_params"), py::arg("param_shape"))
+             py::arg("name"), py::arg("num_params"), py::arg("param_shape"),
+             py::keep_alive<0, 1>())
         .def("new_func_with_param_types", &GlobScope::new_func_with_param_types,
-             py::arg("name"), py::arg("ret_type"), py::arg("param_types"))
+             py::arg("name"), py::arg("ret_type"), py::arg("param_types"),
+             py::keep_alive<0, 1>())
         .def("new_func_with_type", &GlobScope::new_func_with_type,
              py::arg("name"), py::arg("num_params"), py::arg("param_shape"), py::arg("type_name"),
+             py::keep_alive<0, 1>(),
              "Create function with specified parameter type name")
         .def("get_type", &GlobScope::get_type)
         .def("new_array_type", &GlobScope::new_array_type,
@@ -9345,9 +11117,14 @@ PYBIND11_MODULE(air_builder, m) {
     // FHE Compiler - Full Pipeline
     py::class_<FheCompiler, std::shared_ptr<FheCompiler>>(m, "FheCompiler")
         .def(py::init<>())
-        .def("init_with_glob", [](FheCompiler& self, GlobScope& glob_scope) {
+        .def("init_with_glob", [](FheCompiler& self,
+                                  std::shared_ptr<GlobScope> glob_scope) {
+            glob_scope->require_no_air_pass_transaction(
+                "FHE compiler initialization");
+            self.bind_owner(glob_scope);
             // Pass the GlobScope's lower_ctx so FheCompiler uses the same type IDs
-            return self.init_with_glob(glob_scope.glob, glob_scope.get_lower_ctx());
+            return self.init_with_glob(
+                glob_scope->glob, glob_scope->get_lower_ctx());
         }, py::arg("glob_scope"),
            "Initialize compiler with glob scope from a compiled kernel")
         .def("configure", &FheCompiler::configure,
@@ -9358,11 +11135,20 @@ PYBIND11_MODULE(air_builder, m) {
              py::arg("first_prime_bits") = 60,
              py::arg("hamming_weight") = 192,
              "Configure FHE parameters")
-        .def("pre_run", &FheCompiler::pre_run,
+        .def("pre_run", [](FheCompiler& self) {
+            self.require_no_air_pass_transaction("FHE compiler pre-run");
+            return self.pre_run();
+        },
              "Initialize and register FHE types")
-        .def("run", &FheCompiler::run,
+        .def("run", [](FheCompiler& self) {
+            self.require_no_air_pass_transaction("FHE compiler lowering");
+            return self.run();
+        },
              "Run the full FHE pipeline (ckks -> poly)")
-        .def("post_run", &FheCompiler::post_run,
+        .def("post_run", [](FheCompiler& self) {
+            self.require_no_air_pass_transaction("FHE compiler post-run");
+            self.post_run();
+        },
              "Post-processing")
         .def("fini", &FheCompiler::fini,
              "Cleanup")
@@ -9375,6 +11161,8 @@ PYBIND11_MODULE(air_builder, m) {
         .def("run_full_pipeline", [](FheCompiler& self, GlobScope& glob_scope,
                                      uint32_t poly_degree, uint32_t mul_level,
                                      bool enable_poly) {
+            glob_scope.require_no_air_pass_transaction(
+                "FHE compiler full pipeline");
             return self.run_full_pipeline(glob_scope.glob, poly_degree, mul_level, enable_poly);
         }, py::arg("glob_scope"),
            py::arg("poly_degree") = 16384,

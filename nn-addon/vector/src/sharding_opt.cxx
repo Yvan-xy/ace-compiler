@@ -106,6 +106,7 @@ void Lower_formal_type(GLOB_SCOPE* gscope, GLOB_SCOPE* new_sharding_gscope,
     ENTRY_PTR new_entry = new_sharding_gscope->New_entry_point(
         new_func_sig, new_func, entry->Name(), entry->Spos());
     if (entry->Is_program_entry()) new_entry->Set_program_entry();
+    if (entry->Is_callable()) new_entry->Set_callable();
     // id map
     func_map.insert({func->Id(), new_func->Id()});
   }

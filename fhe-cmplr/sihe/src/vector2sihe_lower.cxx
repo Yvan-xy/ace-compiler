@@ -146,6 +146,7 @@ void VECTOR2SIHE_LOWER::Lower_func_tab(GLOB_SCOPE* vec_glob_scope) {
     ENTRY_PTR sihe_entry = Glob_scope()->New_entry_point(
         sihe_func_sig, sihe_func, entry->Name(), entry->Spos());
     if (entry->Is_program_entry()) sihe_entry->Set_program_entry();
+    if (entry->Is_callable()) sihe_entry->Set_callable();
 
     Func_map().insert({func->Id(), sihe_func->Id()});
     Entry_map().insert({entry->Id(), sihe_entry->Id()});

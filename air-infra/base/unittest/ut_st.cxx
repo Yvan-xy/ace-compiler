@@ -593,6 +593,12 @@ void TEST_GLOB_SCOPE::Run_test_new_entry_sym() {
   func->Set_parent(_glob->Comp_env_id());
   SIGNATURE_TYPE_PTR sig = _glob->New_sig_type();
   ENTRY_PTR entry = _glob->New_global_entry_point(sig, func, name_str, spos);
+  EXPECT_FALSE(entry->Is_internal());
+  EXPECT_TRUE(entry->Is_callable());
+  entry->Set_internal();
+  EXPECT_TRUE(entry->Is_internal());
+  EXPECT_FALSE(entry->Is_callable());
+  entry->Set_callable();
 
   std::string expected(
       "ENT[0x1] \"My_func_entry\"\n"
@@ -610,6 +616,8 @@ void TEST_GLOB_SCOPE::Run_test_delete_func_symbols() {
   deleted_sig->Set_complete();
   ENTRY_PTR deleted_entry =
       _glob->New_entry_point(deleted_sig, deleted_func, "deleted", spos);
+  EXPECT_TRUE(deleted_entry->Is_internal());
+  EXPECT_FALSE(deleted_entry->Is_callable());
   const FUNC_ID  deleted_func_id  = deleted_func->Id();
   const ENTRY_ID deleted_entry_id = deleted_entry->Id();
 

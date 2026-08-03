@@ -9,10 +9,13 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <string>
+#include <vector>
 
 #include "air/base/container.h"
 #include "air/base/meta_info.h"
 #include "air/base/st.h"
+#include "air/base/st_iter.h"
 #include "air/base/st_misc.h"
 #include "air/core/opcode.h"
 
@@ -183,6 +186,39 @@ void NODE::Copy_attr(CONST_NODE_PTR node) {
   AIR_ASSERT(META_INFO::Has_prop<OPR_PROP::ATTR>(Opcode()));
   AIR_ASSERT(META_INFO::Has_prop<OPR_PROP::ATTR>(node->Opcode()));
   _data->_comm._attr = node->_data->_comm._attr;
+}
+
+void NODE::Set_attr_bytes(const char* key, std::string_view value,
+                          PRIMITIVE_TYPE type, uint32_t count) {
+  AIR_ASSERT(META_INFO::Has_prop<OPR_PROP::ATTR>(Opcode()));
+  ATTR_LIST list(Attr_id(), (SCOPE_BASE*)Func_scope());
+  list.Set_attr(key, value, type, count);
+}
+
+void NODE::Deep_copy_attr(CONST_NODE_PTR source) {
+  AIR_ASSERT(source != Null_ptr);
+  AIR_ASSERT(&Glob_scope() == &source->Glob_scope());
+  AIR_ASSERT(META_INFO::Has_prop<OPR_PROP::ATTR>(Opcode()));
+  AIR_ASSERT(META_INFO::Has_prop<OPR_PROP::ATTR>(source->Opcode()));
+  struct ATTR_VALUE {
+    std::string    _key;
+    std::string    _value;
+    PRIMITIVE_TYPE _type;
+    uint32_t       _count;
+  };
+  std::vector<ATTR_VALUE> values;
+  for (ATTR_ITER iter = source->Begin_attr();
+       iter != source->End_attr(); ++iter) {
+    ATTR_PTR        attr  = *iter;
+    std::string_view value = attr->Value();
+    values.push_back({attr->Key(),
+                      std::string(value.data(), value.size()),
+                      attr->Type(), attr->Count()});
+  }
+  _data->_comm._attr = ATTR_ID();
+  for (auto iter = values.rbegin(); iter != values.rend(); ++iter)
+    Set_attr_bytes(iter->_key.c_str(), iter->_value,
+                   iter->_type, iter->_count);
 }
 
 const ATTR_ID& NODE::Attr_id() const {

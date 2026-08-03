@@ -812,22 +812,6 @@ void Collect_referenced_helpers(const std::unordered_set<uint64_t>& ids,
 
 }  // namespace
 
-GLOB_SCOPE* Clone_glob_with_code(GLOB_SCOPE& source) {
-  std::unique_ptr<GLOB_SCOPE> clone(new GLOB_SCOPE(source.Id(), true));
-  clone->Clone(source);
-  for (GLOB_SCOPE::FUNC_SCOPE_ITER iter = source.Begin_func_scope();
-       iter != source.End_func_scope(); ++iter) {
-    FUNC_SCOPE& old_function = *iter;
-    FUNC_SCOPE& new_function =
-        clone->New_func_scope(old_function.Owning_func_id());
-    new_function.Clone(old_function);
-    STMT_PTR entry = new_function.Container().Clone_stmt_tree(
-        old_function.Container().Entry_stmt());
-    new_function.Set_entry_stmt(entry);
-  }
-  return clone.release();
-}
-
 AIR_FUNCTION_INLINE_RESULT Inline_tagged_leaf_helpers(
     GLOB_SCOPE& glob, const char* call_attribute,
     const char* helper_attribute) {
