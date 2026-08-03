@@ -418,10 +418,10 @@ def _generate_one(
     output_dir: Path,
     model_dir: Path,
 ) -> None:
-    from ace_edsl.edsl.kernels.vector.baseline_conv import (
+    from ace_edsl.edsl.vector.kernels.baseline_conv import (
         configure_baseline_conv_dsl,
     )
-    from ace_edsl.edsl.kernels.vector.fast_conv import fast_conv_recipe
+    from ace_edsl.edsl.vector.kernels.fast_conv import fast_conv_recipe
     from ace_edsl.edsl.pipeline import Pipeline, PipelineTarget
 
     output_dir.mkdir(parents=True, exist_ok=True)

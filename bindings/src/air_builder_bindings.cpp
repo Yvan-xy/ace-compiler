@@ -4136,7 +4136,7 @@ py::object prepared_baseline_gemm_snapshot(
     data["width"] = plan._width;
     data["input_duplications"] = plan._input_duplications;
     py::object freeze = py::module_::import(
-        "ace_edsl.edsl.vector_kernel_lowering").attr(
+        "ace_edsl.edsl.vector.lowering").attr(
             "_freeze_prepared_baseline_gemm_plan");
     return freeze(std::move(data));
 }
@@ -4160,7 +4160,7 @@ py::object prepared_baseline_conv_snapshot(
     data["stride"] = plan._stride;
     data["input_duplications"] = plan._input_duplications;
     py::object freeze = py::module_::import(
-        "ace_edsl.edsl.vector_kernel_lowering").attr(
+        "ace_edsl.edsl.vector.lowering").attr(
             "_freeze_prepared_baseline_conv_plan");
     return freeze(std::move(data));
 }
@@ -4190,7 +4190,7 @@ py::object prepared_fast_gemm_snapshot(
     data["grid_size"] = plan._grid_size;
     data["input_replications"] = plan._input_replications;
     py::object freeze = py::module_::import(
-        "ace_edsl.edsl.vector_kernel_lowering").attr(
+        "ace_edsl.edsl.vector.lowering").attr(
             "_freeze_prepared_fast_gemm_plan");
     return freeze(std::move(data));
 }
@@ -4236,7 +4236,7 @@ py::object prepared_fast_conv_snapshot(
         data["sharding_offset"] = py::none();
     }
     py::object freeze = py::module_::import(
-        "ace_edsl.edsl.vector_kernel_lowering").attr(
+        "ace_edsl.edsl.vector.lowering").attr(
             "_freeze_prepared_fast_conv_plan");
     return freeze(std::move(data));
 }

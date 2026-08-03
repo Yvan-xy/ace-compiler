@@ -178,6 +178,7 @@ run_tests() {
             tests/test_bootstrap_stage_ops.py \
             tests/test_bootstrap_full.py \
             tests/test_vector_kernel_core_types.py \
+            tests/test_vector_namespace.py \
             tests/test_vector_kernel_planning.py \
             tests/test_vector_kernel_plan_provider.py \
             tests/test_vector_kernel_baseline_gemm.py \

@@ -327,10 +327,10 @@ def _generate_one(
     model_dir: Path,
 ) -> None:
     from ace_edsl.edsl.pipeline import Pipeline, PipelineTarget
-    from ace_edsl.edsl.kernels.vector.baseline_gemm import (
+    from ace_edsl.edsl.vector.kernels.baseline_gemm import (
         configure_baseline_gemm_dsl,
     )
-    from ace_edsl.edsl.kernels.vector.fast_gemm import fast_gemm_recipe
+    from ace_edsl.edsl.vector.kernels.fast_gemm import fast_gemm_recipe
 
     output_dir.mkdir(parents=True, exist_ok=True)
     os.chdir(output_dir)

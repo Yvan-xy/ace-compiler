@@ -384,24 +384,16 @@ def test_missing_fast_recipe_obeys_error_and_explicit_fallback(tmp_path):
 
 def test_fast_gemm_exports_and_configuration_are_canonical():
     import ace_edsl.edsl as edsl
-    from ace_edsl.edsl.kernels.vector.fast_gemm import (
+    from ace_edsl.edsl.vector.kernels.fast_gemm import (
         configure_fast_gemm_dsl as canonical_configure,
         fast_gemm_recipe as canonical_recipe,
         fast_gemm_vector_kernel as canonical_kernel,
     )
     from ace_edsl.edsl.pipeline import Pipeline
-    from ace_edsl.edsl.vector_kernel_fast_gemm import (
-        configure_fast_gemm_dsl as compatibility_configure,
-        fast_gemm_recipe as compatibility_recipe,
-        fast_gemm_vector_kernel as compatibility_kernel,
-    )
 
     assert edsl.fast_gemm_recipe is canonical_recipe
     assert edsl.fast_gemm_vector_kernel is canonical_kernel
     assert edsl.configure_fast_gemm_dsl is canonical_configure
-    assert compatibility_recipe is canonical_recipe
-    assert compatibility_kernel is canonical_kernel
-    assert compatibility_configure is canonical_configure
 
     pipeline = Pipeline("fast-gemm-config", dump_ir=False, verbose=False)
     configured = canonical_configure(pipeline, mask_fuse=True, max_slots=_MAX_SLOTS)
@@ -548,7 +540,7 @@ def _plan_summary(prepared):
 
 
 def _worker_main():
-    from ace_edsl.edsl.kernels.vector.fast_gemm import fast_gemm_recipe
+    from ace_edsl.edsl.vector.kernels.fast_gemm import fast_gemm_recipe
     from ace_edsl.edsl.pipeline import Pipeline, PipelineTarget
 
     model = Path(sys.argv[2])

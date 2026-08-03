@@ -529,28 +529,18 @@ def test_missing_fast_conv_recipe_obeys_error_and_explicit_fallback(tmp_path):
 
 def test_fast_conv_exports_and_configuration_are_canonical():
     import ace_edsl.edsl as edsl
-    from ace_edsl.edsl.kernels.vector.fast_conv import (
+    from ace_edsl.edsl.vector.kernels.fast_conv import (
         configure_fast_conv_dsl as canonical_configure,
         fast_conv_recipe as canonical_recipe,
         fast_conv_sharded_vector_kernel as canonical_sharded,
         fast_conv_vector_kernel as canonical_kernel,
     )
     from ace_edsl.edsl.pipeline import Pipeline
-    from ace_edsl.edsl.vector_kernel_fast_conv import (
-        configure_fast_conv_dsl as compatibility_configure,
-        fast_conv_recipe as compatibility_recipe,
-        fast_conv_sharded_vector_kernel as compatibility_sharded,
-        fast_conv_vector_kernel as compatibility_kernel,
-    )
 
     assert edsl.fast_conv_recipe is canonical_recipe
     assert edsl.fast_conv_vector_kernel is canonical_kernel
     assert edsl.fast_conv_sharded_vector_kernel is canonical_sharded
     assert edsl.configure_fast_conv_dsl is canonical_configure
-    assert compatibility_recipe is canonical_recipe
-    assert compatibility_kernel is canonical_kernel
-    assert compatibility_sharded is canonical_sharded
-    assert compatibility_configure is canonical_configure
 
     pipeline = Pipeline("fast-conv-config", dump_ir=False, verbose=False)
     configured = canonical_configure(
@@ -955,7 +945,7 @@ def _adjust_plan(prepared, behavior):
 
 
 def _worker_main():
-    from ace_edsl.edsl.kernels.vector.fast_conv import fast_conv_recipe
+    from ace_edsl.edsl.vector.kernels.fast_conv import fast_conv_recipe
     from ace_edsl.edsl.pipeline import Pipeline, PipelineTarget
 
     model = Path(sys.argv[2])

@@ -19,7 +19,7 @@ from ace_edsl.edsl import AceEDSL, VectorArray, range_dynamic, vector_kernel
 from ace_edsl.edsl.core.air_value import AIRValue
 from ace_edsl.edsl.core.types import VectorTensor
 from ace_edsl.edsl.core.vector_value import VectorValue
-from ace_edsl.edsl.kernels.vector.fast_common import (
+from ace_edsl.edsl.vector.kernels.fast_common import (
     _ranked_constant,
     blocking_rot,
     clear_valid_data,
@@ -27,7 +27,7 @@ from ace_edsl.edsl.kernels.vector.fast_common import (
     reduce_add_intra,
     roll_cyclic,
 )
-from ace_edsl.edsl.vector_kernel_lowering import (
+from ace_edsl.edsl.vector.lowering import (
     ConstantPlan,
     LoopPlan,
     MaskPlan,

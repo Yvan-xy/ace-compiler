@@ -970,7 +970,7 @@ PYTHON_VECTOR_KERNEL_PLAN_PROVIDER::Plan(
   py::gil_scoped_acquire acquire;
   try {
     py::object planning =
-        py::module_::import("ace_edsl.edsl.vector_kernel_planning");
+        py::module_::import("ace_edsl.edsl.vector.planning");
     py::object numpy = py::module_::import("numpy");
     py::dict request_data = Build_request_binding(request, numpy);
     py::object request_view =

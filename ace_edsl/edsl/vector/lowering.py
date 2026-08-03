@@ -521,10 +521,31 @@ def vector_kernel_recipe(kernel: Callable) -> Callable:
         raise TypeError("vector-kernel recipe requires a @vector_kernel callable")
 
     def recipe(trace_context, prepared):
-        from .edsl import AceEDSL
+        from ..edsl import AceEDSL
 
         return AceEDSL._get_dsl().trace_vector_kernel_into(
             trace_context, kernel, prepared
         )
 
     return recipe
+
+
+__all__ = [
+    "AffineIndexPlan",
+    "ConstantPlan",
+    "LoopPlan",
+    "MaskPlan",
+    "PreparedBaselineConvPlan",
+    "PreparedBaselineGemmPlan",
+    "PreparedFastConvPlan",
+    "PreparedFastGemmPlan",
+    "RankedTypePlan",
+    "ReductionPlan",
+    "RotationPlan",
+    "RuntimePreparationPlan",
+    "ScalarPreparationPlan",
+    "ShardingOffsetPlan",
+    "SlicePlan",
+    "SlotPlan",
+    "vector_kernel_recipe",
+]

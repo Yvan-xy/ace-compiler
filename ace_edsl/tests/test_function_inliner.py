@@ -853,7 +853,7 @@ def _pass_dict(result):
 
 def _new_pipeline(model: Path, implementation: str, artifact_tag: str = "pass"):
     from ace_edsl.edsl.pipeline import Pipeline
-    from ace_edsl.edsl.kernels.vector.baseline_gemm import baseline_gemm_recipe
+    from ace_edsl.edsl.vector.kernels.baseline_gemm import baseline_gemm_recipe
 
     pipeline = Pipeline(
         "function-inliner-worker",
@@ -883,7 +883,7 @@ def _new_fast_gemm_pipeline(
     auto_plan: bool = False,
 ):
     from ace_edsl.edsl.pipeline import Pipeline
-    from ace_edsl.edsl.kernels.vector.fast_gemm import fast_gemm_recipe
+    from ace_edsl.edsl.vector.kernels.fast_gemm import fast_gemm_recipe
 
     pipeline = Pipeline(
         "function-inliner-fast-gemm-worker",
@@ -913,7 +913,7 @@ def _new_conv_pipeline(
     auto_plan: bool = False,
 ):
     from ace_edsl.edsl.pipeline import Pipeline
-    from ace_edsl.edsl.kernels.vector.baseline_conv import baseline_conv_recipe
+    from ace_edsl.edsl.vector.kernels.baseline_conv import baseline_conv_recipe
 
     pipeline = Pipeline(
         "function-inliner-conv-worker",
@@ -943,7 +943,7 @@ def _new_fast_conv_pipeline(
     sharding: bool = False,
 ):
     from ace_edsl.edsl.pipeline import Pipeline
-    from ace_edsl.edsl.kernels.vector.fast_conv import fast_conv_recipe
+    from ace_edsl.edsl.vector.kernels.fast_conv import fast_conv_recipe
 
     pipeline = Pipeline(
         "function-inliner-fast-conv-worker",

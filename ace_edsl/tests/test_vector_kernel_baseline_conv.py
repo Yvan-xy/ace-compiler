@@ -447,27 +447,19 @@ def test_unconfigured_conv_pipeline_preserves_default_native_behavior(tmp_path):
 
 def test_baseline_conv_exports_use_the_canonical_vector_kernel_module():
     import ace_edsl.edsl as edsl
-    from ace_edsl.edsl.kernels.vector.baseline_conv import (
+    from ace_edsl.edsl.vector.kernels.baseline_conv import (
         baseline_conv_recipe as canonical_recipe,
         baseline_conv_vector_kernel as canonical_kernel,
         configure_baseline_conv_dsl as canonical_configure,
-    )
-    from ace_edsl.edsl.vector_kernel_baseline_conv import (
-        baseline_conv_recipe as compatibility_recipe,
-        baseline_conv_vector_kernel as compatibility_kernel,
-        configure_baseline_conv_dsl as compatibility_configure,
     )
 
     assert edsl.baseline_conv_recipe is canonical_recipe
     assert edsl.baseline_conv_vector_kernel is canonical_kernel
     assert edsl.configure_baseline_conv_dsl is canonical_configure
-    assert compatibility_recipe is canonical_recipe
-    assert compatibility_kernel is canonical_kernel
-    assert compatibility_configure is canonical_configure
 
 
 def test_baseline_conv_freezer_rejects_another_plan_kind():
-    from ace_edsl.edsl.vector_kernel_lowering import (
+    from ace_edsl.edsl.vector.lowering import (
         _freeze_prepared_baseline_conv_plan,
     )
 
@@ -479,7 +471,7 @@ def _worker_main():
     from ace_bindings import air_builder
     from ace_edsl.edsl.core.air_value import AIRValue
     from ace_edsl.edsl.domain_ast_decorators import snapshot_tracing_state
-    from ace_edsl.edsl.kernels.vector.baseline_conv import baseline_conv_recipe
+    from ace_edsl.edsl.vector.kernels.baseline_conv import baseline_conv_recipe
     from ace_edsl.edsl.pipeline import Pipeline, PipelineTarget
 
     model = Path(sys.argv[2])

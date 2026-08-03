@@ -19,7 +19,7 @@ import pytest
 from ace_bindings import air_builder
 from ace_edsl.edsl import AceEDSL, Tensor, nn_kernel, tensor_ops
 from ace_edsl.edsl.pipeline import Pipeline, PipelineTarget
-from ace_edsl.edsl.vector_kernel_planning import (
+from ace_edsl.edsl.vector.planning import (
     TypedPayload,
     canonical_payload_hash,
     plan_vector_kernel,
@@ -67,10 +67,10 @@ _PROVIDER_CASE_SETTINGS["baseline-gemm-non-power"] = {
 
 
 def _recipes():
-    from ace_edsl.edsl.kernels.vector.baseline_conv import baseline_conv_recipe
-    from ace_edsl.edsl.kernels.vector.baseline_gemm import baseline_gemm_recipe
-    from ace_edsl.edsl.kernels.vector.fast_conv import fast_conv_recipe
-    from ace_edsl.edsl.kernels.vector.fast_gemm import fast_gemm_recipe
+    from ace_edsl.edsl.vector.kernels.baseline_conv import baseline_conv_recipe
+    from ace_edsl.edsl.vector.kernels.baseline_gemm import baseline_gemm_recipe
+    from ace_edsl.edsl.vector.kernels.fast_conv import fast_conv_recipe
+    from ace_edsl.edsl.vector.kernels.fast_gemm import fast_gemm_recipe
 
     return {
         "baseline-gemm": baseline_gemm_recipe,

@@ -5,14 +5,14 @@ import hashlib
 from ace_edsl.base_dsl.ast_helpers import const_expr, range_dynamic
 from ace_edsl.edsl.core.vector_value import VectorValue
 from ace_edsl.edsl.domain_kernels import vector_kernel
-from ace_edsl.edsl.kernels.vector.fast_common import (
+from ace_edsl.edsl.vector.kernels.fast_common import (
     _ranked_constant,
     _require_core_i32,
     blocking_rot,
     collective_reduce,
     roll_cyclic,
 )
-from ace_edsl.edsl.vector_kernel_lowering import PreparedFastConvPlan
+from ace_edsl.edsl.vector.lowering import PreparedFastConvPlan
 
 
 def _local_vector(container, name, air_type):

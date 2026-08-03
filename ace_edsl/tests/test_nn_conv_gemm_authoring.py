@@ -730,10 +730,10 @@ def test_raw_builders_reject_nonconstants_cross_container_and_non_f32():
 
 
 def _worker_main():
-    from ace_edsl.edsl.kernels.vector.baseline_conv import baseline_conv_recipe
-    from ace_edsl.edsl.kernels.vector.baseline_gemm import baseline_gemm_recipe
-    from ace_edsl.edsl.kernels.vector.fast_conv import fast_conv_recipe
-    from ace_edsl.edsl.kernels.vector.fast_gemm import fast_gemm_recipe
+    from ace_edsl.edsl.vector.kernels.baseline_conv import baseline_conv_recipe
+    from ace_edsl.edsl.vector.kernels.baseline_gemm import baseline_gemm_recipe
+    from ace_edsl.edsl.vector.kernels.fast_conv import fast_conv_recipe
+    from ace_edsl.edsl.vector.kernels.fast_gemm import fast_gemm_recipe
     from ace_edsl.edsl.pipeline import Pipeline, PipelineTarget
 
     case_name = sys.argv[2]

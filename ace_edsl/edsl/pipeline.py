@@ -95,7 +95,7 @@ def _selected_vector_kernel_plan_provider(config, registered_provider):
         return None
     if registered_provider is not None:
         return registered_provider
-    from .vector_kernel_planning import plan_vector_kernel
+    from .vector.planning import plan_vector_kernel
 
     return plan_vector_kernel
 

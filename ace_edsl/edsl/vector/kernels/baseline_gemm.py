@@ -3,7 +3,7 @@
 from ace_edsl.edsl.core.air_value import AIRValue
 from ace_edsl.edsl.core.vector_value import VectorValue
 from ace_edsl.edsl.domain_kernels import vector_kernel
-from ace_edsl.edsl.vector_kernel_lowering import (
+from ace_edsl.edsl.vector.lowering import (
     PreparedBaselineGemmPlan,
     vector_kernel_recipe,
 )

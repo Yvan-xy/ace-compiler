@@ -338,23 +338,15 @@ def test_vector_recipe_configuration_is_per_pipeline():
 
 def test_baseline_gemm_recipe_exports_use_the_canonical_vector_kernel_module():
     import ace_edsl.edsl as edsl
-    from ace_edsl.edsl.kernels.vector.baseline_gemm import (
+    from ace_edsl.edsl.vector.kernels.baseline_gemm import (
         baseline_gemm_recipe as canonical_recipe,
         baseline_gemm_vector_kernel as canonical_kernel,
         configure_baseline_gemm_dsl as canonical_configure,
-    )
-    from ace_edsl.edsl.vector_kernel_baseline_gemm import (
-        baseline_gemm_recipe as compatibility_recipe,
-        baseline_gemm_vector_kernel as compatibility_kernel,
-        configure_baseline_gemm_dsl as compatibility_configure,
     )
 
     assert edsl.baseline_gemm_recipe is canonical_recipe
     assert edsl.baseline_gemm_vector_kernel is canonical_kernel
     assert edsl.configure_baseline_gemm_dsl is canonical_configure
-    assert compatibility_recipe is canonical_recipe
-    assert compatibility_kernel is canonical_kernel
-    assert compatibility_configure is canonical_configure
 
 
 
@@ -626,7 +618,7 @@ def _worker_main():
     from ace_edsl.edsl.core.air_value import AIRValue
     from ace_edsl.edsl.domain_ast_decorators import snapshot_tracing_state
     from ace_edsl.edsl.pipeline import Pipeline, PipelineTarget
-    from ace_edsl.edsl.kernels.vector.baseline_gemm import baseline_gemm_recipe
+    from ace_edsl.edsl.vector.kernels.baseline_gemm import baseline_gemm_recipe
 
     model = Path(sys.argv[2])
     implementation = sys.argv[3]

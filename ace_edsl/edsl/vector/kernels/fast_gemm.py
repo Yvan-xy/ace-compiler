@@ -3,13 +3,13 @@
 from ace_edsl.base_dsl.ast_helpers import range_dynamic
 from ace_edsl.edsl.core.vector_value import VectorValue
 from ace_edsl.edsl.domain_kernels import vector_kernel
-from ace_edsl.edsl.kernels.vector.fast_common import (
+from ace_edsl.edsl.vector.kernels.fast_common import (
     _ranked_constant,
     blocking_rot,
     clear_valid_data,
     reduce_add_intra,
 )
-from ace_edsl.edsl.vector_kernel_lowering import (
+from ace_edsl.edsl.vector.lowering import (
     PreparedFastGemmPlan,
     vector_kernel_recipe,
 )

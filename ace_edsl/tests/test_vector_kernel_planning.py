@@ -9,7 +9,7 @@ import hashlib
 import numpy as np
 import pytest
 
-import ace_edsl.edsl.vector_kernel_planning as planning
+import ace_edsl.edsl.vector.planning as planning
 
 
 _I64_MAX = (1 << 63) - 1

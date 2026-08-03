@@ -76,29 +76,29 @@ from .pipeline import (
     PipelineTarget,
     VectorKernelLoweringConfig,
 )
-from .vector_kernel_lowering import (
+from .vector.lowering import (
     PreparedBaselineConvPlan,
     PreparedBaselineGemmPlan,
     PreparedFastConvPlan,
     PreparedFastGemmPlan,
     vector_kernel_recipe,
 )
-from .kernels.vector.baseline_gemm import (
+from .vector.kernels.baseline_gemm import (
     baseline_gemm_recipe,
     baseline_gemm_vector_kernel,
     configure_baseline_gemm_dsl,
 )
-from .kernels.vector.baseline_conv import (
+from .vector.kernels.baseline_conv import (
     baseline_conv_recipe,
     baseline_conv_vector_kernel,
     configure_baseline_conv_dsl,
 )
-from .kernels.vector.fast_gemm import (
+from .vector.kernels.fast_gemm import (
     configure_fast_gemm_dsl,
     fast_gemm_recipe,
     fast_gemm_vector_kernel,
 )
-from .kernels.vector.fast_conv import (
+from .vector.kernels.fast_conv import (
     configure_fast_conv_dsl,
     fast_conv_recipe,
     fast_conv_sharded_vector_kernel,
