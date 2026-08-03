@@ -751,6 +751,45 @@ TEST(Tensor2VectorPlanning, CppGemmAutoAndForcedPlansAreDeterministic) {
 }
 
 TEST(Tensor2VectorPlanning,
+     BaselineGemmNonPowerFactorPreservesReferenceReduction) {
+  const VECTOR_KERNEL_PLANNING_REQUEST request{
+      VECTOR_KERNEL_OPERATION::GEMM,
+      {},
+      {VECTOR_KERNEL_RANKED_TYPE_PLAN{PRIMITIVE_TYPE::FLOAT_32, {6}},
+       VECTOR_KERNEL_RANKED_TYPE_PLAN{PRIMITIVE_TYPE::FLOAT_32, {2, 6}},
+       VECTOR_KERNEL_RANKED_TYPE_PLAN{PRIMITIVE_TYPE::FLOAT_32, {2}}},
+      VECTOR_KERNEL_RANKED_TYPE_PLAN{PRIMITIVE_TYPE::FLOAT_32, {2}},
+      VECTOR_KERNEL_OPTION_SNAPSHOT{false, false, false, false, false},
+      VECTOR_KERNEL_TARGET_SNAPSHOT{16, 1, 65536},
+      {Float_payload("weight", {2, 6},
+                     {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F,
+                      7.0F, 8.0F, 9.0F, 10.0F, 11.0F, 12.0F}),
+       Float_payload("bias", {2}, {0.25F, -0.5F})},
+      VECTOR_KERNEL_REQUESTED_PLAN_KIND::BASELINE_GEMM};
+
+  const VECTOR_KERNEL_RESOLUTION_RESULT resolved =
+      Resolve_vector_kernel_plan(
+          request,
+          Selection(VECTOR_KERNEL_REQUESTED_PLAN_KIND::BASELINE_GEMM),
+          nullptr);
+  ASSERT_TRUE(resolved.Ok()) << resolved._diagnostic;
+  ASSERT_TRUE(
+      std::holds_alternative<BASELINE_GEMM_PLAN>(resolved._prepared->Plan()));
+  const BASELINE_GEMM_PLAN& plan =
+      std::get<BASELINE_GEMM_PLAN>(resolved._prepared->Plan());
+
+  EXPECT_EQ(plan._height, 2);
+  EXPECT_EQ(plan._width, 6);
+  EXPECT_EQ(plan._input_duplications, 2);
+  ASSERT_FALSE(plan._common._loops.empty());
+  ASSERT_FALSE(plan._common._rotations.empty());
+  ASSERT_EQ(plan._common._reductions.size(), 1U);
+  Expect_loop(plan._common._loops.back(), "block-reduction", 0, 2, 1, 0);
+  Expect_rotation(plan._common._rotations.back(), "block-reduction", {2, 4});
+  Expect_reduction(plan._common._reductions.front(), "block-reduction", 3, 2);
+}
+
+TEST(Tensor2VectorPlanning,
      RankedGemmInputIsPreservedByBothReferencePlans) {
   for (VECTOR_KERNEL_REQUESTED_PLAN_KIND kind :
        {VECTOR_KERNEL_REQUESTED_PLAN_KIND::BASELINE_GEMM,

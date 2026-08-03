@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -77,7 +78,7 @@ def test_validating_driver_accepts_compact_terminal_block(tmp_path):
     assert "CONV_RESULT=%s" in generated
 
 
-def test_three_way_cli_requires_complete_distinct_path_set(monkeypatch):
+def test_comparison_cli_requires_complete_distinct_path_set(monkeypatch):
     monkeypatch.setattr(
         sys,
         "argv",
@@ -94,8 +95,26 @@ def test_three_way_cli_requires_complete_distinct_path_set(monkeypatch):
         conv.THREE_WAY_IMPLEMENTATIONS
     )
 
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "conv_e2e_compare.py",
+            "--implementations",
+            "python-dsl-fast",
+            "metakernel-fast",
+            "dsl-fast",
+            "cpp-baseline",
+        ],
+    )
+    arguments = conv._parse_arguments()
+    assert set(arguments.implementations) == set(
+        conv.FOUR_WAY_IMPLEMENTATIONS
+    )
+
     invalid_selections = (
         ("dsl-fast", "cpp-baseline"),
+        ("dsl-fast", "cpp-baseline", "python-dsl-fast"),
         ("dsl-fast", "dsl-fast", "metakernel-fast"),
         ("native", "dsl-fast", "cpp-baseline", "metakernel-fast"),
         ("dsl", "native"),
@@ -138,7 +157,11 @@ def test_sequence_offsets_require_one_exact_contiguous_copy():
     assert conv._sequence_offsets([[1]], []) == []
 
 
-def test_unsupported_inventory_records_unreadable_onnx(tmp_path):
+def test_unsupported_inventory_records_unreadable_onnx(tmp_path, monkeypatch):
+    def fail_load(*_args, **_kwargs):
+        raise ValueError("not an ONNX model")
+
+    monkeypatch.setitem(sys.modules, "onnx", SimpleNamespace(load=fail_load))
     (tmp_path / "broken.onnx").write_bytes(b"not an ONNX model")
 
     unsupported = conv._unsupported_conv_models(tmp_path)

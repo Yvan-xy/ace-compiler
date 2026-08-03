@@ -86,6 +86,12 @@ check_prerequisites() {
         warn "pybind11 not found. Installing..."
         pip install pybind11
     fi
+
+    # Check NumPy (required by the Python vector-kernel planner)
+    if ! python3 -c "import numpy" &> /dev/null; then
+        warn "NumPy not found. Installing..."
+        pip install "numpy>=1.21.0"
+    fi
     
     # Check ACE libraries
     if [ -z "${ACE_INSTALL_DIR}" ]; then
@@ -172,13 +178,17 @@ run_tests() {
             tests/test_bootstrap_stage_ops.py \
             tests/test_bootstrap_full.py \
             tests/test_vector_kernel_core_types.py \
+            tests/test_vector_kernel_planning.py \
+            tests/test_vector_kernel_plan_provider.py \
             tests/test_vector_kernel_baseline_gemm.py \
             tests/test_vector_kernel_baseline_conv.py \
             tests/test_nn_conv_gemm_authoring.py \
             tests/test_vector_kernel_fast_substrate.py \
             tests/test_vector_kernel_fast_gemm.py \
+            tests/test_vector_kernel_fast_conv.py \
             tests/test_function_inliner.py \
             tests/test_gemm_e2e_compare.py \
+            tests/test_conv_e2e_compare.py \
             -v --tb=short 2>&1; then
             info "Unit tests passed"
             PASSED=$((PASSED + 1))

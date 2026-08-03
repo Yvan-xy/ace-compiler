@@ -34,7 +34,8 @@ THREE_WAY_IMPLEMENTATIONS = (
     "cpp-baseline",
     "metakernel-fast",
 )
-ALL_IMPLEMENTATIONS = IMPLEMENTATIONS + THREE_WAY_IMPLEMENTATIONS
+FOUR_WAY_IMPLEMENTATIONS = THREE_WAY_IMPLEMENTATIONS + ("python-dsl-fast",)
+ALL_IMPLEMENTATIONS = IMPLEMENTATIONS + FOUR_WAY_IMPLEMENTATIONS
 INLINER_IMPLEMENTATION = "tentative-binding-transition"
 _CONV_DRIVER_END = """\
   Finalize_context();
@@ -287,7 +288,9 @@ def _path_evidence(
     if re.search(r"\bNN\.conv\b", tensor_ir, re.IGNORECASE):
         raise RuntimeError("Tensor-to-Vector path left an NN Conv behind")
 
-    if implementation == "dsl-fast":
+    is_dsl_fast = implementation in ("dsl-fast", "python-dsl-fast")
+    plan_provider = _shared._plan_provider_for_implementation(implementation)
+    if is_dsl_fast:
         kernel_impl = "dsl"
         requested_plan_kind = "fast-conv"
     elif implementation == "metakernel-fast":
@@ -303,7 +306,7 @@ def _path_evidence(
     }
     evidence: dict[str, object] = {
         "requested_implementation": implementation,
-        "requested_plan_provider": "cpp",
+        "requested_plan_provider": plan_provider,
         "requested_kernel_impl": kernel_impl,
         "requested_plan_kind": requested_plan_kind,
         "requested_fallback": "error",
@@ -311,15 +314,16 @@ def _path_evidence(
         "fallback_used": False,
         "blocking_markers": blocking_markers,
     }
-    if implementation == "dsl-fast":
+    if is_dsl_fast:
         if len(prepared_plans) != 1:
             raise RuntimeError(
-                "DSL-fast path requires exactly one captured prepared plan"
+                f"{implementation} path requires exactly one captured prepared plan"
             )
         prepared = prepared_plans[0]
-        if prepared.kind != "fast-conv" or prepared.provenance != "cpp":
+        if prepared.kind != "fast-conv" or prepared.provenance != plan_provider:
             raise RuntimeError(
-                "explicit DSL-fast path did not receive the C++ fast-Conv plan"
+                f"explicit {implementation} path did not receive the "
+                f"{plan_provider} fast-Conv plan"
             )
         if not re.fullmatch(
             r"__ace_vkernel_fast_conv_[0-9a-f]{64}", prepared.helper_name
@@ -375,6 +379,7 @@ def _path_evidence(
         evidence.update(_prepared_evidence(prepared))
         evidence.update(
             {
+                "actual_plan_provider": prepared.provenance,
                 "prepared_callback_count": len(prepared_plans),
                 "pre_inline_helper_definitions": definitions,
                 "pre_inline_helper_calls": calls,
@@ -471,14 +476,14 @@ def _generate_one(
             conv_parallel=False,
             sharding=False,
         )
-    elif implementation == "dsl-fast":
+    elif implementation in ("dsl-fast", "python-dsl-fast"):
 
         def capture_recipe(trace, prepared):
             prepared_plans.append(prepared)
             return fast_conv_recipe(trace, prepared)
 
         pipeline.configure_vector_kernel_lowering(
-            plan_provider="cpp",
+            plan_provider=_shared._plan_provider_for_implementation(implementation),
             kernel_impl="dsl",
             plan_kind="fast-conv",
             fallback="error",
@@ -523,7 +528,7 @@ def _generate_one(
         )
         raise RuntimeError(result.error)
 
-    uses_inliner = implementation in ("dsl", "dsl-fast")
+    uses_inliner = implementation in ("dsl", "dsl-fast", "python-dsl-fast")
     expected_stages = [
         "tensor2vector",
         *(["vector_kernel_inline"] if uses_inliner else []),
@@ -635,12 +640,15 @@ def _parse_arguments() -> argparse.Namespace:
     if len(set(arguments.implementations)) != len(arguments.implementations):
         parser.error("--implementations must not contain duplicates")
     selected = tuple(arguments.implementations)
-    if selected != IMPLEMENTATIONS and set(selected) != set(
-        THREE_WAY_IMPLEMENTATIONS
+    if (
+        selected != IMPLEMENTATIONS
+        and set(selected) != set(THREE_WAY_IMPLEMENTATIONS)
+        and set(selected) != set(FOUR_WAY_IMPLEMENTATIONS)
     ):
         parser.error(
             "--implementations must select the default native/DSL pair or "
-            "all three fast-comparison paths"
+            "all three C++ fast-comparison paths, optionally with "
+            "python-dsl-fast"
         )
     if arguments.warmups < 0 or arguments.runs < 1:
         parser.error("--warmups must be nonnegative and --runs must be positive")
@@ -678,6 +686,11 @@ def main() -> int:
     unsupported = _unsupported_conv_models(model_dir)
     root.mkdir(parents=True, exist_ok=True)
     summaries = []
+    plan_providers = {
+        implementation: _shared._plan_provider_for_implementation(implementation)
+        for implementation in arguments.implementations
+    }
+    unique_plan_providers = set(plan_providers.values())
     for model in arguments.models:
         summaries.append(
             _shared._benchmark_model(
@@ -716,7 +729,12 @@ def main() -> int:
                 "mask_fuse": False,
                 "conv_parallel": False,
                 "sharding": False,
-                "plan_provider": "cpp",
+                "plan_provider": (
+                    next(iter(unique_plan_providers))
+                    if len(unique_plan_providers) == 1
+                    else "mixed"
+                ),
+                "plan_provider_by_implementation": plan_providers,
                 "fallback": "error",
                 "cxx_optimization": "-O3",
                 "cxx_openmp": True,

@@ -11,6 +11,7 @@ import sys
 import pytest
 
 from ace_edsl.tests.gemm_e2e_compare import (
+    FOUR_WAY_IMPLEMENTATIONS,
     IMPLEMENTATIONS,
     MODEL_SLOTS,
     THREE_WAY_IMPLEMENTATIONS,
@@ -187,7 +188,13 @@ def test_three_path_timing_summary_reports_pairwise_gaps():
     assert dsl_over_fast["gap_percent"] == pytest.approx(100.0)
 
 
-def test_dsl_fast_path_evidence_requires_actual_fast_plan_and_inlining():
+@pytest.mark.parametrize(
+    ("implementation", "provenance"),
+    [("dsl-fast", "cpp"), ("python-dsl-fast", "python")],
+)
+def test_dsl_fast_path_evidence_requires_actual_fast_plan_and_inlining(
+    implementation, provenance
+):
     helper_name = "__ace_vkernel_fast_gemm_" + "a" * 64
     tensor_ir = (
         f'FUN[1] "{helper_name}"\n'
@@ -199,7 +206,7 @@ def test_dsl_fast_path_evidence_requires_actual_fast_plan_and_inlining():
     )
     prepared = SimpleNamespace(
         kind="fast-gemm",
-        provenance="cpp",
+        provenance=provenance,
         specialization_key="fast-gemm:test",
         helper_name=helper_name,
         constants=(SimpleNamespace(role="weight", content_hash="sha256:x"),),
@@ -209,7 +216,7 @@ def test_dsl_fast_path_evidence_requires_actual_fast_plan_and_inlining():
     )
 
     evidence = _path_evidence(
-        "dsl-fast",
+        implementation,
         {
             "tensor2vector": tensor_ir,
             "vector_kernel_inline": f'STR[1] "{helper_name}"\n',
@@ -219,7 +226,9 @@ def test_dsl_fast_path_evidence_requires_actual_fast_plan_and_inlining():
 
     assert evidence["requested_plan_kind"] == "fast-gemm"
     assert evidence["actual_plan_kind"] == "fast-gemm"
-    assert evidence["plan_provenance"] == "cpp"
+    assert evidence["requested_plan_provider"] == provenance
+    assert evidence["actual_plan_provider"] == provenance
+    assert evidence["plan_provenance"] == provenance
     assert evidence["specialization_key"] == "fast-gemm:test"
     assert evidence["pre_inline_helper_definitions"] == 1
     assert evidence["pre_inline_helper_calls"] == 1
@@ -231,7 +240,7 @@ def test_dsl_fast_path_evidence_requires_actual_fast_plan_and_inlining():
     assert not evidence["fallback_used"]
 
     blocked = _path_evidence(
-        "dsl-fast",
+        implementation,
         {"tensor2vector": tensor_ir},
         [prepared],
         require_inlined=False,
@@ -255,6 +264,16 @@ def test_implementation_cli_preserves_default_and_accepts_exact_three_way(
     )
     selected = _parse_arguments()
     assert tuple(selected.implementations) == THREE_WAY_IMPLEMENTATIONS
+
+
+def test_implementation_cli_accepts_exact_four_way(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gemm_e2e_compare.py", "--implementations", *FOUR_WAY_IMPLEMENTATIONS],
+    )
+    selected = _parse_arguments()
+    assert tuple(selected.implementations) == FOUR_WAY_IMPLEMENTATIONS
 
 
 def test_new_4096_by_10_model_cli_uses_4096_slots(monkeypatch):

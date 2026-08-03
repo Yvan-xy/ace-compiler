@@ -28,7 +28,8 @@ MODEL_SLOTS = {
 }
 IMPLEMENTATIONS = ("native", "dsl")
 THREE_WAY_IMPLEMENTATIONS = ("dsl-fast", "cpp-baseline", "metakernel-fast")
-ALL_IMPLEMENTATIONS = IMPLEMENTATIONS + THREE_WAY_IMPLEMENTATIONS
+FOUR_WAY_IMPLEMENTATIONS = THREE_WAY_IMPLEMENTATIONS + ("python-dsl-fast",)
+ALL_IMPLEMENTATIONS = IMPLEMENTATIONS + FOUR_WAY_IMPLEMENTATIONS
 SCALING_FACTOR_BITS = 56
 FIRST_PRIME_BITS = 60
 HAMMING_WEIGHT = 192
@@ -193,6 +194,10 @@ def _expected_rotation_numbers(prepared: object) -> list[list[int]]:
     return values
 
 
+def _plan_provider_for_implementation(implementation: str) -> str:
+    return "python" if implementation == "python-dsl-fast" else "cpp"
+
+
 def _path_evidence(
     implementation: str,
     phase_irs: dict[str, str],
@@ -206,7 +211,9 @@ def _path_evidence(
     if re.search(r"\bNN\.gemm\b", tensor_ir, re.IGNORECASE):
         raise RuntimeError("Tensor-to-Vector path left an NN Gemm behind")
 
-    if implementation == "dsl-fast":
+    is_dsl_fast = implementation in ("dsl-fast", "python-dsl-fast")
+    plan_provider = _plan_provider_for_implementation(implementation)
+    if is_dsl_fast:
         kernel_impl = "dsl"
         requested_plan_kind = "fast-gemm"
     elif implementation == "metakernel-fast":
@@ -218,7 +225,7 @@ def _path_evidence(
 
     evidence: dict[str, object] = {
         "requested_implementation": implementation,
-        "requested_plan_provider": "cpp",
+        "requested_plan_provider": plan_provider,
         "requested_kernel_impl": kernel_impl,
         "requested_plan_kind": requested_plan_kind,
         "requested_fallback": "error",
@@ -228,15 +235,16 @@ def _path_evidence(
         "packed_partition_comment": "gemm result reduce->Ps=" in tensor_ir,
         "kp_over_np_comment": "gemm result reduce->(kp/np)=" in tensor_ir,
     }
-    if implementation == "dsl-fast":
+    if is_dsl_fast:
         if len(prepared_plans) != 1:
             raise RuntimeError(
-                "DSL-fast path requires exactly one captured prepared plan"
+                f"{implementation} path requires exactly one captured prepared plan"
             )
         prepared = prepared_plans[0]
-        if prepared.kind != "fast-gemm" or prepared.provenance != "cpp":
+        if prepared.kind != "fast-gemm" or prepared.provenance != plan_provider:
             raise RuntimeError(
-                "explicit DSL-fast path did not receive the C++ fast-GEMM plan"
+                f"explicit {implementation} path did not receive the "
+                f"{plan_provider} fast-GEMM plan"
             )
         helper_name = prepared.helper_name
         definitions, calls = _helper_records(tensor_ir, helper_name)
@@ -268,6 +276,7 @@ def _path_evidence(
         evidence.update(
             {
                 "actual_plan_kind": prepared.kind,
+                "actual_plan_provider": prepared.provenance,
                 "plan_provenance": prepared.provenance,
                 "specialization_key": prepared.specialization_key,
                 "helper_name": helper_name,
@@ -374,14 +383,14 @@ def _generate_one(
             mask_fuse=False,
             max_slots=slots,
         )
-    elif implementation == "dsl-fast":
+    elif implementation in ("dsl-fast", "python-dsl-fast"):
 
         def capture_recipe(trace, prepared):
             prepared_plans.append(prepared)
             return fast_gemm_recipe(trace, prepared)
 
         pipeline.configure_vector_kernel_lowering(
-            plan_provider="cpp",
+            plan_provider=_plan_provider_for_implementation(implementation),
             kernel_impl="dsl",
             plan_kind="fast-gemm",
             fallback="error",
@@ -398,7 +407,10 @@ def _generate_one(
         for phase, ir in phase_irs.items():
             (output_dir / f"{phase}.air").write_text(ir)
         path_evidence = None
-        if implementation == "dsl-fast" and "tensor2vector" in phase_irs:
+        if (
+            implementation in ("dsl-fast", "python-dsl-fast")
+            and "tensor2vector" in phase_irs
+        ):
             path_evidence = _path_evidence(
                 implementation,
                 phase_irs,
@@ -418,7 +430,7 @@ def _generate_one(
             json.dumps(failure, indent=2, sort_keys=True) + "\n"
         )
         raise RuntimeError(result.error)
-    uses_inliner = implementation in ("dsl", "dsl-fast")
+    uses_inliner = implementation in ("dsl", "dsl-fast", "python-dsl-fast")
     expected_stages = [
         "tensor2vector",
         *(["vector_kernel_inline"] if uses_inliner else []),
@@ -948,10 +960,15 @@ def _parse_arguments() -> argparse.Namespace:
     if len(set(arguments.implementations)) != len(arguments.implementations):
         parser.error("--implementations must not contain duplicates")
     selected = tuple(arguments.implementations)
-    if selected != IMPLEMENTATIONS and set(selected) != set(THREE_WAY_IMPLEMENTATIONS):
+    if (
+        selected != IMPLEMENTATIONS
+        and set(selected) != set(THREE_WAY_IMPLEMENTATIONS)
+        and set(selected) != set(FOUR_WAY_IMPLEMENTATIONS)
+    ):
         parser.error(
             "--implementations must select the default native/DSL pair or "
-            "all three fast-comparison paths"
+            "all three C++ fast-comparison paths, optionally with "
+            "python-dsl-fast"
         )
     if arguments.warmups < 0 or arguments.runs < 1:
         parser.error("--warmups must be nonnegative and --runs must be positive")
@@ -998,6 +1015,11 @@ def main() -> int:
                 tuple(arguments.implementations),
             )
         )
+    plan_providers = {
+        implementation: _plan_provider_for_implementation(implementation)
+        for implementation in arguments.implementations
+    }
+    unique_plan_providers = set(plan_providers.values())
     aggregate = {
         "settings": {
             "models": arguments.models,
@@ -1013,7 +1035,12 @@ def main() -> int:
                 "hamming_weight": HAMMING_WEIGHT,
                 "free_poly": FREE_POLY,
                 "mask_fuse": False,
-                "plan_provider": "cpp",
+                "plan_provider": (
+                    next(iter(unique_plan_providers))
+                    if len(unique_plan_providers) == 1
+                    else "mixed"
+                ),
+                "plan_provider_by_implementation": plan_providers,
                 "fallback": "error",
                 "cxx_optimization": "-O3",
                 "cxx_openmp": True,
