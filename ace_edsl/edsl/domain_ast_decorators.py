@@ -55,6 +55,11 @@ def get_current_container():
     return _current_container
 
 
+def get_current_domain():
+    """Get the lexical domain of the active AIR trace."""
+    return _current_domain
+
+
 def snapshot_tracing_state():
     """Capture all module-owned state changed by nested AIR tracing."""
     return (

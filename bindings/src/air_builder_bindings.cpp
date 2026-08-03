@@ -16,6 +16,7 @@
 #include <pybind11/complex.h>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <memory>
@@ -583,6 +584,28 @@ public:
         return Type::from_air_type(node->Rtype(), _lifetime);
     }
 
+    bool is_inline_array_constant() const {
+        require_active();
+        return has_node && node != Null_ptr &&
+               node->Opcode() == air::core::OPC_LDC &&
+               node->Const() != Null_ptr &&
+               node->Const()->Kind() == CONSTANT_KIND::ARRAY;
+    }
+
+    py::bytes inline_array_constant_bytes() const {
+        require_active();
+        if (!has_node || node == Null_ptr ||
+            node->Opcode() != air::core::OPC_LDC ||
+            node->Const() == Null_ptr ||
+            node->Const()->Kind() != CONSTANT_KIND::ARRAY) {
+            throw std::runtime_error(
+                "node is not an inline CORE.LDC ARRAY constant");
+        }
+        CONSTANT_PTR constant = node->Const();
+        return py::bytes(
+            constant->Array_buffer(), constant->Array_byte_len());
+    }
+
     void add_child(std::shared_ptr<Node> child) { children.push_back(child); }
 
     std::string to_string() const {
@@ -847,6 +870,73 @@ public:
         return type;
     }
 
+    ARRAY_TYPE_PTR require_ranked_f32_operand(
+        const std::shared_ptr<Node>& value, const char* operation,
+        size_t expected_rank) {
+        TYPE_PTR type = require_vector_operand(value, operation);
+        ARRAY_TYPE_PTR array = type->Cast_to_arr();
+        if (array->Dim() != expected_rank) {
+            throw std::runtime_error(
+                std::string(operation) + " requires a rank-" +
+                std::to_string(expected_rank) + " f32 operand");
+        }
+        TYPE_PTR element = array->Elem_type();
+        if (!element->Is_prim() ||
+            element->Cast_to_prim()->Encoding() !=
+                PRIMITIVE_TYPE::FLOAT_32) {
+            throw std::runtime_error(std::string(operation) +
+                                     " requires f32 ranked operands");
+        }
+        for (int64_t dimension : array->Shape()) {
+            if (dimension <= 0) {
+                throw std::runtime_error(std::string(operation) +
+                                         " requires positive operand dimensions");
+            }
+        }
+        return array;
+    }
+
+    void require_inline_array_constant(const std::shared_ptr<Node>& value,
+                                       const char* operation,
+                                       const char* role) {
+        if (value->node->Opcode() != air::core::OPC_LDC ||
+            value->node->Const() == Null_ptr ||
+            value->node->Const()->Kind() != CONSTANT_KIND::ARRAY) {
+            throw std::runtime_error(std::string(operation) + " requires " +
+                                     role + " to be an inline ARRAY constant");
+        }
+    }
+
+    static std::vector<int32_t> checked_s32_values(
+        const std::vector<int64_t>& values, const char* operation,
+        const char* attribute) {
+        std::vector<int32_t> checked;
+        checked.reserve(values.size());
+        for (int64_t value : values) {
+            if (value < std::numeric_limits<int32_t>::min() ||
+                value > std::numeric_limits<int32_t>::max()) {
+                throw std::runtime_error(
+                    std::string(operation) + " attribute '" + attribute +
+                    "' is out of signed i32 range");
+            }
+            checked.push_back(static_cast<int32_t>(value));
+        }
+        return checked;
+    }
+
+    TYPE_PTR new_ranked_f32_type(const std::vector<int64_t>& shape,
+                                 const char* name) {
+        for (int64_t dimension : shape) {
+            if (dimension <= 0) {
+                throw std::runtime_error(std::string(name) +
+                                         " requires positive dimensions");
+            }
+        }
+        return glob->New_arr_type(
+            glob->New_str(name), glob->Prim_type(PRIMITIVE_TYPE::FLOAT_32),
+            shape, get_spos());
+    }
+
     TYPE_PTR require_core_s32_operand(const std::shared_ptr<Node>& value,
                                       const char* operation) {
         require_not_expired();
@@ -1044,18 +1134,246 @@ public:
         return node;
     }
     
-    std::shared_ptr<Node> new_nn_conv(std::shared_ptr<Node> x, std::shared_ptr<Node> w, std::shared_ptr<Node> b) {
+    std::shared_ptr<Node> new_nn_conv(
+        std::shared_ptr<Node> x, std::shared_ptr<Node> w,
+        std::shared_ptr<Node> b, const std::vector<int64_t>& strides,
+        const std::vector<int64_t>& pads,
+        const std::vector<int64_t>& dilations,
+        const std::vector<int64_t>& kernel_shape, int64_t group) {
         require_not_expired();
-        if (!container || !x->has_node || !w->has_node || !b->has_node) {
-            throw std::runtime_error("new_nn_conv requires real container and operands");
+        if (!(container && glob)) {
+            throw std::runtime_error(
+                "new_nn_conv requires a real container and global scope");
         }
+
+        ARRAY_TYPE_PTR x_type =
+            require_ranked_f32_operand(x, "new_nn_conv", 4);
+        ARRAY_TYPE_PTR w_type =
+            require_ranked_f32_operand(w, "new_nn_conv", 4);
+        ARRAY_TYPE_PTR b_type =
+            require_ranked_f32_operand(b, "new_nn_conv", 1);
+        require_inline_array_constant(w, "new_nn_conv", "weight");
+        require_inline_array_constant(b, "new_nn_conv", "bias");
+
+        if (strides.size() != 2 || pads.size() != 4 ||
+            dilations.size() != 2 || kernel_shape.size() != 2) {
+            throw std::runtime_error(
+                "new_nn_conv requires strides[2], pads[4], dilations[2], "
+                "and kernel_shape[2]");
+        }
+        std::vector<int32_t> checked_strides =
+            checked_s32_values(strides, "new_nn_conv", "strides");
+        std::vector<int32_t> checked_pads =
+            checked_s32_values(pads, "new_nn_conv", "pads");
+        std::vector<int32_t> checked_dilations =
+            checked_s32_values(dilations, "new_nn_conv", "dilations");
+        std::vector<int32_t> checked_kernel_shape =
+            checked_s32_values(kernel_shape, "new_nn_conv", "kernel_shape");
+        std::vector<int32_t> checked_group =
+            checked_s32_values({group}, "new_nn_conv", "group");
+
+        if (checked_strides[0] <= 0 || checked_strides[1] <= 0 ||
+            checked_dilations[0] <= 0 || checked_dilations[1] <= 0 ||
+            checked_kernel_shape[0] <= 0 ||
+            checked_kernel_shape[1] <= 0 || checked_group[0] <= 0) {
+            throw std::runtime_error(
+                "new_nn_conv requires positive strides, dilations, "
+                "kernel_shape, and group");
+        }
+        if (std::any_of(checked_pads.begin(), checked_pads.end(),
+                        [](int32_t value) { return value < 0; })) {
+            throw std::runtime_error(
+                "new_nn_conv requires nonnegative padding");
+        }
+
+        const std::vector<int64_t> x_shape = x_type->Shape();
+        const std::vector<int64_t> w_shape = w_type->Shape();
+        const std::vector<int64_t> b_shape = b_type->Shape();
+        if (x_shape[0] != 1) {
+            throw std::runtime_error(
+                "new_nn_conv supports only batch-one NCHW input");
+        }
+        if (w_shape[2] != kernel_shape[0] ||
+            w_shape[3] != kernel_shape[1]) {
+            throw std::runtime_error(
+                "new_nn_conv kernel_shape must match the weight shape");
+        }
+        if (kernel_shape[0] != kernel_shape[1]) {
+            throw std::runtime_error(
+                "new_nn_conv supports only square spatial kernels");
+        }
+        if (dilations[0] != 1 || dilations[1] != 1) {
+            throw std::runtime_error(
+                "new_nn_conv supports only unit dilation");
+        }
+        if (strides[0] != 1 || strides[1] != 1) {
+            throw std::runtime_error(
+                "new_nn_conv supports only unit authored strides");
+        }
+        if (pads[0] != pads[1] || pads[0] != pads[2] ||
+            pads[0] != pads[3]) {
+            throw std::runtime_error(
+                "new_nn_conv supports only equal spatial padding");
+        }
+
+        const int64_t channel_in = x_shape[1];
+        const int64_t channel_out = w_shape[0];
+        if (group == 1) {
+            if (w_shape[1] != channel_in) {
+                throw std::runtime_error(
+                    "new_nn_conv weight/input channels do not match");
+            }
+        } else if (group != channel_in || w_shape[1] != 1 ||
+                   channel_out != channel_in) {
+            throw std::runtime_error(
+                "new_nn_conv supports grouped input only as depthwise Conv");
+        }
+        if (b_shape[0] != channel_out) {
+            throw std::runtime_error(
+                "new_nn_conv bias length must match output channels");
+        }
+
+        std::vector<int64_t> result_shape{1, channel_out, 0, 0};
+        for (size_t axis = 0; axis < 2; ++axis) {
+            const __int128 padded = static_cast<__int128>(x_shape[axis + 2]) +
+                                    pads[axis] + pads[axis + 2];
+            const __int128 effective_kernel =
+                static_cast<__int128>(kernel_shape[axis] - 1) *
+                    dilations[axis] +
+                1;
+            const __int128 numerator = padded - effective_kernel;
+            if (numerator < 0) {
+                throw std::runtime_error(
+                    "new_nn_conv kernel exceeds the padded input");
+            }
+            const __int128 output = numerator / strides[axis] + 1;
+            if (output <= 0 ||
+                output > std::numeric_limits<int64_t>::max()) {
+                throw std::runtime_error(
+                    "new_nn_conv inferred result shape is out of range");
+            }
+            result_shape[axis + 2] = static_cast<int64_t>(output);
+        }
+        if (result_shape[2] != x_shape[2] ||
+            result_shape[3] != x_shape[3]) {
+            throw std::runtime_error(
+                "new_nn_conv requires output-preserving spatial attributes");
+        }
+
+        TYPE_PTR result_type =
+            new_ranked_f32_type(result_shape, "new_nn_conv");
         OPCODE op(nn::core::NN, nn::core::OPCODE::CONV);
-        NODE_PTR n = container->New_cust_node(op, x->node->Rtype(), get_spos());
+        NODE_PTR n = container->New_tern_arith(
+            op, result_type, x->node, w->node, b->node, get_spos());
+        n->Set_attr("dilations", checked_dilations.data(),
+                    checked_dilations.size());
+        n->Set_attr(nn::core::ATTR::GROUP, checked_group.data(),
+                    checked_group.size());
+        n->Set_attr(nn::core::ATTR::KSHAPE, checked_kernel_shape.data(),
+                    checked_kernel_shape.size());
+        n->Set_attr(nn::core::ATTR::PAD, checked_pads.data(),
+                    checked_pads.size());
+        n->Set_attr(nn::core::ATTR::STRIDE, checked_strides.data(),
+                    checked_strides.size());
+        auto node = wrap_node(n, "nn::core::CONV");
+        node->add_child(x);
+        node->add_child(w);
+        node->add_child(b);
+        return node;
+    }
+
+    std::shared_ptr<Node> new_nn_gemm(
+        std::shared_ptr<Node> a, std::shared_ptr<Node> b,
+        std::shared_ptr<Node> c, double alpha, double beta, int64_t trans_a,
+        int64_t trans_b) {
+        require_not_expired();
+        if (!(container && glob)) {
+            throw std::runtime_error(
+                "new_nn_gemm requires a real container and global scope");
+        }
+
+        ARRAY_TYPE_PTR a_type =
+            require_ranked_f32_operand(a, "new_nn_gemm", 2);
+        ARRAY_TYPE_PTR b_type =
+            require_ranked_f32_operand(b, "new_nn_gemm", 2);
+        ARRAY_TYPE_PTR c_type =
+            require_ranked_f32_operand(c, "new_nn_gemm", 1);
+        require_inline_array_constant(b, "new_nn_gemm", "weight");
+        require_inline_array_constant(c, "new_nn_gemm", "bias");
+
+        if (!std::isfinite(alpha) || !std::isfinite(beta)) {
+            throw std::runtime_error(
+                "new_nn_gemm requires finite alpha and beta");
+        }
+        std::vector<int32_t> checked_trans_a =
+            checked_s32_values({trans_a}, "new_nn_gemm", "transA");
+        std::vector<int32_t> checked_trans_b =
+            checked_s32_values({trans_b}, "new_nn_gemm", "transB");
+        if ((trans_a != 0 && trans_a != 1) ||
+            (trans_b != 0 && trans_b != 1)) {
+            throw std::runtime_error(
+                "new_nn_gemm transA and transB must be zero or one");
+        }
+        if (alpha != 1.0 || beta != 1.0 || trans_a != 0 || trans_b != 1) {
+            throw std::runtime_error(
+                "new_nn_gemm supports alpha=1, beta=1, transA=0, "
+                "and transB=1");
+        }
+
+        const std::vector<int64_t> a_shape = a_type->Shape();
+        const std::vector<int64_t> b_shape = b_type->Shape();
+        const std::vector<int64_t> c_shape = c_type->Shape();
+        if (a_shape[0] != 1) {
+            throw std::runtime_error(
+                "new_nn_gemm supports only a single input row");
+        }
+        if (a_shape[1] != b_shape[1]) {
+            throw std::runtime_error(
+                "new_nn_gemm reduction dimensions do not match");
+        }
+        if (c_shape[0] != b_shape[0]) {
+            throw std::runtime_error(
+                "new_nn_gemm bias length must match output columns");
+        }
+
+        std::vector<int64_t> result_shape{1, b_shape[0]};
+        TYPE_PTR result_type =
+            new_ranked_f32_type(result_shape, "new_nn_gemm");
+        OPCODE op(nn::core::NN, nn::core::OPCODE::GEMM);
+        NODE_PTR n = container->New_tern_arith(
+            op, result_type, a->node, b->node, c->node, get_spos());
+        const float checked_alpha = static_cast<float>(alpha);
+        const float checked_beta = static_cast<float>(beta);
+        n->Set_attr("alpha", &checked_alpha, 1);
+        n->Set_attr("beta", &checked_beta, 1);
+        n->Set_attr("transA", checked_trans_a.data(),
+                    checked_trans_a.size());
+        n->Set_attr("transB", checked_trans_b.data(),
+                    checked_trans_b.size());
+        auto node = wrap_node(n, "nn::core::GEMM");
+        node->add_child(a);
+        node->add_child(b);
+        node->add_child(c);
+        return node;
+    }
+
+    std::shared_ptr<Node> new_nn_conv_compat(
+        std::shared_ptr<Node> x, std::shared_ptr<Node> w,
+        std::shared_ptr<Node> b) {
+        require_not_expired();
+        require_real_expression(x, "new_nn_conv");
+        require_real_expression(w, "new_nn_conv");
+        require_real_expression(b, "new_nn_conv");
+        OPCODE op(nn::core::NN, nn::core::OPCODE::CONV);
+        NODE_PTR n =
+            container->New_cust_node(op, x->node->Rtype(), get_spos());
         n->Set_child(0, x->node);
         n->Set_child(1, w->node);
         n->Set_child(2, b->node);
         auto node = wrap_node(n, "nn::core::CONV");
-        node->add_child(x); node->add_child(w); node->add_child(b);
+        node->add_child(x);
+        node->add_child(w);
+        node->add_child(b);
         return node;
     }
     
@@ -2325,6 +2643,73 @@ public:
         return value;
     }
     
+    std::shared_ptr<Node> new_ranked_f32_const(
+        py::list values, const std::vector<int64_t>& shape) {
+        require_not_expired();
+        if (!(container && glob)) {
+            throw std::runtime_error(
+                "new_ranked_f32_const requires a real container and global scope");
+        }
+        if (shape.empty()) {
+            throw std::runtime_error(
+                "new_ranked_f32_const requires a non-empty shape");
+        }
+
+        size_t element_count = 1;
+        for (int64_t dimension : shape) {
+            if (dimension <= 0) {
+                throw std::runtime_error(
+                    "new_ranked_f32_const requires positive dimensions");
+            }
+            const uint64_t unsigned_dimension =
+                static_cast<uint64_t>(dimension);
+            if (unsigned_dimension >
+                    static_cast<uint64_t>(
+                        std::numeric_limits<size_t>::max()) ||
+                element_count >
+                    std::numeric_limits<size_t>::max() /
+                        static_cast<size_t>(unsigned_dimension)) {
+                throw std::runtime_error(
+                    "new_ranked_f32_const shape element count overflows");
+            }
+            element_count *= static_cast<size_t>(unsigned_dimension);
+        }
+        if (element_count >
+            std::numeric_limits<size_t>::max() / sizeof(float)) {
+            throw std::runtime_error(
+                "new_ranked_f32_const payload byte count overflows");
+        }
+        if (values.size() != element_count) {
+            throw std::runtime_error(
+                "new_ranked_f32_const value count does not match shape");
+        }
+
+        std::vector<float> buffer;
+        buffer.reserve(element_count);
+        for (size_t index = 0; index < element_count; ++index) {
+            py::handle item = values[index];
+            if (PyBool_Check(item.ptr())) {
+                throw std::runtime_error(
+                    "new_ranked_f32_const values must be real numbers, not bool");
+            }
+            try {
+                buffer.push_back(static_cast<float>(item.cast<double>()));
+            } catch (const py::cast_error&) {
+                throw std::runtime_error(
+                    "new_ranked_f32_const values must be real numbers");
+            }
+        }
+
+        SPOS spos = get_spos();
+        TYPE_PTR array_type =
+            new_ranked_f32_type(shape, "new_ranked_f32_const");
+        CONSTANT_PTR constant = glob->New_const(
+            CONSTANT_KIND::ARRAY, array_type, buffer.data(),
+            buffer.size() * sizeof(float));
+        NODE_PTR node = container->New_ldc(constant, spos);
+        return wrap_node(node, "air::core::LDC(ARRAY)");
+    }
+
     // Create an LDC node referencing a CONSTANT_KIND::ARRAY constant.
     // Accepts:
     //  - real list: [x0, x1, ...]              -> float32 array
@@ -8465,6 +8850,11 @@ PYBIND11_MODULE(air_builder, m) {
         .def("name", &Node::name)
         .def("opcode_name", &Node::opcode_name)
         .def("rtype", &Node::rtype)
+        .def("is_inline_array_constant", &Node::is_inline_array_constant,
+             "Return whether this node is a CORE.LDC ARRAY constant")
+        .def("inline_array_constant_bytes",
+             &Node::inline_array_constant_bytes,
+             "Return an owned copy of a CORE.LDC ARRAY payload")
         .def("to_string", &Node::to_string)
         .def("set_s32_attr", &Node::set_s32_attr,
              py::arg("attr_name"), py::arg("value"))
@@ -8497,7 +8887,20 @@ PYBIND11_MODULE(air_builder, m) {
         .def("new_nn_add", &Container::new_nn_add)
         .def("new_nn_sub", &Container::new_nn_sub)
         .def("new_nn_mul", &Container::new_nn_mul)
-        .def("new_nn_conv", &Container::new_nn_conv)
+        .def("new_nn_conv", &Container::new_nn_conv_compat,
+             py::arg("x"), py::arg("weight"), py::arg("bias"),
+             "Create a legacy unattributed NN.CONV")
+        .def("new_nn_conv", &Container::new_nn_conv,
+             py::arg("x"), py::arg("weight"), py::arg("bias"),
+             py::arg("strides"), py::arg("pads"),
+             py::arg("dilations"), py::arg("kernel_shape"),
+             py::arg("group"),
+             "Create a typed, validated NN.CONV node")
+        .def("new_nn_gemm", &Container::new_nn_gemm,
+             py::arg("a"), py::arg("weight"), py::arg("bias"),
+             py::arg("alpha"), py::arg("beta"), py::arg("trans_a"),
+             py::arg("trans_b"),
+             "Create a typed, validated NN.GEMM node")
         .def("new_nn_relu", &Container::new_nn_relu)
         // Domain: nn::vector
         .def("new_vec_add", &Container::new_vec_add)
@@ -8636,6 +9039,10 @@ PYBIND11_MODULE(air_builder, m) {
         .def("new_floatconst_typed", &Container::new_floatconst_typed,
              py::arg("value"), py::arg("type"),
              "Create a floating constant with an explicit AIR type")
+        .def("new_ranked_f32_const", &Container::new_ranked_f32_const,
+             py::arg("values"), py::arg("shape"),
+             "Create an inline ranked f32 LDC ARRAY constant from a flat "
+             "Python list")
         .def("new_array_const", &Container::new_array_const,
              py::arg("values"),
              "Create LDC ARRAY constant from Python list: real->float32, complex/pair->interleaved float64")
