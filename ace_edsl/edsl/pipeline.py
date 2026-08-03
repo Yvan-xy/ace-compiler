@@ -90,6 +90,16 @@ def _uses_tentative_vector_kernel_inliner(config):
     )
 
 
+def _selected_vector_kernel_plan_provider(config, registered_provider):
+    if config is None or config.plan_provider != "python":
+        return None
+    if registered_provider is not None:
+        return registered_provider
+    from .vector_kernel_planning import plan_vector_kernel
+
+    return plan_vector_kernel
+
+
 @dataclass
 class PipelineResult:
     """Result of running the pipeline."""
@@ -142,6 +152,7 @@ class AcePipeline:
         self._rewrite_ckks_extended_ops = env_rewrite in ("1", "true", "yes", "on")
         self.vector_kernel_config: Optional[VectorKernelLoweringConfig] = None
         self.vector_kernel_recipes: Dict[str, Callable] = {}
+        self.vector_kernel_plan_provider: Optional[Callable] = None
         
     def _get_air_builder(self):
         """Lazy import air_builder."""
@@ -250,6 +261,14 @@ class AcePipeline:
             raise ValueError(f"duplicate vector-kernel recipe: {plan_kind}")
         self.vector_kernel_recipes[plan_kind] = recipe
         return self
+
+    def register_vector_kernel_plan_provider(self, provider: Callable) -> "AcePipeline":
+        if not callable(provider):
+            raise TypeError("vector-kernel plan provider must be callable")
+        if self.vector_kernel_plan_provider is not None:
+            raise ValueError("a vector-kernel plan provider is already registered")
+        self.vector_kernel_plan_provider = provider
+        return self
     
     def dump_air(self, stage_name: str) -> str:
         """Dump current AIR state."""
@@ -277,6 +296,9 @@ class AcePipeline:
                     dict(self.vector_kernel_recipes),
                     config.mask_fuse, config.max_slots,
                     config.conv_parallel, config.sharding,
+                    _selected_vector_kernel_plan_provider(
+                        config, self.vector_kernel_plan_provider
+                    ),
                 )
             return True
         except Exception as e:
@@ -716,6 +738,7 @@ class Pipeline:
         self.python_lowering_func: Optional[Callable] = None
         self.vector_kernel_config: Optional[VectorKernelLoweringConfig] = None
         self.vector_kernel_recipes: Dict[str, Callable] = {}
+        self.vector_kernel_plan_provider: Optional[Callable] = None
         env_rewrite = os.environ.get("ACE_CKKS_PRIMITIVE_REWRITE", "").strip().lower()
         self.rewrite_ckks_extended_ops: bool = env_rewrite in ("1", "true", "yes", "on")
         
@@ -886,6 +909,14 @@ class Pipeline:
         self.vector_kernel_recipes[plan_kind] = recipe
         return self
 
+    def register_vector_kernel_plan_provider(self, provider: Callable) -> "Pipeline":
+        if not callable(provider):
+            raise TypeError("vector-kernel plan provider must be callable")
+        if self.vector_kernel_plan_provider is not None:
+            raise ValueError("a vector-kernel plan provider is already registered")
+        self.vector_kernel_plan_provider = provider
+        return self
+
     def set_ckks_extended_op_rewrite(self, enabled: bool = True) -> "Pipeline":
         """Enable/disable primitive rewrite of CKKS extended ops."""
         self.rewrite_ckks_extended_ops = bool(enabled)
@@ -923,6 +954,9 @@ class Pipeline:
                 dict(self.vector_kernel_recipes),
                 config.mask_fuse, config.max_slots,
                 config.conv_parallel, config.sharding,
+                _selected_vector_kernel_plan_provider(
+                    config, self.vector_kernel_plan_provider
+                ),
             )
         
         elif phase == "vector2sihe":

@@ -24,6 +24,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <complex>
 
@@ -88,6 +89,7 @@
 // For ONNX model loading (separate compilation unit to avoid namespace conflicts)
 #include "onnx_loader.h"
 #include "air_function_inliner.h"
+#include "vector_kernel_plan_provider.h"
 #endif
 
 namespace py = pybind11;
@@ -7071,7 +7073,8 @@ public:
         const std::string& plan_kind,
         const std::string& fallback, py::dict recipes,
         bool mask_fuse, uint64_t max_slots, bool conv_parallel,
-        bool sharding) {
+        bool sharding,
+        py::object python_plan_provider) {
         if (!glob) {
             throw std::runtime_error(
                 "tensor2vector recipe lowering requires a real GLOB_SCOPE");
@@ -7081,6 +7084,20 @@ public:
                 plan_provider, kernel_impl, plan_kind, fallback);
         if (!selection._selection.has_value()) {
             throw std::invalid_argument(selection._diagnostic);
+        }
+
+        nn::vector::VECTOR_KERNEL_PLAN_PROVIDER_REGISTRY
+            plan_provider_registry;
+        std::optional<pyace::PYTHON_VECTOR_KERNEL_PLAN_PROVIDER>
+            python_provider;
+        if (!python_plan_provider.is_none()) {
+            python_provider.emplace(std::move(python_plan_provider));
+            if (!plan_provider_registry.Register(
+                    nn::vector::VECTOR_KERNEL_PLAN_PROVIDER_KIND::PYTHON,
+                    &*python_provider)) {
+                throw std::runtime_error(
+                    "failed to register Python vector-kernel plan provider");
+            }
         }
 
         pyace::PythonLoweringBridge::instance().set_skip_ops(skip_ops);
@@ -7143,6 +7160,8 @@ public:
 
         nn::vector::VECTOR_CTX ctx;
         ctx.Set_vector_kernel_lowering_registry(&registry);
+        ctx.Set_vector_kernel_plan_provider_registry(
+            &plan_provider_registry);
         nn::vector::VECTOR_CONFIG config;
         config._plan_provider = plan_provider;
         config._kernel_impl = kernel_impl;
@@ -9239,6 +9258,7 @@ PYBIND11_MODULE(air_builder, m) {
              py::arg("max_slots") = 0,
              py::arg("conv_parallel") = false,
              py::arg("sharding") = false,
+             py::arg("python_plan_provider") = py::none(),
              "Run one Tensor-to-Vector pass with a synchronous per-pass recipe registry")
         .def("run_poly2c", &GlobScope::run_poly2c_pass_with_config,
              py::arg("output_file") = "",

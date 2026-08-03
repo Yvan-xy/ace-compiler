@@ -1515,11 +1515,20 @@ bool Validate_baseline_gemm_plan(
     }
     loops.push_back(VECTOR_KERNEL_LOOP_PLAN{
         "block-reduction", 0, static_cast<int32_t>(loop_count), 1, 0});
-    if (!Append_reduction_schema("block-reduction", reduction_factor,
-                                 plan._height, 0, &rotations, &reductions,
-                                 diagnostic)) {
-      return false;
+    std::vector<int32_t> shifts;
+    for (uint32_t idx = 0; idx < loop_count; ++idx) {
+      const int64_t multiplier = int64_t{1} << idx;
+      int64_t shift = 0;
+      if (!Checked_mul_i64(multiplier, plan._height, &shift) ||
+          !Append_i32(&shifts, shift, diagnostic)) {
+        return false;
+      }
     }
+    rotations.push_back(VECTOR_KERNEL_ROTATION_PLAN{
+        "block-reduction", std::move(shifts)});
+    reductions.push_back(VECTOR_KERNEL_REDUCTION_PLAN{
+        "block-reduction", VECTOR_KERNEL_REDUCTION_KIND::POWER_OF_TWO,
+        reduction_factor, plan._height, 0});
   }
   const std::vector<VECTOR_KERNEL_SLICE_PLAN> slices{
       VECTOR_KERNEL_SLICE_PLAN{

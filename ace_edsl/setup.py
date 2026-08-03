@@ -25,6 +25,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         'pybind11>=2.10.0',
+        'numpy>=1.21.0',
     ],
     python_requires='>=3.8',
     # Note: C++ bindings are shared via ace_bindings and must be built separately

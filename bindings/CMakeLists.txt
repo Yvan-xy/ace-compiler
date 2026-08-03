@@ -124,6 +124,7 @@ pybind11_add_module(air_builder
     src/air_builder_bindings.cpp
     src/air_function_inliner.cpp
     src/onnx_loader.cpp
+    src/vector_kernel_plan_provider.cpp
 )
 target_include_directories(air_builder PRIVATE
     ${AIR_INFRA_DIR}/include
