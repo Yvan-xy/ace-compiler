@@ -28,7 +28,7 @@ namespace ace::bindings {
 namespace {
 
 // This file intentionally implements only the temporary binding-side path
-// described in air_function_inliner.h; it does not close M13.
+// described in air_function_inliner.h; it does not close M14.
 
 using namespace air::base;
 

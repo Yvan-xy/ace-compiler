@@ -6227,9 +6227,9 @@ public:
     
     bool has_native_ir() const { return glob != nullptr; }
     bool verify_ir() const { return glob != nullptr && glob->Verify_ir(); }
-    // Temporary baseline-kernel E2E bridge. M13 replaces this binding-side
-    // algorithm with the independent Python pass, and M15 removes this entry
-    // point after differential and downstream validation.
+    // Temporary baseline-kernel E2E bridge. M15 replaces its production use
+    // with the M14 Python passes, and M16 removes this entry point after
+    // differential and downstream validation.
 
     py::dict inline_generated_vector_kernel_helpers() {
         py::dict output;
@@ -6293,7 +6293,7 @@ public:
                     // GlobScope wrappers do not own prior native scopes. Keep
                     // the old scope alive so externally copied Type wrappers
                     // remain readable; they become foreign to the candidate
-                    // and existing scope checks reject their reuse. M15 removes
+                    // and existing scope checks reject their reuse. M16 removes
                     // this transition-only clone/swap path.
                     glob = candidate.release();
                     types.swap(candidate_types);

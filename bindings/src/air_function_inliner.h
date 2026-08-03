@@ -17,8 +17,8 @@
 namespace ace::bindings {
 
 // Temporary baseline-kernel E2E bridge. This binding-side algorithm is not
-// the independent Python inliner planned for M13 and is removed in M15 after
-// the Python pass has passed differential and downstream validation.
+// the independent Python inliner planned for M14. M15 replaces its production
+// use, and M16 removes it after differential and downstream validation.
 
 struct AIR_FUNCTION_INLINE_RESULT {
   bool        _success         = false;

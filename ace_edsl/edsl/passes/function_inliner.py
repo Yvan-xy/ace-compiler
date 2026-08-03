@@ -1,7 +1,8 @@
 """Temporary pass facade for binding-side generated-helper inlining.
 
 This baseline-kernel E2E bridge is not the independent Python AIR algorithm
-planned for M13. M13 replaces it, and M15 removes the tentative native path.
+planned for M14. M15 replaces its production use, and M16 removes the
+tentative native path.
 """
 
 from dataclasses import dataclass

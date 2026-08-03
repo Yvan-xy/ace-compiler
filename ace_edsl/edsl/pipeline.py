@@ -460,9 +460,9 @@ class AcePipeline:
             
             # Stage 2: vector2sihe (skip if starting at fhe::sihe or later)
             if start_domain in ("nn::core", "nn::vector"):
-                # Temporary baseline-kernel E2E bridge. M13 replaces this
-                # binding-side delegation with the Python AIR inliner, and M15
-                # removes the tentative path.
+                # Temporary baseline-kernel E2E bridge. M15 replaces its
+                # production use with the M14 Python AIR passes, and M16 removes
+                # the tentative path.
                 if _uses_tentative_vector_kernel_inliner(
                     self.vector_kernel_config
                 ):
@@ -1066,9 +1066,9 @@ class Pipeline:
         # Run each phase
         try:
             for phase in phases:
-                # Temporary baseline-kernel E2E bridge. M13 replaces this
-                # binding-side delegation with the Python AIR inliner, and M15
-                # removes the tentative path.
+                # Temporary baseline-kernel E2E bridge. M15 replaces its
+                # production use with the M14 Python AIR passes, and M16 removes
+                # the tentative path.
                 if (
                     phase == "vector2sihe"
                     and _uses_tentative_vector_kernel_inliner(
