@@ -35,6 +35,22 @@ from enum import Enum
 import os
 import time
 
+from .passes.framework.pipeline_hooks import (
+    HookExecutionResult,
+    PassPipelineConfig,
+    PipelinePoint,
+    run_pipeline_hook,
+)
+from .passes.transition import tentative_native_inliner_barriers
+
+
+def _pass_pipeline_config(config):
+    if config is None:
+        return PassPipelineConfig()
+    if not isinstance(config, PassPipelineConfig):
+        raise TypeError("pass_pipeline_config must be PassPipelineConfig")
+    return config
+
 
 @dataclass
 class FHEConfig:
@@ -77,19 +93,6 @@ class VectorKernelLoweringConfig:
 _VECTOR_KERNEL_RECIPE_KINDS = frozenset(
     ("baseline-gemm", "baseline-conv", "fast-gemm", "fast-conv")
 )
-_TENTATIVE_VECTOR_KERNEL_INLINE_PLAN_KINDS = frozenset(
-    ("auto", "baseline-gemm", "baseline-conv", "fast-gemm", "fast-conv")
-)
-
-
-def _uses_tentative_vector_kernel_inliner(config):
-    return (
-        config is not None
-        and config.kernel_impl == "dsl"
-        and config.plan_kind in _TENTATIVE_VECTOR_KERNEL_INLINE_PLAN_KINDS
-    )
-
-
 def _selected_vector_kernel_plan_provider(config, registered_provider):
     if config is None or config.plan_provider != "python":
         return None
@@ -108,6 +111,9 @@ class PipelineResult:
     error: Optional[str] = None
     stages_completed: list = field(default_factory=list)
     air_dumps: Dict[str, str] = field(default_factory=dict)
+    pass_results: Dict[PipelinePoint, HookExecutionResult] = field(
+        default_factory=dict
+    )
 
 
 class AcePipeline:
@@ -137,7 +143,12 @@ class AcePipeline:
             print(result.c_code)
     """
     
-    def __init__(self, glob_scope, fhe_config: Optional[FHEConfig] = None):
+    def __init__(
+        self,
+        glob_scope,
+        fhe_config: Optional[FHEConfig] = None,
+        pass_pipeline_config: Optional[PassPipelineConfig] = None,
+    ):
         """
         Initialize the pipeline.
         
@@ -153,6 +164,7 @@ class AcePipeline:
         self.vector_kernel_config: Optional[VectorKernelLoweringConfig] = None
         self.vector_kernel_recipes: Dict[str, Callable] = {}
         self.vector_kernel_plan_provider: Optional[Callable] = None
+        self.pass_pipeline_config = _pass_pipeline_config(pass_pipeline_config)
         
     def _get_air_builder(self):
         """Lazy import air_builder."""
@@ -268,6 +280,12 @@ class AcePipeline:
         if self.vector_kernel_plan_provider is not None:
             raise ValueError("a vector-kernel plan provider is already registered")
         self.vector_kernel_plan_provider = provider
+        return self
+
+    def set_pass_pipeline_config(
+        self, config: Optional[PassPipelineConfig]
+    ) -> "AcePipeline":
+        self.pass_pipeline_config = _pass_pipeline_config(config)
         return self
     
     def dump_air(self, stage_name: str) -> str:
@@ -460,23 +478,21 @@ class AcePipeline:
             
             # Stage 2: vector2sihe (skip if starting at fhe::sihe or later)
             if start_domain in ("nn::core", "nn::vector"):
-                # Temporary baseline-kernel E2E bridge. M15 replaces its
-                # production use with the M14 Python AIR passes, and M16 removes
-                # the tentative path.
-                if _uses_tentative_vector_kernel_inliner(
-                    self.vector_kernel_config
-                ):
-                    log("Running generated-helper function inliner...")
-                    from .passes.function_inliner import FunctionInlinerPass
-
-                    inline_result = FunctionInlinerPass.run(
-                        self.glob_scope, policy="always"
+                hook_result = run_pipeline_hook(
+                    self.glob_scope,
+                    PipelinePoint.BEFORE_VECTOR2SIHE,
+                    self.pass_pipeline_config,
+                    native_barriers=tentative_native_inliner_barriers(
+                        self.vector_kernel_config
+                    ),
+                )
+                result.pass_results[PipelinePoint.BEFORE_VECTOR2SIHE] = hook_result
+                if not hook_result.success:
+                    result.error = "before-vector2sihe pass hook failed: " + "; ".join(
+                        diagnostic.message for diagnostic in hook_result.diagnostics
                     )
-                    if not inline_result.success:
-                        result.error = "vector-kernel inliner failed: " + "; ".join(
-                            inline_result.diagnostics
-                        )
-                        return result
+                    return result
+                if hook_result.barrier_records:
                     result.stages_completed.append("vector_kernel_inline")
                     if dump_stages:
                         result.air_dumps["vector_kernel_inline"] = self.dump_air(
@@ -709,6 +725,7 @@ class Pipeline:
         dump_ir: bool = True,
         verbose: bool = True,
         on_phase_complete: Optional[Callable[[str, str], None]] = None,
+        pass_pipeline_config: Optional[PassPipelineConfig] = None,
     ):
         """
         Initialize the pipeline.
@@ -739,12 +756,19 @@ class Pipeline:
         self.vector_kernel_config: Optional[VectorKernelLoweringConfig] = None
         self.vector_kernel_recipes: Dict[str, Callable] = {}
         self.vector_kernel_plan_provider: Optional[Callable] = None
+        self.pass_pipeline_config = _pass_pipeline_config(pass_pipeline_config)
         env_rewrite = os.environ.get("ACE_CKKS_PRIMITIVE_REWRITE", "").strip().lower()
         self.rewrite_ckks_extended_ops: bool = env_rewrite in ("1", "true", "yes", "on")
         
         # Results
         self.phase_irs: Dict[str, str] = {}
         self.timings: Dict[str, float] = {}
+
+    def set_pass_pipeline_config(
+        self, config: Optional[PassPipelineConfig]
+    ) -> "Pipeline":
+        self.pass_pipeline_config = _pass_pipeline_config(config)
+        return self
         
     def load_onnx(self, model_path: str) -> "Pipeline":
         """
@@ -1066,47 +1090,37 @@ class Pipeline:
         # Run each phase
         try:
             for phase in phases:
-                # Temporary baseline-kernel E2E bridge. M15 replaces its
-                # production use with the M14 Python AIR passes, and M16 removes
-                # the tentative path.
-                if (
-                    phase == "vector2sihe"
-                    and _uses_tentative_vector_kernel_inliner(
-                        self.vector_kernel_config
+                if phase == "vector2sihe":
+                    hook_result = run_pipeline_hook(
+                        self.glob,
+                        PipelinePoint.BEFORE_VECTOR2SIHE,
+                        self.pass_pipeline_config,
+                        native_barriers=tentative_native_inliner_barriers(
+                            self.vector_kernel_config
+                        ),
                     )
-                ):
-                    if self.verbose:
-                        print("[Pipeline] Running vector_kernel_inline...")
-                    from .passes.function_inliner import FunctionInlinerPass
-
-                    inline_start = time.time()
-                    inline_result = FunctionInlinerPass.run(self.glob, policy="always")
-                    inline_elapsed = time.time() - inline_start
-                    self.timings["vector_kernel_inline"] = inline_elapsed
-                    if not inline_result.success:
+                    result.pass_results[
+                        PipelinePoint.BEFORE_VECTOR2SIHE
+                    ] = hook_result
+                    if not hook_result.success:
                         result.success = False
                         result.error = (
-                            "Phase vector_kernel_inline failed: "
-                            + "; ".join(inline_result.diagnostics)
-                        )
-                        if self.verbose:
-                            print(
-                                "  ✗ vector_kernel_inline failed "
-                                f"({inline_elapsed:.2f}s)"
+                            "Phase before-vector2sihe pass hook failed: "
+                            + "; ".join(
+                                diagnostic.message
+                                for diagnostic in hook_result.diagnostics
                             )
-                        return result
-                    result.stages_completed.append("vector_kernel_inline")
-                    if self.verbose:
-                        print(
-                            "  ✓ vector_kernel_inline "
-                            f"({inline_elapsed:.2f}s, "
-                            f"{inline_result.calls_inlined} calls)"
                         )
-                    if self.dump_ir:
-                        self.phase_irs["vector_kernel_inline"] = self.glob.dump()
-                        self._save_ir("vector_kernel_inline")
-                    if self.on_phase_complete:
-                        self.on_phase_complete("vector_kernel_inline", self.glob.dump())
+                        return result
+                    if hook_result.barrier_records:
+                        result.stages_completed.append("vector_kernel_inline")
+                        if self.dump_ir:
+                            self.phase_irs["vector_kernel_inline"] = self.glob.dump()
+                            self._save_ir("vector_kernel_inline")
+                        if self.on_phase_complete:
+                            self.on_phase_complete(
+                                "vector_kernel_inline", self.glob.dump()
+                            )
 
                 if self.verbose:
                     print(f"[Pipeline] Running {phase}...")

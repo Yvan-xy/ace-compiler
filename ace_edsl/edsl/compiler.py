@@ -38,6 +38,12 @@ from enum import Enum
 import os
 
 from .lowering_registry import get_ops_to_skip, configure_pipeline_skip_ops
+from .passes.framework.pipeline_hooks import (
+    HookExecutionResult,
+    PassPipelineConfig,
+    PipelinePoint,
+    run_pipeline_hook,
+)
 
 
 class OptLevel(Enum):
@@ -91,10 +97,15 @@ class CompilerOptions:
     dump_ir_to_file: Optional[str] = None
     inline_lowerings: bool = True
     skip_cpp_for_registered_ops: bool = True
+    pass_pipeline_config: PassPipelineConfig = field(
+        default_factory=PassPipelineConfig
+    )
     
     def __post_init__(self):
         if not 0 <= self.opt_level <= 3:
             raise ValueError(f"opt_level must be 0-3, got {self.opt_level}")
+        if not isinstance(self.pass_pipeline_config, PassPipelineConfig):
+            raise TypeError("pass_pipeline_config must be PassPipelineConfig")
 
 
 # Default pass pipelines for each starting domain
@@ -210,6 +221,9 @@ class CompileResult:
     pipeline: List[str]
     options: CompilerOptions
     c_code: Optional[str] = None
+    pass_results: Dict[PipelinePoint, HookExecutionResult] = field(
+        default_factory=dict
+    )
     
     def dump(self) -> str:
         """Dump the AIR as a string."""
@@ -347,18 +361,39 @@ def ace_compile(
     
     # Run C++ passes if available
     c_code = None
+    pass_results = {}
     if pipeline and hasattr(glob_scope, 'run_cpp_pass'):
         for pass_name in pipeline:
             if options.verbose:
                 print(f"[ace_compile] Running C++ pass: {pass_name}")
-            
+
+            if pass_name == "vector2sihe":
+                hook_result = run_pipeline_hook(
+                    glob_scope,
+                    PipelinePoint.BEFORE_VECTOR2SIHE,
+                    options.pass_pipeline_config,
+                )
+                pass_results[PipelinePoint.BEFORE_VECTOR2SIHE] = hook_result
+                if not hook_result.success:
+                    details = "; ".join(
+                        diagnostic.message
+                        for diagnostic in hook_result.diagnostics
+                    )
+                    raise RuntimeError(
+                        "before-vector2sihe pass hook failed"
+                        + (f": {details}" if details else "")
+                    )
+
             try:
                 success = glob_scope.run_cpp_pass(pass_name, skip_ops)
-                if not success and options.verbose:
-                    print(f"[ace_compile] Pass {pass_name} returned false")
             except Exception as e:
-                if options.verbose:
-                    print(f"[ace_compile] Pass {pass_name} failed: {e}")
+                raise RuntimeError(
+                    f"ace_compile pass {pass_name} failed: {e}"
+                ) from e
+            if not success:
+                raise RuntimeError(
+                    f"ace_compile pass {pass_name} returned false"
+                )
             
             if options.dump_ir:
                 print(f"\n=== AIR after {pass_name} ===")
@@ -380,7 +415,8 @@ def ace_compile(
         domain=domain,
         pipeline=pipeline,
         options=options,
-        c_code=c_code
+        c_code=c_code,
+        pass_results=pass_results,
     )
 
 
@@ -563,4 +599,3 @@ __all__ = [
     'OptLevel',
     'Target',
 ]
-

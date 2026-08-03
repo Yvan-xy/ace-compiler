@@ -76,6 +76,12 @@ from .pipeline import (
     PipelineTarget,
     VectorKernelLoweringConfig,
 )
+from .passes.framework.pipeline_hooks import (
+    HookExecutionResult,
+    PassInstrumentation,
+    PassPipelineConfig,
+    PipelinePoint,
+)
 from .vector.lowering import (
     PreparedBaselineConvPlan,
     PreparedBaselineGemmPlan,
@@ -179,6 +185,10 @@ __all__ = [
     'configure_fast_conv_dsl',
     'FHEConfig',
     'PipelineResult',
+    'HookExecutionResult',
+    'PassInstrumentation',
+    'PassPipelineConfig',
+    'PipelinePoint',
     'compile_to_c',
     # Selective lowering
     'register_lowering',

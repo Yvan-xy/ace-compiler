@@ -1,4 +1,4 @@
-"""Tests for the temporary binding-side generated-helper inliner."""
+"""Tests for the explicitly tentative native-inliner adapter and barrier."""
 
 from __future__ import annotations
 
@@ -205,6 +205,138 @@ def _run_worker(model: Path, action: str):
     return json.loads(lines[-1])
 
 
+def _generic_air_summary(glob, helper_prefix, *, graph=False):
+    from ace_edsl.edsl.passes.analyses import (
+        CallGraphAnalysis,
+        FunctionReachabilityAnalysis,
+    )
+    from ace_edsl.edsl.passes.framework import (
+        AIRPassManager,
+        AnalysisRequest,
+        ModuleView,
+        MutableModuleView,
+    )
+
+    module_id = (glob.air_pass_module_id, "tentative-worker")
+    module = ModuleView(glob, module_id)
+    helper = next(
+        function
+        for function in module.functions
+        if function.name.startswith(helper_prefix)
+    )
+    calls = [
+        statement.node
+        for function in module.functions
+        for block in function.blocks
+        for statement in block.statements
+        if statement.node.call_target is not None
+        and statement.node.call_target.owning_function.id == helper.id
+    ]
+    call = calls[0] if len(calls) == 1 else None
+    entries = []
+    for entry in module.entries:
+        try:
+            function_name = entry.owning_function.name
+        except RuntimeError:
+            continue
+        entries.append(
+            {
+                "name": entry.name,
+                "function": function_name,
+                "program": entry.program_entry,
+                "exported": entry.exported,
+            }
+        )
+    summary = {
+        "call_count": len(calls),
+        "call": None
+        if call is None
+        else {
+            "opcode": call.opcode,
+            "target": call.call_target.name,
+            "target_function": call.call_target.owning_function.name,
+            "arguments": [list(argument.id.backend_key) for argument in call.arguments],
+            "children": [list(child.id.backend_key) for child in call.children],
+            "result_preg": None
+            if call.result_preg is None
+            else call.result_preg.native_id,
+            "result_type": None
+            if call.result_preg is None
+            else call.result_preg.type.name,
+        },
+        "globals": [
+            {
+                "name": symbol.name,
+                "owner": symbol.id.function_id,
+                "type": symbol.type.name,
+            }
+            for symbol in module.symbols
+        ],
+        "entries": entries,
+    }
+
+    transaction = glob.begin_air_pass_transaction()
+    candidate = MutableModuleView(glob, module_id, transaction=transaction)
+    candidate_helper = next(
+        function
+        for function in candidate.functions
+        if function.name.startswith(helper_prefix)
+    )
+    candidate_calls = [
+        statement.node
+        for function in candidate.functions
+        for block in function.blocks
+        for statement in block.statements
+        if statement.node.call_target is not None
+        and statement.node.call_target.owning_function.id == candidate_helper.id
+    ]
+    if len(candidate_calls) == 1:
+        candidate_call = candidate_calls[0]
+        candidate_call.set_call_target(candidate_helper.entries[0])
+        if candidate_call.result_preg is not None:
+            candidate_call.set_result_preg(candidate_call.result_preg)
+        summary["call_edits_checked"] = True
+    else:
+        summary["call_edits_checked"] = False
+    try:
+        candidate.remove_function(candidate_helper)
+    except ValueError as exc:
+        summary["remove_helper_error"] = str(exc)
+    else:
+        summary["remove_helper_error"] = ""
+    finally:
+        transaction.rollback()
+
+    if graph:
+        result = AIRPassManager().run(
+            glob,
+            (
+                AnalysisRequest(CallGraphAnalysis()),
+                AnalysisRequest(FunctionReachabilityAnalysis()),
+            ),
+        )
+        call_graph = result.executions[0].analysis_result.value
+        reachability = result.executions[1].analysis_result.value
+        names = {function.native_id: function.name for function in module.functions}
+        summary["graph"] = {
+            "success": result.success,
+            "program_roots": [
+                names[root.native_id] for root in call_graph.program_roots
+            ],
+            "exported_roots": [
+                names[root.native_id] for root in call_graph.exported_roots
+            ],
+            "edges": [
+                [names[edge.caller.native_id], names[edge.callee.native_id]]
+                for edge in call_graph.edges
+            ],
+            "reachable": [
+                names[function.native_id] for function in reachability.reachable
+            ],
+        }
+    return summary
+
+
 def test_always_inlines_nested_helper_and_is_idempotent(tmp_path):
     model = tmp_path / "nested_gemm.onnx"
     _write_gemm_model(model)
@@ -216,6 +348,15 @@ def test_always_inlines_nested_helper_and_is_idempotent(tmp_path):
     assert result["before"]["helper_calls"] == 1
     assert result["before"]["helper_scopes"] == 1
     assert result["before"]["helper_symbols"] == 1
+    assert result["air_view"]["call_count"] == 1
+    call = result["air_view"]["call"]
+    assert call["opcode"] == "call"
+    assert call["target"].startswith(_HELPER_PREFIX)
+    assert call["target_function"].startswith(_HELPER_PREFIX)
+    assert call["arguments"] == call["children"][: len(call["arguments"])]
+    assert call["result_preg"] is not None and call["result_type"]
+    assert result["air_view"]["call_edits_checked"]
+    assert "referenced AIR function" in result["air_view"]["remove_helper_error"]
     assert result["selection"] == [
         {
             "attribute": "ace.vector_kernel.generated_call",
@@ -237,8 +378,7 @@ def test_always_inlines_nested_helper_and_is_idempotent(tmp_path):
     assert result["after"]["vector_ops"] == result["before"]["vector_ops"]
     assert result["after"]["rotations"] == result["before"]["rotations"]
     assert not result["native_ptr_stable"]
-    assert result["stale_type_readable"]
-    assert result["stale_type_is_foreign"]
+    assert result["stale_type_rejected"]
     assert result["cached_type_usable"]
     assert result["second"] == {
         "success": True,
@@ -475,10 +615,19 @@ def test_tentative_inliner_clones_conv_constant_array_access(tmp_path):
     [
         ("never", True, ""),
         ("predicate-false", True, ""),
-        ("predicate-raise", False, "predicate failed: selection failure"),
-        ("invalid-policy", False, "unsupported function-inliner policy"),
+        (
+            "predicate-raise",
+            False,
+            "tentative native-inliner predicate raised RuntimeError: selection failure",
+        ),
+        (
+            "invalid-policy",
+            False,
+            "unsupported tentative native-inliner policy",
+        ),
         ("extra-entry", False, "additional entry point"),
         ("program-entry", False, "one non-program entry point"),
+        ("null-result-preg", False, "no result preg"),
         ("conv-array-non-pointer-rtype", False, "array address"),
         ("conv-escaping-ldca", False, "escaping address"),
         ("fast-mutable-array-escape", False, "escaping mutable array"),
@@ -553,42 +702,76 @@ def test_policy_and_predicate_failures_do_not_mutate(
         assert result["pass"]["diagnostics"] == []
     if action == "predicate-false":
         assert result["selection"][0]["kind"] == "same-module-generated-leaf"
+    if action == "program-entry":
+        graph = result["air_view"]["graph"]
+        assert graph["success"]
+        assert len(graph["program_roots"]) == 2
+        assert graph["program_roots"] == graph["exported_roots"]
+        assert graph["edges"] == [
+            [
+                next(
+                    entry["function"]
+                    for entry in result["air_view"]["entries"]
+                    if entry["program"]
+                    and not entry["function"].startswith(_HELPER_PREFIX)
+                ),
+                next(
+                    entry["function"]
+                    for entry in result["air_view"]["entries"]
+                    if entry["function"].startswith(_HELPER_PREFIX)
+                ),
+            ]
+        ]
+        assert "program-entry function" in result["air_view"]["remove_helper_error"]
+    if action == "null-result-preg":
+        assert result["air_view"]["call"]["result_preg"] is None
+        assert result["air_view"]["call"]["result_type"] is None
+    if action in {
+        "fast-mutable-array-global-base",
+        "fast-pointer-global-load",
+    }:
+        globals_ = result["air_view"]["globals"]
+        assert len(globals_) == 1
+        assert globals_[0]["owner"] is None
+        assert globals_[0]["type"]
 
 
 def test_python_pass_rejects_missing_scope_or_binding():
-    from ace_edsl.edsl.passes.function_inliner import FunctionInlinerPass
+    from ace_edsl.edsl.passes.transition.tentative_native_inliner import (
+        TentativeNativeInlinerAdapter,
+    )
 
-    missing_scope = FunctionInlinerPass.run(None)
+    missing_scope = TentativeNativeInlinerAdapter().run(None)
     assert not missing_scope.success
-    assert missing_scope.diagnostics == ("glob_scope is None",)
+    assert missing_scope.diagnostics[0].message == "glob_scope is None"
 
-    missing_binding = FunctionInlinerPass.run(object())
+    missing_binding = TentativeNativeInlinerAdapter().run(object())
     assert not missing_binding.success
-    assert "has no generated-helper inlining binding" in missing_binding.diagnostics[0]
+    assert "has no generated-helper inlining binding" in missing_binding.diagnostics[0].message
 
 
 def test_tentative_pipeline_gate_is_limited_to_supported_dsl_requests():
-    from ace_edsl.edsl.pipeline import (
-        VectorKernelLoweringConfig,
-        _uses_tentative_vector_kernel_inliner,
+    from ace_edsl.edsl.pipeline import VectorKernelLoweringConfig
+    from ace_edsl.edsl.passes.transition.tentative_native_inliner import (
+        requires_tentative_native_inliner,
     )
 
     base = VectorKernelLoweringConfig(kernel_impl="dsl")
-    assert _uses_tentative_vector_kernel_inliner(base)
-    assert _uses_tentative_vector_kernel_inliner(
+    assert requires_tentative_native_inliner(base)
+    assert requires_tentative_native_inliner(
         dataclasses.replace(base, plan_kind="baseline-gemm")
     )
-    assert _uses_tentative_vector_kernel_inliner(
+    assert requires_tentative_native_inliner(
         dataclasses.replace(base, plan_kind="baseline-conv")
     )
-    assert not _uses_tentative_vector_kernel_inliner(None)
-    assert not _uses_tentative_vector_kernel_inliner(
+    assert not requires_tentative_native_inliner(None)
+    assert not requires_tentative_native_inliner(
         dataclasses.replace(base, kernel_impl="native")
     )
-    assert _uses_tentative_vector_kernel_inliner(
+    assert requires_tentative_native_inliner(
         dataclasses.replace(base, plan_kind="fast-gemm")
     )
-    assert _uses_tentative_vector_kernel_inliner(
+    assert requires_tentative_native_inliner(
         dataclasses.replace(base, plan_kind="fast-conv")
     )
 
@@ -846,9 +1029,13 @@ def _summary(glob, helper_prefix=_HELPER_PREFIX):
 
 
 def _pass_dict(result):
-    value = dataclasses.asdict(result)
-    value["diagnostics"] = list(value["diagnostics"])
-    return value
+    return {
+        "success": result.success,
+        "changed": result.changed,
+        "calls_inlined": result.metrics.get("calls_inlined", 0),
+        "helpers_removed": result.metrics.get("helpers_removed", 0),
+        "diagnostics": [diagnostic.message for diagnostic in result.diagnostics],
+    }
 
 
 def _new_pipeline(model: Path, implementation: str, artifact_tag: str = "pass"):
@@ -969,7 +1156,9 @@ def _new_fast_conv_pipeline(
 
 
 def _worker_main():
-    from ace_edsl.edsl.passes.function_inliner import FunctionInlinerPass
+    from ace_edsl.edsl.passes.transition.tentative_native_inliner import (
+        TentativeNativeInlinerAdapter,
+    )
     from ace_edsl.edsl.pipeline import PipelineTarget
 
     model = Path(sys.argv[2])
@@ -1059,6 +1248,7 @@ def _worker_main():
     if action in (
         "extra-entry",
         "program-entry",
+        "null-result-preg",
         "array-non-pointer-rtype",
         "escaping-ldca",
         "mutable-array-escape",
@@ -1081,34 +1271,44 @@ def _worker_main():
         "loop-iv-i64",
     ):
         pipeline.glob._mutate_generated_vector_helper_for_testing(action)
+    air_view = _generic_air_summary(
+        pipeline.glob,
+        helper_prefix,
+        graph=action == "program-entry",
+    )
     before_dump = pipeline.glob.dump()
     before_ptr = pipeline.glob.get_native_ptr()
     cached_type = pipeline.glob.get_type("f32")
     selection = []
 
     if action == "always":
-        inline_result = FunctionInlinerPass.run(
-            pipeline.glob,
+        inline_result = TentativeNativeInlinerAdapter(
             predicate=lambda descriptor: selection.append(descriptor) or True,
-        )
+        ).run(pipeline.glob)
     elif action == "never":
-        inline_result = FunctionInlinerPass.run(pipeline.glob, policy="never")
-    elif action == "predicate-false":
-        inline_result = FunctionInlinerPass.run(
-            pipeline.glob,
-            predicate=lambda descriptor: selection.append(descriptor) or False,
+        inline_result = TentativeNativeInlinerAdapter(policy="never").run(
+            pipeline.glob
         )
+    elif action == "predicate-false":
+        inline_result = TentativeNativeInlinerAdapter(
+            predicate=lambda descriptor: selection.append(descriptor) or False,
+        ).run(pipeline.glob)
     elif action == "predicate-raise":
 
         def fail_predicate(_descriptor):
             raise RuntimeError("selection failure")
 
-        inline_result = FunctionInlinerPass.run(pipeline.glob, predicate=fail_predicate)
+        inline_result = TentativeNativeInlinerAdapter(
+            predicate=fail_predicate
+        ).run(pipeline.glob)
     elif action == "invalid-policy":
-        inline_result = FunctionInlinerPass.run(pipeline.glob, policy="unsupported")
+        inline_result = TentativeNativeInlinerAdapter(
+            policy="unsupported"
+        ).run(pipeline.glob)
     elif action in (
         "extra-entry",
         "program-entry",
+        "null-result-preg",
         "array-non-pointer-rtype",
         "escaping-ldca",
         "mutable-array-escape",
@@ -1130,7 +1330,7 @@ def _worker_main():
         "unsupported-if",
         "loop-iv-i64",
     ):
-        inline_result = FunctionInlinerPass.run(pipeline.glob)
+        inline_result = TentativeNativeInlinerAdapter().run(pipeline.glob)
     else:
         raise ValueError(action)
 
@@ -1138,23 +1338,27 @@ def _worker_main():
     cached_type_usable = None
     if committed:
         cached_type_usable = bool(pipeline.glob.new_array_type([2], "f32"))
-    stale_type_readable = cached_type.is_float()
-    stale_type_is_foreign = not cached_type.same_scope(pipeline.glob.get_type("f32"))
+    try:
+        cached_type.is_float()
+    except RuntimeError:
+        stale_type_rejected = True
+    else:
+        stale_type_rejected = False
     after_dump = pipeline.glob.dump()
     payload = {
         "pipeline_success": pipeline_result.success,
         "before": _summary_from_dump(before_dump, True, helper_prefix),
         "after": _summary(pipeline.glob, helper_prefix),
         "pass": _pass_dict(inline_result),
+        "air_view": air_view,
         "selection": selection,
         "dump_unchanged": before_dump == after_dump,
         "native_ptr_stable": before_ptr == pipeline.glob.get_native_ptr(),
     }
     if committed:
         payload["cached_type_usable"] = cached_type_usable
-        payload["stale_type_readable"] = stale_type_readable
-        payload["stale_type_is_foreign"] = stale_type_is_foreign
-        second = FunctionInlinerPass.run(pipeline.glob)
+        payload["stale_type_rejected"] = stale_type_rejected
+        second = TentativeNativeInlinerAdapter().run(pipeline.glob)
         payload["second"] = _pass_dict(second)
         payload["second_dump_unchanged"] = pipeline.glob.dump() == after_dump
     print(json.dumps(payload))

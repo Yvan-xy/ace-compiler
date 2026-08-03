@@ -187,7 +187,10 @@ run_tests() {
             tests/test_vector_kernel_fast_substrate.py \
             tests/test_vector_kernel_fast_gemm.py \
             tests/test_vector_kernel_fast_conv.py \
-            tests/test_function_inliner.py \
+            tests/test_air_pass_framework.py \
+            tests/test_air_pass_bindings.py \
+            tests/test_air_pass_pipeline.py \
+            tests/test_tentative_native_inliner.py \
             tests/test_gemm_e2e_compare.py \
             tests/test_conv_e2e_compare.py \
             -v --tb=short 2>&1; then
