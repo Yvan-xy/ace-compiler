@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 LOCK_FILE="${SCRIPT_DIR}/configs/dependencies.env"
+PROFILE_PATH="${REPO_ROOT}/fhe-cmplr/rtlib/phantom/config/fullpacked_bts_v1.json"
 STATE_ROOT="${REPO_ROOT}/build/phantom_gpu"
 DEPENDENCY_ROOT="${STATE_ROOT}/dependencies"
 INSTALL_ROOT="${STATE_ROOT}/install-cuda-sm80"
@@ -56,8 +57,170 @@ set +a
 PINNED_SOURCE="${DEPENDENCY_ROOT}/phantom-ant-${PHANTOM_COMMIT}"
 PHANTOM_BUILD="${STATE_ROOT}/phantom-${PHANTOM_COMMIT}-sm80"
 PHANTOM_ARCHIVE="${PHANTOM_BUILD}/lib/libphantom.a"
-TOOLCHAIN_RESULTS="${STATE_ROOT}/compile_only_results/toolchain"
-CKKS2C_RESULTS="${STATE_ROOT}/compile_only_results/ckks2c"
+RESULTS_ROOT="${STATE_ROOT}/compile_only_results"
+mkdir -p "${RESULTS_ROOT}/runs"
+RUN_ROOT="$(mktemp -d "${RESULTS_ROOT}/runs/$(date -u +%Y%m%dT%H%M%SZ)-$$.XXXXXX")"
+RUN_ID="${RUN_ROOT##*/}"
+TOOLCHAIN_RESULTS="${RUN_ROOT}/toolchain"
+CKKS2C_RESULTS="${RUN_ROOT}/ckks2c"
+CURRENT_RECORD="${RESULTS_ROOT}/current-${GATE}.json"
+LATEST_SUCCESS_RECORD="${RESULTS_ROOT}/latest-success-${GATE}.json"
+STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+RUN_ACTIVE=0
+
+atomic_json() {
+  local target="$1"
+  shift
+  local temporary
+  temporary="$(mktemp "${target}.tmp.XXXXXX")"
+  jq "$@" >"${temporary}"
+  chmod 0644 "${temporary}"
+  mv "${temporary}" "${target}"
+}
+
+write_run_state() {
+  local status="$1"
+  local exit_code="$2"
+  local completed_utc="$3"
+  local manifest_path="${4:-}"
+  local manifest_sha256="${5:-}"
+  atomic_json "${CURRENT_RECORD}" \
+    -n \
+    --arg run_id "${RUN_ID}" \
+    --arg gate "${GATE}" \
+    --arg status "${status}" \
+    --arg run_root "${RUN_ROOT}" \
+    --arg started_utc "${STARTED_UTC}" \
+    --arg completed_utc "${completed_utc}" \
+    --arg image_id "${ACE_PHANTOM_IMAGE_ID:-}" \
+    --arg definition_sha256 "${ACE_PHANTOM_DEFINITION_SHA256:-}" \
+    --arg manifest_path "${manifest_path}" \
+    --arg manifest_sha256 "${manifest_sha256}" \
+    --argjson exit_code "${exit_code}" \
+    '{
+      run_id: $run_id,
+      gate: $gate,
+      status: $status,
+      exit_code: $exit_code,
+      run_root: $run_root,
+      started_utc: $started_utc,
+      completed_utc: (if $completed_utc == "" then null else $completed_utc end),
+      development_image_id: $image_id,
+      development_definition_sha256: $definition_sha256,
+      manifest_path: (if $manifest_path == "" then null else $manifest_path end),
+      manifest_sha256:
+        (if $manifest_sha256 == "" then null else $manifest_sha256 end)
+    }'
+}
+
+handle_exit() {
+  local exit_code="$?"
+  trap - EXIT
+  if [[ ${RUN_ACTIVE} -eq 1 ]]; then
+    set +e
+    write_run_state failed "${exit_code}" \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "" ""
+  fi
+  exit "${exit_code}"
+}
+
+write_manifest() {
+  local completed_utc
+  completed_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  (
+    cd "${REPO_ROOT}"
+    git ls-files -z |
+      LC_ALL=C sort -z |
+      xargs -0 sha256sum
+  ) >"${RUN_ROOT}/ace_tracked_sources.sha256"
+  (
+    cd "${RUN_ROOT}"
+    find . -type f ! -name manifest.json ! -name SHA256SUMS -print0 |
+      LC_ALL=C sort -z |
+      xargs -0 -r sha256sum
+  ) >"${RUN_ROOT}/SHA256SUMS"
+
+  local sums_sha256
+  local profile_sha256
+  local source_manifest_sha256
+  local tracked_diff_sha256
+  local worktree_status_sha256
+  local worktree_dirty=false
+  sums_sha256="$(sha256sum "${RUN_ROOT}/SHA256SUMS" | awk '{print $1}')"
+  profile_sha256="$(sha256sum "${PROFILE_PATH}" | awk '{print $1}')"
+  source_manifest_sha256="$(
+    sha256sum "${RUN_ROOT}/ace_tracked_sources.sha256" | awk '{print $1}'
+  )"
+  tracked_diff_sha256="$(
+    git -C "${REPO_ROOT}" diff --binary HEAD | sha256sum | awk '{print $1}'
+  )"
+  worktree_status_sha256="$(
+    git -C "${REPO_ROOT}" status --porcelain=v1 -z --untracked-files=all |
+      sha256sum |
+      awk '{print $1}'
+  )"
+  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain=v1 --untracked-files=all)" ]]; then
+    worktree_dirty=true
+  fi
+  atomic_json "${RUN_ROOT}/manifest.json" \
+    -n \
+    --arg run_id "${RUN_ID}" \
+    --arg gate "${GATE}" \
+    --arg started_utc "${STARTED_UTC}" \
+    --arg completed_utc "${completed_utc}" \
+    --arg ace_commit "$(git -C "${REPO_ROOT}" rev-parse HEAD)" \
+    --arg phantom_commit "${PHANTOM_COMMIT}" \
+    --arg image_id "${ACE_PHANTOM_IMAGE_ID}" \
+    --arg definition_sha256 "${ACE_PHANTOM_DEFINITION_SHA256}" \
+    --arg profile_sha256 "${profile_sha256}" \
+    --arg sums_sha256 "${sums_sha256}" \
+    --arg source_manifest_sha256 "${source_manifest_sha256}" \
+    --arg tracked_diff_sha256 "${tracked_diff_sha256}" \
+    --arg worktree_status_sha256 "${worktree_status_sha256}" \
+    --argjson worktree_dirty "${worktree_dirty}" \
+    '{
+      status: "pass",
+      run_id: $run_id,
+      gate: $gate,
+      started_utc: $started_utc,
+      completed_utc: $completed_utc,
+      ace_commit: $ace_commit,
+      phantom_commit: $phantom_commit,
+      development_image_id: $image_id,
+      development_definition_sha256: $definition_sha256,
+      profile_sha256: $profile_sha256,
+      ace_worktree_dirty: $worktree_dirty,
+      ace_tracked_diff_sha256: $tracked_diff_sha256,
+      ace_worktree_status_sha256: $worktree_status_sha256,
+      ace_tracked_source_manifest: "ace_tracked_sources.sha256",
+      ace_tracked_source_manifest_sha256: $source_manifest_sha256,
+      evidence_sha256_manifest: "SHA256SUMS",
+      evidence_sha256_manifest_sha256: $sums_sha256,
+      link_mode: "manual_static_closure",
+      installed_cmake_target_qualified: false,
+      executables_were_run: false
+    }'
+  local manifest_sha256
+  manifest_sha256="$(sha256sum "${RUN_ROOT}/manifest.json" | awk '{print $1}')"
+  write_run_state pass 0 "${completed_utc}" \
+    "${RUN_ROOT}/manifest.json" "${manifest_sha256}"
+  local latest_temporary
+  latest_temporary="$(mktemp "${LATEST_SUCCESS_RECORD}.tmp.XXXXXX")"
+  cp "${CURRENT_RECORD}" "${latest_temporary}"
+  chmod 0644 "${latest_temporary}"
+  mv "${latest_temporary}" "${LATEST_SUCCESS_RECORD}"
+  RUN_ACTIVE=0
+}
+
+mkdir -p "${TOOLCHAIN_RESULTS}" "${CKKS2C_RESULTS}"
+exec 9>"${RESULTS_ROOT}/compile-only.lock"
+if ! flock -n 9; then
+  echo "another compile-only qualification is already running" >&2
+  exit 1
+fi
+RUN_ACTIVE=1
+write_run_state running 0 "" "" ""
+trap handle_exit EXIT
 
 require_readonly_mount() {
   local target="$1"
@@ -82,7 +245,15 @@ require_environment() {
     echo "CUDA architecture environment does not match the dependency lock" >&2
     exit 1
   fi
-  for command in cmake c++ git ninja python3 rg file readelf nm jq; do
+  if [[ ! "${ACE_PHANTOM_IMAGE_ID:-}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "development image ID is absent or malformed" >&2
+    exit 1
+  fi
+  if [[ ! "${ACE_PHANTOM_DEFINITION_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "development image definition hash is absent or malformed" >&2
+    exit 1
+  fi
+  for command in cmake c++ git ninja python3 rg file readelf nm jq flock; do
     command -v "${command}" >/dev/null
   done
   test -x "${NVCC}"
@@ -134,6 +305,7 @@ record_common_configuration() {
     --dataset-dir "${DATASET_MOUNT}"
     --phantom-dir "${PHANTOM_MOUNT}"
     --json-output "${result_dir}/configuration.json"
+    --cpp-header-output "${result_dir}/fullpacked_bts_profile.h"
   )
   python3 "${SCRIPT_DIR}/check_configuration.py" "${arguments[@]}"
   bash "${SCRIPT_DIR}/collect_environment.sh" "${result_dir}/environment.txt"
@@ -185,6 +357,7 @@ run_toolchain_gate() {
   local compile_arguments=(
     "${nvcc_common[@]}"
     -dc
+    -I"${TOOLCHAIN_RESULTS}"
     -I"${PINNED_SOURCE}/include"
     "${source}"
     -o "${object}"
@@ -227,13 +400,66 @@ run_toolchain_gate() {
   c++ "${host_link_arguments[@]}"
 
   inspect_binary "${binary}" "${TOOLCHAIN_RESULTS}"
+
+  local health_source="${SCRIPT_DIR}/harness/native_phantom_health.cu"
+  local health_object="${TOOLCHAIN_RESULTS}/native_phantom_health.o"
+  local health_device_link="${TOOLCHAIN_RESULTS}/native_phantom_health.dlink.o"
+  local health_binary="${TOOLCHAIN_RESULTS}/native_phantom_health_sm80"
+  local health_compile_arguments=(
+    "${nvcc_common[@]}"
+    -dc
+    -I"${TOOLCHAIN_RESULTS}"
+    -I"${PINNED_SOURCE}/include"
+    "${health_source}"
+    -o "${health_object}"
+  )
+  "${NVCC}" "${health_compile_arguments[@]}"
+  local health_device_link_arguments=(
+    "${nvcc_common[@]}"
+    -dlink
+    "${health_object}"
+    "${PHANTOM_ARCHIVE}"
+    -L"${CUDA_ROOT}/lib64"
+    -lcudadevrt
+    -o "${health_device_link}"
+  )
+  "${NVCC}" "${health_device_link_arguments[@]}"
+  local health_host_link_arguments=(
+    -std=c++17
+    "${health_object}"
+    "${health_device_link}"
+    -Wl,--start-group
+    "${PHANTOM_ARCHIVE}"
+    -lntl
+    -lgmpxx
+    -lgmp
+    -Wl,--end-group
+    -L"${CUDA_ROOT}/lib64"
+    -Wl,-rpath,"${CUDA_ROOT}/lib64"
+    -lcudadevrt
+    -lcudart
+    -pthread
+    -ldl
+    -lrt
+    -lm
+    -o "${health_binary}"
+  )
+  c++ "${health_host_link_arguments[@]}"
+  mkdir -p "${TOOLCHAIN_RESULTS}/native_health_inspection"
+  inspect_binary "${health_binary}" \
+    "${TOOLCHAIN_RESULTS}/native_health_inspection"
+
   nm -A -C --defined-only "${PHANTOM_ARCHIVE}" >"${TOOLCHAIN_RESULTS}/phantom_archive_symbols.txt"
   rg 'phantom::arith::CoeffModulus::Create' "${TOOLCHAIN_RESULTS}/phantom_archive_symbols.txt"
 
   local binary_sha
+  local health_binary_sha
   local archive_sha
+  local profile_sha
   binary_sha="$(sha256sum "${binary}" | awk '{print $1}')"
+  health_binary_sha="$(sha256sum "${health_binary}" | awk '{print $1}')"
   archive_sha="$(sha256sum "${PHANTOM_ARCHIVE}" | awk '{print $1}')"
+  profile_sha="$(sha256sum "${PROFILE_PATH}" | awk '{print $1}')"
   local report_arguments=(
     -n
     --arg status pass
@@ -242,16 +468,27 @@ run_toolchain_gate() {
     --arg phantom_commit "${PHANTOM_COMMIT}"
     --arg phantom_archive_sha256 "${archive_sha}"
     --arg binary_sha256 "${binary_sha}"
+    --arg health_binary_sha256 "${health_binary_sha}"
+    --arg profile_sha256 "${profile_sha}"
+    --arg image_id "${ACE_PHANTOM_IMAGE_ID}"
+    --arg definition_sha256 "${ACE_PHANTOM_DEFINITION_SHA256}"
   )
-  jq "${report_arguments[@]}" '{
+  atomic_json "${TOOLCHAIN_RESULTS}/qualification.json" \
+    "${report_arguments[@]}" '{
       status: $status,
       gate: $gate,
       architecture: $architecture,
       phantom_commit: $phantom_commit,
       phantom_archive_sha256: $phantom_archive_sha256,
       binary_sha256: $binary_sha256,
+      health_binary_sha256: $health_binary_sha256,
+      profile_sha256: $profile_sha256,
+      development_image_id: $image_id,
+      development_definition_sha256: $definition_sha256,
+      link_mode: "manual_static_closure",
+      installed_cmake_target_qualified: false,
       executable_was_run: false
-    }' >"${TOOLCHAIN_RESULTS}/qualification.json"
+    }'
   echo "toolchain compile, device-link, host-link, and static inspection passed"
 }
 
@@ -314,6 +551,7 @@ run_compiler_tests() {
   local codegen_tests=(
     ace_edsl/tests/test_air_pass_pipeline.py
     ace_edsl/tests/test_ckks2c_codegen.py
+    tools/phantom_gpu/tests/test_codegen_tools.py
   )
   (
     cd "${REPO_ROOT}"
@@ -344,6 +582,103 @@ run_compiler_tests() {
     tee "${CKKS2C_RESULTS}/ctest.txt"
 }
 
+run_native_terminal_probes() {
+  local model="${CKKS2C_RESULTS}/native_terminal_probe.onnx"
+  local positive_source="${CKKS2C_RESULTS}/native_ckks_phantom.cu"
+  local negative_source="${CKKS2C_RESULTS}/native_poly_phantom.cu"
+  local positive_stdout="${CKKS2C_RESULTS}/native_ckks_phantom.stdout.txt"
+  local positive_stderr="${CKKS2C_RESULTS}/native_ckks_phantom.stderr.txt"
+  local negative_stdout="${CKKS2C_RESULTS}/native_poly_phantom.stdout.txt"
+  local negative_stderr="${CKKS2C_RESULTS}/native_poly_phantom.stderr.txt"
+  local commands_file="${CKKS2C_RESULTS}/terminal_selection_commands.txt"
+
+  python3 "${SCRIPT_DIR}/generate_native_terminal_probe.py" --output "${model}"
+  local positive_command=(
+    "${INSTALL_ROOT}/bin/fhe_cmplr"
+    -FHE:codegen_ir=ckks
+    -K2C:lib=phantom
+    -o "${positive_source}"
+    "${model}"
+  )
+  local negative_command=(
+    "${INSTALL_ROOT}/bin/fhe_cmplr"
+    -FHE:codegen_ir=poly
+    -P2C:lib=phantom
+    -o "${negative_source}"
+    "${model}"
+  )
+  {
+    printf '%q ' "${positive_command[@]}"
+    printf '\n'
+    printf '%q ' "${negative_command[@]}"
+    printf '\n'
+  } >"${commands_file}"
+
+  local positive_exit_code
+  if "${positive_command[@]}" >"${positive_stdout}" 2>"${positive_stderr}"; then
+    positive_exit_code=0
+  else
+    positive_exit_code=$?
+  fi
+  if [[ ${positive_exit_code} -ne 0 || ! -s "${positive_source}" ]]; then
+    echo "native CKKS-to-Phantom terminal probe failed" >&2
+    exit 1
+  fi
+  python3 "${SCRIPT_DIR}/check_primitive_codegen.py" \
+    "${positive_source}" \
+    --report "${CKKS2C_RESULTS}/native_ckks_phantom_audit.json" \
+    --required-token '#include "rt_phantom/rt_phantom.h"' \
+    --required-token LIB_PHANTOM \
+    --required-token 'Add_ciph('
+
+  if [[ -e "${negative_source}" ]]; then
+    echo "negative terminal probe output unexpectedly exists before the run" >&2
+    exit 1
+  fi
+  local negative_exit_code
+  if "${negative_command[@]}" >"${negative_stdout}" 2>"${negative_stderr}"; then
+    negative_exit_code=0
+  else
+    negative_exit_code=$?
+  fi
+  if [[ ${negative_exit_code} -ne 1 ]]; then
+    echo "POLY-to-Phantom terminal probe returned ${negative_exit_code}, expected 1" >&2
+    exit 1
+  fi
+  if [[ -e "${negative_source}" ]]; then
+    echo "rejected POLY-to-Phantom route created source output" >&2
+    exit 1
+  fi
+  if ! rg -Fq \
+    'Phantom source generation requires -FHE:codegen_ir=ckks' \
+    "${negative_stdout}" "${negative_stderr}"; then
+    echo "POLY-to-Phantom rejection diagnostic was not emitted" >&2
+    exit 1
+  fi
+
+  local model_sha
+  local source_sha
+  model_sha="$(sha256sum "${model}" | awk '{print $1}')"
+  source_sha="$(sha256sum "${positive_source}" | awk '{print $1}')"
+  atomic_json "${CKKS2C_RESULTS}/terminal_selection.json" \
+    -n \
+    --arg status pass \
+    --arg model_sha256 "${model_sha}" \
+    --arg source_sha256 "${source_sha}" \
+    --argjson positive_exit_code "${positive_exit_code}" \
+    --argjson negative_exit_code "${negative_exit_code}" \
+    '{
+      status: $status,
+      model_sha256: $model_sha256,
+      positive_exit_code: $positive_exit_code,
+      positive_source_sha256: $source_sha256,
+      positive_source_audit: "pass",
+      negative_exit_code: $negative_exit_code,
+      negative_output_created: false,
+      negative_diagnostic_matched: true
+    }'
+}
+
 link_generated_probe() {
   local source="${CKKS2C_RESULTS}/add_mul_rotate.cu"
   local object="${CKKS2C_RESULTS}/add_mul_rotate.o"
@@ -362,8 +697,13 @@ link_generated_probe() {
   test -s "${external_archive}"
   test "$(git -C "${external_source}" rev-parse HEAD)" = "${PHANTOM_COMMIT}"
 
-  python3 "${SCRIPT_DIR}/generate_ckks2c_probe.py" --output "${source}"
-  python3 "${SCRIPT_DIR}/check_primitive_codegen.py" "${source}" --report "${CKKS2C_RESULTS}/source_audit.json"
+  python3 "${SCRIPT_DIR}/generate_ckks2c_probe.py" \
+    --profile "${PROFILE_PATH}" \
+    --output "${source}"
+  python3 "${SCRIPT_DIR}/check_primitive_codegen.py" \
+    "${source}" \
+    --profile "${PROFILE_PATH}" \
+    --report "${CKKS2C_RESULTS}/source_audit.json"
 
   local compile_arguments=(
     "${nvcc_common[@]}"
@@ -427,8 +767,14 @@ link_generated_probe() {
 
   local source_sha
   local binary_sha
+  local profile_sha
+  local terminal_selection_sha
   source_sha="$(sha256sum "${source}" | awk '{print $1}')"
   binary_sha="$(sha256sum "${binary}" | awk '{print $1}')"
+  profile_sha="$(sha256sum "${PROFILE_PATH}" | awk '{print $1}')"
+  terminal_selection_sha="$(
+    sha256sum "${CKKS2C_RESULTS}/terminal_selection.json" | awk '{print $1}'
+  )"
   local report_arguments=(
     -n
     --arg status pass
@@ -437,20 +783,32 @@ link_generated_probe() {
     --arg phantom_commit "${PHANTOM_COMMIT}"
     --arg source_sha256 "${source_sha}"
     --arg binary_sha256 "${binary_sha}"
+    --arg profile_sha256 "${profile_sha}"
+    --arg terminal_selection_sha256 "${terminal_selection_sha}"
+    --arg image_id "${ACE_PHANTOM_IMAGE_ID}"
+    --arg definition_sha256 "${ACE_PHANTOM_DEFINITION_SHA256}"
     --argjson production_archive_contains_native_bootstrap "${archive_contains_native_bootstrap}"
   )
-  jq "${report_arguments[@]}" '{
+  atomic_json "${CKKS2C_RESULTS}/qualification.json" \
+    "${report_arguments[@]}" '{
       status: $status,
       gate: $gate,
       architecture: $architecture,
       phantom_commit: $phantom_commit,
       source_sha256: $source_sha256,
       binary_sha256: $binary_sha256,
+      profile_sha256: $profile_sha256,
+      terminal_selection_sha256: $terminal_selection_sha256,
+      development_image_id: $image_id,
+      development_definition_sha256: $definition_sha256,
       production_archive_contains_native_bootstrap:
         $production_archive_contains_native_bootstrap,
       production_archive_split_pending: true,
+      generated_source_contains_native_bootstrap: false,
+      link_mode: "manual_static_closure",
+      installed_cmake_target_qualified: false,
       executable_was_run: false
-    }' >"${CKKS2C_RESULTS}/qualification.json"
+    }'
   echo "generated CKKS2C source compile, device-link, host-link, and inspection passed"
 }
 
@@ -461,6 +819,7 @@ run_ckks2c_gate() {
   configure_ace
   configure_bindings
   run_compiler_tests
+  run_native_terminal_probes
   link_generated_probe
 }
 
@@ -472,3 +831,6 @@ case "${GATE}" in
     run_ckks2c_gate
     ;;
 esac
+
+write_manifest
+echo "qualification evidence: ${RUN_ROOT}"
