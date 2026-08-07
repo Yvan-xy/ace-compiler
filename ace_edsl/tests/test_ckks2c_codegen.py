@@ -37,12 +37,14 @@ def test_phantom_add_mul_rotate_uses_only_dedicated_ckks2c():
         AceEDSL._get_dsl.cache_clear()
 
         @ckks_kernel
-        def m1_kernel(a: CkksCiphertext, b: CkksCiphertext) -> CkksCiphertext:
+        def arithmetic_kernel(
+            a: CkksCiphertext, b: CkksCiphertext
+        ) -> CkksCiphertext:
             return (a * b) + a.rotate(3)
 
         a = CkksCiphertext(shape=(16384,), name="a")
         b = CkksCiphertext(shape=(16384,), name="b")
-        m1_kernel(a, b)
+        arithmetic_kernel(a, b)
         glob = AceEDSL._get_dsl().current_air_module
         raw_air = glob.dump().lower()
         assert "fhe::poly" not in raw_air
@@ -84,11 +86,11 @@ def test_phantom_add_mul_rotate_uses_only_dedicated_ckks2c():
             assert token in source, token
         for token in forbidden:
             assert token not in source, token
-        print("CKKS2C_M1_SOURCE_OK")
+        print("CKKS2C_ARITHMETIC_SOURCE_OK")
         '''
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "CKKS2C_M1_SOURCE_OK" in result.stdout
+    assert "CKKS2C_ARITHMETIC_SOURCE_OK" in result.stdout
 
 
 def test_full_primitive_bootstrap_preserves_retained_ops_through_ckks2c():
