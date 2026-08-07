@@ -259,6 +259,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--models-dir", type=Path, default=Path("/inputs/models"))
     parser.add_argument("--dataset-dir", type=Path, default=Path("/inputs/dataset"))
     parser.add_argument("--phantom-dir", type=Path, default=Path("/deps/phantom-ant"))
+    parser.add_argument("--source-mode", choices=("git", "snapshot"), default="git")
+    parser.add_argument("--ace-commit")
+    parser.add_argument("--source-manifest-sha256")
+    parser.add_argument("--base-image")
+    parser.add_argument("--base-config-digest")
+    parser.add_argument("--bootstrap-sha256")
     parser.add_argument("--json-output", type=Path)
     parser.add_argument("--cpp-header-output", type=Path)
     return parser.parse_args()
@@ -287,27 +293,43 @@ def main() -> int:
         fail("CUDA image is not digest-pinned")
     toolchain = verify_toolchain(tools_root, repo_root)
 
-    ace_branch = git(repo_root, "branch", "--show-current")
-    if ace_branch != lock["ACE_BRANCH"]:
-        fail(f"ACE branch is {ace_branch}, expected {lock['ACE_BRANCH']}")
-
     phantom_root = arguments.phantom_dir.resolve(strict=True)
-    phantom_head = git(phantom_root, "rev-parse", "HEAD")
-    phantom_branch = git(phantom_root, "branch", "--show-current")
-    if phantom_head != lock["PHANTOM_COMMIT"]:
-        fail(f"Phantom HEAD is {phantom_head}, expected {lock['PHANTOM_COMMIT']}")
-    if phantom_branch != lock["PHANTOM_BRANCH"]:
-        fail(f"Phantom branch is {phantom_branch}, expected {lock['PHANTOM_BRANCH']}")
-    git(phantom_root, "cat-file", "-e", f"{lock['PHANTOM_COMMIT']}^{{commit}}")
-    untracked_count = len(
-        [
-            line
-            for line in git(
-                phantom_root, "status", "--porcelain", "--untracked-files=all"
-            ).splitlines()
-            if line.startswith("?? ")
-        ]
-    )
+    if arguments.source_mode == "snapshot":
+        if not PIN_PATTERN.fullmatch(arguments.ace_commit or ""):
+            fail("snapshot ACE commit is absent or malformed")
+        if not SHA256_PATTERN.fullmatch(arguments.source_manifest_sha256 or ""):
+            fail("snapshot source manifest SHA-256 is absent or malformed")
+        if (repo_root / ".git").exists() or (phantom_root / ".git").exists():
+            fail("source snapshots must not contain Git metadata")
+        for required in ("CMakeLists.txt", "include", "src"):
+            if not (phantom_root / required).exists():
+                fail(f"Phantom source snapshot is missing {required}")
+        ace_branch = lock["ACE_BRANCH"]
+        ace_commit = arguments.ace_commit
+        phantom_branch = lock["PHANTOM_BRANCH"]
+        phantom_head = lock["PHANTOM_COMMIT"]
+        untracked_count = 0
+    else:
+        ace_branch = git(repo_root, "branch", "--show-current")
+        if ace_branch != lock["ACE_BRANCH"]:
+            fail(f"ACE branch is {ace_branch}, expected {lock['ACE_BRANCH']}")
+        ace_commit = git(repo_root, "rev-parse", "HEAD")
+        phantom_head = git(phantom_root, "rev-parse", "HEAD")
+        phantom_branch = git(phantom_root, "branch", "--show-current")
+        if phantom_head != lock["PHANTOM_COMMIT"]:
+            fail(f"Phantom HEAD is {phantom_head}, expected {lock['PHANTOM_COMMIT']}")
+        if phantom_branch != lock["PHANTOM_BRANCH"]:
+            fail(f"Phantom branch is {phantom_branch}, expected {lock['PHANTOM_BRANCH']}")
+        git(phantom_root, "cat-file", "-e", f"{lock['PHANTOM_COMMIT']}^{{commit}}")
+        untracked_count = len(
+            [
+                line
+                for line in git(
+                    phantom_root, "status", "--porcelain", "--untracked-files=all"
+                ).splitlines()
+                if line.startswith("?? ")
+            ]
+        )
 
     profile_path = (
         repo_root
@@ -322,64 +344,85 @@ def main() -> int:
             render_cpp_profile_header(profile, profile_sha256), encoding="utf-8"
         )
 
-    image_id = os.environ.get("ACE_PHANTOM_IMAGE_ID", "")
-    definition_sha256 = os.environ.get("ACE_PHANTOM_DEFINITION_SHA256", "")
-    if not IMAGE_ID_PATTERN.fullmatch(image_id):
-        fail("development image ID is absent or malformed")
-    if not SHA256_PATTERN.fullmatch(definition_sha256):
-        fail("development image definition hash is absent or malformed")
+    if arguments.source_mode == "snapshot":
+        if arguments.base_image != lock["CUDA_IMAGE"]:
+            fail("base image differs from the dependency lock")
+        if not IMAGE_ID_PATTERN.fullmatch(arguments.base_config_digest or ""):
+            fail("base image config digest is absent or malformed")
+        if not SHA256_PATTERN.fullmatch(arguments.bootstrap_sha256 or ""):
+            fail("bootstrap SHA-256 is absent or malformed")
+        image_record = {
+            "base_image": arguments.base_image,
+            "config_digest": arguments.base_config_digest,
+            "bootstrap_sha256": arguments.bootstrap_sha256,
+        }
+        fixture_record = None
+    else:
+        image_id = os.environ.get("ACE_PHANTOM_IMAGE_ID", "")
+        definition_sha256 = os.environ.get("ACE_PHANTOM_DEFINITION_SHA256", "")
+        if not IMAGE_ID_PATTERN.fullmatch(image_id):
+            fail("development image ID is absent or malformed")
+        if not SHA256_PATTERN.fullmatch(definition_sha256):
+            fail("development image definition hash is absent or malformed")
+        image_record = {"id": image_id, "definition_sha256": definition_sha256}
 
-    fixture_path = tools_root / "configs/resnet20_cifar10_pre.json"
-    fixture = read_json(fixture_path)
-    if fixture.get("schema_version") != "1.0.0":
-        fail("unsupported ResNet fixture schema")
-    model = verify_input(arguments.models_dir, fixture["inputs"]["model"])
-    dataset = verify_input(arguments.dataset_dir, fixture["inputs"]["dataset"])
-
-    reference_path = repo_root / fixture["reference"]["log_path_at_capture"]
-    reference: dict[str, Any] = {"path": os.fspath(reference_path), "present": False}
-    if reference_path.is_file():
-        reference.update(
-            {
-                "present": True,
-                "size_bytes": reference_path.stat().st_size,
-                "sha256": sha256(reference_path),
-            }
-        )
-        if reference["size_bytes"] != fixture["reference"]["log_size_bytes"]:
-            fail("preserved reference log size differs from its manifest")
-        if reference["sha256"] != fixture["reference"]["log_sha256"]:
-            fail("preserved reference log hash differs from its manifest")
-
-    report = {
-        "status": "pass",
-        "ace": {
-            "branch": ace_branch,
-            "commit": git(repo_root, "rev-parse", "HEAD"),
-        },
-        "phantom": {
-            "branch": phantom_branch,
-            "commit": phantom_head,
-            "untracked_file_count": untracked_count,
-            "build_source_policy": "clone the pinned commit; never build the mounted worktree",
-        },
-        "cuda_architecture": 80,
-        "development_image": {
-            "id": image_id,
-            "definition_sha256": definition_sha256,
-        },
-        "toolchain": toolchain,
-        "profile": {
-            "path": os.fspath(profile_path),
-            "sha256": profile_sha256,
-        },
-        "fixture": {
+        fixture_path = tools_root / "configs/resnet20_cifar10_pre.json"
+        fixture = read_json(fixture_path)
+        if fixture.get("schema_version") != "1.0.0":
+            fail("unsupported ResNet fixture schema")
+        model = verify_input(arguments.models_dir, fixture["inputs"]["model"])
+        dataset = verify_input(arguments.dataset_dir, fixture["inputs"]["dataset"])
+        reference_path = repo_root / fixture["reference"]["log_path_at_capture"]
+        reference: dict[str, Any] = {
+            "path": os.fspath(reference_path),
+            "present": False,
+        }
+        if reference_path.is_file():
+            reference.update(
+                {
+                    "present": True,
+                    "size_bytes": reference_path.stat().st_size,
+                    "sha256": sha256(reference_path),
+                }
+            )
+            if reference["size_bytes"] != fixture["reference"]["log_size_bytes"]:
+                fail("preserved reference log size differs from its manifest")
+            if reference["sha256"] != fixture["reference"]["log_sha256"]:
+                fail("preserved reference log hash differs from its manifest")
+        fixture_record = {
             "path": os.fspath(fixture_path),
             "sha256": sha256(fixture_path),
             "model": model,
             "dataset": dataset,
             "reference_log": reference,
+        }
+
+    report = {
+        "status": "pass",
+        "source_mode": arguments.source_mode,
+        "ace": {
+            "branch": ace_branch,
+            "commit": ace_commit,
         },
+        "phantom": {
+            "branch": phantom_branch,
+            "commit": phantom_head,
+            "untracked_file_count": untracked_count,
+            "build_source_policy": (
+                "use the checksum-verified source snapshot"
+                if arguments.source_mode == "snapshot"
+                else "clone the pinned commit; never build the mounted worktree"
+            ),
+        },
+        "cuda_architecture": 80,
+        "environment_identity": image_record,
+        "source_manifest_sha256": arguments.source_manifest_sha256,
+        "toolchain": toolchain,
+        "profile": {
+            "path": os.fspath(profile_path),
+            "sha256": profile_sha256,
+        },
+        "fixture": fixture_record,
     }
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if arguments.json_output:

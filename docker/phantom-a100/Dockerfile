@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:5645fec64549cc35930eee9d85aafd2b0006c0c3f22632be5a1d85e2604e9749
+FROM --platform=linux/amd64 docker.io/nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:5645fec64549cc35930eee9d85aafd2b0006c0c3f22632be5a1d85e2604e9749
 
 ARG ACE_PHANTOM_DEFINITION_SHA256
 LABEL org.ace.phantom.definition-sha256=${ACE_PHANTOM_DEFINITION_SHA256}

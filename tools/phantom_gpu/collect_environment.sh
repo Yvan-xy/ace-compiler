@@ -17,6 +17,10 @@ mkdir -p "$(dirname -- "${OUTPUT}")"
   echo "toolchain_identity=${ACE_PHANTOM_TOOLCHAIN:-unset}"
   echo "development_image_id=${ACE_PHANTOM_IMAGE_ID:-unset}"
   echo "development_definition_sha256=${ACE_PHANTOM_DEFINITION_SHA256:-unset}"
+  echo "base_image=${ACE_RUNPOD_BASE_IMAGE:-unset}"
+  echo "base_config_digest=${ACE_RUNPOD_BASE_CONFIG_DIGEST:-unset}"
+  echo "bootstrap_sha256=${ACE_RUNPOD_BOOTSTRAP_SHA256:-unset}"
+  echo "source_mode=${ACE_PHANTOM_SOURCE_MODE:-git}"
   echo
   echo "[os-release]"
   sed -n '1,40p' /etc/os-release
@@ -29,6 +33,12 @@ mkdir -p "$(dirname -- "${OUTPUT}")"
   echo
   echo "[c++]"
   c++ --version
+  echo
+  echo "[gcc]"
+  gcc --version
+  echo
+  echo "[g++]"
+  g++ --version
   echo
   echo "[ninja]"
   ninja --version
@@ -66,6 +76,12 @@ mkdir -p "$(dirname -- "${OUTPUT}")"
   echo
   echo "[cuda-libraries]"
   ldconfig -p | rg 'libcudart|libcuda'
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    echo
+    echo "[driver]"
+    nvidia-smi --query-gpu=name,uuid,memory.total,driver_version \
+      --format=csv,noheader
+  fi
 } >"${OUTPUT}"
 
 echo "recorded host toolchain at ${OUTPUT}"

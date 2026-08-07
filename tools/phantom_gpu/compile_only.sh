@@ -2,21 +2,22 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
+REPO_ROOT="${ACE_PHANTOM_REPO_ROOT:-$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)}"
 LOCK_FILE="${SCRIPT_DIR}/configs/dependencies.env"
 PROFILE_PATH="${REPO_ROOT}/fhe-cmplr/rtlib/phantom/config/fullpacked_bts_v1.json"
-STATE_ROOT="${REPO_ROOT}/build/phantom_gpu"
+STATE_ROOT="${ACE_PHANTOM_STATE_ROOT:-${REPO_ROOT}/build/phantom_gpu}"
 DEPENDENCY_ROOT="${STATE_ROOT}/dependencies"
 INSTALL_ROOT="${STATE_ROOT}/install-cuda-sm80"
 ACE_BUILD="${STATE_ROOT}/ace-cuda-sm80"
 BINDINGS_BUILD="${STATE_ROOT}/bindings-cuda-sm80"
-PHANTOM_MOUNT="/deps/phantom-ant"
+PHANTOM_MOUNT="${ACE_PHANTOM_SOURCE_DIR:-/deps/phantom-ant}"
 MODELS_MOUNT="/inputs/models"
 DATASET_MOUNT="/inputs/dataset"
 CUDA_ROOT="/usr/local/cuda"
 NVCC="${CUDA_ROOT}/bin/nvcc"
 CUOBJDUMP="${CUDA_ROOT}/bin/cuobjdump"
 BUILD_JOBS="${ACE_PHANTOM_BUILD_JOBS:-2}"
+SOURCE_MODE="${ACE_PHANTOM_SOURCE_MODE:-git}"
 GATE=""
 
 usage() {
@@ -54,7 +55,21 @@ set -a
 source "${LOCK_FILE}"
 set +a
 
-PINNED_SOURCE="${DEPENDENCY_ROOT}/phantom-ant-${PHANTOM_COMMIT}"
+case "${SOURCE_MODE}" in
+  git|snapshot) ;;
+  *)
+    echo "ACE_PHANTOM_SOURCE_MODE must be git or snapshot" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "${SOURCE_MODE}" == "snapshot" ]]; then
+  PINNED_SOURCE="${PHANTOM_MOUNT}"
+  ACE_PHANTOM_IMAGE_ID="${ACE_RUNPOD_BASE_CONFIG_DIGEST:-}"
+  ACE_PHANTOM_DEFINITION_SHA256="${ACE_RUNPOD_BOOTSTRAP_SHA256:-}"
+else
+  PINNED_SOURCE="${DEPENDENCY_ROOT}/phantom-ant-${PHANTOM_COMMIT}"
+fi
 PHANTOM_BUILD="${STATE_ROOT}/phantom-${PHANTOM_COMMIT}-sm80"
 PHANTOM_ARCHIVE="${PHANTOM_BUILD}/lib/libphantom.a"
 RESULTS_ROOT="${STATE_ROOT}/compile_only_results"
@@ -68,6 +83,23 @@ CURRENT_RECORD="${RESULTS_ROOT}/current-${GATE}.json"
 LATEST_SUCCESS_RECORD="${RESULTS_ROOT}/latest-success-${GATE}.json"
 STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RUN_ACTIVE=0
+TIMINGS_FILE="${RUN_ROOT}/phase-timings.tsv"
+: >"${TIMINGS_FILE}"
+
+timed_phase() {
+  local name="$1"
+  shift
+  local started ended status
+  started="$(date +%s)"
+  set +e
+  "$@"
+  status=$?
+  set -e
+  ended="$(date +%s)"
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "${name}" "${started}" "${ended}" "$((ended - started))" "${status}" >>"${TIMINGS_FILE}"
+  return "${status}"
+}
 
 atomic_json() {
   local target="$1"
@@ -77,6 +109,13 @@ atomic_json() {
   jq "$@" >"${temporary}"
   chmod 0644 "${temporary}"
   mv "${temporary}" "${target}"
+}
+
+record_command() {
+  local target="$1"
+  shift
+  printf '%q ' "$@" >>"${target}"
+  printf '\n' >>"${target}"
 }
 
 write_run_state() {
@@ -128,12 +167,16 @@ handle_exit() {
 write_manifest() {
   local completed_utc
   completed_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  (
-    cd "${REPO_ROOT}"
-    git ls-files -z |
-      LC_ALL=C sort -z |
-      xargs -0 sha256sum
-  ) >"${RUN_ROOT}/ace_tracked_sources.sha256"
+  if [[ "${SOURCE_MODE}" == "snapshot" ]]; then
+    cp "${ACE_PHANTOM_SOURCE_MANIFEST}" "${RUN_ROOT}/ace_source_manifest.json"
+  else
+    (
+      cd "${REPO_ROOT}"
+      git ls-files -z |
+        LC_ALL=C sort -z |
+        xargs -0 sha256sum
+    ) >"${RUN_ROOT}/ace_tracked_sources.sha256"
+  fi
   (
     cd "${RUN_ROOT}"
     find . -type f ! -name manifest.json ! -name SHA256SUMS -print0 |
@@ -147,21 +190,33 @@ write_manifest() {
   local tracked_diff_sha256
   local worktree_status_sha256
   local worktree_dirty=false
+  local ace_commit
+  local source_manifest_name
   sums_sha256="$(sha256sum "${RUN_ROOT}/SHA256SUMS" | awk '{print $1}')"
   profile_sha256="$(sha256sum "${PROFILE_PATH}" | awk '{print $1}')"
-  source_manifest_sha256="$(
-    sha256sum "${RUN_ROOT}/ace_tracked_sources.sha256" | awk '{print $1}'
-  )"
-  tracked_diff_sha256="$(
-    git -C "${REPO_ROOT}" diff --binary HEAD | sha256sum | awk '{print $1}'
-  )"
-  worktree_status_sha256="$(
-    git -C "${REPO_ROOT}" status --porcelain=v1 -z --untracked-files=all |
-      sha256sum |
-      awk '{print $1}'
-  )"
-  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain=v1 --untracked-files=all)" ]]; then
-    worktree_dirty=true
+  if [[ "${SOURCE_MODE}" == "snapshot" ]]; then
+    source_manifest_sha256="$(sha256sum "${RUN_ROOT}/ace_source_manifest.json" | awk '{print $1}')"
+    tracked_diff_sha256="$(printf '' | sha256sum | awk '{print $1}')"
+    worktree_status_sha256="${tracked_diff_sha256}"
+    ace_commit="${ACE_PHANTOM_ACE_COMMIT}"
+    source_manifest_name="ace_source_manifest.json"
+  else
+    source_manifest_sha256="$(
+      sha256sum "${RUN_ROOT}/ace_tracked_sources.sha256" | awk '{print $1}'
+    )"
+    tracked_diff_sha256="$(
+      git -C "${REPO_ROOT}" diff --binary HEAD | sha256sum | awk '{print $1}'
+    )"
+    worktree_status_sha256="$(
+      git -C "${REPO_ROOT}" status --porcelain=v1 -z --untracked-files=all |
+        sha256sum |
+        awk '{print $1}'
+    )"
+    if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain=v1 --untracked-files=all)" ]]; then
+      worktree_dirty=true
+    fi
+    ace_commit="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+    source_manifest_name="ace_tracked_sources.sha256"
   fi
   atomic_json "${RUN_ROOT}/manifest.json" \
     -n \
@@ -169,13 +224,15 @@ write_manifest() {
     --arg gate "${GATE}" \
     --arg started_utc "${STARTED_UTC}" \
     --arg completed_utc "${completed_utc}" \
-    --arg ace_commit "$(git -C "${REPO_ROOT}" rev-parse HEAD)" \
+    --arg ace_commit "${ace_commit}" \
     --arg phantom_commit "${PHANTOM_COMMIT}" \
+    --arg source_mode "${SOURCE_MODE}" \
     --arg image_id "${ACE_PHANTOM_IMAGE_ID}" \
     --arg definition_sha256 "${ACE_PHANTOM_DEFINITION_SHA256}" \
     --arg profile_sha256 "${profile_sha256}" \
     --arg sums_sha256 "${sums_sha256}" \
     --arg source_manifest_sha256 "${source_manifest_sha256}" \
+    --arg source_manifest_name "${source_manifest_name}" \
     --arg tracked_diff_sha256 "${tracked_diff_sha256}" \
     --arg worktree_status_sha256 "${worktree_status_sha256}" \
     --argjson worktree_dirty "${worktree_dirty}" \
@@ -187,13 +244,14 @@ write_manifest() {
       completed_utc: $completed_utc,
       ace_commit: $ace_commit,
       phantom_commit: $phantom_commit,
+      source_mode: $source_mode,
       development_image_id: $image_id,
       development_definition_sha256: $definition_sha256,
       profile_sha256: $profile_sha256,
       ace_worktree_dirty: $worktree_dirty,
       ace_tracked_diff_sha256: $tracked_diff_sha256,
       ace_worktree_status_sha256: $worktree_status_sha256,
-      ace_tracked_source_manifest: "ace_tracked_sources.sha256",
+      ace_tracked_source_manifest: $source_manifest_name,
       ace_tracked_source_manifest_sha256: $source_manifest_sha256,
       evidence_sha256_manifest: "SHA256SUMS",
       evidence_sha256_manifest_sha256: $sums_sha256,
@@ -262,12 +320,35 @@ require_environment() {
   test -r "${CUDA_ROOT}/include/cuda_runtime.h"
   test -r "${CUDA_ROOT}/lib64/libcudadevrt.a"
   test -r "${CUDA_ROOT}/lib64/libcudart.so"
-  require_readonly_mount "${PHANTOM_MOUNT}"
-  require_readonly_mount "${MODELS_MOUNT}"
-  require_readonly_mount "${DATASET_MOUNT}"
+  if [[ "${SOURCE_MODE}" == "snapshot" ]]; then
+    [[ "${ACE_RUNPOD_BASE_IMAGE:-}" == "${CUDA_IMAGE}" ]]
+    [[ "${ACE_PHANTOM_ACE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]
+    [[ "${ACE_PHANTOM_SOURCE_MANIFEST_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]
+    [[ -f "${ACE_PHANTOM_SOURCE_MANIFEST:-}" ]]
+    [[ "$(sha256sum "${ACE_PHANTOM_SOURCE_MANIFEST}" | awk '{print $1}')" == \
+       "${ACE_PHANTOM_SOURCE_MANIFEST_SHA256}" ]]
+  else
+    require_readonly_mount "${PHANTOM_MOUNT}"
+    require_readonly_mount "${MODELS_MOUNT}"
+    require_readonly_mount "${DATASET_MOUNT}"
+  fi
 }
 
 prepare_pinned_source() {
+  if [[ "${SOURCE_MODE}" == "snapshot" ]]; then
+    if [[ -e "${PINNED_SOURCE}/.git" ]]; then
+      echo "Phantom source snapshot unexpectedly contains Git metadata" >&2
+      exit 1
+    fi
+    for required in CMakeLists.txt include src; do
+      test -e "${PINNED_SOURCE}/${required}"
+    done
+    if find "${PINNED_SOURCE}" -type f -name '._*' -print -quit | grep -q .; then
+      echo "Phantom source snapshot contains AppleDouble files" >&2
+      exit 1
+    fi
+    return
+  fi
   mkdir -p "${DEPENDENCY_ROOT}"
   if [[ ! -e "${PINNED_SOURCE}" ]]; then
     local clone_arguments=(
@@ -308,6 +389,16 @@ record_common_configuration() {
     --json-output "${result_dir}/configuration.json"
     --cpp-header-output "${result_dir}/fullpacked_bts_profile.h"
   )
+  if [[ "${SOURCE_MODE}" == "snapshot" ]]; then
+    arguments+=(
+      --source-mode snapshot
+      --ace-commit "${ACE_PHANTOM_ACE_COMMIT}"
+      --source-manifest-sha256 "${ACE_PHANTOM_SOURCE_MANIFEST_SHA256}"
+      --base-image "${ACE_RUNPOD_BASE_IMAGE}"
+      --base-config-digest "${ACE_RUNPOD_BASE_CONFIG_DIGEST}"
+      --bootstrap-sha256 "${ACE_RUNPOD_BOOTSTRAP_SHA256}"
+    )
+  fi
   python3 "${SCRIPT_DIR}/check_configuration.py" "${arguments[@]}"
   bash "${SCRIPT_DIR}/collect_environment.sh" "${result_dir}/environment.txt"
 }
@@ -347,7 +438,7 @@ run_toolchain_gate() {
   require_environment
   record_common_configuration "${TOOLCHAIN_RESULTS}"
   prepare_pinned_source
-  configure_phantom
+  timed_phase phantom_build configure_phantom
 
   local source="${SCRIPT_DIR}/harness/minimal_phantom.cu"
   local object="${TOOLCHAIN_RESULTS}/minimal_phantom.o"
@@ -363,6 +454,8 @@ run_toolchain_gate() {
     "${source}"
     -o "${object}"
   )
+  record_command "${TOOLCHAIN_RESULTS}/link-commands.txt" \
+    "${NVCC}" "${compile_arguments[@]}"
   "${NVCC}" "${compile_arguments[@]}"
   nm -C "${object}" >"${TOOLCHAIN_RESULTS}/object_symbols.txt"
   rg ' U phantom::arith::CoeffModulus::Create' "${TOOLCHAIN_RESULTS}/object_symbols.txt"
@@ -376,6 +469,8 @@ run_toolchain_gate() {
     -lcudadevrt
     -o "${device_link}"
   )
+  record_command "${TOOLCHAIN_RESULTS}/link-commands.txt" \
+    "${NVCC}" "${device_link_arguments[@]}"
   "${NVCC}" "${device_link_arguments[@]}"
 
   local host_link_arguments=(
@@ -398,6 +493,8 @@ run_toolchain_gate() {
     -lm
     -o "${binary}"
   )
+  record_command "${TOOLCHAIN_RESULTS}/link-commands.txt" \
+    c++ "${host_link_arguments[@]}"
   c++ "${host_link_arguments[@]}"
 
   inspect_binary "${binary}" "${TOOLCHAIN_RESULTS}"
@@ -414,6 +511,8 @@ run_toolchain_gate() {
     "${health_source}"
     -o "${health_object}"
   )
+  record_command "${TOOLCHAIN_RESULTS}/link-commands.txt" \
+    "${NVCC}" "${health_compile_arguments[@]}"
   "${NVCC}" "${health_compile_arguments[@]}"
   local health_device_link_arguments=(
     "${nvcc_common[@]}"
@@ -424,6 +523,8 @@ run_toolchain_gate() {
     -lcudadevrt
     -o "${health_device_link}"
   )
+  record_command "${TOOLCHAIN_RESULTS}/link-commands.txt" \
+    "${NVCC}" "${health_device_link_arguments[@]}"
   "${NVCC}" "${health_device_link_arguments[@]}"
   local health_host_link_arguments=(
     -std=c++17
@@ -445,6 +546,8 @@ run_toolchain_gate() {
     -lm
     -o "${health_binary}"
   )
+  record_command "${TOOLCHAIN_RESULTS}/link-commands.txt" \
+    c++ "${health_host_link_arguments[@]}"
   c++ "${health_host_link_arguments[@]}"
   mkdir -p "${TOOLCHAIN_RESULTS}/native_health_inspection"
   inspect_binary "${health_binary}" \
@@ -521,6 +624,12 @@ configure_ace() {
     -DAIR_CODE_CHECK=OFF
     -DNN_CODE_CHECK=OFF
   )
+  if [[ "${SOURCE_MODE}" == "snapshot" ]]; then
+    arguments+=(
+      -DACE_SOURCE_COMMIT="${ACE_PHANTOM_ACE_COMMIT}"
+      -DPHANTOM_SOURCE_SNAPSHOT=ON
+    )
+  fi
   cmake "${arguments[@]}"
   cmake --build "${ACE_BUILD}" --target install --parallel "${BUILD_JOBS}"
 }
@@ -554,6 +663,7 @@ run_compiler_tests() {
     ace_edsl/tests/test_ckks2c_codegen.py
     tools/phantom_gpu/tests/test_a100_evidence_archives.py
     tools/phantom_gpu/tests/test_codegen_tools.py
+    tools/phantom_gpu/tests/test_runpod_pipeline.py
   )
   (
     cd "${REPO_ROOT}"
@@ -697,7 +807,12 @@ link_generated_probe() {
   test -s "${adapter_archive}"
   test -s "${common_archive}"
   test -s "${external_archive}"
-  test "$(git -C "${external_source}" rev-parse HEAD)" = "${PHANTOM_COMMIT}"
+  if [[ "${SOURCE_MODE}" == "snapshot" ]]; then
+    external_source="${PINNED_SOURCE}"
+    test ! -e "${external_source}/.git"
+  else
+    test "$(git -C "${external_source}" rev-parse HEAD)" = "${PHANTOM_COMMIT}"
+  fi
 
   python3 "${SCRIPT_DIR}/generate_ckks2c_probe.py" \
     --profile "${PROFILE_PATH}" \
@@ -715,7 +830,14 @@ link_generated_probe() {
     "${source}"
     -o "${object}"
   )
+  record_command "${CKKS2C_RESULTS}/link-commands.txt" \
+    "${NVCC}" "${compile_arguments[@]}"
   "${NVCC}" "${compile_arguments[@]}"
+  record_command "${CKKS2C_RESULTS}/link-commands.txt" \
+    c++ -std=c++17 \
+      -I"${REPO_ROOT}/fhe-cmplr/rtlib/include" \
+      -c "${SCRIPT_DIR}/harness/generated_link_main.cc" \
+      -o "${main_object}"
   c++ -std=c++17 \
     -I"${REPO_ROOT}/fhe-cmplr/rtlib/include" \
     -c "${SCRIPT_DIR}/harness/generated_link_main.cc" \
@@ -732,6 +854,8 @@ link_generated_probe() {
     -lcudadevrt
     -o "${device_link}"
   )
+  record_command "${CKKS2C_RESULTS}/link-commands.txt" \
+    "${NVCC}" "${device_link_arguments[@]}"
   "${NVCC}" "${device_link_arguments[@]}"
 
   local host_link_arguments=(
@@ -758,6 +882,8 @@ link_generated_probe() {
     -lm
     -o "${binary}"
   )
+  record_command "${CKKS2C_RESULTS}/link-commands.txt" \
+    c++ "${host_link_arguments[@]}"
   c++ "${host_link_arguments[@]}"
 
   inspect_binary "${binary}" "${CKKS2C_RESULTS}"
@@ -815,14 +941,14 @@ link_generated_probe() {
 }
 
 run_ckks2c_gate() {
-  run_toolchain_gate
+  timed_phase toolchain_gate run_toolchain_gate
   mkdir -p "${CKKS2C_RESULTS}"
   record_common_configuration "${CKKS2C_RESULTS}"
-  configure_ace
-  configure_bindings
-  run_compiler_tests
-  run_native_terminal_probes
-  link_generated_probe
+  timed_phase ace_build configure_ace
+  timed_phase bindings_build configure_bindings
+  timed_phase tests run_compiler_tests
+  timed_phase terminal_selection run_native_terminal_probes
+  timed_phase generated_compile_links link_generated_probe
 }
 
 case "${GATE}" in
