@@ -67,15 +67,40 @@ class FHEConfig:
     relu_vr_def: float = 3.0
     relu_vr: str = ""
     
-    # poly2c options
+    # Source-codegen options. enable_poly is a deprecated compatibility alias
+    # for codegen_ir and is resolved once in __post_init__.
     data_file: str = "data.msg"
     ct_encode: bool = False
     free_poly: bool = True
-    enable_poly: bool = True      # False = CKKS-level C code (for debugging)
+    provider: str = "ant"
+    codegen_ir: Optional[str] = None
+    enable_poly: Optional[bool] = None
     function_name_prefix: str = ""
     constant_name_prefix: str = ""
     pt_from_msg_name: str = "Pt_from_msg"
     raise_mod_level_func: str = ""
+
+    def __post_init__(self):
+        self.provider = self.provider.strip().lower()
+        if self.provider not in ("ant", "phantom"):
+            raise ValueError("provider must be 'ant' or 'phantom'")
+
+        selected = self.codegen_ir
+        if selected is not None:
+            selected = selected.strip().lower()
+        if selected is None:
+            selected = "poly" if self.enable_poly is not False else "ckks"
+        if selected not in ("ckks", "poly"):
+            raise ValueError("codegen_ir must be 'ckks' or 'poly'")
+        if self.enable_poly is not None:
+            compatibility_selection = "poly" if self.enable_poly else "ckks"
+            if selected != compatibility_selection:
+                raise ValueError("enable_poly conflicts with codegen_ir")
+        if self.provider == "phantom" and selected != "ckks":
+            raise ValueError("provider='phantom' requires codegen_ir='ckks'")
+
+        self.codegen_ir = selected
+        self.enable_poly = selected == "poly"
 
 
 @dataclass(frozen=True)
@@ -194,7 +219,9 @@ class AcePipeline:
         data_file: str = "data.msg",
         ct_encode: bool = False,
         free_poly: bool = True,
-        enable_poly: bool = True,
+        provider: str = "ant",
+        codegen_ir: Optional[str] = None,
+        enable_poly: Optional[bool] = None,
         function_name_prefix: str = "",
         constant_name_prefix: str = "",
         pt_from_msg_name: str = "Pt_from_msg",
@@ -234,6 +261,8 @@ class AcePipeline:
             data_file=data_file,
             ct_encode=ct_encode,
             free_poly=free_poly,
+            provider=provider,
+            codegen_ir=codegen_ir,
             enable_poly=enable_poly,
             function_name_prefix=function_name_prefix,
             constant_name_prefix=constant_name_prefix,
@@ -410,6 +439,9 @@ class AcePipeline:
         """
         if self.glob_scope is None:
             return None
+
+        if self.fhe_config.codegen_ir == "ckks":
+            return self.run_ckks2c()
         
         if not hasattr(self.glob_scope, "run_poly2c"):
             return None
@@ -421,13 +453,32 @@ class AcePipeline:
             data_file=data_file,
             ct_encode=self.fhe_config.ct_encode,
             free_poly=self.fhe_config.free_poly,
-            enable_poly=self.fhe_config.enable_poly,
+            enable_poly=True,
             function_name_prefix=self.fhe_config.function_name_prefix,
             constant_name_prefix=self.fhe_config.constant_name_prefix,
             pt_from_msg_name=self.fhe_config.pt_from_msg_name,
             raise_mod_level_func=self.fhe_config.raise_mod_level_func,
         )
         
+        if ok and hasattr(self.glob_scope, "get_c_code"):
+            return self.glob_scope.get_c_code()
+        return None
+
+    def run_ckks2c(self) -> Optional[str]:
+        """Run the dedicated post-CKKS AIR source emitter."""
+        if self.glob_scope is None or not hasattr(self.glob_scope, "run_ckks2c"):
+            return None
+
+        ok = self.glob_scope.run_ckks2c(
+            data_file=self.fhe_config.data_file,
+            ct_encode=self.fhe_config.ct_encode,
+            free_poly=self.fhe_config.free_poly,
+            provider=self.fhe_config.provider,
+            function_name_prefix=self.fhe_config.function_name_prefix,
+            constant_name_prefix=self.fhe_config.constant_name_prefix,
+            pt_from_msg_name=self.fhe_config.pt_from_msg_name,
+            raise_mod_level_func=self.fhe_config.raise_mod_level_func,
+        )
         if ok and hasattr(self.glob_scope, "get_c_code"):
             return self.glob_scope.get_c_code()
         return None
@@ -526,6 +577,14 @@ class AcePipeline:
                         result.air_dumps["python_lower"] = self.dump_air("python_lower")
             
             # Stage 4: CKKS driver (scale management)
+            if (self.fhe_config.provider == "phantom" and
+                    self.fhe_config.codegen_ir == "ckks" and
+                    self._rewrite_ckks_extended_ops):
+                result.error = (
+                    "rewrite_ckks_extended_ops is prohibited for the Phantom "
+                    "CKKS2C backend"
+                )
+                return result
             if self._rewrite_ckks_extended_ops:
                 log("Running CKKS extended-op rewrite (primitive lowering)...")
                 from .passes.ckks_extended_ops_rewrite import (
@@ -554,8 +613,8 @@ class AcePipeline:
             if dump_stages:
                 result.air_dumps["ckks_driver"] = self.dump_air("ckks_driver")
             
-            # Stage 5: Poly driver (skip when enable_poly=False for CKKS-level debugging)
-            if self.fhe_config.enable_poly:
+            # Exactly one terminal path is selected by codegen_ir.
+            if self.fhe_config.codegen_ir == "poly":
                 log("Running Poly driver (fhe::ckks → fhe::poly)...")
                 poly_result = self.run_poly_driver()
                 if not poly_result.get("success"):
@@ -564,22 +623,19 @@ class AcePipeline:
                 result.stages_completed.append("poly_driver")
                 if dump_stages:
                     result.air_dumps["poly_driver"] = self.dump_air("poly_driver")
-            else:
-                log("Poly pass disabled -- staying at CKKS level")
-                result.stages_completed.append("poly_driver_skipped")
-            
-            # Stage 6: poly2c / ckks2c
-            if self.fhe_config.enable_poly:
                 log("Running poly2c (fhe::poly → C code)...")
+                c_code = self.run_poly2c()
+                terminal = "poly2c"
             else:
                 log("Running ckks2c (fhe::ckks → C code)...")
-            c_code = self.run_poly2c()
+                c_code = self.run_ckks2c()
+                terminal = "ckks2c"
             if c_code is None:
-                result.error = "poly2c failed to generate C code"
+                result.error = f"{terminal} failed to generate source"
                 return result
-            result.stages_completed.append("poly2c")
+            result.stages_completed.append(terminal)
             if dump_stages:
-                result.air_dumps["poly2c"] = self.dump_air("poly2c")
+                result.air_dumps[terminal] = self.dump_air(terminal)
             
             result.success = True
             result.c_code = c_code
@@ -829,7 +885,9 @@ class Pipeline:
         data_file: str = "data.msg",
         ct_encode: bool = False,
         free_poly: bool = True,
-        enable_poly: bool = True,
+        provider: str = "ant",
+        codegen_ir: Optional[str] = None,
+        enable_poly: Optional[bool] = None,
     ) -> "Pipeline":
         """
         Configure FHE parameters.
@@ -865,6 +923,8 @@ class Pipeline:
             data_file=data_file,
             ct_encode=ct_encode,
             free_poly=free_poly,
+            provider=provider,
+            codegen_ir=codegen_ir,
             enable_poly=enable_poly,
         )
         return self
@@ -999,6 +1059,13 @@ class Pipeline:
             return success
         
         elif phase == "ckks_driver":
+            if (self.config.provider == "phantom" and
+                    self.config.codegen_ir == "ckks" and
+                    self.rewrite_ckks_extended_ops):
+                raise RuntimeError(
+                    "rewrite_ckks_extended_ops is prohibited for the Phantom "
+                    "CKKS2C backend"
+                )
             if self.rewrite_ckks_extended_ops:
                 from .passes.ckks_extended_ops_rewrite import (
                     rewrite_extended_ckks_ops_to_primitives,
@@ -1029,10 +1096,8 @@ class Pipeline:
             return result.get("success", False)
         
         elif phase == "poly_driver":
-            if not self.config.enable_poly:
-                if self.verbose:
-                    print("  [Poly Driver] Skipped (enable_poly=False)")
-                return True
+            if self.config.codegen_ir != "poly":
+                raise RuntimeError("poly_driver is not selected by codegen_ir")
             result = air_builder.run_poly_driver(self.glob)
             return result.get("success", False)
         
@@ -1042,7 +1107,21 @@ class Pipeline:
                     data_file=self.config.data_file,
                     ct_encode=self.config.ct_encode,
                     free_poly=self.config.free_poly,
-                    enable_poly=self.config.enable_poly,
+                    enable_poly=True,
+                )
+            return False
+
+        elif phase == "ckks2c":
+            if hasattr(self.glob, "run_ckks2c"):
+                return self.glob.run_ckks2c(
+                    data_file=self.config.data_file,
+                    ct_encode=self.config.ct_encode,
+                    free_poly=self.config.free_poly,
+                    provider=self.config.provider,
+                    function_name_prefix=self.config.function_name_prefix,
+                    constant_name_prefix=self.config.constant_name_prefix,
+                    pt_from_msg_name=self.config.pt_from_msg_name,
+                    raise_mod_level_func=self.config.raise_mod_level_func,
                 )
             return False
         
@@ -1073,7 +1152,20 @@ class Pipeline:
         
         # Determine phases to run
         if phases is None:
-            phases = self.TARGET_PHASES.get(target, self.PHASES)
+            phases = list(self.TARGET_PHASES.get(target, self.PHASES))
+            if target == PipelineTarget.C and self.config.codegen_ir == "ckks":
+                phases = phases[: phases.index("poly_driver")] + ["ckks2c"]
+        terminal_phases = [phase for phase in phases
+                           if phase in ("ckks2c", "poly2c")]
+        if len(terminal_phases) > 1:
+            return PipelineResult(
+                success=False, error="pipeline selects more than one terminal pass"
+            )
+        if terminal_phases and terminal_phases[0] != self.config.codegen_ir + "2c":
+            return PipelineResult(
+                success=False,
+                error="terminal phase conflicts with codegen_ir",
+            )
         
         if self.verbose:
             print(f"[Pipeline] Running {len(phases)} phases: {phases}")
@@ -1150,8 +1242,8 @@ class Pipeline:
                 if self.on_phase_complete:
                     self.on_phase_complete(phase, self.glob.dump())
             
-            # Get C code if poly2c was run
-            if "poly2c" in phases and hasattr(self.glob, "get_c_code"):
+            # Get source code if one terminal pass was run.
+            if terminal_phases and hasattr(self.glob, "get_c_code"):
                 result.c_code = self.glob.get_c_code()
             
             if self.verbose:

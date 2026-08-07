@@ -97,6 +97,8 @@ class CompilerOptions:
     dump_ir_to_file: Optional[str] = None
     inline_lowerings: bool = True
     skip_cpp_for_registered_ops: bool = True
+    provider: str = "ant"
+    codegen_ir: str = "poly"
     pass_pipeline_config: PassPipelineConfig = field(
         default_factory=PassPipelineConfig
     )
@@ -104,6 +106,14 @@ class CompilerOptions:
     def __post_init__(self):
         if not 0 <= self.opt_level <= 3:
             raise ValueError(f"opt_level must be 0-3, got {self.opt_level}")
+        self.provider = self.provider.strip().lower()
+        self.codegen_ir = self.codegen_ir.strip().lower()
+        if self.provider not in ("ant", "phantom"):
+            raise ValueError("provider must be 'ant' or 'phantom'")
+        if self.codegen_ir not in ("ckks", "poly"):
+            raise ValueError("codegen_ir must be 'ckks' or 'poly'")
+        if self.provider == "phantom" and self.codegen_ir != "ckks":
+            raise ValueError("provider='phantom' requires codegen_ir='ckks'")
         if not isinstance(self.pass_pipeline_config, PassPipelineConfig):
             raise TypeError("pass_pipeline_config must be PassPipelineConfig")
 
@@ -150,7 +160,9 @@ def _detect_domain(kernel) -> str:
     return 'nn::core'
 
 
-def _get_pipeline_for_domain(domain: str, target: Optional[Target]) -> List[str]:
+def _get_pipeline_for_domain(
+    domain: str, target: Optional[Target], codegen_ir: str = "poly"
+) -> List[str]:
     """Get the pass pipeline for a domain and target."""
     # Get default pipeline for domain
     if domain not in _DEFAULT_PIPELINES:
@@ -165,9 +177,35 @@ def _get_pipeline_for_domain(domain: str, target: Optional[Target]) -> List[str]
             # Filter to only include passes in default pipeline
             return [p for p in target_pipeline if p in default_pipeline or domain == 'nn::core']
         # target_pipeline is None means use full pipeline
-        return default_pipeline
-    
-    return default_pipeline
+        selected = default_pipeline
+    else:
+        selected = default_pipeline
+
+    if codegen_ir == "ckks" and (target is None or target == Target.C):
+        if domain == "fhe::poly":
+            raise ValueError(
+                "codegen_ir='ckks' cannot start from fhe::poly AIR"
+            )
+        if "poly2c" in selected:
+            selected = [
+                pass_name for pass_name in selected
+                if pass_name not in ("ckks2poly", "poly2c")
+            ]
+            if domain == "fhe::ckks":
+                selected.append("ckks_driver")
+            selected.append("ckks2c")
+    return selected
+
+
+def _run_ckks_driver(glob_scope) -> bool:
+    """Run the existing CKKS driver and preserve its diagnostic."""
+    from ace_bindings import air_builder
+
+    result = air_builder.run_ckks_driver(glob_scope)
+    if bool(result.get("success", False)):
+        return True
+    message = str(result.get("message", "CKKS driver failed"))
+    raise RuntimeError(message)
 
 
 def _notify_cpp_skip_ops(skip_ops: List[str], verbose: bool = False):
@@ -304,7 +342,9 @@ def ace_compile(
         print(f"[ace_compile] Kernel domain: {domain}")
     
     # Get pipeline for this domain and target
-    pipeline = _get_pipeline_for_domain(domain, options.target)
+    pipeline = _get_pipeline_for_domain(
+        domain, options.target, options.codegen_ir
+    )
     
     if options.verbose:
         print(f"[ace_compile] Pipeline: {pipeline if pipeline else '(none)'}")
@@ -385,7 +425,18 @@ def ace_compile(
                     )
 
             try:
-                success = glob_scope.run_cpp_pass(pass_name, skip_ops)
+                if pass_name == "ckks_driver":
+                    success = _run_ckks_driver(glob_scope)
+                elif pass_name == "ckks2c":
+                    if not hasattr(glob_scope, "run_ckks2c"):
+                        raise RuntimeError(
+                            "GlobScope does not expose the dedicated CKKS2C binding"
+                        )
+                    success = glob_scope.run_ckks2c(
+                        provider=options.provider
+                    )
+                else:
+                    success = glob_scope.run_cpp_pass(pass_name, skip_ops)
             except Exception as e:
                 raise RuntimeError(
                     f"ace_compile pass {pass_name} failed: {e}"
@@ -399,8 +450,9 @@ def ace_compile(
                 print(f"\n=== AIR after {pass_name} ===")
                 print(glob_scope.dump())
         
-        # Get C code if poly2c was run
-        if 'poly2c' in pipeline and hasattr(glob_scope, 'get_c_code'):
+        # Get source code if either exclusive terminal was run.
+        if ({'poly2c', 'ckks2c'} & set(pipeline) and
+                hasattr(glob_scope, 'get_c_code')):
             c_code = glob_scope.get_c_code()
     
     # Save IR to file if requested

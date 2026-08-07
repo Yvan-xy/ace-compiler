@@ -74,6 +74,8 @@
 #include "fhe/sihe/sihe_gen.h"
 #include "fhe/sihe/config.h"
 #include "fhe/ckks/ckks_gen.h"
+#include "fhe/ckks/ckks2c_config.h"
+#include "fhe/ckks/ckks2c_driver.h"
 #include "fhe/ckks/config.h"
 #include "fhe/ckks/sihe2ckks_lower.h"
 #include "air/driver/driver_ctx.h"
@@ -7256,6 +7258,9 @@ public:
         else if (pass_name == "ckks2poly") {
             return run_ckks2poly_pass();
         }
+        else if (pass_name == "ckks2c") {
+            return run_ckks2c_pass();
+        }
         else if (pass_name == "poly2c") {
             return run_poly2c_pass();
         }
@@ -7913,6 +7918,85 @@ private:
     bool run_poly2c_pass() {
         return run_poly2c_pass_with_config("", "", false, true);
     }
+
+    bool run_ckks2c_pass() {
+        return run_ckks2c_pass_with_config(
+            "", "", false, true, "phantom");
+    }
+
+public:
+    // Run the dedicated post-CKKS AIR source emitter. Diagnostics intentionally
+    // propagate through pybind instead of being converted into a false result.
+    bool run_ckks2c_pass_with_config(
+        const std::string& output_file, const std::string& data_file,
+        bool ct_encode, bool free_poly, const std::string& provider,
+        const std::string& function_name_prefix = "",
+        const std::string& constant_name_prefix = "",
+        const std::string& pt_from_msg_name = "Pt_from_msg",
+        const std::string& raise_mod_level_func = "") {
+        require_no_air_pass_transaction("CKKS-to-source lowering");
+        if (!glob) {
+            throw std::runtime_error(
+                "CKKS2C requires a real post-CKKS GLOB_SCOPE");
+        }
+        if (provider != "phantom" && provider != "ant") {
+            throw std::invalid_argument(
+                "CKKS2C provider must be phantom or ant");
+        }
+        if (provider == "phantom" && ct_encode) {
+            throw std::invalid_argument(
+                "Phantom CKKS2C does not support compile-time encoding");
+        }
+        if (!output_file.empty() &&
+            (output_file.size() < 3 ||
+             output_file.compare(output_file.size() - 3, 3, ".cu") != 0)) {
+            throw std::invalid_argument(
+                "CKKS2C output_file must use the .cu suffix");
+        }
+
+        ensure_lower_ctx();
+        std::ostringstream output;
+        fhe::ckks::CKKS2C_CONFIG config;
+        config.Set_provider(provider.c_str());
+        config._data_file = data_file;
+        config._ct_encode = ct_encode;
+        config._free_poly = free_poly;
+        config._function_name_prefix = function_name_prefix;
+        config._constant_name_prefix = constant_name_prefix;
+        config._pt_from_msg_name = pt_from_msg_name;
+        config._raise_mod_level_func = raise_mod_level_func;
+        if (!data_file.empty()) {
+            config.Set_ifile(data_file.c_str());
+        }
+
+        fhe::ckks::CKKS2C_DRIVER ckks2c(output, *lower_ctx, config);
+        ckks2c.Verify_or_throw(glob);
+        GLOB_SCOPE* source = release_owned_scope_for_consuming_driver();
+        install_owned_scope(
+            std::unique_ptr<GLOB_SCOPE>(ckks2c.Flatten(source)));
+        fhe::ckks::CKKS2C_VISITOR visitor(ckks2c.Ctx());
+        ckks2c.Run(glob, visitor);
+
+        generated_c_code = output.str();
+        fhe::ckks::CKKS2C_DRIVER::Verify_source_or_throw(
+            generated_c_code, config.Provider());
+        p2c_data_file = data_file;
+        p2c_output_file = output_file;
+
+        if (!output_file.empty()) {
+            std::ofstream ofs(output_file);
+            if (!ofs.is_open()) {
+                throw std::runtime_error(
+                    "failed to open CKKS2C output file: " + output_file);
+            }
+            ofs << generated_c_code;
+            if (!ofs.good()) {
+                throw std::runtime_error(
+                    "failed while writing CKKS2C output file: " + output_file);
+            }
+        }
+        return true;
+    }
     
 public:
     // Run poly2c with configuration options
@@ -7920,7 +8004,7 @@ public:
     // data_file: if non-empty, constants are written to this file (makes C code much smaller)
     // ct_encode: if true, encode constants at compile time
     // free_poly: if true, insert Free_poly_data calls for memory management (native default)
-    // enable_poly: if true, use POLY2C_VISITOR (poly-level); if false, use CKKS2C_VISITOR (CKKS-level for debugging)
+    // enable_poly=false is a deprecated forwarding shim to CKKS2C with ANT.
     bool run_poly2c_pass_with_config(
         const std::string& output_file, const std::string& data_file,
         bool ct_encode, bool free_poly = true, bool enable_poly = true,
@@ -7928,6 +8012,12 @@ public:
         const std::string& constant_name_prefix = "",
         const std::string& pt_from_msg_name = "Pt_from_msg",
         const std::string& raise_mod_level_func = "") {
+        if (!enable_poly) {
+            return run_ckks2c_pass_with_config(
+                output_file, data_file, ct_encode, free_poly, "ant",
+                function_name_prefix, constant_name_prefix, pt_from_msg_name,
+                raise_mod_level_func);
+        }
         require_no_air_pass_transaction("Poly-to-C lowering");
         if (!glob) {
             return false;
@@ -7962,14 +8052,6 @@ public:
             // Enable free_poly for memory management (matches native compiler)
             p2c_config._free_poly = free_poly;
             
-            // When poly is disabled, use SEAL provider internally so that
-            // POLY2C_DRIVER::Run selects fhe::ckks::MFREE_PASS (which handles
-            // CKKS-level IR) instead of fhe::poly::MFREE_PASS.
-            // We then patch the generated C code to use rt_ant headers.
-            if (!enable_poly) {
-                p2c_config._provider = fhe::core::PROVIDER::SEAL;
-            }
-            
             fhe::poly::POLY2C_DRIVER poly2c(output, *lower_ctx, p2c_config);
             // Flatten non-core expressions so CKKS ops are lowered into temporaries
             // before IR2C emits C code.
@@ -7977,32 +8059,10 @@ public:
             install_owned_scope(
                 std::unique_ptr<GLOB_SCOPE>(poly2c.Flatten(source)));
             
-            // Select visitor:
-            //   enable_poly=true  -> POLY2C_VISITOR (poly-level C code)
-            //   enable_poly=false -> CKKS2C_VISITOR (CKKS-level C code for debugging)
-            if (enable_poly) {
-                fhe::poly::POLY2C_VISITOR visitor(poly2c.Ctx());
-                poly2c.Run(glob, visitor);
-            } else {
-                fhe::poly::CKKS2C_VISITOR visitor(poly2c.Ctx());
-                poly2c.Run(glob, visitor);
-            }
+            fhe::poly::POLY2C_VISITOR visitor(poly2c.Ctx());
+            poly2c.Run(glob, visitor);
             
             generated_c_code = output.str();
-            
-            // Patch generated C code to use rt_ant (which is already built)
-            // instead of rt_seal (used internally for correct MFREE_PASS selection).
-            if (!enable_poly) {
-                auto replace_all = [](std::string& s, const std::string& from, const std::string& to) {
-                    size_t pos = 0;
-                    while ((pos = s.find(from, pos)) != std::string::npos) {
-                        s.replace(pos, from.length(), to);
-                        pos += to.length();
-                    }
-                };
-                replace_all(generated_c_code, "rt_seal/rt_seal.h", "rt_ant/rt_ant.h");
-                replace_all(generated_c_code, "LIB_SEAL", "LIB_ANT");
-            }
             p2c_data_file = data_file;
             p2c_output_file = output_file;
             
@@ -8039,6 +8099,7 @@ public:
             "vector2sihe",    // nn::vector -> fhe::sihe (C++ Sihe_driver)
             "sihe2ckks",      // fhe::sihe -> fhe::ckks (C++ Ckks_driver)
             "ckks2poly",      // fhe::ckks -> fhe::poly (C++ POLY_DRIVER)
+            "ckks2c",         // Generate source directly from CKKS AIR
             "poly2c"          // Generate C code from current IR level
         };
     }
@@ -11047,8 +11108,20 @@ PYBIND11_MODULE(air_builder, m) {
              "  data_file: if non-empty, write constants to this file (makes C code MUCH smaller)\n"
              "  ct_encode: if true, encode constants at compile time\n"
              "  free_poly: if true, insert Free_poly_data calls (matches native compiler)\n"
-             "  enable_poly: if true, use POLY2C_VISITOR (poly-level); if false, use CKKS2C_VISITOR (CKKS-level)\n"
+             "  enable_poly: false is deprecated and forwards to dedicated CKKS2C with ANT\n"
              "  function_name_prefix/constant_name_prefix: prefix generated symbols for embedding")
+        .def("run_ckks2c", &GlobScope::run_ckks2c_pass_with_config,
+             py::arg("output_file") = "",
+             py::arg("data_file") = "",
+             py::arg("ct_encode") = false,
+             py::arg("free_poly") = true,
+             py::arg("provider") = "phantom",
+             py::arg("function_name_prefix") = "",
+             py::arg("constant_name_prefix") = "",
+             py::arg("pt_from_msg_name") = "Pt_from_msg",
+             py::arg("raise_mod_level_func") = "",
+             "Emit CUDA C++ directly from post-driver CKKS AIR. Errors are "
+             "reported as Python exceptions.")
         .def("list_available_passes", &GlobScope::list_available_passes,
              "List available C++ passes")
         // Python lowering integration
