@@ -9,7 +9,7 @@
 function(build_external_phantom)
   set(PHANTOM_SOURCE_DIR "" CACHE PATH
       "Local Git repository used to clone the pinned Phantom source")
-  set(PHANTOM_GIT_TAG "faa6ba2bb990e17c88d826a880ef40136aaa8bc7"
+  set(PHANTOM_GIT_TAG "5a1c9d954800e4634f0195a5849a339f74bd7c38"
       CACHE STRING "Exact Phantom Git commit")
   option(PHANTOM_SOURCE_SNAPSHOT
          "Use a preverified source-only Phantom snapshot" OFF)
@@ -67,9 +67,9 @@ function(build_external_phantom)
                  -DCMAKE_CUDA_STANDARD_REQUIRED=ON
                  -DPHANTOM_BUILD_EXAMPLES=OFF
                  -DPHANTOM_BUILD_TESTS=OFF
-      BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target phantom
+      BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target phantom_ordinary
       INSTALL_COMMAND ""
-      BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/external/src/phantom_external-build/lib/libphantom.a)
+      BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/external/src/phantom_external-build/lib/libphantom_ordinary.a)
   if(PHANTOM_SOURCE_SNAPSHOT)
     ExternalProject_Add(
       phantom_external
@@ -94,18 +94,18 @@ function(build_external_phantom)
   find_library(GMP_LIBRARY NAMES gmp REQUIRED)
   find_library(GMPXX_LIBRARY NAMES gmpxx REQUIRED)
 
-  add_library(phantom IMPORTED STATIC GLOBAL)
-  set_target_properties(phantom PROPERTIES
-    IMPORTED_LOCATION ${BINARY_DIR}/lib/libphantom.a
+  add_library(phantom_ordinary IMPORTED STATIC GLOBAL)
+  set_target_properties(phantom_ordinary PROPERTIES
+    IMPORTED_LOCATION ${BINARY_DIR}/lib/libphantom_ordinary.a
     INTERFACE_LINK_LIBRARIES
       "${NTL_LIBRARY};${GMPXX_LIBRARY};${GMP_LIBRARY};${CUDA_DEVICE_RUNTIME_LIBRARY};CUDA::cudart"
   )
   include_directories(${SOURCE_DIR}/include)
-  add_dependencies(phantom phantom_external)
+  add_dependencies(phantom_ordinary phantom_external)
 
-  set(phantom phantom PARENT_SCOPE)
+  set(phantom phantom_ordinary PARENT_SCOPE)
   set(ENV{PHANTOM_INCLUDE_DIR} ${SOURCE_DIR}/include)
   set(PHANTOM_LIBS
-      phantom ${NTL_LIBRARY} ${GMPXX_LIBRARY} ${GMP_LIBRARY}
+      phantom_ordinary ${NTL_LIBRARY} ${GMPXX_LIBRARY} ${GMP_LIBRARY}
       ${CUDA_DEVICE_RUNTIME_LIBRARY} CUDA::cudart PARENT_SCOPE)
 endfunction()

@@ -35,7 +35,9 @@ extern std::unordered_map<std::string, OperationStats> operation_stats;
 #endif
 
 //! @brief Get polynomial degree
-inline uint32_t Degree() { return Get_context_params()->_poly_degree; }
+inline uint32_t Degree() {
+  return Get_phantom_context_manifest()->_poly_degree;
+}
 
 //! @brief Get input cipher by name and index
 inline CIPHERTEXT Get_input_data(const char* name, size_t idx) {
@@ -52,9 +54,7 @@ inline void Set_output_data(const char* name, size_t idx, CIPHER data) {
   END_TIMER("Set_output_data")
 }
 
-//! @brief Encode float array into plaintext.
-//!  The 4th parameter is named with 'sc_degree' to match with other libraries
-//!  but it's actually the scale value = pow(2.0, sc_degree).
+//! @brief Encode real arrays using the compiler-emitted scale basis.
 inline void Encode_float(PLAIN plain, float* input, size_t len,
                          SCALE_T sc_degree, LEVEL_T level) {
   START_TIMER
@@ -62,11 +62,32 @@ inline void Encode_float(PLAIN plain, float* input, size_t len,
   END_TIMER("Encode_float")
 }
 
+inline void Encode_double(PLAIN plain, double* input, size_t len,
+                          SCALE_T sc_degree, LEVEL_T level) {
+  START_TIMER
+  Phantom_encode_double(plain, input, len, sc_degree, level);
+  END_TIMER("Encode_double")
+}
+
+inline void Encode_dcmplx(PLAIN plain, DCMPLX* input, size_t len,
+                          SCALE_T sc_degree, LEVEL_T level) {
+  START_TIMER
+  Phantom_encode_dcmplx(plain, input, len, sc_degree, level);
+  END_TIMER("Encode_dcmplx")
+}
+
 inline void Encode_float_cst_lvl(PLAIN plain, float* input, size_t len,
                                  SCALE_T sc_degree, int level) {
   START_TIMER
   Phantom_encode_float_cst_lvl(plain, input, len, sc_degree, level);
   END_TIMER("Encode_float_cst_lvl")
+}
+
+inline void Encode_double_mask(PLAIN plain, double input, size_t len,
+                               SCALE_T sc_degree, LEVEL_T level) {
+  START_TIMER
+  Phantom_encode_double_mask(plain, input, len, sc_degree, level);
+  END_TIMER("Encode_double_mask")
 }
 
 inline void Encode_float_mask(PLAIN plain, float input, size_t len,
@@ -102,6 +123,27 @@ inline CIPHER Add_plain(CIPHER res, CIPHER op1, PLAIN op2) {
   START_TIMER
   Phantom_add_plain(res, op1, op2);
   END_TIMER("Add_plain")
+  return res;
+}
+
+inline CIPHER Sub_scalar(CIPHER res, CIPHER op, double op2) {
+  START_TIMER
+  Phantom_sub_const(res, op, op2);
+  END_TIMER("Sub_scalar")
+  return res;
+}
+
+inline CIPHER Sub_ciph(CIPHER res, CIPHER op1, CIPHER op2) {
+  START_TIMER
+  Phantom_sub_ciph(res, op1, op2);
+  END_TIMER("Sub_ciph")
+  return res;
+}
+
+inline CIPHER Sub_plain(CIPHER res, CIPHER op1, PLAIN op2) {
+  START_TIMER
+  Phantom_sub_plain(res, op1, op2);
+  END_TIMER("Sub_plain")
   return res;
 }
 
@@ -155,19 +197,10 @@ inline CIPHER Relin(CIPHER res, CIPHER3 ciph) {
   return res;
 }
 
-inline CIPHER Bootstrap(CIPHER res, CIPHER op, int level, int slot) {
-  START_TIMER
-  Phantom_bootstrap(res, op, level, slot);
-  END_TIMER("Bootstrap")
-  return res;
-}
-
 inline void Copy_ciph(CIPHER res, CIPHER op) {
-  if (res != op) {
-    START_TIMER
-    Phantom_copy(res, op);
-    END_TIMER("Copy_ciph")
-  }
+  START_TIMER
+  Phantom_copy(res, op);
+  END_TIMER("Copy_ciph")
 }
 
 inline void Zero_ciph(CIPHER res) {
@@ -178,17 +211,57 @@ inline void Zero_ciph(CIPHER res) {
 
 inline SCALE_T Sc_degree(CIPHER ct) {
   START_TIMER
-  auto result = Phantom_scale(ct);
+  auto result = Phantom_scale_degree(ct);
   END_TIMER("Sc_degree")
   return result;
 }
 
 inline LEVEL_T Level(CIPHER ct) {
   START_TIMER
-  auto result = Phantom_level(ct);
+  auto result = Phantom_ace_level(ct);
   END_TIMER("Level")
   return result;
 }
+
+inline LEVEL_T Active_q_count(CIPHER ct) {
+  return Phantom_active_q_count(ct);
+}
+
+inline LEVEL_T Chain_index(CIPHER ct) { return Phantom_chain_index(ct); }
+
+inline SCALE_T Raw_scale(CIPHER ct) { return Phantom_raw_scale(ct); }
+
+inline size_t Get_ciph_slots(CIPHER ct) { return Phantom_slots(ct); }
+
+inline size_t Get_ciph_size(CIPHER ct) {
+  return Phantom_ciphertext_size(ct);
+}
+
+inline bool Is_ciph_ntt(CIPHER ct) { return Phantom_is_ntt(ct); }
+
+inline LEVEL_T Get_plain_level(PLAIN pt) {
+  return Phantom_plain_ace_level(pt);
+}
+
+inline LEVEL_T Get_plain_active_q_count(PLAIN pt) {
+  return Phantom_plain_active_q_count(pt);
+}
+
+inline LEVEL_T Get_plain_chain_index(PLAIN pt) {
+  return Phantom_plain_chain_index(pt);
+}
+
+inline SCALE_T Get_plain_raw_scale(PLAIN pt) {
+  return Phantom_plain_raw_scale(pt);
+}
+
+inline SCALE_T Get_plain_scale_degree(PLAIN pt) {
+  return Phantom_plain_scale_degree(pt);
+}
+
+inline size_t Get_plain_slots(PLAIN pt) { return Phantom_plain_slots(pt); }
+
+inline bool Is_plain_ntt(PLAIN pt) { return Phantom_plain_is_ntt(pt); }
 
 inline void Free_ciph(CIPHER res) {
   START_TIMER
@@ -218,10 +291,6 @@ void Dump_plain_msg(const char* name, PLAIN pt, uint32_t len);
 double* Get_msg(CIPHER ct);
 
 double* Get_msg_from_plain(PLAIN pt);
-
-inline uint32_t Get_ciph_slots(CIPHER ct) { return Degree() / 2; }
-
-inline uint32_t Get_plain_slots(PLAIN pt) { return Degree() / 2; }
 
 bool Within_value_range(CIPHER ciph, double* msg, uint32_t len);
 
