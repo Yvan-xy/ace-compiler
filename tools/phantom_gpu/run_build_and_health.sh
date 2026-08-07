@@ -62,7 +62,13 @@ finalize() {
   rm -f "${temporary}"
   tar -C "${WORK}" -czf "${temporary}" results
   mv "${temporary}" "${RESULT_ARCHIVE}"
-  sha256sum "${RESULT_ARCHIVE}" >"${RESULT_ARCHIVE}.sha256"
+  local archive_directory archive_name
+  archive_directory="$(dirname -- "${RESULT_ARCHIVE}")"
+  archive_name="$(basename -- "${RESULT_ARCHIVE}")"
+  (
+    cd "${archive_directory}"
+    sha256sum "${archive_name}" >"${archive_name}.sha256"
+  )
   exit "${incoming}"
 }
 trap finalize EXIT
