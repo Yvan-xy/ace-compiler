@@ -164,7 +164,15 @@ run_qualification() {
 }
 
 run_native_health() {
-  local query gpu_count gpu_name health_binary profile_sha health_json health_exit
+  local expected_gpu query gpu_count gpu_name health_binary profile_sha health_json health_exit
+  expected_gpu="${ACE_RUNPOD_EXPECTED_GPU_NAME:-}"
+  case "${expected_gpu}" in
+    "NVIDIA A100 80GB PCIe"|"NVIDIA A100-SXM4-80GB") ;;
+    *)
+      echo "an exact supported A100 GPU identity is required" >&2
+      return 1
+      ;;
+  esac
   nvidia-smi -L >"${RESULT_DIR}/nvidia-smi-list.txt"
   nvidia-smi \
     --query-gpu=name,uuid,memory.total,driver_version,pstate,power.limit \
@@ -173,7 +181,7 @@ run_native_health() {
   gpu_count="$(wc -l <"${query}" | tr -d ' ')"
   gpu_name="$(cut -d, -f1 "${query}" | sed 's/[[:space:]]*$//')"
   [[ "${gpu_count}" == 1 ]]
-  [[ "${gpu_name}" == "NVIDIA A100 80GB PCIe" ]]
+  [[ "${gpu_name}" == "${expected_gpu}" ]]
   health_binary="$(find "${WORK}/build-state/compile_only_results/runs" \
     -path '*/toolchain/native_phantom_health_sm80' -type f -print -quit)"
   [[ -n "${health_binary}" && -x "${health_binary}" ]]
@@ -186,9 +194,9 @@ run_native_health() {
   set -e
   [[ ${health_exit} -eq 0 ]]
   health_json="$(tail -n 1 "${RESULT_DIR}/native-health.stdout.txt")"
-  jq -e --arg profile_sha "${profile_sha}" \
+  jq -e --arg profile_sha "${profile_sha}" --arg expected_gpu "${expected_gpu}" \
     'select(.status == "pass" and .device_count == 1
-     and .gpu == "NVIDIA A100 80GB PCIe"
+     and .gpu == $expected_gpu
      and (.max_error | type == "number") and .max_error <= 0.0001
      and .profile_sha256 == $profile_sha)' <<<"${health_json}" \
     >"${RESULT_DIR}/native-health.json"

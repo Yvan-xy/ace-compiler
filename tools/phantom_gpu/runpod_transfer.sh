@@ -7,9 +7,10 @@ KEY=""
 PAYLOAD=""
 OUTPUT=""
 REMOTE_TIMEOUT=""
+EXPECTED_GPU=""
 
 usage() {
-  echo "usage: $0 --host HOST --port PORT --key KEY --payload DIR --output DIR --remote-timeout SECONDS" >&2
+  echo "usage: $0 --host HOST --port PORT --key KEY --payload DIR --output DIR --remote-timeout SECONDS --expected-gpu-name NAME" >&2
 }
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -19,6 +20,7 @@ while [[ $# -gt 0 ]]; do
     --payload) PAYLOAD="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
     --remote-timeout) REMOTE_TIMEOUT="$2"; shift 2 ;;
+    --expected-gpu-name) EXPECTED_GPU="$2"; shift 2 ;;
     *) usage; exit 2 ;;
   esac
 done
@@ -28,6 +30,13 @@ if [[ -z "${HOST}" || ! "${PORT}" =~ ^[0-9]+$ || ! -f "${KEY}" ||
   usage
   exit 2
 fi
+case "${EXPECTED_GPU}" in
+  "NVIDIA A100 80GB PCIe"|"NVIDIA A100-SXM4-80GB") ;;
+  *)
+    echo "expected GPU must be an exact supported A100 identity" >&2
+    exit 2
+    ;;
+esac
 if (( REMOTE_TIMEOUT < 60 || REMOTE_TIMEOUT > 2100 )); then
   echo "remote timeout must reserve cleanup time within the first-run ceiling" >&2
   exit 2
@@ -107,6 +116,7 @@ printf '%q ' ssh "${SSH_OPTIONS[@]}" "root@${HOST}" \
   env \
     ACE_RUNPOD_BASE_IMAGE="${ACE_RUNPOD_BASE_IMAGE}" \
     ACE_RUNPOD_BASE_CONFIG_DIGEST="${ACE_RUNPOD_BASE_CONFIG_DIGEST}" \
+    ACE_RUNPOD_EXPECTED_GPU_NAME="${EXPECTED_GPU}" \
     ACE_PHANTOM_BUILD_JOBS="${ACE_PHANTOM_BUILD_JOBS:-$(nproc)}" \
   timeout --signal=TERM --kill-after=30 "${REMOTE_TIMEOUT}" \
   bash /root/input/run_build_and_health.sh \
@@ -123,6 +133,7 @@ ssh "${SSH_OPTIONS[@]}" "root@${HOST}" \
   env \
     ACE_RUNPOD_BASE_IMAGE="${ACE_RUNPOD_BASE_IMAGE}" \
     ACE_RUNPOD_BASE_CONFIG_DIGEST="${ACE_RUNPOD_BASE_CONFIG_DIGEST}" \
+    ACE_RUNPOD_EXPECTED_GPU_NAME="${EXPECTED_GPU}" \
     ACE_PHANTOM_BUILD_JOBS="${ACE_PHANTOM_BUILD_JOBS:-$(nproc)}" \
   timeout --signal=TERM --kill-after=30 "${REMOTE_TIMEOUT}" \
   bash /root/input/run_build_and_health.sh \
