@@ -10,6 +10,7 @@
 #define FHE_CKKS_IR2C_HANDLER_H
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 
 #include "air/base/container_decl.h"
@@ -114,6 +115,31 @@ public:
   }
 
   template <typename RETV, typename VISITOR>
+  void Handle_rotate_batch(VISITOR* visitor, air::base::NODE_PTR node) {
+    IR2C_CTX&           ctx    = visitor->Context();
+    air::base::NODE_PTR parent = ctx.Parent(1);
+
+    AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
+    AIR_ASSERT(parent->Addr_datum()->Type()->Is_array());
+    uint32_t   rot_count = 0;
+    const int* rotations =
+        node->Attr<int>(nn::core::ATTR::RNUM, &rot_count);
+    AIR_ASSERT(rotations != nullptr && rot_count > 0);
+    ctx << "{ static const int32_t _rot_batch_" << parent->Id().Value()
+        << "[] = {";
+    for (uint32_t i = 0; i < rot_count; ++i) {
+      if (i > 0) ctx << ", ";
+      ctx << rotations[i];
+    }
+    ctx << "}; Rotate_batch_ciph(";
+    ctx.Emit_st_var(parent);
+    ctx << ", ";
+    visitor->template Visit<RETV>(node->Child(0));
+    ctx << ", _rot_batch_" << parent->Id().Value() << ", " << rot_count
+        << "); }";
+  }
+
+  template <typename RETV, typename VISITOR>
   void Handle_relin(VISITOR* visitor, air::base::NODE_PTR node) {
     IR2C_CTX&           ctx    = visitor->Context();
     air::base::NODE_PTR parent = ctx.Parent(1);
@@ -140,7 +166,7 @@ public:
   }
 
   template <typename RETV, typename VISITOR>
-  void Handle_mod_switch(VISITOR* visitor, air::base::NODE_PTR node) {
+  void Handle_modswitch(VISITOR* visitor, air::base::NODE_PTR node) {
     IR2C_CTX&           ctx    = visitor->Context();
     air::base::NODE_PTR parent = ctx.Parent(1);
 
@@ -208,6 +234,10 @@ public:
     air::base::NODE_PTR parent = ctx.Parent(1);
 
     AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
+    if (ctx.Provider() == core::PROVIDER::PHANTOM) {
+      throw std::runtime_error(
+          "Phantom primitive CKKS2C rejects fhe::ckks::bootstrap");
+    }
     const uint32_t* mul_lev =
         node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
     const uint32_t* slot = node->Attr<uint32_t>(nn::core::ATTR::SLOT);
@@ -241,6 +271,11 @@ public:
     air::base::NODE_PTR parent = ctx.Parent(1);
 
     AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
+    if (ctx.Provider() == core::PROVIDER::PHANTOM) {
+      throw std::runtime_error(
+          "Phantom primitive CKKS2C rejects "
+          "fhe::ckks::bootstrap_coeffs_to_slots");
+    }
     const uint32_t* slot = node->Attr<uint32_t>(nn::core::ATTR::SLOT);
     if (ctx.Provider() == core::PROVIDER::ANT) {
       ctx << "Eval_bootstrap_coeffs_to_slots_ciph(&";
@@ -266,6 +301,10 @@ public:
     air::base::NODE_PTR parent = ctx.Parent(1);
 
     AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
+    if (ctx.Provider() == core::PROVIDER::PHANTOM) {
+      throw std::runtime_error(
+          "Phantom primitive CKKS2C rejects fhe::ckks::bootstrap_eval_mod");
+    }
     const uint32_t* slot = node->Attr<uint32_t>(nn::core::ATTR::SLOT);
     if (ctx.Provider() == core::PROVIDER::ANT) {
       ctx << "Eval_bootstrap_eval_mod_ciph(&";
@@ -292,6 +331,11 @@ public:
     air::base::NODE_PTR parent = ctx.Parent(1);
 
     AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
+    if (ctx.Provider() == core::PROVIDER::PHANTOM) {
+      throw std::runtime_error(
+          "Phantom primitive CKKS2C rejects "
+          "fhe::ckks::bootstrap_slots_to_coeffs");
+    }
     const uint32_t* slot = node->Attr<uint32_t>(nn::core::ATTR::SLOT);
     if (ctx.Provider() == core::PROVIDER::ANT) {
       ctx << "Eval_bootstrap_slots_to_coeffs_ciph(&";

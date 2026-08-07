@@ -11,6 +11,7 @@
 
 #include "air/driver/driver.h"
 #include "fhe/core/lower_ctx.h"
+#include "fhe/driver/codegen_config.h"
 #include "fhe_pipeline.h"
 
 namespace fhe {
@@ -24,11 +25,13 @@ public:
   template <typename UP_DRV>
   R_CODE Init(UP_DRV* drv) {
     air::driver::DRIVER::Init(drv);
+    _codegen_config.Register_options(Context());
     return _pass_mgr.Init(this);
   }
 
   R_CODE Init(int argc, char** argv) {
     air::driver::DRIVER::Init(argc, argv);
+    _codegen_config.Register_options(Context());
     return _pass_mgr.Init(this);
   }
 
@@ -52,6 +55,8 @@ public:
     _pass_mgr.Set_pass_enable<PASS_ID::POLY2C>(false);
   }
 
+  CODEGEN_IR Codegen_ir() const { return _codegen_config.Codegen_ir(); }
+
   template <typename PASS, int PASS_ID>
   PASS& Get_pass() {
     return _pass_mgr.template Get_pass<PASS, PASS_ID>();
@@ -64,6 +69,7 @@ public:
 
 private:
   FHE_PASS_MANAGER     _pass_mgr;
+  CODEGEN_CONFIG       _codegen_config;
   fhe::core::LOWER_CTX _lower_ctx;
 };  // FHE_COMPILER
 

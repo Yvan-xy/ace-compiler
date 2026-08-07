@@ -65,7 +65,7 @@ R_CODE ONNX_FHE_COMPILER::Pre_run() {
 R_CODE ONNX_FHE_COMPILER::Run() {
   R_CODE ret_code = _onnx_pass.Run(this);
   if (ret_code == R_CODE::NORMAL) {
-    _fhe_cmplr.Run();
+    ret_code = _fhe_cmplr.Run();
   }
   return ret_code;
 }

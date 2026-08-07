@@ -9,6 +9,7 @@
 #ifndef FHE_CORE_RT_DATA_MGR_H
 #define FHE_CORE_RT_DATA_MGR_H
 
+#include "fhe/cg/ir2c_config.h"
 #include "fhe/core/rt_context.h"
 #include "fhe/core/rt_data_writer.h"
 #include "fhe/core/rt_encode_api.h"
@@ -21,8 +22,8 @@ namespace core {
 class RT_DATA_MGR {
 public:
   //! @brief Construct a plaintext data manager
-  RT_DATA_MGR(const fhe::core::LOWER_CTX&     lower_ctx,
-              const fhe::poly::POLY2C_CONFIG& cfg)
+  RT_DATA_MGR(const fhe::core::LOWER_CTX& lower_ctx,
+              const fhe::cg::IR2C_CONFIG& cfg)
       : _rt_data_writer(nullptr) {
     if (cfg.Emit_data_file()) {
       // prepare encode context

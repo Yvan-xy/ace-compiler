@@ -10,6 +10,7 @@
 #define FHE_DRIVER_FHE_PIPELINE_H
 
 #include "air/driver/pass_manager.h"
+#include "fhe/ckks/ckks2c_pass.h"
 #include "fhe/ckks/pass.h"
 #include "fhe/poly/pass.h"
 #include "fhe/poly/poly2c_pass.h"
@@ -19,10 +20,11 @@ namespace fhe {
 
 namespace driver {
 
-enum PASS_ID : int { SIHE, CKKS, POLY, POLY2C };
+enum PASS_ID : int { SIHE, CKKS, CKKS2C, POLY, POLY2C };
 
 typedef ::air::driver::PASS_MANAGER<sihe::SIHE_PASS, ckks::CKKS_PASS,
-                                    poly::POLY_PASS, poly::POLY2C_PASS>
+                                    ckks::CKKS2C_PASS, poly::POLY_PASS,
+                                    poly::POLY2C_PASS>
     FHE_PASS_MANAGER;
 
 }  // namespace driver

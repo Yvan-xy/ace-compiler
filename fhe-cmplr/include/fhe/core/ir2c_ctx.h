@@ -10,8 +10,8 @@
 #define FHE_CORE_IR2C_CTX_H
 
 #include "air/core/ir2c_ctx.h"
+#include "fhe/cg/ir2c_config.h"
 #include "fhe/core/lower_ctx.h"
-#include "fhe/poly/poly2c_config.h"
 
 namespace fhe {
 
@@ -29,7 +29,7 @@ public:
    * @param os Output stream
    */
   IR2C_CTX(std::ostream& os, const LOWER_CTX& lower_ctx,
-           const fhe::poly::POLY2C_CONFIG& cfg)
+           const fhe::cg::IR2C_CONFIG& cfg)
       : air::core::IR2C_CTX(os), _lower_ctx(lower_ctx), _config(cfg) {
     Set_function_name_prefix(cfg.Function_name_prefix());
     Set_constant_name_prefix(cfg.Constant_name_prefix());
@@ -56,13 +56,13 @@ public:
   void        Set_output_name(const char* name) { _output_name = name; }
   const char* Output_name() const { return _output_name.c_str(); }
 
-  DECLARE_POLY2C_CONFIG_ACCESS_API(_config)
+  DECLARE_IR2C_CONFIG_ACCESS_API(_config)
 
 private:
   // lower context
   const core::LOWER_CTX&          _lower_ctx;
   std::string                     _output_name;
-  const fhe::poly::POLY2C_CONFIG& _config;
+  const fhe::cg::IR2C_CONFIG&     _config;
 
 };  // IR2C_CTX
 

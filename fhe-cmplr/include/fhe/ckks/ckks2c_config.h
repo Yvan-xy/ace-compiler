@@ -6,29 +6,26 @@
 //
 //=============================================================================
 
-#ifndef FHE_POLY_POLY2C_CONFIG_H
-#define FHE_POLY_POLY2C_CONFIG_H
+#ifndef FHE_CKKS_CKKS2C_CONFIG_H
+#define FHE_CKKS_CKKS2C_CONFIG_H
 
 #include "air/driver/driver_ctx.h"
 #include "fhe/cg/ir2c_config.h"
 
 namespace fhe {
-namespace poly {
+namespace ckks {
 
-struct POLY2C_CONFIG : public fhe::cg::IR2C_CONFIG {
+//! @brief Configuration for direct CKKS AIR source generation.
+struct CKKS2C_CONFIG : public fhe::cg::IR2C_CONFIG {
 public:
-  POLY2C_CONFIG(void) : fhe::cg::IR2C_CONFIG("ant") {}
+  CKKS2C_CONFIG() : fhe::cg::IR2C_CONFIG("phantom") {}
 
   void Register_options(air::driver::DRIVER_CTX* ctx);
   void Update_options();
   void Print(std::ostream& os) const;
 };
 
-//! @brief Macro to define API to access POLY2C config
-#define DECLARE_POLY2C_CONFIG_ACCESS_API(cfg) \
-  DECLARE_IR2C_CONFIG_ACCESS_API(cfg)
-
-}  // namespace poly
+}  // namespace ckks
 }  // namespace fhe
 
-#endif  // FHE_POLY_POLY2C_CONFIG_H
+#endif  // FHE_CKKS_CKKS2C_CONFIG_H
