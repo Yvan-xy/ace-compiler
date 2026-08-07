@@ -146,3 +146,34 @@ set -e
     fields = timings.read_text(encoding="utf-8").strip().split("\t")
     assert fields[0] == "deliberate_failure"
     assert fields[-1] != "0"
+
+
+def test_remote_command_preserves_space_containing_gpu_name() -> None:
+    expected = "NVIDIA A100-SXM4-80GB"
+    script = r'''
+set -euo pipefail
+source "$1"
+expected="$2"
+remote_args=(
+  env
+  "ACE_RUNPOD_EXPECTED_GPU_NAME=${expected}"
+  bash -c 'printf "%s" "${ACE_RUNPOD_EXPECTED_GPU_NAME}"'
+)
+shell_join remote_command "${remote_args[@]}"
+bash -c "${remote_command}"
+'''
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            script,
+            "transport-test",
+            str(TOOLS / "transport_helpers.sh"),
+            expected,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout == expected

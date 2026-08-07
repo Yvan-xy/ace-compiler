@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/transport_helpers.sh"
+
 HOST=""
 PORT=""
 KEY=""
@@ -112,35 +115,26 @@ ended="$(date +%s)"
 record_timing source_transfer "${started}" "${ended}" "${transfer_exit}"
 [[ ${transfer_exit} -eq 0 ]]
 
-printf '%q ' ssh "${SSH_OPTIONS[@]}" "root@${HOST}" \
-  env \
-    ACE_RUNPOD_BASE_IMAGE="${ACE_RUNPOD_BASE_IMAGE}" \
-    ACE_RUNPOD_BASE_CONFIG_DIGEST="${ACE_RUNPOD_BASE_CONFIG_DIGEST}" \
-    ACE_RUNPOD_EXPECTED_GPU_NAME="${EXPECTED_GPU}" \
-    ACE_PHANTOM_BUILD_JOBS="${ACE_PHANTOM_BUILD_JOBS:-$(nproc)}" \
-  timeout --signal=TERM --kill-after=30 "${REMOTE_TIMEOUT}" \
-  bash /root/input/run_build_and_health.sh \
-    --mode runpod \
-    --input-dir /root/input \
-    --work-dir /root/runpod-work \
-    --result-archive /root/runpod-result.tar.gz \
-  >"${OUTPUT}/remote-command.txt"
-printf '\n' >>"${OUTPUT}/remote-command.txt"
+REMOTE_ARGS=(
+  env
+  "ACE_RUNPOD_BASE_IMAGE=${ACE_RUNPOD_BASE_IMAGE}"
+  "ACE_RUNPOD_BASE_CONFIG_DIGEST=${ACE_RUNPOD_BASE_CONFIG_DIGEST}"
+  "ACE_RUNPOD_EXPECTED_GPU_NAME=${EXPECTED_GPU}"
+  "ACE_PHANTOM_BUILD_JOBS=${ACE_PHANTOM_BUILD_JOBS:-$(nproc)}"
+  timeout --signal=TERM --kill-after=30 "${REMOTE_TIMEOUT}"
+  bash /root/input/run_build_and_health.sh
+  --mode runpod
+  --input-dir /root/input
+  --work-dir /root/runpod-work
+  --result-archive /root/runpod-result.tar.gz
+)
+shell_join REMOTE_COMMAND "${REMOTE_ARGS[@]}"
+printf '%q ' ssh "${SSH_OPTIONS[@]}" "root@${HOST}" >"${OUTPUT}/remote-command.txt"
+printf '%s\n' "${REMOTE_COMMAND}" >>"${OUTPUT}/remote-command.txt"
 
 started="$(date +%s)"
 set +e
-ssh "${SSH_OPTIONS[@]}" "root@${HOST}" \
-  env \
-    ACE_RUNPOD_BASE_IMAGE="${ACE_RUNPOD_BASE_IMAGE}" \
-    ACE_RUNPOD_BASE_CONFIG_DIGEST="${ACE_RUNPOD_BASE_CONFIG_DIGEST}" \
-    ACE_RUNPOD_EXPECTED_GPU_NAME="${EXPECTED_GPU}" \
-    ACE_PHANTOM_BUILD_JOBS="${ACE_PHANTOM_BUILD_JOBS:-$(nproc)}" \
-  timeout --signal=TERM --kill-after=30 "${REMOTE_TIMEOUT}" \
-  bash /root/input/run_build_and_health.sh \
-    --mode runpod \
-    --input-dir /root/input \
-    --work-dir /root/runpod-work \
-    --result-archive /root/runpod-result.tar.gz \
+ssh "${SSH_OPTIONS[@]}" "root@${HOST}" "${REMOTE_COMMAND}" \
   >"${OUTPUT}/remote.stdout.txt" \
   2>"${OUTPUT}/remote.stderr.txt"
 remote_exit=$?
