@@ -1,0 +1,124 @@
+#include "rt_phantom/rt_phantom.h"
+
+#include <cstddef>
+#include <cstdint>
+
+// This generated function deliberately has external linkage and is never
+// called by main. The compiler-generated translation unit linked beside this
+// probe owns both Phantom manifest callbacks.
+bool Ordinary_runtime_symbol_probe() {
+  CIPHERTEXT left = Get_input_data("ordinary_input", 0);
+  CIPHERTEXT right = Get_input_data("ordinary_input", 1);
+  CIPHERTEXT destination{};
+  CIPHERTEXT product{};
+  CIPHERTEXT3 cipher_array[2]{};
+  PLAINTEXT plain_float{};
+  PLAINTEXT plain_double{};
+  PLAINTEXT plain_complex{};
+  PLAINTEXT plain_float_mask{};
+  PLAINTEXT plain_double_mask{};
+
+  float float_values[2] = {0.25F, -0.5F};
+  double double_values[2] = {0.75, -1.25};
+  DCMPLX complex_values[2] = {{0.5, -0.25}, {-1.0, 1.5}};
+
+  // ORDINARY_RUNTIME_CALLS_BEGIN
+  const std::uint32_t degree = Degree();
+  const std::size_t slots = degree / 2;
+  Encode_float(&plain_float, float_values, 2, 1.0, 1);
+  Encode_double(&plain_double, double_values, 2, 1.0, 1);
+  Encode_dcmplx(&plain_complex, complex_values, 2, 1.0, 1);
+  Encode_float_mask(&plain_float_mask, 0.5F, slots, 1.0, 1);
+  Encode_double_mask(&plain_double_mask, -0.75, slots, 1.0, 1);
+
+  Add_ciph(&destination, &left, &right);
+  Add_ciph(&left, &left, &right);
+  Add_ciph(&right, &left, &right);
+  Sub_ciph(&destination, &left, &right);
+  Sub_ciph(&left, &left, &right);
+  Sub_ciph(&right, &left, &right);
+  Mul_ciph(&product, &left, &right);
+  Mul_ciph(&left, &left, &right);
+  Mul_ciph(&right, &left, &right);
+
+  Add_plain(&destination, &left, &plain_float);
+  Add_plain(&left, &left, &plain_float);
+  Sub_plain(&destination, &left, &plain_double);
+  Sub_plain(&left, &left, &plain_double);
+  Mul_plain(&destination, &left, &plain_complex);
+  Mul_plain(&left, &left, &plain_complex);
+
+  Add_scalar(&destination, &left, 1.25);
+  Add_scalar(&left, &left, 1.25);
+  Sub_scalar(&destination, &left, -0.5);
+  Sub_scalar(&left, &left, -0.5);
+  Mul_scalar(&destination, &left, 2.0);
+  Mul_scalar(&left, &left, 2.0);
+
+  Relin(&destination, &product);
+  Relin(&product, &product);
+  Rescale_ciph(&destination, &left);
+  Rescale_ciph(&left, &left);
+  Mod_switch(&destination, &left);
+  Mod_switch(&left, &left);
+
+  Rotate_ciph(&destination, &left, 1);
+  Rotate_ciph(&left, &left, 1);
+  Rotate_ciph(&destination, &left, -1);
+  Rotate_ciph(&left, &left, -1);
+  Rotate_ciph(&destination, &left, 0);
+  Rotate_ciph(&left, &left, 0);
+
+  Copy_ciph(&destination, &left);
+  Copy_ciph(&left, &left);
+  Zero_ciph(&destination);
+
+  const SCALE_T cipher_scale_degree = Sc_degree(&left);
+  const LEVEL_T cipher_level = Level(&left);
+  const LEVEL_T cipher_active_q = Active_q_count(&left);
+  const LEVEL_T cipher_chain = Chain_index(&left);
+  const SCALE_T cipher_raw_scale = Raw_scale(&left);
+  const std::size_t cipher_slots = Get_ciph_slots(&left);
+  const std::size_t cipher_size = Get_ciph_size(&left);
+  const bool cipher_is_ntt = Is_ciph_ntt(&left);
+
+  const LEVEL_T plain_level = Get_plain_level(&plain_float);
+  const LEVEL_T plain_active_q = Get_plain_active_q_count(&plain_float);
+  const LEVEL_T plain_chain = Get_plain_chain_index(&plain_float);
+  const SCALE_T plain_raw_scale = Get_plain_raw_scale(&plain_float);
+  const SCALE_T plain_scale_degree = Get_plain_scale_degree(&plain_float);
+  const std::size_t plain_slots = Get_plain_slots(&plain_float);
+  const bool plain_is_ntt = Is_plain_ntt(&plain_float);
+
+  Set_output_data("ordinary_output", 0, &destination);
+  Free_ciph(&left);
+  Free_ciph(&right);
+  Free_ciph(&destination);
+  Free_ciph(&product);
+  Free_plain(&plain_float);
+  Free_plain(&plain_double);
+  Free_plain(&plain_complex);
+  Free_plain(&plain_float_mask);
+  Free_plain(&plain_double_mask);
+  Free_ciph_array(cipher_array, 2);
+  // ORDINARY_RUNTIME_CALLS_END
+
+  (void)degree;
+  (void)slots;
+  (void)cipher_scale_degree;
+  (void)cipher_level;
+  (void)cipher_active_q;
+  (void)cipher_chain;
+  (void)cipher_raw_scale;
+  (void)cipher_slots;
+  (void)cipher_size;
+  (void)cipher_is_ntt;
+  (void)plain_level;
+  (void)plain_active_q;
+  (void)plain_chain;
+  (void)plain_raw_scale;
+  (void)plain_scale_degree;
+  (void)plain_slots;
+  (void)plain_is_ntt;
+  return true;
+}

@@ -11,9 +11,6 @@ import tarfile
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TOOLS_ROOT = REPO_ROOT / "tools/phantom_gpu"
-PROFILE_PATH = (
-    REPO_ROOT / "fhe-cmplr/rtlib/phantom/config/fullpacked_bts_v1.json"
-)
 
 
 def sha256(path: Path) -> str:
@@ -47,37 +44,40 @@ def make_packaging_fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
         TOOLS_ROOT / "run_a100_health.sh", tools_root / "run_a100_health.sh"
     )
 
-    profile_path = (
-        fixture_root / "fhe-cmplr/rtlib/phantom/config/fullpacked_bts_v1.json"
-    )
-    profile_path.parent.mkdir(parents=True)
-    shutil.copy2(PROFILE_PATH, profile_path)
-    profile_digest = sha256(profile_path)
-
     run_id = "20260807T000000Z-1.abc123"
     results_root = fixture_root / "build/phantom_gpu/compile_only_results"
     run_root = results_root / "runs" / run_id
-    toolchain_root = run_root / "toolchain"
-    toolchain_root.mkdir(parents=True)
+    codegen_root = run_root / "ckks2c"
+    codegen_root.mkdir(parents=True)
 
-    health_binary = toolchain_root / "native_phantom_health_sm80"
+    health_binary = codegen_root / "native_phantom_health_sm80"
     health_binary.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     health_binary.chmod(0o755)
     health_digest = sha256(health_binary)
+
+    context_manifest = codegen_root / "compiler_context_manifest.json"
+    resource_manifest = codegen_root / "compiler_resource_manifest.json"
+    write_json(context_manifest, {"schema_version": 1})
+    write_json(resource_manifest, {"schema_version": 1})
+    context_digest = sha256(context_manifest)
+    resource_digest = sha256(resource_manifest)
     write_json(
-        toolchain_root / "qualification.json",
+        codegen_root / "qualification.json",
         {
             "status": "pass",
             "executable_was_run": False,
             "health_binary_sha256": health_digest,
-            "profile_sha256": profile_digest,
+            "compiler_context_manifest_sha256": context_digest,
+            "compiler_resource_manifest_sha256": resource_digest,
         },
     )
 
     sums_path = run_root / "SHA256SUMS"
     qualified_files = [
-        toolchain_root / "native_phantom_health_sm80",
-        toolchain_root / "qualification.json",
+        health_binary,
+        codegen_root / "qualification.json",
+        context_manifest,
+        resource_manifest,
     ]
     sums_path.write_text(
         "".join(
@@ -99,7 +99,7 @@ def make_packaging_fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
             "development_image_id": image_id,
             "development_definition_sha256": definition_digest,
             "evidence_sha256_manifest_sha256": sha256(sums_path),
-            "profile_sha256": profile_digest,
+            "compiler_context_manifest_sha256": context_digest,
         },
     )
     qualification_record = results_root / "current-ckks2c.json"
@@ -166,7 +166,7 @@ def test_failed_health_result_archive_is_readable_under_private_umask(
         {
             "development_image_id": expected_image_id,
             "development_definition_sha256": "5" * 64,
-            "profile_sha256": "6" * 64,
+            "compiler_context_manifest_sha256": "6" * 64,
             "health_binary_sha256": "7" * 64,
             "registry_image": "registry.invalid/health@sha256:" + "8" * 64,
             "health_timeout_seconds": 300,

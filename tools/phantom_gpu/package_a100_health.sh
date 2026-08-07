@@ -3,7 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
-PROFILE_PATH="${REPO_ROOT}/fhe-cmplr/rtlib/phantom/config/fullpacked_bts_v1.json"
 QUALIFICATION_RECORD=""
 REGISTRY_IMAGE=""
 OUTPUT_ROOT="${REPO_ROOT}/build/phantom_gpu/a100_health_bundles"
@@ -105,11 +104,13 @@ fi
   sha256sum -c SHA256SUMS
 ) >/dev/null
 
-HEALTH_BINARY="${RUN_ROOT}/toolchain/native_phantom_health_sm80"
-TOOLCHAIN_QUALIFICATION="${RUN_ROOT}/toolchain/qualification.json"
+HEALTH_BINARY="${RUN_ROOT}/ckks2c/native_phantom_health_sm80"
+CODEGEN_QUALIFICATION="${RUN_ROOT}/ckks2c/qualification.json"
+CONTEXT_MANIFEST="${RUN_ROOT}/ckks2c/compiler_context_manifest.json"
+RESOURCE_MANIFEST="${RUN_ROOT}/ckks2c/compiler_resource_manifest.json"
 test -x "${HEALTH_BINARY}"
 jq -e '.status == "pass" and .executable_was_run == false' \
-  "${TOOLCHAIN_QUALIFICATION}" >/dev/null
+  "${CODEGEN_QUALIFICATION}" >/dev/null
 
 BUNDLE_DIR="${OUTPUT_ROOT}/${RUN_ID}"
 if [[ -e "${BUNDLE_DIR}" ]]; then
@@ -131,8 +132,9 @@ trap cleanup_staging EXIT
 PACKAGE_DIR="${STAGING_DIR}"
 cp "${HEALTH_BINARY}" "${PACKAGE_DIR}/native_phantom_health_sm80"
 cp "${SCRIPT_DIR}/run_a100_health.sh" "${PACKAGE_DIR}/run_a100_health.sh"
-cp "${PROFILE_PATH}" "${PACKAGE_DIR}/fullpacked_bts_v1.json"
-cp "${TOOLCHAIN_QUALIFICATION}" "${PACKAGE_DIR}/host_qualification.json"
+cp "${CONTEXT_MANIFEST}" "${PACKAGE_DIR}/compiler_context_manifest.json"
+cp "${RESOURCE_MANIFEST}" "${PACKAGE_DIR}/compiler_resource_manifest.json"
+cp "${CODEGEN_QUALIFICATION}" "${PACKAGE_DIR}/host_qualification.json"
 cp "${MANIFEST_PATH}" "${PACKAGE_DIR}/host_manifest.json"
 cp "${HOST_SUMS}" "${PACKAGE_DIR}/host_SHA256SUMS"
 
@@ -140,28 +142,35 @@ IMAGE_ID="$(jq -er '.development_image_id' "${QUALIFICATION_RECORD}")"
 DEFINITION_SHA256="$(
   jq -er '.development_definition_sha256' "${QUALIFICATION_RECORD}"
 )"
-PROFILE_SHA256="$(sha256sum "${PROFILE_PATH}" | awk '{print $1}')"
+CONTEXT_MANIFEST_SHA256="$(sha256sum "${CONTEXT_MANIFEST}" | awk '{print $1}')"
+RESOURCE_MANIFEST_SHA256="$(sha256sum "${RESOURCE_MANIFEST}" | awk '{print $1}')"
 HEALTH_BINARY_SHA256="$(sha256sum "${HEALTH_BINARY}" | awk '{print $1}')"
-if [[ "$(jq -er '.health_binary_sha256' "${TOOLCHAIN_QUALIFICATION}")" != \
+if [[ "$(jq -er '.health_binary_sha256' "${CODEGEN_QUALIFICATION}")" != \
       "${HEALTH_BINARY_SHA256}" ]]; then
   echo "health binary does not match the host qualification" >&2
   exit 1
 fi
-if [[ "$(jq -er '.profile_sha256' "${TOOLCHAIN_QUALIFICATION}")" != \
-      "${PROFILE_SHA256}" ]]; then
-  echo "profile does not match the host qualification" >&2
+if [[ "$(jq -er '.compiler_context_manifest_sha256' "${CODEGEN_QUALIFICATION}")" != \
+      "${CONTEXT_MANIFEST_SHA256}" ]]; then
+  echo "compiler context manifest does not match the host qualification" >&2
   exit 1
 fi
-if [[ "$(jq -er '.profile_sha256' "${MANIFEST_PATH}")" != \
-      "${PROFILE_SHA256}" ]]; then
-  echo "profile does not match the host manifest" >&2
+if [[ "$(jq -er '.compiler_resource_manifest_sha256' "${CODEGEN_QUALIFICATION}")" != \
+      "${RESOURCE_MANIFEST_SHA256}" ]]; then
+  echo "compiler resource manifest does not match the host qualification" >&2
+  exit 1
+fi
+if [[ "$(jq -er '.compiler_context_manifest_sha256' "${MANIFEST_PATH}")" != \
+      "${CONTEXT_MANIFEST_SHA256}" ]]; then
+  echo "compiler context manifest does not match the host manifest" >&2
   exit 1
 fi
 jq -n \
   --arg run_id "${RUN_ID}" \
   --arg image_id "${IMAGE_ID}" \
   --arg definition_sha256 "${DEFINITION_SHA256}" \
-  --arg profile_sha256 "${PROFILE_SHA256}" \
+  --arg context_manifest_sha256 "${CONTEXT_MANIFEST_SHA256}" \
+  --arg resource_manifest_sha256 "${RESOURCE_MANIFEST_SHA256}" \
   --arg health_binary_sha256 "${HEALTH_BINARY_SHA256}" \
   --arg host_manifest_sha256 "${MANIFEST_SHA256}" \
   --arg host_sums_sha256 "${HOST_SUMS_SHA256}" \
@@ -171,7 +180,8 @@ jq -n \
     run_id: $run_id,
     development_image_id: $image_id,
     development_definition_sha256: $definition_sha256,
-    profile_sha256: $profile_sha256,
+    compiler_context_manifest_sha256: $context_manifest_sha256,
+    compiler_resource_manifest_sha256: $resource_manifest_sha256,
     health_binary_sha256: $health_binary_sha256,
     host_manifest_sha256: $host_manifest_sha256,
     host_sums_sha256: $host_sums_sha256,

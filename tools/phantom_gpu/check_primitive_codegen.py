@@ -9,16 +9,13 @@ import json
 from pathlib import Path
 import re
 
-from check_configuration import (
-    profile_codegen_parameters,
-    read_json,
-    verify_profile,
-)
+from check_configuration import read_json, verify_context_manifest
 
 
 REQUIRED = (
     '#include "rt_phantom/rt_phantom.h"',
-    "LIB_PHANTOM",
+    "Get_phantom_context_manifest()",
+    "Get_phantom_resource_manifest()",
     "Add_ciph(",
     "Mul_ciph(",
     "Rotate_ciph(",
@@ -37,6 +34,7 @@ FORBIDDEN = {
     "hardware-level call": re.compile(r"\bHw_[A-Za-z0-9_]*\s*\("),
     "POLY-level call": re.compile(r"\bPoly_[A-Za-z0-9_]*\s*\("),
     "opaque bootstrap call": re.compile(r"\bBootstrap\s*\("),
+    "obsolete bootstrap flag": re.compile(r"\bNeed_bts\s*\("),
     "ANT bootstrap evaluator": re.compile(r"\bEval_bootstrap[A-Za-z0-9_]*\s*\("),
     "native Phantom bootstrap call": re.compile(r"\bPhantom_bootstrap\s*\("),
     "native Phantom bootstrap implementation": re.compile(
@@ -52,11 +50,19 @@ FORBIDDEN = {
         r"\b(?:bootstrap_slots_to_coeffs|SlotToCoeffs?)\b"
     ),
     "direct Phantom implementation": re.compile(r"\bphantom::"),
+    "duplicate legacy context": re.compile(
+        r"\b(?:CKKS_PARAMS|Get_context_params|Get_phantom_ordinary_features)\b"
+    ),
 }
 
-CKKS_PARAMS_PATTERN = re.compile(
-    r"static\s+CKKS_PARAMS\s+parm\s*=\s*\{\s*LIB_PHANTOM\s*,\s*"
-    + r"\s*,\s*".join([r"(\d+)"] * 9),
+ARRAY_PATTERN = re.compile(
+    r"static\s+const\s+uint32_t\s+(?P<name>[A-Za-z_]\w*)\[\]\s*=\s*"
+    r"\{(?P<values>[^}]*)\}\s*;",
+    re.MULTILINE,
+)
+CONTEXT_PATTERN = re.compile(
+    r"static\s+const\s+PHANTOM_CONTEXT_MANIFEST\s+context\s*=\s*"
+    r"\{(?P<fields>[^}]*)\}\s*;",
     re.MULTILINE,
 )
 
@@ -66,8 +72,126 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("source", type=Path)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--required-token", action="append")
-    parser.add_argument("--profile", type=Path)
+    parser.add_argument("--context-manifest", type=Path)
     return parser.parse_args()
+
+
+def _comma_values(text: str) -> list[str]:
+    return [value.strip() for value in text.split(",") if value.strip()]
+
+
+def extract_context(source: str) -> tuple[dict[str, object] | None, list[str]]:
+    arrays = {
+        match.group("name"): [
+            int(value) for value in _comma_values(match.group("values"))
+        ]
+        for match in ARRAY_PATTERN.finditer(source)
+    }
+    data_names = [name for name in arrays if name.endswith("phantom_data_q_bit_sizes")]
+    special_names = [
+        name for name in arrays if name.endswith("phantom_special_p_bit_sizes")
+    ]
+    if len(data_names) != 1 or len(special_names) != 1:
+        return None, [
+            "generated source must define exactly one data-Q and special-P array"
+        ]
+    match = CONTEXT_PATTERN.search(source)
+    if match is None:
+        return None, ["PHANTOM_CONTEXT_MANIFEST initializer is absent"]
+    fields = _comma_values(match.group("fields"))
+    if len(fields) != 15:
+        return None, ["PHANTOM_CONTEXT_MANIFEST initializer has the wrong arity"]
+    data_name = data_names[0]
+    special_name = special_names[0]
+    if fields[1] != "PHANTOM_PACKING_FULL" or fields[5] != data_name or fields[7] != special_name:
+        return None, ["PHANTOM_CONTEXT_MANIFEST initializer has invalid structural fields"]
+    try:
+        numeric = [
+            int(fields[index])
+            for index in (0, 2, 3, 4, 6, 8, 9, 10, 11, 12, 13, 14)
+        ]
+    except ValueError:
+        return None, ["PHANTOM_CONTEXT_MANIFEST initializer contains a non-integer field"]
+    (
+        schema_version,
+        polynomial_degree,
+        logical_slots,
+        data_q_count,
+        special_p_count,
+        input_level,
+        q_part_count,
+        hamming_weight,
+        security_level,
+        first_modulus_bits,
+        scaling_modulus_bits,
+        resource_schema_version,
+    ) = numeric
+    data_q = arrays[data_name]
+    special_p = arrays[special_name]
+    errors: list[str] = []
+    if data_q_count != len(data_q) or special_p_count != len(special_p):
+        errors.append("generated context array lengths disagree with their counts")
+    return {
+        "schema_version": schema_version,
+        "packing": "full",
+        "polynomial_degree": polynomial_degree,
+        "logical_slot_capacity": logical_slots,
+        "data_q_bit_sizes": data_q,
+        "special_p_bit_sizes": special_p,
+        "input_level": input_level,
+        "q_part_count": q_part_count,
+        "hamming_weight": hamming_weight,
+        "security_level": security_level,
+        "first_modulus_bits": first_modulus_bits,
+        "scaling_modulus_bits": scaling_modulus_bits,
+        "resource_schema_version": resource_schema_version,
+    }, errors
+
+
+def compare_context(source: str, manifest: dict[str, object]) -> list[str]:
+    mismatches: list[str] = []
+    arrays = {
+        match.group("name"): [int(value) for value in _comma_values(match.group("values"))]
+        for match in ARRAY_PATTERN.finditer(source)
+    }
+    data_names = [name for name in arrays if name.endswith("phantom_data_q_bit_sizes")]
+    special_names = [
+        name for name in arrays if name.endswith("phantom_special_p_bit_sizes")
+    ]
+    if len(data_names) != 1 or len(special_names) != 1:
+        return ["generated source must define exactly one data-Q and special-P array"]
+    data_name = data_names[0]
+    special_name = special_names[0]
+    if arrays[data_name] != manifest["data_q_bit_sizes"]:
+        mismatches.append("generated data-Q array differs from context manifest")
+    if arrays[special_name] != manifest["special_p_bit_sizes"]:
+        mismatches.append("generated special-P array differs from context manifest")
+
+    match = CONTEXT_PATTERN.search(source)
+    if match is None:
+        mismatches.append("PHANTOM_CONTEXT_MANIFEST initializer is absent")
+        return mismatches
+    fields = _comma_values(match.group("fields"))
+    expected = [
+        str(manifest["schema_version"]),
+        "PHANTOM_PACKING_FULL",
+        str(manifest["polynomial_degree"]),
+        str(manifest["logical_slot_capacity"]),
+        str(len(manifest["data_q_bit_sizes"])),
+        data_name,
+        str(len(manifest["special_p_bit_sizes"])),
+        special_name,
+        str(manifest["input_level"]),
+        str(manifest["q_part_count"]),
+        str(manifest["hamming_weight"]),
+        str(manifest["security_level"]),
+        str(manifest["first_modulus_bits"]),
+        str(manifest["scaling_modulus_bits"]),
+        str(manifest["resource_schema_version"]),
+    ]
+    if fields != expected:
+        mismatches.append("generated context initializer differs from manifest")
+    return mismatches
 
 
 def main() -> int:
@@ -79,56 +203,17 @@ def main() -> int:
     forbidden = [
         label for label, pattern in FORBIDDEN.items() if pattern.search(source)
     ]
-    profile_mismatches: list[str] = []
-    if arguments.profile:
-        repo_root = Path(__file__).resolve().parents[2]
-        profile = read_json(arguments.profile)
-        verify_profile(repo_root, profile)
-        expected = profile_codegen_parameters(profile)
-        match = CKKS_PARAMS_PATTERN.search(source)
-        if not match:
-            profile_mismatches.append("CKKS_PARAMS initializer is absent")
-        else:
-            (
-                poly_degree,
-                security_level,
-                mul_depth,
-                input_level,
-                first_prime_bits,
-                scaling_factor_bits,
-                q_parts,
-                hamming_weight,
-                _rotation_count,
-            ) = (int(value) for value in match.groups())
-            observed = {
-                "poly_degree": poly_degree,
-                "security_level": security_level,
-                "mul_depth": mul_depth,
-                "input_level": input_level,
-                "first_prime_bits": first_prime_bits,
-                "scaling_factor_bits": scaling_factor_bits,
-                "q_parts": q_parts,
-                "hamming_weight": hamming_weight,
-            }
-            expected_source = {
-                "poly_degree": expected["poly_degree"],
-                "security_level": expected["security_level"],
-                "mul_depth": expected["mul_level"] - 1,
-                "input_level": expected["input_level"],
-                "first_prime_bits": expected["first_prime_bits"],
-                "scaling_factor_bits": expected["scaling_factor_bits"],
-                "q_parts": profile["special_p"]["derivation"]["q_parts"],
-                "hamming_weight": expected["hamming_weight"],
-            }
-            for key, value in expected_source.items():
-                if observed[key] != value:
-                    profile_mismatches.append(
-                        f"{key}: expected {value}, got {observed[key]}"
-                    )
+    emitted_context, context_mismatches = extract_context(source)
+    context_digest = None
+    if arguments.context_manifest:
+        manifest = read_json(arguments.context_manifest)
+        verify_context_manifest(manifest)
+        context_mismatches.extend(compare_context(source, manifest))
+        context_digest = hashlib.sha256(arguments.context_manifest.read_bytes()).hexdigest()
     report = {
         "status": (
             "pass"
-            if not missing and not forbidden and not profile_mismatches
+            if not missing and not forbidden and not context_mismatches
             else "fail"
         ),
         "source": str(arguments.source),
@@ -137,8 +222,12 @@ def main() -> int:
         "required_tokens": list(required),
         "missing_required_tokens": missing,
         "forbidden_matches": forbidden,
-        "profile": str(arguments.profile) if arguments.profile else None,
-        "profile_mismatches": profile_mismatches,
+        "compiler_context_manifest": (
+            str(arguments.context_manifest) if arguments.context_manifest else None
+        ),
+        "compiler_context_manifest_sha256": context_digest,
+        "emitted_context": emitted_context,
+        "context_mismatches": context_mismatches,
     }
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if arguments.report:

@@ -6,12 +6,20 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 PROTECTED_NAME="ace-compiler-dev"
 
 usage() {
-  echo "usage: $0 --ace-commit COMMIT --phantom-commit COMMIT OUTPUT_DIRECTORY" >&2
+  echo "usage: $0 --ace-commit COMMIT --phantom-commit COMMIT --ordinary-run-root DIR --poly-degree N --mul-level Q --input-level L --security-level B --scaling-factor-bits B --first-prime-bits B --hamming-weight W OUTPUT_DIRECTORY" >&2
   exit 2
 }
 
 ACE_COMMIT=""
 PHANTOM_COMMIT=""
+POLY_DEGREE=""
+MUL_LEVEL=""
+INPUT_LEVEL=""
+SECURITY_LEVEL=""
+SCALING_BITS=""
+FIRST_PRIME_BITS=""
+HAMMING_WEIGHT=""
+ORDINARY_RUN_ROOT=""
 OUTPUT_ARGUMENT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,6 +33,18 @@ while [[ $# -gt 0 ]]; do
       PHANTOM_COMMIT="$2"
       shift 2
       ;;
+    --ordinary-run-root)
+      [[ $# -ge 2 ]] || usage
+      ORDINARY_RUN_ROOT="$2"
+      shift 2
+      ;;
+    --poly-degree) [[ $# -ge 2 ]] || usage; POLY_DEGREE="$2"; shift 2 ;;
+    --mul-level) [[ $# -ge 2 ]] || usage; MUL_LEVEL="$2"; shift 2 ;;
+    --input-level) [[ $# -ge 2 ]] || usage; INPUT_LEVEL="$2"; shift 2 ;;
+    --security-level) [[ $# -ge 2 ]] || usage; SECURITY_LEVEL="$2"; shift 2 ;;
+    --scaling-factor-bits) [[ $# -ge 2 ]] || usage; SCALING_BITS="$2"; shift 2 ;;
+    --first-prime-bits) [[ $# -ge 2 ]] || usage; FIRST_PRIME_BITS="$2"; shift 2 ;;
+    --hamming-weight) [[ $# -ge 2 ]] || usage; HAMMING_WEIGHT="$2"; shift 2 ;;
     --)
       shift
       [[ $# -eq 1 && -z "${OUTPUT_ARGUMENT}" ]] || usage
@@ -40,7 +60,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "${ACE_COMMIT}" && -n "${PHANTOM_COMMIT}" &&
+   -n "${ORDINARY_RUN_ROOT}" &&
    -n "${OUTPUT_ARGUMENT}" ]] || usage
+for value in "${POLY_DEGREE}" "${MUL_LEVEL}" "${INPUT_LEVEL}" \
+  "${SECURITY_LEVEL}" "${SCALING_BITS}" "${FIRST_PRIME_BITS}" \
+  "${HAMMING_WEIGHT}"; do
+  [[ "${value}" =~ ^[0-9]+$ ]] || usage
+done
 if [[ ! "${ACE_COMMIT}" =~ ^[0-9a-f]{40}$ ||
       ! "${PHANTOM_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "source commits must be full lowercase 40-character object IDs" >&2
@@ -139,6 +165,14 @@ trap 'exit 130' INT TERM
 bash "${SCRIPT_DIR}/package_runpod_sources.sh" \
   --ace-commit "${ACE_COMMIT}" \
   --phantom-commit "${PHANTOM_COMMIT}" \
+  --ordinary-run-root "${ORDINARY_RUN_ROOT}" \
+  --poly-degree "${POLY_DEGREE}" \
+  --mul-level "${MUL_LEVEL}" \
+  --input-level "${INPUT_LEVEL}" \
+  --security-level "${SECURITY_LEVEL}" \
+  --scaling-factor-bits "${SCALING_BITS}" \
+  --first-prime-bits "${FIRST_PRIME_BITS}" \
+  --hamming-weight "${HAMMING_WEIGHT}" \
   "${PAYLOAD}"
 docker pull --platform linux/amd64 "${BASE_IMAGE}" | tee "${DOCKER_EVIDENCE}/pull.txt"
 ACTUAL_BASE_ID="$(docker image inspect -f '{{.Id}}' "${BASE_IMAGE}")"

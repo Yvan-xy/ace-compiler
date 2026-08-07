@@ -112,7 +112,9 @@ EXPECTED_IMAGE_ID="$(jq -er '.development_image_id' "${BUNDLE_MANIFEST}")"
 EXPECTED_DEFINITION_SHA256="$(
   jq -er '.development_definition_sha256' "${BUNDLE_MANIFEST}"
 )"
-EXPECTED_PROFILE_SHA256="$(jq -er '.profile_sha256' "${BUNDLE_MANIFEST}")"
+EXPECTED_CONTEXT_MANIFEST_SHA256="$(
+  jq -er '.compiler_context_manifest_sha256' "${BUNDLE_MANIFEST}"
+)"
 EXPECTED_BINARY_SHA256="$(
   jq -er '.health_binary_sha256' "${BUNDLE_MANIFEST}"
 )"
@@ -159,12 +161,12 @@ fi
 
 HEALTH_JSON="$(tail -n 1 "${RESULT_DIR}/native_health.stdout.txt")"
 echo "${HEALTH_JSON}" | jq -e \
-  --arg profile_sha256 "${EXPECTED_PROFILE_SHA256}" \
+  --arg context_manifest_sha256 "${EXPECTED_CONTEXT_MANIFEST_SHA256}" \
   '.status == "pass"
    and .device_count == 1
    and .gpu == "NVIDIA A100 80GB PCIe"
    and .max_error <= 0.0001
-   and .profile_sha256 == $profile_sha256' >/dev/null
+   and .context_manifest_sha256 == $context_manifest_sha256' >/dev/null
 echo "${HEALTH_JSON}" >"${RESULT_DIR}/native_health.json"
 COMPLETED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -176,7 +178,7 @@ atomic_json "${RESULT_DIR}/result.json" -n \
   --arg image_id "${EXPECTED_IMAGE_ID}" \
   --arg definition_sha256 "${EXPECTED_DEFINITION_SHA256}" \
   --arg registry_image "${EXPECTED_REGISTRY_IMAGE}" \
-  --arg profile_sha256 "${EXPECTED_PROFILE_SHA256}" \
+  --arg context_manifest_sha256 "${EXPECTED_CONTEXT_MANIFEST_SHA256}" \
   --arg health_binary_sha256 "${EXPECTED_BINARY_SHA256}" \
   --argjson health_exit_code "${HEALTH_EXIT_CODE}" \
   --argjson max_error "$(echo "${HEALTH_JSON}" | jq '.max_error')" \
@@ -189,7 +191,7 @@ atomic_json "${RESULT_DIR}/result.json" -n \
     development_image_id: $image_id,
     development_definition_sha256: $definition_sha256,
     registry_image: $registry_image,
-    profile_sha256: $profile_sha256,
+    compiler_context_manifest_sha256: $context_manifest_sha256,
     health_binary_sha256: $health_binary_sha256,
     health_exit_code: $health_exit_code,
     max_error: $max_error

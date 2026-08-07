@@ -47,10 +47,11 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def fields(root: Path) -> dict[str, Any]:
-    configuration = read_json(root / "qualification/toolchain/configuration.json")
+    configuration = read_json(root / "qualification/ckks2c/configuration.json")
     ace_audit = read_json(root / "ace-source-audit.json")
     phantom_audit = read_json(root / "phantom-source-audit.json")
     qualification = read_json(root / "qualification/ckks2c/qualification.json")
+    frozen_reference = read_json(root / "ordinary-frozen-reference.json")
     return {
         "base_image": configuration["environment_identity"]["base_image"],
         "base_config_digest": configuration["environment_identity"]["config_digest"],
@@ -62,7 +63,9 @@ def fields(root: Path) -> dict[str, Any]:
         "phantom_archive_sha256": phantom_audit["archive_sha256"],
         "cuda_architecture": configuration["cuda_architecture"],
         "tool_versions": configuration["toolchain"]["versions"],
-        "profile_sha256": configuration["profile"]["sha256"],
+        "compiler_context_manifest_sha256": configuration[
+            "compiler_context_manifest"
+        ]["sha256"],
         "apt_lock_sha256": sha256(root / "environment/apt-packages.lock"),
         "python_lock_sha256": sha256(
             root / "environment/python-requirements-hashed.lock"
@@ -73,6 +76,20 @@ def fields(root: Path) -> dict[str, Any]:
         "generated_source_sha256": qualification["source_sha256"],
         "terminal_selection_sha256": qualification["terminal_selection_sha256"],
         "generated_binary_sha256": qualification["binary_sha256"],
+        "ordinary_context_manifest_sha256": frozen_reference[
+            "context_manifest_sha256"
+        ],
+        "ordinary_resource_manifest_sha256": frozen_reference[
+            "resource_manifest_sha256"
+        ],
+        "ordinary_fixture_sha256": frozen_reference["fixture_sha256"],
+        "ordinary_cpu_reference_sha256": frozen_reference[
+            "cpu_reference_sha256"
+        ],
+        "ordinary_cpu_values_sha256": frozen_reference["cpu_values_sha256"],
+        "ordinary_ant_verification_sha256": frozen_reference[
+            "ant_verification_sha256"
+        ],
     }
 
 

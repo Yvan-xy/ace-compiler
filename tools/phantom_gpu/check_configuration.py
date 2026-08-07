@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Verify pinned sources, shared profiles, and immutable mounted inputs."""
+"""Verify pinned sources, compiler context, and immutable mounted inputs."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
-import runpy
 import subprocess
 import sys
 from typing import Any
@@ -153,104 +151,55 @@ def verify_input(directory: Path, record: dict[str, Any]) -> dict[str, Any]:
     return {"path": os.fspath(path), "size_bytes": size, "sha256": digest}
 
 
-def verify_profile(repo_root: Path, profile: dict[str, Any]) -> None:
-    if profile.get("schema_version") != "1.0.0":
-        fail("unsupported Phantom profile schema")
-    if profile.get("profile_id") != "fullpacked_bts_v1":
-        fail("unexpected Phantom profile identifier")
-    ring = profile["ring"]
-    if ring != {
-        "polynomial_degree": 16384,
-        "active_slot_count": 8192,
-        "packing_mode": "full",
-    }:
-        fail("ring profile does not match the frozen full-packed contract")
-
-    data_q = profile["data_q"]
-    if data_q["count"] != len(data_q["bit_sizes"]):
-        fail("data-Q count does not match its bit-size list")
-    if data_q["count"] != profile["depth"]["data_multiplication_depth"] + 1:
-        fail("data-Q count does not match the declared multiplication depth")
-    if data_q["bit_sizes"] != [60] + [56] * 26:
-        fail("data-Q bit sizes do not match the frozen chain")
-
-    special_p = profile["special_p"]
-    if special_p["count"] != len(special_p["bit_sizes"]):
-        fail("special-P count does not match its bit-size list")
-    expected_p = math.ceil(
-        (
-            data_q["first_modulus_bits"]
-            + (
-                math.ceil(
-                    special_p["derivation"]["data_depth"]
-                    / special_p["derivation"]["q_parts"]
-                )
-                - 1
-            )
-            * data_q["scaling_modulus_bits"]
-        )
-        / 60
-    )
-    if special_p["count"] != expected_p or special_p["bit_sizes"] != [60] * expected_p:
-        fail("special-P derivation does not match the frozen chain")
-
-    constants = runpy.run_path(
-        os.fspath(repo_root / "ace_edsl/examples/bootstrap_ant_constants.py")
-    )
-    coefficients = list(constants["G_COEFFICIENTS_UNIFORM_HW_192"])
-    scalars = list(constants["get_double_angle_scalars"]())
-    if profile["eval_mod"]["chebyshev_coefficients"] != coefficients:
-        fail("Chebyshev coefficients differ from the shared EDSL constants")
-    if profile["eval_mod"]["double_angle_scalars"] != scalars:
-        fail("double-angle scalars differ from the shared EDSL constants")
-    if profile["scale"]["post_bootstrap_multiplier"] != constants["BOOTSTRAP_POST_SCALE"]:
-        fail("post-bootstrap multiplier differs from the shared EDSL constant")
-    if profile["phantom"]["cuda_architecture"] != 80:
-        fail("Phantom profile must target CUDA architecture 80")
-
-
-def profile_codegen_parameters(profile: dict[str, Any]) -> dict[str, Any]:
-    """Map the shared profile to the EDSL configuration contract."""
-    return {
-        "poly_degree": profile["ring"]["polynomial_degree"],
-        "mul_level": profile["depth"]["data_multiplication_depth"],
-        "input_level": profile["levels"]["input"]["logical_level"],
-        "security_level": profile["security"]["validation_level_bits"],
-        "scaling_factor_bits": profile["data_q"]["scaling_modulus_bits"],
-        "first_prime_bits": profile["data_q"]["first_modulus_bits"],
-        "hamming_weight": profile["security"]["secret_key_hamming_weight"],
-        "ct_encode": profile["transforms"]["ciphertext_encoded_constants"],
+def verify_context_manifest(manifest: dict[str, Any]) -> None:
+    required = {
+        "schema_version",
+        "packing",
+        "polynomial_degree",
+        "logical_slot_capacity",
+        "data_q_bit_sizes",
+        "special_p_bit_sizes",
+        "input_level",
+        "q_part_count",
+        "hamming_weight",
+        "security_level",
+        "first_modulus_bits",
+        "scaling_modulus_bits",
+        "resource_schema_version",
     }
-
-
-def render_cpp_profile_header(
-    profile: dict[str, Any], profile_sha256: str
-) -> str:
-    """Render native Phantom parameters from the verified JSON profile."""
-    if not SHA256_PATTERN.fullmatch(profile_sha256):
-        fail("profile SHA-256 is malformed")
-
-    def cpp_array(values: list[int]) -> str:
-        return ", ".join(str(value) for value in values)
-
-    data_q = profile["data_q"]["bit_sizes"]
-    special_p = profile["special_p"]["bit_sizes"]
-    return f"""#pragma once
-
-#include <array>
-#include <cstddef>
-
-namespace ace::phantom_profile {{
-inline constexpr char kProfileSha256[] = "{profile_sha256}";
-inline constexpr std::size_t kPolynomialDegree = {profile['ring']['polynomial_degree']};
-inline constexpr std::size_t kActiveSlotCount = {profile['ring']['active_slot_count']};
-inline constexpr int kCudaArchitecture = {profile['phantom']['cuda_architecture']};
-inline constexpr int kScalingModulusBits = {profile['data_q']['scaling_modulus_bits']};
-inline constexpr int kSecretKeyHammingWeight = {profile['security']['secret_key_hamming_weight']};
-inline constexpr std::array<int, {len(data_q)}> kDataQBitSizes = {{{cpp_array(data_q)}}};
-inline constexpr std::array<int, {len(special_p)}> kSpecialPBitSizes = {{{cpp_array(special_p)}}};
-}}  // namespace ace::phantom_profile
-"""
+    if set(manifest) != required:
+        fail("compiler context manifest keys do not match schema")
+    if manifest["schema_version"] != 1 or manifest["resource_schema_version"] != 1:
+        fail("unsupported compiler context manifest schema")
+    degree = manifest["polynomial_degree"]
+    slots = manifest["logical_slot_capacity"]
+    if (
+        not isinstance(degree, int)
+        or degree < 2
+        or degree & (degree - 1)
+        or manifest["packing"] != "full"
+        or slots != degree // 2
+    ):
+        fail("invalid compiler-declared degree, packing, or slot capacity")
+    data_q = manifest["data_q_bit_sizes"]
+    special_p = manifest["special_p_bit_sizes"]
+    if not data_q or not special_p or not all(
+        isinstance(bits, int) and 0 < bits <= 60
+        for bits in data_q + special_p
+    ):
+        fail("compiler context manifest has invalid Q/P arrays")
+    if data_q[0] != manifest["first_modulus_bits"] or any(
+        bits != manifest["scaling_modulus_bits"] for bits in data_q[1:]
+    ):
+        fail("compiler context manifest Q list disagrees with prime metadata")
+    if not 1 <= manifest["input_level"] <= len(data_q):
+        fail("compiler context manifest input level is invalid")
+    if not 1 <= manifest["q_part_count"] <= len(data_q):
+        fail("compiler context manifest Q-part count is invalid")
+    if not 1 <= manifest["hamming_weight"] <= degree:
+        fail("compiler context manifest hamming weight is invalid")
+    if manifest["security_level"] not in (0, 128, 192, 256):
+        fail("compiler context manifest security setting is invalid")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -265,8 +214,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--base-image")
     parser.add_argument("--base-config-digest")
     parser.add_argument("--bootstrap-sha256")
+    parser.add_argument("--context-manifest", required=True, type=Path)
     parser.add_argument("--json-output", type=Path)
-    parser.add_argument("--cpp-header-output", type=Path)
     return parser.parse_args()
 
 
@@ -334,18 +283,10 @@ def main() -> int:
             ]
         )
 
-    profile_path = (
-        repo_root
-        / "fhe-cmplr/rtlib/phantom/config/fullpacked_bts_v1.json"
-    )
-    profile = read_json(profile_path)
-    verify_profile(repo_root, profile)
-    profile_sha256 = sha256(profile_path)
-    if arguments.cpp_header_output:
-        arguments.cpp_header_output.parent.mkdir(parents=True, exist_ok=True)
-        arguments.cpp_header_output.write_text(
-            render_cpp_profile_header(profile, profile_sha256), encoding="utf-8"
-        )
+    context_manifest_path = arguments.context_manifest.resolve(strict=True)
+    context_manifest = read_json(context_manifest_path)
+    verify_context_manifest(context_manifest)
+    context_manifest_sha256 = sha256(context_manifest_path)
 
     if arguments.source_mode == "snapshot":
         if arguments.base_image != lock["CUDA_IMAGE"]:
@@ -423,9 +364,9 @@ def main() -> int:
         "environment_identity": image_record,
         "source_manifest_sha256": arguments.source_manifest_sha256,
         "toolchain": toolchain,
-        "profile": {
-            "path": os.fspath(profile_path),
-            "sha256": profile_sha256,
+        "compiler_context_manifest": {
+            "path": os.fspath(context_manifest_path),
+            "sha256": context_manifest_sha256,
         },
         "fixture": fixture_record,
     }

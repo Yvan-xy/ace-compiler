@@ -1,5 +1,6 @@
 #include "phantom.h"
-#include "fullpacked_bts_profile.h"
+#include "common/rt_api.h"
+#include "rt_phantom/phantom_api.h"
 
 #include <cuda_runtime_api.h>
 
@@ -11,6 +12,17 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifndef ACE_CONTEXT_MANIFEST_SHA256
+#error "ACE_CONTEXT_MANIFEST_SHA256 must identify the compiler-emitted manifest"
+#endif
+
+extern "C" {
+int Get_input_count() { return 0; }
+int Get_output_count() { return 0; }
+DATA_SCHEME* Get_encode_scheme(int) { return nullptr; }
+DATA_SCHEME* Get_decode_scheme(int) { return nullptr; }
+}
 
 namespace {
 
@@ -25,7 +37,11 @@ void RequireCuda(cudaError_t result, const char* operation) {
 
 int main() {
   try {
-    static_assert(ace::phantom_profile::kCudaArchitecture == 80);
+    const PHANTOM_CONTEXT_MANIFEST* manifest = Get_phantom_context_manifest();
+    if (manifest == nullptr || manifest->_data_q_bit_sizes == nullptr ||
+        manifest->_special_p_bit_sizes == nullptr) {
+      throw std::runtime_error("compiler context manifest is incomplete");
+    }
     int device_count = 0;
     RequireCuda(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
     if (device_count != 1) {
@@ -42,27 +58,24 @@ int main() {
       return 1;
     }
 
-    std::vector<int> bit_sizes(
-        ace::phantom_profile::kDataQBitSizes.begin(),
-        ace::phantom_profile::kDataQBitSizes.end());
-    bit_sizes.insert(bit_sizes.end(),
-                     ace::phantom_profile::kSpecialPBitSizes.begin(),
-                     ace::phantom_profile::kSpecialPBitSizes.end());
+    std::vector<int> bit_sizes(manifest->_data_q_bit_sizes,
+                               manifest->_data_q_bit_sizes +
+                                   manifest->_data_q_count);
+    bit_sizes.insert(bit_sizes.end(), manifest->_special_p_bit_sizes,
+                     manifest->_special_p_bit_sizes +
+                         manifest->_special_p_count);
 
     phantom::EncryptionParameters parameters(phantom::scheme_type::ckks);
-    parameters.set_poly_modulus_degree(
-        ace::phantom_profile::kPolynomialDegree);
+    parameters.set_poly_modulus_degree(manifest->_poly_degree);
     parameters.set_coeff_modulus(phantom::arith::CoeffModulus::Create(
-        ace::phantom_profile::kPolynomialDegree, bit_sizes));
-    parameters.set_special_modulus_size(
-        ace::phantom_profile::kSpecialPBitSizes.size());
-    parameters.set_secret_key_hamming_weight(
-        ace::phantom_profile::kSecretKeyHammingWeight);
+        manifest->_poly_degree, bit_sizes));
+    parameters.set_special_modulus_size(manifest->_special_p_count);
+    parameters.set_secret_key_hamming_weight(manifest->_hamming_weight);
 
     PhantomContext context(parameters);
     PhantomCKKSEncoder encoder(context);
-    if (encoder.slot_count() != ace::phantom_profile::kActiveSlotCount) {
-      std::cerr << "expected " << ace::phantom_profile::kActiveSlotCount
+    if (encoder.slot_count() != manifest->_logical_slots) {
+      std::cerr << "expected " << manifest->_logical_slots
                 << " active slots, found " << encoder.slot_count() << '\n';
       return 1;
     }
@@ -73,8 +86,7 @@ int main() {
     input[1] = {-1.5, 2.25};
     input[2] = {3.0, 0.5};
     input[3] = {-0.75, -4.0};
-    const double scale =
-        std::ldexp(1.0, ace::phantom_profile::kScalingModulusBits);
+    const double scale = std::ldexp(1.0, manifest->_scaling_modulus_bits);
 
     PhantomPlaintext plaintext;
     encoder.encode(context, input, scale, plaintext);
@@ -105,8 +117,8 @@ int main() {
     std::cout << "{\"status\":\"pass\",\"gpu\":\""
               << properties.name << "\",\"device_count\":" << device_count
               << ",\"max_error\":" << max_error
-              << ",\"profile_sha256\":\""
-              << ace::phantom_profile::kProfileSha256 << "\"}\n";
+              << ",\"context_manifest_sha256\":\""
+              << ACE_CONTEXT_MANIFEST_SHA256 << "\"}\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "native Phantom health failed: " << error.what() << '\n';
