@@ -8,13 +8,8 @@
 # Build external onnx project dependent function
 function(build_external_proto)
 
-  set(ONNX_URL      "https://git:$ENV{CI_TOKEN}@code.alipay.com/air-infra/onnx.git")
-  set(ONNX_URL_SSH  "git@code.alipay.com:air-infra/onnx.git")
-  if(EXTERNAL_URL_SSH)
-    set(REPO_ONNX_URL ${ONNX_URL_SSH})
-  else()
-    set(REPO_ONNX_URL ${ONNX_URL})
-  endif()
+  set(REPO_ONNX_URL "https://github.com/onnx/onnx.git")
+  set(ONNX_GIT_TAG "1089b9e8045a3a2882d7bb6a1dbaeaf9cae131da")
 
   message(STATUS "Cloning External Repository   : ${REPO_ONNX_URL}")
 
@@ -22,7 +17,7 @@ function(build_external_proto)
   FetchContent_Declare(
     onnx
     GIT_REPOSITORY  ${REPO_ONNX_URL}
-    GIT_TAG         feat-ACI_v1.9.0
+    GIT_TAG         ${ONNX_GIT_TAG}
     GIT_SUBMODULES  ""
   )
 

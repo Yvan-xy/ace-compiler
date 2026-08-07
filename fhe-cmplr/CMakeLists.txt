@@ -42,10 +42,34 @@ option(FHE_ENABLE_SEAL     "Control whether to build with SEAL libraries"      O
 option(FHE_ENABLE_SEAL_BTS "Control whether to build with SEAL_BTS libraries" OFF)
 option(FHE_ENABLE_OPENFHE  "Control whether to build with OPENFHE libraries"   ON)
 option(FHE_ENABLE_CUDA     "Control whether to build with CUDA libraries"     OFF)
+option(FHE_ENABLE_PHANTOM  "Control whether to build with Phantom libraries"  OFF)
 option(BUILD_WITH_OPENMP   "Control whether to build with OpenMP libraries"   OFF)
 option(EXTERNAL_URL_SSH    "Control choose external URL for repository"       OFF)
 
 set(FHE_WITH_SRC "" CACHE STRING "The default compilation depends")
+set(PHANTOM_SOURCE_DIR "" CACHE PATH
+    "Local Git repository used to clone the pinned Phantom source")
+set(PHANTOM_GIT_TAG "faa6ba2bb990e17c88d826a880ef40136aaa8bc7" CACHE STRING
+    "Exact Phantom Git commit used by the runtime")
+
+if(FHE_ENABLE_PHANTOM)
+  if(NOT FHE_ENABLE_CUDA)
+    message(FATAL_ERROR "FHE_ENABLE_PHANTOM requires FHE_ENABLE_CUDA=ON")
+  endif()
+  if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "80")
+    message(FATAL_ERROR
+      "Phantom qualification requires CMAKE_CUDA_ARCHITECTURES=80")
+  endif()
+  if(NOT IS_DIRECTORY "${PHANTOM_SOURCE_DIR}/.git")
+    message(FATAL_ERROR
+      "PHANTOM_SOURCE_DIR must name a mounted local Git repository")
+  endif()
+  string(LENGTH "${PHANTOM_GIT_TAG}" PHANTOM_GIT_TAG_LENGTH)
+  if(NOT PHANTOM_GIT_TAG_LENGTH EQUAL 40 OR
+     NOT PHANTOM_GIT_TAG MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR "PHANTOM_GIT_TAG must be an exact 40-character commit")
+  endif()
+endif()
 
 if(NOT DEFINED FHE_SEED_MODE)
   set(FHE_SEED_MODE "prng" CACHE STRINGS "Default seed mode")
@@ -99,7 +123,13 @@ message(STATUS "FHE_BUILD_EXAMPLE             : ${FHE_BUILD_EXAMPLE}")
 message(STATUS "FHE_ENABLE_SEAL               : ${FHE_ENABLE_SEAL}")
 message(STATUS "FHE_ENABLE_SEAL_BTS           : ${FHE_ENABLE_SEAL_BTS}")
 message(STATUS "FHE_ENABLE_OPENFHE            : ${FHE_ENABLE_OPENFHE}")
+message(STATUS "FHE_ENABLE_CUDA               : ${FHE_ENABLE_CUDA}")
 message(STATUS "FHE_ENABLE_PHANTOM            : ${FHE_ENABLE_PHANTOM}")
+if(FHE_ENABLE_PHANTOM)
+  message(STATUS "PHANTOM_SOURCE_DIR             : ${PHANTOM_SOURCE_DIR}")
+  message(STATUS "PHANTOM_GIT_TAG                : ${PHANTOM_GIT_TAG}")
+  message(STATUS "CMAKE_CUDA_ARCHITECTURES       : ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
 message(STATUS "FHE_INSTALL_APP               : ${FHE_INSTALL_APP}")
 message(STATUS "BUILD_WITH_OPENMP             : ${BUILD_WITH_OPENMP}")
 message(STATUS "BUILD_TIMESTAMP               : ${BUILD_TIMESTAMP}")

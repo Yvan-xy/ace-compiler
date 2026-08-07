@@ -23,17 +23,25 @@ list(APPEND RT_PHANTOM_INCLUDE_DIRS "${PROJECT_SOURCE_DIR}/include")
 list(APPEND RT_PHANTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/include")
 list(APPEND RT_PHANTOM_INCLUDE_DIRS "${PHANTOM_INCLUDE_DIR}")
 list(APPEND RT_PHANTOM_INCLUDE_DIRS ${CUDA_INCLUDE_DIRS})
-include_directories(${RT_PHANTOM_INCLUDE_DIRS})
 set(RT_PHANTOM_INCLUDE_DIRS "${RT_PHANTOM_INCLUDE_DIRS}" CACHE INTERNAL "")
 
 add_library(fhert_phantom_obj OBJECT ${RT_PHANTOM_SRC_FILES})
+target_include_directories(fhert_phantom_obj PRIVATE ${RT_PHANTOM_INCLUDE_DIRS})
 set_property(TARGET fhert_phantom_obj PROPERTY POSITION_INDEPENDENT_CODE 1)
-set_target_properties(fhert_phantom_obj PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+set_target_properties(fhert_phantom_obj PROPERTIES
+  CUDA_ARCHITECTURES 80
+  CUDA_SEPARABLE_COMPILATION ON
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON)
 add_dependencies(fhert_phantom_obj phantom_external)
 
 if(BUILD_STATIC)
   add_library(FHErt_phantom STATIC $<TARGET_OBJECTS:fhert_phantom_obj>)
   set_property(TARGET FHErt_phantom PROPERTY RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/rtlib/lib)
+  target_include_directories(FHErt_phantom PUBLIC ${RT_PHANTOM_INCLUDE_DIRS})
+  target_link_libraries(FHErt_phantom PUBLIC
+    ${PHANTOM_LIBS}
+    FHErt_common)
   add_dependencies(FHErt_phantom rtlib_depend)
   install(TARGETS FHErt_phantom EXPORT FHETargets DESTINATION rtlib/lib)
 endif()

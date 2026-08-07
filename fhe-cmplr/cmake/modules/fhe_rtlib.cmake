@@ -12,30 +12,53 @@ function(build_rtlib)
   # Passing a list of include files requires a custom transformation
   string(JOIN "|" PACKAGE_INC_DIR_TF ${PACKAGE_INC_DIR})
 
+  set(RTLIB_CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+      -DCMAKE_CXX_STANDARD=17
+      -DCMAKE_CXX_STANDARD_REQUIRED=ON
+      -DBUILD_STATIC=${BUILD_STATIC}
+      -DBUILD_UNITTEST=${BUILD_UNITTEST}
+      -DBUILD_BENCH=${BUILD_BENCH}
+      -DRTLIB_BUILD_TEST=${FHE_BUILD_TEST}
+      -DRTLIB_BUILD_EXAMPLE=${FHE_BUILD_EXAMPLE}
+      -DRTLIB_INSTALL_APP=${FHE_INSTALL_APP}
+      -DRTLIB_CODE_CHECK=${FHE_CODE_CHECK}
+      -DRTLIB_ENABLE_SEAL=${FHE_ENABLE_SEAL}
+      -DRTLIB_ENABLE_SEAL_BTS=${FHE_ENABLE_SEAL_BTS}
+      -DRTLIB_ENABLE_OPENFHE=${FHE_ENABLE_OPENFHE}
+      -DRTLIB_ENABLE_CUDA=${FHE_ENABLE_CUDA}
+      -DRTLIB_ENABLE_PHANTOM=${FHE_ENABLE_PHANTOM}
+      -DRTLIB_SUPPORT_HPU=${FHE_SUPPORT_HPU}
+      -DRTLIB_SEED_MODE=${FHE_SEED_MODE}
+      -DBUILD_WITH_OPENMP=${BUILD_WITH_OPENMP}
+      -DPACKAGE_BASE_DIR=$ENV{PACKAGE_BASE_DIR}
+      -DPACKAGE_INC_DIR_TF=${PACKAGE_INC_DIR_TF}
+      -DEXTERNAL_URL_SSH=${EXTERNAL_URL_SSH}
+      -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX})
+
+  if(FHE_ENABLE_CUDA)
+    list(APPEND RTLIB_CMAKE_ARGS
+      -DCMAKE_CUDA_ARCHITECTURES:STRING=${CMAKE_CUDA_ARCHITECTURES}
+      -DCMAKE_CUDA_STANDARD=17
+      -DCMAKE_CUDA_STANDARD_REQUIRED=ON)
+    if(CMAKE_CUDA_COMPILER)
+      list(APPEND RTLIB_CMAKE_ARGS
+        -DCMAKE_CUDA_COMPILER:FILEPATH=${CMAKE_CUDA_COMPILER})
+    endif()
+  endif()
+
+  if(FHE_ENABLE_PHANTOM)
+    list(APPEND RTLIB_CMAKE_ARGS
+      -DPHANTOM_SOURCE_DIR:PATH=${PHANTOM_SOURCE_DIR}
+      -DPHANTOM_GIT_TAG:STRING=${PHANTOM_GIT_TAG})
+  endif()
+
   ExternalProject_Add(
     fhe_rtlib
     PREFIX ${CMAKE_BINARY_DIR}/rtlib
     SOURCE_DIR ${PROJECT_SOURCE_DIR}/rtlib
     BINARY_DIR ${CMAKE_BINARY_DIR}/rtlib/build
-    CMAKE_ARGS -G "Unix Makefiles"
-              -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-              -DBUILD_STATIC=${BUILD_STATIC}
-              -DBUILD_UNITTEST=${BUILD_UNITTEST}
-              -DBUILD_BENCH=${BUILD_BENCH}
-              -DRTLIB_BUILD_TEST=${FHE_BUILD_TEST}
-              -DRTLIB_BUILD_EXAMPLE=${FHE_BUILD_EXAMPLE}
-              -DRTLIB_INSTALL_APP=${FHE_INSTALL_APP}
-              -DRTLIB_ENABLE_SEAL=${FHE_ENABLE_SEAL}
-              -DRTLIB_ENABLE_SEAL_BTS=${FHE_ENABLE_SEAL_BTS}
-              -DRTLIB_ENABLE_OPENFHE=${FHE_ENABLE_OPENFHE}
-              -DRTLIB_ENABLE_CUDA=${FHE_ENABLE_CUDA}
-              -DRTLIB_SUPPORT_HPU=${FHE_SUPPORT_HPU}
-              -DRTLIB_SEED_MODE=${FHE_SEED_MODE}
-              -DBUILD_WITH_OPENMP=${BUILD_WITH_OPENMP}
-              -DPACKAGE_BASE_DIR=$ENV{PACKAGE_BASE_DIR}
-              -DPACKAGE_INC_DIR_TF=${PACKAGE_INC_DIR_TF}
-              -DEXTERNAL_URL_SSH=${EXTERNAL_URL_SSH}
-              -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}
+    CMAKE_ARGS ${RTLIB_CMAKE_ARGS}
     UPDATE_COMMAND ""
     BUILD_ALWAYS ON
     BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config ${CMAKE_BUILD_TYPE}
@@ -47,6 +70,7 @@ function(build_rtlib)
                       <BINARY_DIR>/seal/libFHErt_seal.a
                       <BINARY_DIR>/openfhe/libFHErt_openfhe.a
                       <BINARY_DIR>/phantom/libFHErt_phantom.a
+                      <BINARY_DIR>/external/src/phantom_external-build/lib/libphantom.a
   )
   ExternalProject_Get_Property(fhe_rtlib SOURCE_DIR BINARY_DIR)
 
@@ -79,11 +103,23 @@ function(build_rtlib)
     install(FILES ${BINARY_DIR}/openfhe/libFHErt_openfhe.a DESTINATION rtlib/lib)
   endif()
   if(FHE_ENABLE_PHANTOM)
+    find_package(CUDAToolkit REQUIRED)
+    find_library(CUDA_DEVICE_RUNTIME_LIBRARY NAMES cudadevrt
+      HINTS "${CUDAToolkit_LIBRARY_DIR}" "${CUDAToolkit_LIBRARY_ROOT}/lib64"
+      REQUIRED)
+    find_library(NTL_LIBRARY NAMES ntl REQUIRED)
+    find_library(GMPXX_LIBRARY NAMES gmpxx REQUIRED)
+    find_library(GMP_LIBRARY NAMES gmp REQUIRED)
+    set(PHANTOM_ARCHIVE
+      "${BINARY_DIR}/external/src/phantom_external-build/lib/libphantom.a")
     add_library(FHErt_phantom STATIC IMPORTED GLOBAL)
     set_target_properties(FHErt_phantom PROPERTIES
       IMPORTED_LOCATION "${BINARY_DIR}/phantom/libFHErt_phantom.a"
+      INTERFACE_LINK_LIBRARIES
+        "${PHANTOM_ARCHIVE};FHErt_common;${NTL_LIBRARY};${GMPXX_LIBRARY};${GMP_LIBRARY};${CUDA_DEVICE_RUNTIME_LIBRARY};CUDA::cudart"
     )
     install(FILES ${BINARY_DIR}/phantom/libFHErt_phantom.a DESTINATION rtlib/lib)
+    install(FILES ${PHANTOM_ARCHIVE} DESTINATION rtlib/lib)
   endif()
 
   add_test(NAME test_fhe_rtlib COMMAND ${CMAKE_COMMAND} --build ${BINARY_DIR} --target test)

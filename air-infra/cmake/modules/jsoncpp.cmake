@@ -8,13 +8,8 @@
 # Build external jsoncpp project dependent function
 function(build_external_jsoncpp)
 
-  set(JSONCPP_URL      "https://git:$ENV{CI_TOKEN}@code.alipay.com/air-infra/jsoncpp.git")
-  set(JSONCPP_URL_SSH  "git@code.alipay.com:air-infra/jsoncpp.git")
-  if(EXTERNAL_URL_SSH)
-    set(REPO_JSONCPP_URL ${JSONCPP_URL_SSH})
-  else()
-    set(REPO_JSONCPP_URL ${JSONCPP_URL})
-  endif()
+  set(REPO_JSONCPP_URL "https://github.com/open-source-parsers/jsoncpp.git")
+  set(JSONCPP_GIT_TAG "60de77f915ab08499032d6e5a63e05e974f85d01")
 
   message(STATUS "Cloning External Repository    : ${REPO_JSONCPP_URL}")
 
@@ -22,7 +17,7 @@ function(build_external_jsoncpp)
   FetchContent_Declare(
     jsoncpp
     GIT_REPOSITORY ${REPO_JSONCPP_URL}
-    GIT_TAG master
+    GIT_TAG ${JSONCPP_GIT_TAG}
     SOURCE_SUBDIR cmake
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=Release

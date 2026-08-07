@@ -7,14 +7,9 @@
 
 # Build external unittest project dependent function
 function(build_external_unittest)
-  
-  set(UNITTEST_URL      "https://git:$ENV{CI_TOKEN}@code.alipay.com/opencc/googletest.git")
-  set(UNITTEST_URL_SSH  "git@code.alipay.com:opencc/googletest.git")
-  if(EXTERNAL_URL_SSH)
-    set(REPO_UNITTEST_URL ${UNITTEST_URL_SSH})
-  else()
-    set(REPO_UNITTEST_URL ${UNITTEST_URL})
-  endif()
+
+  set(REPO_UNITTEST_URL "https://github.com/google/googletest.git")
+  set(UNITTEST_GIT_TAG "f8d7d77c06936315286eb55f8de22cd23c188571")
 
   message(STATUS "Cloning External Repository   : ${REPO_UNITTEST_URL}")
 
@@ -22,7 +17,7 @@ function(build_external_unittest)
   ExternalProject_Add(
     unittest
     GIT_REPOSITORY ${REPO_UNITTEST_URL}
-    GIT_TAG main
+    GIT_TAG ${UNITTEST_GIT_TAG}
     PREFIX ${CMAKE_BINARY_DIR}/external
     CMAKE_ARGS  -DCMAKE_GENERATOR=${CMAKE_GENERATOR}
                 -DCMAKE_BUILD_TYPE=Release

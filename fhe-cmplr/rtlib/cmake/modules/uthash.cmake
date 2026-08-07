@@ -7,13 +7,8 @@
 
 function(fetch_uthash)
 
-  set(UTHASH_URL      "https://git:$ENV{CI_TOKEN}@code.alipay.com/fhe-cmplr/uthash.git")
-  set(UTHASH_URL_SSH  "git@code.alipay.com:fhe-cmplr/uthash.git")
-  if(EXTERNAL_URL_SSH)
-    set(REPO_UTHASH_URL ${UTHASH_URL_SSH})
-  else()
-    set(REPO_UTHASH_URL ${UTHASH_URL})
-  endif()
+  set(REPO_UTHASH_URL "https://github.com/troydhanson/uthash.git")
+  set(UTHASH_GIT_TAG "a49bed0b4abb7dff16c73906dcdc8a9718d582d2")
 
   message(STATUS "Cloning External Repository   : ${REPO_UTHASH_URL}")
 
@@ -21,18 +16,16 @@ function(fetch_uthash)
   FetchContent_Declare(
       uthash
       GIT_REPOSITORY ${REPO_UTHASH_URL}
-      GIT_TAG master
+      GIT_TAG ${UTHASH_GIT_TAG}
   )
   FetchContent_MakeAvailable(uthash)
 
-  include_directories(${uthash_SOURCE_DIR}/include)
+  include_directories(${uthash_SOURCE_DIR}/src)
 
-  install(FILES ${uthash_SOURCE_DIR}/include/uthash.h DESTINATION include/rtlib)
+  install(FILES ${uthash_SOURCE_DIR}/src/uthash.h DESTINATION include/rtlib)
 endfunction()
 
 if(NOT TARGET uthash)
   fetch_uthash()
 endif()
-
-
 

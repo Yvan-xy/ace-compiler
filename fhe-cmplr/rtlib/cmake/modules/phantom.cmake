@@ -7,51 +7,81 @@
 
 # Build external Phantom project dependent function
 function(build_external_phantom)
-  
-  set(PHANTOM_URL      "https://git:$ENV{CI_TOKEN}@code.alipay.com/zhanggongliang.zgl/phantom-fhe.git")
-  set(PHANTOM_URL_SSH  "git@code.alipay.com:zhanggongliang.zgl/phantom-fhe.git")
-  if(EXTERNAL_URL_SSH)
-    set(REPO_PHANTOM_URL ${PHANTOM_URL_SSH})
-  else()
-    set(REPO_PHANTOM_URL ${PHANTOM_URL})
+  set(PHANTOM_SOURCE_DIR "" CACHE PATH
+      "Local Git repository used to clone the pinned Phantom source")
+  set(PHANTOM_GIT_TAG "faa6ba2bb990e17c88d826a880ef40136aaa8bc7"
+      CACHE STRING "Exact Phantom Git commit")
+
+  if(NOT IS_DIRECTORY "${PHANTOM_SOURCE_DIR}/.git")
+    message(FATAL_ERROR
+      "PHANTOM_SOURCE_DIR must name a mounted local Git repository")
+  endif()
+  string(LENGTH "${PHANTOM_GIT_TAG}" PHANTOM_GIT_TAG_LENGTH)
+  if(NOT PHANTOM_GIT_TAG_LENGTH EQUAL 40 OR
+     NOT PHANTOM_GIT_TAG MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR "PHANTOM_GIT_TAG must be an exact 40-character commit")
+  endif()
+  execute_process(
+    COMMAND git -C "${PHANTOM_SOURCE_DIR}" cat-file -e
+            "${PHANTOM_GIT_TAG}^{commit}"
+    RESULT_VARIABLE PHANTOM_COMMIT_RESULT
+    OUTPUT_QUIET
+    ERROR_QUIET)
+  if(NOT PHANTOM_COMMIT_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "Pinned Phantom commit is absent from PHANTOM_SOURCE_DIR")
+  endif()
+  if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "80")
+    message(FATAL_ERROR
+      "Phantom qualification requires CMAKE_CUDA_ARCHITECTURES=80")
   endif()
 
-  message(STATUS "Cloning External Repository   : ${REPO_PHANTOM_URL}")
+  message(STATUS "Phantom source repository     : ${PHANTOM_SOURCE_DIR}")
+  message(STATUS "Phantom pinned commit         : ${PHANTOM_GIT_TAG}")
 
   include(ExternalProject)
   ExternalProject_Add(
     phantom_external
-    GIT_REPOSITORY ${REPO_PHANTOM_URL}
-    GIT_TAG master
+    GIT_REPOSITORY ${PHANTOM_SOURCE_DIR}
+    GIT_TAG ${PHANTOM_GIT_TAG}
+    GIT_SHALLOW OFF
     PREFIX ${CMAKE_BINARY_DIR}/external
     UPDATE_COMMAND ""
     BUILD_ALWAYS OFF
     CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR>
+               -DCMAKE_CUDA_ARCHITECTURES:STRING=${CMAKE_CUDA_ARCHITECTURES}
+               -DCMAKE_CXX_STANDARD=17
+               -DCMAKE_CXX_STANDARD_REQUIRED=ON
+               -DCMAKE_CUDA_STANDARD=17
+               -DCMAKE_CUDA_STANDARD_REQUIRED=ON
+               -DPHANTOM_BUILD_EXAMPLES=OFF
+               -DPHANTOM_BUILD_TESTS=OFF
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target phantom
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/external/src/phantom_external-build/lib/libphantom.a
   )
   ExternalProject_Get_Property(phantom_external SOURCE_DIR BINARY_DIR)
 
-  find_library(NTL_LIBRARY ntl)
-  find_library(GMP_LIBRARY gmp)
-  find_library(GMPXX_LIBRARY gmpxx)
-
-  if(NOT NTL_LIBRARY OR NOT GMP_LIBRARY OR NOT GMPXX_LIBRARY)
-    message(FATAL_ERROR "NTL or GMP libraries not found")
-  endif()
+  find_package(CUDAToolkit REQUIRED)
+  find_library(CUDA_DEVICE_RUNTIME_LIBRARY NAMES cudadevrt
+    HINTS "${CUDAToolkit_LIBRARY_DIR}" "${CUDAToolkit_LIBRARY_ROOT}/lib64"
+    REQUIRED)
+  find_library(NTL_LIBRARY NAMES ntl REQUIRED)
+  find_library(GMP_LIBRARY NAMES gmp REQUIRED)
+  find_library(GMPXX_LIBRARY NAMES gmpxx REQUIRED)
 
   add_library(phantom IMPORTED STATIC GLOBAL)
   set_target_properties(phantom PROPERTIES
     IMPORTED_LOCATION ${BINARY_DIR}/lib/libphantom.a
+    INTERFACE_LINK_LIBRARIES
+      "${NTL_LIBRARY};${GMPXX_LIBRARY};${GMP_LIBRARY};${CUDA_DEVICE_RUNTIME_LIBRARY};CUDA::cudart"
   )
   include_directories(${SOURCE_DIR}/include)
   add_dependencies(phantom phantom_external)
 
   set(phantom phantom PARENT_SCOPE)
   set(ENV{PHANTOM_INCLUDE_DIR} ${SOURCE_DIR}/include)
-  set(PHANTOM_LIBS phantom ${NTL_LIBRARY} ${GMPXX_LIBRARY} ${GMP_LIBRARY} PARENT_SCOPE)
-  
-  
+  set(PHANTOM_LIBS
+      phantom ${NTL_LIBRARY} ${GMPXX_LIBRARY} ${GMP_LIBRARY}
+      ${CUDA_DEVICE_RUNTIME_LIBRARY} CUDA::cudart PARENT_SCOPE)
 endfunction()
-
