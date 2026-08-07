@@ -91,7 +91,7 @@ for required in \
     exit 1
   fi
 done
-EXPECTED_DATA_Q_COUNT="$((MUL_LEVEL + 1))"
+EXPECTED_DATA_Q_COUNT="${MUL_LEVEL}"
 python3 - "${FROZEN_CONTEXT}" "${POLY_DEGREE}" \
   "${EXPECTED_DATA_Q_COUNT}" "${INPUT_LEVEL}" "${SECURITY_LEVEL}" \
   "${SCALING_BITS}" "${FIRST_PRIME_BITS}" "${HAMMING_WEIGHT}" <<'PY'

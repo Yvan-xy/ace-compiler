@@ -191,6 +191,7 @@ def test_remote_pipeline_uses_the_packaged_frozen_cpu_reference() -> None:
 def test_source_packaging_requires_local_ordinary_evidence() -> None:
     source = (TOOLS / "package_runpod_sources.sh").read_text(encoding="utf-8")
     assert "--ordinary-run-root" in source
+    assert 'EXPECTED_DATA_Q_COUNT="${MUL_LEVEL}"' in source
     assert "ordinary-context-manifest.json" in source
     assert "ordinary-resource-manifest.json" in source
     assert "ordinary-cpu-reference.json" in source
