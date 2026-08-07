@@ -3,15 +3,74 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
-BASE_IMAGE="docker.io/nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:5645fec64549cc35930eee9d85aafd2b0006c0c3f22632be5a1d85e2604e9749"
-BASE_CONFIG="sha256:0131784115794405cb36a8068a82d7aea0937196d1d6e844b9dd021252ccf7e4"
 PROTECTED_NAME="ace-compiler-dev"
 
-if [[ $# -ne 1 ]]; then
-  echo "usage: $0 OUTPUT_DIRECTORY" >&2
+usage() {
+  echo "usage: $0 --ace-commit COMMIT --phantom-commit COMMIT OUTPUT_DIRECTORY" >&2
   exit 2
+}
+
+ACE_COMMIT=""
+PHANTOM_COMMIT=""
+OUTPUT_ARGUMENT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ace-commit)
+      [[ $# -ge 2 ]] || usage
+      ACE_COMMIT="$2"
+      shift 2
+      ;;
+    --phantom-commit)
+      [[ $# -ge 2 ]] || usage
+      PHANTOM_COMMIT="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      [[ $# -eq 1 && -z "${OUTPUT_ARGUMENT}" ]] || usage
+      OUTPUT_ARGUMENT="$1"
+      shift
+      ;;
+    -*) usage ;;
+    *)
+      [[ -z "${OUTPUT_ARGUMENT}" ]] || usage
+      OUTPUT_ARGUMENT="$1"
+      shift
+      ;;
+  esac
+done
+[[ -n "${ACE_COMMIT}" && -n "${PHANTOM_COMMIT}" &&
+   -n "${OUTPUT_ARGUMENT}" ]] || usage
+if [[ ! "${ACE_COMMIT}" =~ ^[0-9a-f]{40}$ ||
+      ! "${PHANTOM_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "source commits must be full lowercase 40-character object IDs" >&2
+  exit 1
 fi
-OUTPUT="$(realpath -m -- "$1")"
+git -C "${REPO_ROOT}" cat-file -e "${ACE_COMMIT}^{commit}"
+
+DEPENDENCY_LOCK="$(
+  git -C "${REPO_ROOT}" show \
+    "${ACE_COMMIT}:tools/phantom_gpu/configs/dependencies.env"
+)"
+lock_value() {
+  local key="$1"
+  local value
+  value="$(sed -n "s/^${key}=//p" <<<"${DEPENDENCY_LOCK}")"
+  if [[ -z "${value}" || "${value}" == *$'\n'* ]]; then
+    echo "selected ACE commit has an invalid ${key} dependency lock" >&2
+    exit 1
+  fi
+  printf '%s\n' "${value}"
+}
+BASE_IMAGE="$(lock_value CUDA_IMAGE)"
+BASE_CONFIG="$(lock_value CUDA_IMAGE_CONFIG)"
+LOCKED_PHANTOM_COMMIT="$(lock_value PHANTOM_COMMIT)"
+if [[ "${PHANTOM_COMMIT}" != "${LOCKED_PHANTOM_COMMIT}" ]]; then
+  echo "requested Phantom commit does not match the selected ACE commit lock" >&2
+  exit 1
+fi
+
+OUTPUT="$(realpath -m -- "${OUTPUT_ARGUMENT}")"
 if [[ -e "${OUTPUT}" ]]; then
   echo "output already exists: ${OUTPUT}" >&2
   exit 1
@@ -77,7 +136,10 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-bash "${SCRIPT_DIR}/package_runpod_sources.sh" "${PAYLOAD}"
+bash "${SCRIPT_DIR}/package_runpod_sources.sh" \
+  --ace-commit "${ACE_COMMIT}" \
+  --phantom-commit "${PHANTOM_COMMIT}" \
+  "${PAYLOAD}"
 docker pull --platform linux/amd64 "${BASE_IMAGE}" | tee "${DOCKER_EVIDENCE}/pull.txt"
 ACTUAL_BASE_ID="$(docker image inspect -f '{{.Id}}' "${BASE_IMAGE}")"
 if [[ "${ACTUAL_BASE_ID}" != "${BASE_CONFIG}" ]]; then
