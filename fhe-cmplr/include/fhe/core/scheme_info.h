@@ -89,6 +89,7 @@ public:
     return _scaling_factor_bit_num;
   }
   uint32_t Get_p_prime_num() const;
+  uint32_t Get_p_prime_bit_num() const;
   void     Set_q_part_num(uint32_t num) { _q_part_num = num; }
   uint32_t Get_q_part_num() const { return _q_part_num; }
   void     Set_hamming_weight(uint32_t hw) { _hamming_weight = hw; }
@@ -97,6 +98,8 @@ public:
   void     Add_rotate_index(const std::set<int32_t>& index) {
     _rotate_index.insert(index.begin(), index.end());
   }
+  void Require_relin_key() { _relin_key_required = true; }
+  bool Relin_key_required() const { return _relin_key_required; }
   void     Set_input_level(uint32_t lev) { _input_level = lev; }
   uint32_t Get_input_level(void) const { return _input_level; }
   uint32_t Get_tot_prime_num() const {
@@ -139,6 +142,7 @@ private:
   uint32_t          _scaling_factor_bit_num = 56;
   uint32_t          _q_part_num             = 0;
   uint32_t          _hamming_weight         = 0;
+  bool              _relin_key_required     = false;
   std::set<int32_t> _rotate_index;
 };
 

@@ -7933,7 +7933,9 @@ public:
         const std::string& function_name_prefix = "",
         const std::string& constant_name_prefix = "",
         const std::string& pt_from_msg_name = "Pt_from_msg",
-        const std::string& raise_mod_level_func = "") {
+        const std::string& raise_mod_level_func = "",
+        const std::string& context_manifest_file = "",
+        const std::string& resource_manifest_file = "") {
         require_no_air_pass_transaction("CKKS-to-source lowering");
         if (!glob) {
             throw std::runtime_error(
@@ -7952,6 +7954,22 @@ public:
              output_file.compare(output_file.size() - 3, 3, ".cu") != 0)) {
             throw std::invalid_argument(
                 "CKKS2C output_file must use the .cu suffix");
+        }
+        for (const std::string* manifest_file :
+             {&context_manifest_file, &resource_manifest_file}) {
+            if (!manifest_file->empty() &&
+                (manifest_file->size() < 5 ||
+                 manifest_file->compare(manifest_file->size() - 5, 5,
+                                        ".json") != 0)) {
+                throw std::invalid_argument(
+                    "CKKS2C manifest outputs must use the .json suffix");
+            }
+        }
+        if (provider != "phantom" &&
+            (!context_manifest_file.empty() ||
+             !resource_manifest_file.empty())) {
+            throw std::invalid_argument(
+                "CKKS2C manifest outputs are supported only for Phantom");
         }
 
         ensure_lower_ctx();
@@ -7994,6 +8012,29 @@ public:
                 throw std::runtime_error(
                     "failed while writing CKKS2C output file: " + output_file);
             }
+        }
+        auto write_manifest = [](const std::string& file_name,
+                                 const std::string& contents,
+                                 const char* description) {
+            if (file_name.empty()) return;
+            std::ofstream output_stream(file_name);
+            if (!output_stream.is_open()) {
+                throw std::runtime_error(std::string("failed to open ") +
+                                         description + ": " + file_name);
+            }
+            output_stream << contents;
+            if (!output_stream.good()) {
+                throw std::runtime_error(std::string("failed while writing ") +
+                                         description + ": " + file_name);
+            }
+        };
+        if (config.Provider() == fhe::core::PROVIDER::PHANTOM) {
+            write_manifest(context_manifest_file,
+                           ckks2c.Ctx().Phantom_context_json(),
+                           "Phantom context manifest");
+            write_manifest(resource_manifest_file,
+                           ckks2c.Ctx().Phantom_resource_json(),
+                           "Phantom resource manifest");
         }
         return true;
     }
@@ -11120,6 +11161,8 @@ PYBIND11_MODULE(air_builder, m) {
              py::arg("constant_name_prefix") = "",
              py::arg("pt_from_msg_name") = "Pt_from_msg",
              py::arg("raise_mod_level_func") = "",
+             py::arg("context_manifest_file") = "",
+             py::arg("resource_manifest_file") = "",
              "Emit CUDA C++ directly from post-driver CKKS AIR. Errors are "
              "reported as Python exceptions.")
         .def("list_available_passes", &GlobScope::list_available_passes,

@@ -124,35 +124,37 @@ private:
   void Emit_get_context_params() {
     const core::CTX_PARAM& param = _ctx.Lower_ctx().Get_ctx_param();
     const std::set<int32_t>& rot_keys = param.Get_rotate_index();
-    _ctx << "CKKS_PARAMS* ";
-    _ctx.Emit_identifier(_ctx.Function_name_prefix());
-    _ctx << "Get_context_params() {\n";
-    _ctx << "  static CKKS_PARAMS parm = {\n";
-    _ctx << "    " << fhe::core::Provider_name(_ctx.Provider()) << ", ";
-    _ctx << param.Get_poly_degree() << ", ";
-    _ctx << param.Get_security_level() << ", ";
-    uint32_t mul_level = param.Get_mul_level();
-    AIR_ASSERT_MSG(mul_level >= 1, "mul_level must be at least 1.");
-    _ctx << (mul_level - 1) << ", ";
-    _ctx << param.Get_input_level() << ", ";
-    _ctx << param.Get_first_prime_bit_num() << ", ";
-    _ctx << param.Get_scaling_factor_bit_num() << ", ";
-    _ctx << param.Get_q_part_num() << ", ";
-    _ctx << param.Get_hamming_weight() << ", ";
-    _ctx << rot_keys.size() << ", \n";
-    _ctx << "    { ";
-    int i = 0;
-    for (auto it = rot_keys.begin(); it != rot_keys.end(); ++it) {
-      if (i > 0) {
-        _ctx << (((i % 8) == 0) ? ",\n      " : ", ");
+    if (!_ctx.Emit_provider_context_manifest()) {
+      _ctx << "CKKS_PARAMS* ";
+      _ctx.Emit_identifier(_ctx.Function_name_prefix());
+      _ctx << "Get_context_params() {\n";
+      _ctx << "  static CKKS_PARAMS parm = {\n";
+      _ctx << "    " << fhe::core::Provider_name(_ctx.Provider()) << ", ";
+      _ctx << param.Get_poly_degree() << ", ";
+      _ctx << param.Get_security_level() << ", ";
+      uint32_t mul_level = param.Get_mul_level();
+      AIR_ASSERT_MSG(mul_level >= 1, "mul_level must be at least 1.");
+      _ctx << (mul_level - 1) << ", ";
+      _ctx << param.Get_input_level() << ", ";
+      _ctx << param.Get_first_prime_bit_num() << ", ";
+      _ctx << param.Get_scaling_factor_bit_num() << ", ";
+      _ctx << param.Get_q_part_num() << ", ";
+      _ctx << param.Get_hamming_weight() << ", ";
+      _ctx << rot_keys.size() << ", \n";
+      _ctx << "    { ";
+      int i = 0;
+      for (auto it = rot_keys.begin(); it != rot_keys.end(); ++it) {
+        if (i > 0) {
+          _ctx << (((i % 8) == 0) ? ",\n      " : ", ");
+        }
+        _ctx << (*it);
+        ++i;
       }
-      _ctx << (*it);
-      ++i;
+      _ctx << " }\n";
+      _ctx << "  };\n";
+      _ctx << "  return &parm;\n";
+      _ctx << "}\n\n";
     }
-    _ctx << " }\n";
-    _ctx << "  };\n";
-    _ctx << "  return &parm;\n";
-    _ctx << "}\n\n";
 
     _ctx << "RT_DATA_INFO* ";
     _ctx.Emit_identifier(_ctx.Function_name_prefix());

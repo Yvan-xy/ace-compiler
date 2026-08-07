@@ -13,6 +13,7 @@
 
 #include "air/base/container.h"
 #include "fhe/core/lib_provider.h"
+#include "fhe/core/scheme_info.h"
 
 namespace fhe {
 namespace ckks {
@@ -20,7 +21,9 @@ namespace ckks {
 //! @brief Post-CKKS AIR and generated-source legality checks for CKKS2C.
 class CKKS2C_VERIFIER {
 public:
-  static bool Verify(air::base::GLOB_SCOPE* glob, core::PROVIDER provider,
+  static bool Verify(air::base::GLOB_SCOPE* glob,
+                     const core::CTX_PARAM& ctx_param,
+                     core::PROVIDER provider,
                      std::string* diagnostic);
 
   static bool Verify_source(const std::string& source,

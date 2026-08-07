@@ -14,6 +14,7 @@
 #include "air/util/debug.h"
 #include <cstdlib>
 #include "fhe/core/ir2c_ctx.h"
+#include "fhe/ckks/phantom_context_manifest.h"
 #include "fhe/core/rt_context.h"
 #include "fhe/core/rt_data_writer.h"
 #include "fhe/core/rt_encode_api.h"
@@ -33,6 +34,13 @@ public:
       : fhe::core::IR2C_CTX(os, lower_ctx, cfg),
         _rt_data_writer(nullptr),
         _ct_encode(cfg.Ct_encode()) {
+    if (cfg.Provider() == fhe::core::PROVIDER::PHANTOM) {
+      _phantom_context =
+          Build_phantom_context_descriptor(lower_ctx.Get_ctx_param());
+      _phantom_resources = Build_phantom_resource_descriptor(
+          lower_ctx.Get_ctx_param(), _phantom_context);
+      _has_phantom_manifests = true;
+    }
     if (cfg.Emit_data_file()) {
       // create rt_data_writer
       _data_file_uuid  = "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX";
@@ -60,6 +68,61 @@ public:
             ctx_param.Get_hamming_weight());
       }
     }
+  }
+
+  bool Emit_provider_context_manifest() {
+    if (!_has_phantom_manifests) return false;
+
+    _ir2c_util << "static const uint32_t ";
+    _ir2c_util.Emit_identifier(Function_name_prefix());
+    _ir2c_util << "phantom_data_q_bit_sizes[] = {";
+    for (size_t index = 0; index < _phantom_context._data_q_bit_sizes.size();
+         ++index) {
+      if (index != 0) _ir2c_util << ", ";
+      _ir2c_util << _phantom_context._data_q_bit_sizes[index];
+    }
+    _ir2c_util << "};\n";
+
+    _ir2c_util << "static const uint32_t ";
+    _ir2c_util.Emit_identifier(Function_name_prefix());
+    _ir2c_util << "phantom_special_p_bit_sizes[] = {";
+    for (size_t index = 0;
+         index < _phantom_context._special_p_bit_sizes.size(); ++index) {
+      if (index != 0) _ir2c_util << ", ";
+      _ir2c_util << _phantom_context._special_p_bit_sizes[index];
+    }
+    _ir2c_util << "};\n\n";
+
+    _ir2c_util << "extern \"C\" const PHANTOM_CONTEXT_MANIFEST* ";
+    _ir2c_util.Emit_identifier(Function_name_prefix());
+    _ir2c_util << "Get_phantom_context_manifest() {\n";
+    _ir2c_util << "  static const PHANTOM_CONTEXT_MANIFEST context = {\n";
+    _ir2c_util << "    " << _phantom_context._schema_version << ",\n";
+    _ir2c_util << "    PHANTOM_PACKING_FULL,\n";
+    _ir2c_util << "    " << _phantom_context._poly_degree << ",\n";
+    _ir2c_util << "    " << _phantom_context._logical_slots << ",\n";
+    _ir2c_util << "    " << _phantom_context._data_q_bit_sizes.size()
+                 << ",\n";
+    _ir2c_util << "    ";
+    _ir2c_util.Emit_identifier(Function_name_prefix());
+    _ir2c_util << "phantom_data_q_bit_sizes,\n";
+    _ir2c_util << "    " << _phantom_context._special_p_bit_sizes.size()
+                 << ",\n";
+    _ir2c_util << "    ";
+    _ir2c_util.Emit_identifier(Function_name_prefix());
+    _ir2c_util << "phantom_special_p_bit_sizes,\n";
+    _ir2c_util << "    " << _phantom_context._input_level << ",\n";
+    _ir2c_util << "    " << _phantom_context._q_part_count << ",\n";
+    _ir2c_util << "    " << _phantom_context._hamming_weight << ",\n";
+    _ir2c_util << "    " << _phantom_context._security_level << ",\n";
+    _ir2c_util << "    " << _phantom_context._first_modulus_bits << ",\n";
+    _ir2c_util << "    " << _phantom_context._scaling_modulus_bits << ",\n";
+    _ir2c_util << "    " << _phantom_context._resource_schema_version
+                 << "\n";
+    _ir2c_util << "  };\n";
+    _ir2c_util << "  return &context;\n";
+    _ir2c_util << "}\n\n";
+    return true;
   }
 
   //! @brief Destruct ir2c ctx object
@@ -174,12 +237,100 @@ public:
 
   //! @brief Emit the runtime feature query without introducing BTS calls.
   void Emit_need_bts() {
-    if (Provider() == core::PROVIDER::SEAL ||
-        Provider() == core::PROVIDER::PHANTOM) {
+    if (Provider() == core::PROVIDER::PHANTOM) {
+      if (!_phantom_resources._rotation_steps.empty()) {
+        _ir2c_util << "static const int32_t ";
+        _ir2c_util.Emit_identifier(Function_name_prefix());
+        _ir2c_util << "phantom_rotation_steps[] = {";
+        for (size_t index = 0;
+             index < _phantom_resources._rotation_steps.size(); ++index) {
+          if (index != 0) _ir2c_util << ", ";
+          _ir2c_util << _phantom_resources._rotation_steps[index];
+        }
+        _ir2c_util << "};\n\n";
+      }
+      _ir2c_util << "extern \"C\" const PHANTOM_RESOURCE_MANIFEST* ";
+      _ir2c_util.Emit_identifier(Function_name_prefix());
+      _ir2c_util << "Get_phantom_resource_manifest() {\n";
+      _ir2c_util << "  static const PHANTOM_RESOURCE_MANIFEST resources = {\n";
+      _ir2c_util << "    " << _phantom_resources._schema_version << ",\n";
+      _ir2c_util << "    " << _phantom_resources._context_schema_version
+                   << ",\n";
+      _ir2c_util << "    ";
+      if (_phantom_resources._flags == 0) {
+        _ir2c_util << "0";
+      } else {
+        bool separator = false;
+        if ((_phantom_resources._flags & PHANTOM_RESOURCE_RELIN_KEY) != 0) {
+          _ir2c_util << "PHANTOM_RESOURCE_RELIN_KEY";
+          separator = true;
+        }
+        if ((_phantom_resources._flags & PHANTOM_RESOURCE_ROTATION_KEYS) != 0) {
+          if (separator) _ir2c_util << " | ";
+          _ir2c_util << "PHANTOM_RESOURCE_ROTATION_KEYS";
+        }
+      }
+      _ir2c_util << ",\n";
+      _ir2c_util << "    " << _phantom_resources._rotation_steps.size()
+                   << ",\n";
+      if (_phantom_resources._rotation_steps.empty()) {
+        _ir2c_util << "    nullptr\n";
+      } else {
+        _ir2c_util << "    ";
+        _ir2c_util.Emit_identifier(Function_name_prefix());
+        _ir2c_util << "phantom_rotation_steps\n";
+      }
+      _ir2c_util << "  };\n";
+      _ir2c_util << "  return &resources;\n";
+      _ir2c_util << "}\n\n";
+    }
+    if (Provider() == core::PROVIDER::SEAL) {
       _ir2c_util << "bool Need_bts() {\n";
       _ir2c_util << (_need_bts ? "  return true;\n" : "  return false;\n");
       _ir2c_util << "}\n\n";
     }
+  }
+
+  bool Has_phantom_manifests() const { return _has_phantom_manifests; }
+
+  const PHANTOM_CONTEXT_DESCRIPTOR& Phantom_context_descriptor() const {
+    AIR_ASSERT(_has_phantom_manifests);
+    return _phantom_context;
+  }
+
+  const PHANTOM_RESOURCE_DESCRIPTOR& Phantom_resource_descriptor() const {
+    AIR_ASSERT(_has_phantom_manifests);
+    return _phantom_resources;
+  }
+
+  std::string Phantom_context_json() const {
+    AIR_ASSERT(_has_phantom_manifests);
+    return Serialize_phantom_context_descriptor(_phantom_context);
+  }
+
+  std::string Phantom_resource_json() const {
+    AIR_ASSERT(_has_phantom_manifests);
+    return Serialize_phantom_resource_descriptor(_phantom_resources);
+  }
+
+  void Require_phantom_relinearization_key() {
+    if (!_has_phantom_manifests) return;
+    _phantom_resources._flags |= PHANTOM_RESOURCE_RELIN_KEY;
+  }
+
+  void Require_phantom_rotation_key(int64_t step) {
+    if (!_has_phantom_manifests) return;
+    const int32_t normalized =
+        Canonical_signed_rotation(step, _phantom_context._logical_slots);
+    if (normalized == 0) return;
+    auto position = std::lower_bound(_phantom_resources._rotation_steps.begin(),
+                                     _phantom_resources._rotation_steps.end(),
+                                     normalized);
+    if (position == _phantom_resources._rotation_steps.end() ||
+        *position != normalized) {
+      _phantom_resources._rotation_steps.insert(position, normalized);
+    }
+    _phantom_resources._flags |= PHANTOM_RESOURCE_ROTATION_KEYS;
   }
 
   void Emit_get_input_data(air::base::ADDR_DATUM_PTR var) {
@@ -214,7 +365,13 @@ public:
     const uint32_t* cache_attr =
         node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::ENCODE_CACHE);
     bool encoding_dcmplx = (complex_attr != nullptr) && (*complex_attr != 0);
-    bool encode_cache = (cache_attr != nullptr) && (*cache_attr != 0);
+    bool encode_cache     = (cache_attr != nullptr) && (*cache_attr != 0);
+    // NUM_P describes ANT's extended Q+P plaintext encoding.  Phantom
+    // constants always use the ordinary Q-level complex encoder and therefore
+    // retain the full (length, scale_degree, logical_level) argument list.
+    bool use_extended_dcmplx =
+        encoding_dcmplx && Provider() != core::PROVIDER::PHANTOM &&
+        num_p_attr != nullptr && *num_p_attr != 0;
     if (!encoding_dcmplx && _rt_data_writer != nullptr &&
         node->Child(0)->Opcode() == air::core::OPC_LDC &&
         node->Child(1)->Opcode() == air::core::OPC_INTCONST &&
@@ -377,7 +534,7 @@ public:
     } else {
       // runtime encoding with internal data embedded in C code
       // Encode_float(&dest, cst, len, scale, level);
-      if (_ct_encode && encoding_dcmplx && encode_cache &&
+      if (_ct_encode && use_extended_dcmplx && encode_cache &&
           node->Child(0)->Opcode() == air::core::OPC_LDC) {
         Emit_offline_dcmplx_encode<RETV, VISITOR>(visitor, dest, node);
         return;
@@ -391,7 +548,7 @@ public:
     }
     _ir2c_util << ", ";
     visitor->template Visit<RETV>(node->Child(1));  // element count
-    if (encoding_dcmplx && num_p_attr != nullptr && *num_p_attr != 0) {
+    if (use_extended_dcmplx) {
       // Encode_dcmplx_ext(plain, input, len, level, p_cnt)
       _ir2c_util << ", ";
       if (level_attr != nullptr) {
@@ -492,6 +649,9 @@ public:
         node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::NUM_P);
     const uint32_t* level_attr =
         node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
+    bool use_extended_dcmplx =
+        Provider() != core::PROVIDER::PHANTOM && num_p_attr != nullptr &&
+        *num_p_attr != 0;
 
     uint32_t node_id = node->Id().Value();
     _ir2c_util << "{ static PLAINTEXT _pre_plain_" << node_id
@@ -499,14 +659,14 @@ public:
                << "_init = 0; if (!_pre_plain_" << node_id << "_init) {\n";
     _ir2c_util << "#pragma omp critical(_pre_plain_" << node_id << "_lock)\n";
     _ir2c_util << "{ if (!_pre_plain_" << node_id << "_init) { ";
-    _ir2c_util << ((num_p_attr != nullptr && *num_p_attr != 0)
+    _ir2c_util << (use_extended_dcmplx
                        ? "Encode_dcmplx_ext(&_pre_plain_"
                        : "Encode_dcmplx(&_pre_plain_");
     _ir2c_util << node_id << ", (DCMPLX*)";
     Emit_buffer_address<RETV, VISITOR>(visitor, cst);
     _ir2c_util << ", ";
     visitor->template Visit<RETV>(node->Child(1));
-    if (num_p_attr != nullptr && *num_p_attr != 0) {
+    if (use_extended_dcmplx) {
       _ir2c_util << ", ";
       if (level_attr != nullptr) {
         _ir2c_util << *level_attr;
@@ -568,7 +728,10 @@ public:
                      "Encode_dcmplx and mask-encoding are mutually exclusive");
       const uint32_t* num_p_attr =
           node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::NUM_P);
-      _ir2c_util << ((num_p_attr != nullptr && *num_p_attr != 0)
+      bool use_extended_dcmplx =
+          Provider() != core::PROVIDER::PHANTOM && num_p_attr != nullptr &&
+          *num_p_attr != 0;
+      _ir2c_util << (use_extended_dcmplx
                          ? "Encode_dcmplx_ext(&"
                          : "Encode_dcmplx(&");
       Emit_st_var<RETV, VISITOR>(visitor, dest);
@@ -812,6 +975,9 @@ public:
   fhe::core::DATA_ENTRY_TYPE _data_entry_type;
   bool                       _ct_encode = false;
   bool                       _need_bts = false;
+  bool                       _has_phantom_manifests = false;
+  PHANTOM_CONTEXT_DESCRIPTOR _phantom_context;
+  PHANTOM_RESOURCE_DESCRIPTOR _phantom_resources;
 };  // IR2C_CTX
 
 }  // namespace ckks

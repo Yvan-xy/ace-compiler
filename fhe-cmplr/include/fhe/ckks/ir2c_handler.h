@@ -105,6 +105,10 @@ public:
     air::base::NODE_PTR parent = ctx.Parent(1);
 
     AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
+    if (ctx.Provider() == core::PROVIDER::PHANTOM) {
+      AIR_ASSERT(node->Child(1)->Opcode() == air::core::OPC_INTCONST);
+      ctx.Require_phantom_rotation_key(node->Child(1)->Intconst());
+    }
     ctx << "Rotate_ciph(&";
     ctx.Emit_st_var(parent);
     ctx << ", ";
@@ -145,6 +149,9 @@ public:
     air::base::NODE_PTR parent = ctx.Parent(1);
 
     AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
+    if (ctx.Provider() == core::PROVIDER::PHANTOM) {
+      ctx.Require_phantom_relinearization_key();
+    }
     ctx << "Relin(&";
     ctx.Emit_st_var(parent);
     ctx << ", ";

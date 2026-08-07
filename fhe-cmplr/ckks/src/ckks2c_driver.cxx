@@ -29,7 +29,7 @@ air::base::GLOB_SCOPE* CKKS2C_DRIVER::Flatten(
 
 void CKKS2C_DRIVER::Verify_or_throw(air::base::GLOB_SCOPE* glob) const {
   std::string diagnostic;
-  if (!CKKS2C_VERIFIER::Verify(glob, _provider, &diagnostic)) {
+  if (!CKKS2C_VERIFIER::Verify(glob, _ctx_param, _provider, &diagnostic)) {
     throw std::runtime_error(diagnostic);
   }
 }

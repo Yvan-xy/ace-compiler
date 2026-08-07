@@ -53,6 +53,9 @@ public:
 
   const core::LOWER_CTX& Lower_ctx() { return _lower_ctx; }
 
+  //! @brief Provider hook. Returning true suppresses legacy CKKS_PARAMS.
+  bool Emit_provider_context_manifest() { return false; }
+
   void        Set_output_name(const char* name) { _output_name = name; }
   const char* Output_name() const { return _output_name.c_str(); }
 

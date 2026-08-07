@@ -40,6 +40,23 @@ namespace core {
 
 using namespace air::base;
 
+//! Canonical key-manifest representative for one scalar CKKS rotation.
+//! The caller supplies the logical slot count; zero denotes an identity and is
+//! deliberately filtered by context analysis rather than requested as a key.
+inline int32_t Normalize_scalar_rotation_index(int64_t index,
+                                               uint32_t slot_count) {
+  AIR_ASSERT_MSG(slot_count > 0, "rotation normalization needs logical slots");
+  int64_t normalized = index % static_cast<int64_t>(slot_count);
+  if (normalized < 0) {
+    normalized += slot_count;
+  }
+  const int64_t half_slots = static_cast<int64_t>(slot_count / 2);
+  if (normalized > half_slots) {
+    normalized -= slot_count;
+  }
+  return static_cast<int32_t>(normalized);
+}
+
 // TODO: mv IV_INFO and related APIs into air_infra
 class IV_INFO {
 public:
@@ -139,6 +156,8 @@ public:
   uint32_t              Get_mul_level() const { return _func_mul_level; }
   void                  Add_rotate_index(int32_t idx) { _rot_idx.insert(idx); }
   const ROTATE_IDX_SET& Get_rotate_index() const { return _rot_idx; }
+  void                  Require_relin_key() { _relin_key_required = true; }
+  bool Relin_key_required() const { return _relin_key_required; }
   //! set mul_level attr for node result
   void Set_node_mul_level(NODE_PTR node, uint32_t mul_level) const {
     node->Set_attr(core::FHE_ATTR_KIND::LEVEL, &mul_level, 1);
@@ -205,7 +224,8 @@ private:
   SSA_CONTAINER* _ssa_cntr;
   const ckks::CKKS_CONFIG*       _config;
   const air::driver::DRIVER_CTX* _driver_ctx;
-  uint32_t _func_mul_level = 0;  // mul_level of current function
+  uint32_t _func_mul_level     = 0;  // mul_level of current function
+  bool     _relin_key_required = false;
 };
 
 //! @brief impl of CORE IR handler
@@ -904,8 +924,17 @@ RETV CKKS_ANA_IMPL::Handle_rotate(VISITOR* visitor, NODE_PTR rot_node) {
   uint32_t    rot_idx_count = 0;
   const int*  rot_idx       = rot_node->Attr<int>(rot_idx_key, &rot_idx_count);
   AIR_ASSERT(rot_idx != nullptr && rot_idx_count > 0);
+  uint32_t poly_degree =
+      ana_ctx.Lower_ctx()->Get_ctx_param().Get_poly_degree();
+  AIR_ASSERT_MSG(poly_degree >= 2 && (poly_degree % 2) == 0,
+                 "scalar rotation requires an even CKKS polynomial degree");
+  uint32_t slot_count = poly_degree / 2;
   for (uint32_t i = 0; i < rot_idx_count; ++i) {
-    visitor->Context().Add_rotate_index(rot_idx[i]);
+    int32_t normalized =
+        Normalize_scalar_rotation_index(rot_idx[i], slot_count);
+    if (normalized != 0) {
+      visitor->Context().Add_rotate_index(normalized);
+    }
   }
 
   return child0_res;
@@ -1006,6 +1035,8 @@ RETV CKKS_ANA_IMPL::Handle_relin(VISITOR* visitor, NODE_PTR relin_node) {
   ana_ctx.Trace(ckks::TRACE_DETAIL::TD_CKKS_LEVEL_MGT,
                 std::string(ana_ctx.Indent(), '+'), "relin: l=", mul_level,
                 "\n");
+
+  ana_ctx.Require_relin_key();
 
   return visitor->template Visit<RETV>(relin_node->Child(0));
 }

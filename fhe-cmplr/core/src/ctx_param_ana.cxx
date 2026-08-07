@@ -409,6 +409,9 @@ R_CODE CTX_PARAM_ANA::Run() {
   }
   ctx_param.Set_mul_level(mul_lev, true);
   ctx_param.Add_rotate_index(ana_ctx.Get_rotate_index());
+  if (ana_ctx.Relin_key_required()) {
+    ctx_param.Require_relin_key();
+  }
 
   // 4. update CTX_PARAM with Config
   R_CODE res = Update_ctx_param_with_config();

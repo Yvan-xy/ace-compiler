@@ -52,6 +52,7 @@ def test_phantom_add_mul_rotate_uses_only_dedicated_ckks2c():
         pipeline = AcePipeline(glob).configure_fhe(
             poly_degree=16384,
             mul_level=4,
+            input_level=1,
             security_level=0,
             scaling_factor_bits=56,
             first_prime_bits=60,
@@ -71,7 +72,8 @@ def test_phantom_add_mul_rotate_uses_only_dedicated_ckks2c():
         source = compiled.c_code or ""
         required = (
             '#include "rt_phantom/rt_phantom.h"',
-            "LIB_PHANTOM",
+            "Get_phantom_context_manifest()",
+            "Get_phantom_resource_manifest()",
             "Add_ciph(",
             "Mul_ciph(",
             "Rotate_ciph(",
@@ -81,6 +83,7 @@ def test_phantom_add_mul_rotate_uses_only_dedicated_ckks2c():
             "Hw_", "Poly_", "Bootstrap(", "Eval_bootstrap",
             "bootstrap_coeffs_to_slots", "bootstrap_eval_mod",
             "bootstrap_slots_to_coeffs", "phantom::",
+            "Need_bts(", "CKKS_PARAMS",
         )
         for token in required:
             assert token in source, token
@@ -202,7 +205,9 @@ def test_phantom_rejects_opaque_bootstrap_and_each_stage(expression, expected):
         rejected(CkksCiphertext(shape=(16384,), name="ct"))
         pipeline = AcePipeline(AceEDSL._get_dsl().current_air_module)
         pipeline.configure_fhe(
-            poly_degree=16384, mul_level=8, security_level=0,
+            poly_degree=16384, mul_level=8, input_level=1,
+            security_level=0, scaling_factor_bits=56,
+            first_prime_bits=60, hamming_weight=192,
             data_file="", provider="phantom", codegen_ir="ckks",
         )
         compiled = pipeline.run(start_domain="fhe::ckks", verbose=False)

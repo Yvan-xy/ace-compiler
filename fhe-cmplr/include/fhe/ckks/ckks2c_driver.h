@@ -44,7 +44,9 @@ class CKKS2C_DRIVER
 public:
   CKKS2C_DRIVER(std::ostream& os, core::LOWER_CTX& lower_ctx,
                 const CKKS2C_CONFIG& cfg)
-      : BASE(os, lower_ctx, cfg), _provider(cfg.Provider()) {}
+      : BASE(os, lower_ctx, cfg),
+        _provider(cfg.Provider()),
+        _ctx_param(lower_ctx.Get_ctx_param()) {}
 
   air::base::GLOB_SCOPE* Flatten(air::base::GLOB_SCOPE* in_scope);
 
@@ -65,7 +67,8 @@ public:
                                      core::PROVIDER provider);
 
 private:
-  core::PROVIDER _provider;
+  core::PROVIDER        _provider;
+  const core::CTX_PARAM& _ctx_param;
 };
 
 }  // namespace ckks

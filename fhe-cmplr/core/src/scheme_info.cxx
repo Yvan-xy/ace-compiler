@@ -145,6 +145,10 @@ uint32_t CTX_PARAM::Get_p_prime_num() const {
   return p_prime_num;
 }
 
+uint32_t CTX_PARAM::Get_p_prime_bit_num() const {
+  return BIT_NUM_OF_P_PRIME;
+}
+
 uint32_t CTX_PARAM::Get_modulus_bit_num() const {
   uint32_t mod_bit_num = Get_first_prime_bit_num();
   if (Get_mul_level() > 1) {

@@ -79,6 +79,8 @@ class FHEConfig:
     constant_name_prefix: str = ""
     pt_from_msg_name: str = "Pt_from_msg"
     raise_mod_level_func: str = ""
+    context_manifest_file: str = ""
+    resource_manifest_file: str = ""
 
     def __post_init__(self):
         self.provider = self.provider.strip().lower()
@@ -226,6 +228,8 @@ class AcePipeline:
         constant_name_prefix: str = "",
         pt_from_msg_name: str = "Pt_from_msg",
         raise_mod_level_func: str = "",
+        context_manifest_file: str = "",
+        resource_manifest_file: str = "",
     ) -> "AcePipeline":
         """
         Configure FHE parameters.
@@ -246,6 +250,8 @@ class AcePipeline:
             constant_name_prefix: Prefix for generated C constant symbols
             pt_from_msg_name: Plaintext data loader function name
             raise_mod_level_func: Runtime helper name for attributed raise_mod
+            context_manifest_file: Optional generated context attestation path
+            resource_manifest_file: Optional generated resource attestation path
             
         Returns:
             self (for method chaining)
@@ -268,6 +274,8 @@ class AcePipeline:
             constant_name_prefix=constant_name_prefix,
             pt_from_msg_name=pt_from_msg_name,
             raise_mod_level_func=raise_mod_level_func,
+            context_manifest_file=context_manifest_file,
+            resource_manifest_file=resource_manifest_file,
         )
         return self
 
@@ -478,6 +486,8 @@ class AcePipeline:
             constant_name_prefix=self.fhe_config.constant_name_prefix,
             pt_from_msg_name=self.fhe_config.pt_from_msg_name,
             raise_mod_level_func=self.fhe_config.raise_mod_level_func,
+            context_manifest_file=self.fhe_config.context_manifest_file,
+            resource_manifest_file=self.fhe_config.resource_manifest_file,
         )
         if ok and hasattr(self.glob_scope, "get_c_code"):
             return self.glob_scope.get_c_code()
@@ -888,6 +898,8 @@ class Pipeline:
         provider: str = "ant",
         codegen_ir: Optional[str] = None,
         enable_poly: Optional[bool] = None,
+        context_manifest_file: str = "",
+        resource_manifest_file: str = "",
     ) -> "Pipeline":
         """
         Configure FHE parameters.
@@ -926,6 +938,8 @@ class Pipeline:
             provider=provider,
             codegen_ir=codegen_ir,
             enable_poly=enable_poly,
+            context_manifest_file=context_manifest_file,
+            resource_manifest_file=resource_manifest_file,
         )
         return self
     
@@ -1122,6 +1136,8 @@ class Pipeline:
                     constant_name_prefix=self.config.constant_name_prefix,
                     pt_from_msg_name=self.config.pt_from_msg_name,
                     raise_mod_level_func=self.config.raise_mod_level_func,
+                    context_manifest_file=self.config.context_manifest_file,
+                    resource_manifest_file=self.config.resource_manifest_file,
                 )
             return False
         
