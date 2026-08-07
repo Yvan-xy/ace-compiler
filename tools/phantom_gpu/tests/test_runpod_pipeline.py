@@ -120,3 +120,29 @@ def test_audit_rejects_sensitive_tracked_file(tmp_path: Path) -> None:
 
     with pytest.raises(SystemExit, match="sensitive filename"):
         create(repo, git(repo, "rev-parse", "HEAD"), output)
+
+
+def test_timed_phase_stops_at_first_failure(tmp_path: Path) -> None:
+    timings = tmp_path / "timings.tsv"
+    marker = tmp_path / "continued"
+    script = f"""
+set -euo pipefail
+source {TOOLS / 'phase_helpers.sh'}
+fail_then_continue() {{
+  false
+  touch "$1"
+}}
+set +e
+run_timed_phase "$1" deliberate_failure fail_then_continue "$2"
+phase_result=$?
+set -e
+[[ ${{phase_result}} -ne 0 ]]
+[[ ! -e "$2" ]]
+"""
+    subprocess.run(
+        ["bash", "-c", script, "phase-test", str(timings), str(marker)],
+        check=True,
+    )
+    fields = timings.read_text(encoding="utf-8").strip().split("\t")
+    assert fields[0] == "deliberate_failure"
+    assert fields[-1] != "0"

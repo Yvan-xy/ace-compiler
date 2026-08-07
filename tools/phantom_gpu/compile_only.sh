@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+source "${SCRIPT_DIR}/phase_helpers.sh"
 REPO_ROOT="${ACE_PHANTOM_REPO_ROOT:-$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)}"
 LOCK_FILE="${SCRIPT_DIR}/configs/dependencies.env"
 PROFILE_PATH="${REPO_ROOT}/fhe-cmplr/rtlib/phantom/config/fullpacked_bts_v1.json"
@@ -87,18 +88,7 @@ TIMINGS_FILE="${RUN_ROOT}/phase-timings.tsv"
 : >"${TIMINGS_FILE}"
 
 timed_phase() {
-  local name="$1"
-  shift
-  local started ended status
-  started="$(date +%s)"
-  set +e
-  "$@"
-  status=$?
-  set -e
-  ended="$(date +%s)"
-  printf '%s\t%s\t%s\t%s\t%s\n' \
-    "${name}" "${started}" "${ended}" "$((ended - started))" "${status}" >>"${TIMINGS_FILE}"
-  return "${status}"
+  run_timed_phase "${TIMINGS_FILE}" "$@"
 }
 
 atomic_json() {

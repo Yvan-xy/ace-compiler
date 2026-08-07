@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+source "${SCRIPT_DIR}/phase_helpers.sh"
+
 MODE=""
 INPUT=""
 WORK=""
@@ -76,18 +79,7 @@ trap 'exit 130' INT
 trap 'exit 124' TERM
 
 phase() {
-  local name="$1"
-  shift
-  local started ended status
-  started="$(date +%s)"
-  set +e
-  "$@"
-  status=$?
-  set -e
-  ended="$(date +%s)"
-  printf '%s\t%s\t%s\t%s\t%s\n' \
-    "${name}" "${started}" "${ended}" "$((ended - started))" "${status}" >>"${TIMINGS}"
-  return "${status}"
+  run_timed_phase "${TIMINGS}" "$@"
 }
 
 verify_outer_payload() {

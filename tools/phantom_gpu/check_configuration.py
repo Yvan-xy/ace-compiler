@@ -281,6 +281,7 @@ def main() -> int:
         "PHANTOM_COMMIT",
         "CUDA_ARCHITECTURES",
         "CUDA_IMAGE",
+        "CUDA_IMAGE_CONFIG",
         "DEVELOPMENT_IMAGE",
     }
     if set(lock) != required_lock:
@@ -291,6 +292,8 @@ def main() -> int:
         fail("dependency lock must target CUDA architecture 80")
     if "@sha256:" not in lock["CUDA_IMAGE"]:
         fail("CUDA image is not digest-pinned")
+    if not IMAGE_ID_PATTERN.fullmatch(lock["CUDA_IMAGE_CONFIG"]):
+        fail("CUDA image config digest is malformed")
     toolchain = verify_toolchain(tools_root, repo_root)
 
     phantom_root = arguments.phantom_dir.resolve(strict=True)
@@ -349,6 +352,8 @@ def main() -> int:
             fail("base image differs from the dependency lock")
         if not IMAGE_ID_PATTERN.fullmatch(arguments.base_config_digest or ""):
             fail("base image config digest is absent or malformed")
+        if arguments.base_config_digest != lock["CUDA_IMAGE_CONFIG"]:
+            fail("base image config digest differs from the dependency lock")
         if not SHA256_PATTERN.fullmatch(arguments.bootstrap_sha256 or ""):
             fail("bootstrap SHA-256 is absent or malformed")
         image_record = {

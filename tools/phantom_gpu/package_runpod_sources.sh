@@ -110,6 +110,7 @@ while IFS= read -r relative; do
   git -C "${REPO_ROOT}" show "${ACE_COMMIT}:${relative}" >"${OUTPUT}/${relative##*/}"
 done <<'FILES'
 tools/phantom_gpu/source_archive.py
+tools/phantom_gpu/phase_helpers.sh
 tools/phantom_gpu/bootstrap_environment.sh
 tools/phantom_gpu/run_build_and_health.sh
 tools/phantom_gpu/configs/apt-packages.lock
@@ -120,6 +121,7 @@ tools/phantom_gpu/configs/toolchain.env
 FILES
 chmod 0755 \
   "${OUTPUT}/source_archive.py" \
+  "${OUTPUT}/phase_helpers.sh" \
   "${OUTPUT}/bootstrap_environment.sh" \
   "${OUTPUT}/run_build_and_health.sh"
 
