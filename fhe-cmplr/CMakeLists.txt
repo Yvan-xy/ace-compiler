@@ -51,6 +51,8 @@ set(PHANTOM_SOURCE_DIR "" CACHE PATH
     "Local Git repository used to clone the pinned Phantom source")
 set(PHANTOM_GIT_TAG "faa6ba2bb990e17c88d826a880ef40136aaa8bc7" CACHE STRING
     "Exact Phantom Git commit used by the runtime")
+option(PHANTOM_SOURCE_SNAPSHOT
+       "Use a preverified source-only Phantom snapshot" OFF)
 
 if(FHE_ENABLE_PHANTOM)
   if(NOT FHE_ENABLE_CUDA)
@@ -60,7 +62,17 @@ if(FHE_ENABLE_PHANTOM)
     message(FATAL_ERROR
       "Phantom qualification requires CMAKE_CUDA_ARCHITECTURES=80")
   endif()
-  if(NOT IS_DIRECTORY "${PHANTOM_SOURCE_DIR}/.git")
+  if(PHANTOM_SOURCE_SNAPSHOT)
+    foreach(PHANTOM_REQUIRED_PATH CMakeLists.txt include src)
+      if(NOT EXISTS "${PHANTOM_SOURCE_DIR}/${PHANTOM_REQUIRED_PATH}")
+        message(FATAL_ERROR
+          "Phantom source snapshot is missing ${PHANTOM_REQUIRED_PATH}")
+      endif()
+    endforeach()
+    if(EXISTS "${PHANTOM_SOURCE_DIR}/.git")
+      message(FATAL_ERROR "Phantom source snapshot must not contain .git")
+    endif()
+  elseif(NOT IS_DIRECTORY "${PHANTOM_SOURCE_DIR}/.git")
     message(FATAL_ERROR
       "PHANTOM_SOURCE_DIR must name a mounted local Git repository")
   endif()
@@ -128,6 +140,7 @@ message(STATUS "FHE_ENABLE_PHANTOM            : ${FHE_ENABLE_PHANTOM}")
 if(FHE_ENABLE_PHANTOM)
   message(STATUS "PHANTOM_SOURCE_DIR             : ${PHANTOM_SOURCE_DIR}")
   message(STATUS "PHANTOM_GIT_TAG                : ${PHANTOM_GIT_TAG}")
+  message(STATUS "PHANTOM_SOURCE_SNAPSHOT        : ${PHANTOM_SOURCE_SNAPSHOT}")
   message(STATUS "CMAKE_CUDA_ARCHITECTURES       : ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 message(STATUS "FHE_INSTALL_APP               : ${FHE_INSTALL_APP}")

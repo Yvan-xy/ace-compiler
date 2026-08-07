@@ -70,13 +70,23 @@ endfunction()
 function(check_code_revision project commit)
   assert("${project}" "project can't be empty")
 
-  execute_process(
-    COMMAND git rev-parse HEAD
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE GIT_COMMIT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-  )
-  assert("${GIT_COMMIT}" "can't get commit id")
+  if(DEFINED ACE_SOURCE_COMMIT AND NOT "${ACE_SOURCE_COMMIT}" STREQUAL "")
+    string(LENGTH "${ACE_SOURCE_COMMIT}" ACE_SOURCE_COMMIT_LENGTH)
+    if(NOT ACE_SOURCE_COMMIT_LENGTH EQUAL 40 OR
+       NOT ACE_SOURCE_COMMIT MATCHES "^[0-9a-f]+$")
+      message(FATAL_ERROR
+        "ACE_SOURCE_COMMIT must be an exact 40-character commit")
+    endif()
+    set(GIT_COMMIT "${ACE_SOURCE_COMMIT}")
+  else()
+    execute_process(
+      COMMAND git rev-parse HEAD
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      OUTPUT_VARIABLE GIT_COMMIT
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    assert("${GIT_COMMIT}" "can't get commit id")
+  endif()
 
   set(${commit} ${GIT_COMMIT} PARENT_SCOPE)
   file(APPEND "${CMAKE_BINARY_DIR}/git_commit.txt" "${project} Commit: ${GIT_COMMIT}\n")

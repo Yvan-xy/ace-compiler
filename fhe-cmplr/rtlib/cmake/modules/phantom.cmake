@@ -11,25 +11,39 @@ function(build_external_phantom)
       "Local Git repository used to clone the pinned Phantom source")
   set(PHANTOM_GIT_TAG "faa6ba2bb990e17c88d826a880ef40136aaa8bc7"
       CACHE STRING "Exact Phantom Git commit")
+  option(PHANTOM_SOURCE_SNAPSHOT
+         "Use a preverified source-only Phantom snapshot" OFF)
 
-  if(NOT IS_DIRECTORY "${PHANTOM_SOURCE_DIR}/.git")
-    message(FATAL_ERROR
-      "PHANTOM_SOURCE_DIR must name a mounted local Git repository")
-  endif()
   string(LENGTH "${PHANTOM_GIT_TAG}" PHANTOM_GIT_TAG_LENGTH)
   if(NOT PHANTOM_GIT_TAG_LENGTH EQUAL 40 OR
      NOT PHANTOM_GIT_TAG MATCHES "^[0-9a-f]+$")
     message(FATAL_ERROR "PHANTOM_GIT_TAG must be an exact 40-character commit")
   endif()
-  execute_process(
-    COMMAND git -C "${PHANTOM_SOURCE_DIR}" cat-file -e
-            "${PHANTOM_GIT_TAG}^{commit}"
-    RESULT_VARIABLE PHANTOM_COMMIT_RESULT
-    OUTPUT_QUIET
-    ERROR_QUIET)
-  if(NOT PHANTOM_COMMIT_RESULT EQUAL 0)
-    message(FATAL_ERROR
-      "Pinned Phantom commit is absent from PHANTOM_SOURCE_DIR")
+  if(PHANTOM_SOURCE_SNAPSHOT)
+    foreach(PHANTOM_REQUIRED_PATH CMakeLists.txt include src)
+      if(NOT EXISTS "${PHANTOM_SOURCE_DIR}/${PHANTOM_REQUIRED_PATH}")
+        message(FATAL_ERROR
+          "Phantom source snapshot is missing ${PHANTOM_REQUIRED_PATH}")
+      endif()
+    endforeach()
+    if(EXISTS "${PHANTOM_SOURCE_DIR}/.git")
+      message(FATAL_ERROR "Phantom source snapshot must not contain .git")
+    endif()
+  else()
+    if(NOT IS_DIRECTORY "${PHANTOM_SOURCE_DIR}/.git")
+      message(FATAL_ERROR
+        "PHANTOM_SOURCE_DIR must name a mounted local Git repository")
+    endif()
+    execute_process(
+      COMMAND git -C "${PHANTOM_SOURCE_DIR}" cat-file -e
+              "${PHANTOM_GIT_TAG}^{commit}"
+      RESULT_VARIABLE PHANTOM_COMMIT_RESULT
+      OUTPUT_QUIET
+      ERROR_QUIET)
+    if(NOT PHANTOM_COMMIT_RESULT EQUAL 0)
+      message(FATAL_ERROR
+        "Pinned Phantom commit is absent from PHANTOM_SOURCE_DIR")
+    endif()
   endif()
   if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "80")
     message(FATAL_ERROR
@@ -38,28 +52,38 @@ function(build_external_phantom)
 
   message(STATUS "Phantom source repository     : ${PHANTOM_SOURCE_DIR}")
   message(STATUS "Phantom pinned commit         : ${PHANTOM_GIT_TAG}")
+  message(STATUS "Phantom source snapshot       : ${PHANTOM_SOURCE_SNAPSHOT}")
 
   include(ExternalProject)
-  ExternalProject_Add(
-    phantom_external
-    GIT_REPOSITORY ${PHANTOM_SOURCE_DIR}
-    GIT_TAG ${PHANTOM_GIT_TAG}
-    GIT_SHALLOW OFF
-    PREFIX ${CMAKE_BINARY_DIR}/external
-    UPDATE_COMMAND ""
-    BUILD_ALWAYS OFF
-    CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release
-               -DCMAKE_CUDA_ARCHITECTURES:STRING=${CMAKE_CUDA_ARCHITECTURES}
-               -DCMAKE_CXX_STANDARD=17
-               -DCMAKE_CXX_STANDARD_REQUIRED=ON
-               -DCMAKE_CUDA_STANDARD=17
-               -DCMAKE_CUDA_STANDARD_REQUIRED=ON
-               -DPHANTOM_BUILD_EXAMPLES=OFF
-               -DPHANTOM_BUILD_TESTS=OFF
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target phantom
-    INSTALL_COMMAND ""
-    BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/external/src/phantom_external-build/lib/libphantom.a
-  )
+  set(PHANTOM_EXTERNAL_ARGUMENTS
+      PREFIX ${CMAKE_BINARY_DIR}/external
+      UPDATE_COMMAND ""
+      BUILD_ALWAYS OFF
+      CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release
+                 -DCMAKE_CUDA_ARCHITECTURES:STRING=${CMAKE_CUDA_ARCHITECTURES}
+                 -DCMAKE_CXX_STANDARD=17
+                 -DCMAKE_CXX_STANDARD_REQUIRED=ON
+                 -DCMAKE_CUDA_STANDARD=17
+                 -DCMAKE_CUDA_STANDARD_REQUIRED=ON
+                 -DPHANTOM_BUILD_EXAMPLES=OFF
+                 -DPHANTOM_BUILD_TESTS=OFF
+      BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target phantom
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/external/src/phantom_external-build/lib/libphantom.a)
+  if(PHANTOM_SOURCE_SNAPSHOT)
+    ExternalProject_Add(
+      phantom_external
+      SOURCE_DIR ${PHANTOM_SOURCE_DIR}
+      DOWNLOAD_COMMAND ""
+      ${PHANTOM_EXTERNAL_ARGUMENTS})
+  else()
+    ExternalProject_Add(
+      phantom_external
+      GIT_REPOSITORY ${PHANTOM_SOURCE_DIR}
+      GIT_TAG ${PHANTOM_GIT_TAG}
+      GIT_SHALLOW OFF
+      ${PHANTOM_EXTERNAL_ARGUMENTS})
+  endif()
   ExternalProject_Get_Property(phantom_external SOURCE_DIR BINARY_DIR)
 
   find_package(CUDAToolkit REQUIRED)
