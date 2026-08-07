@@ -15,6 +15,8 @@ mkdir -p "$(dirname -- "${OUTPUT}")"
   echo "kernel=$(uname -sr)"
   echo "cuda_architectures=${CMAKE_CUDA_ARCHITECTURES:-unset}"
   echo "toolchain_identity=${ACE_PHANTOM_TOOLCHAIN:-unset}"
+  echo "development_image_id=${ACE_PHANTOM_IMAGE_ID:-unset}"
+  echo "development_definition_sha256=${ACE_PHANTOM_DEFINITION_SHA256:-unset}"
   echo
   echo "[os-release]"
   sed -n '1,40p' /etc/os-release
@@ -44,6 +46,15 @@ mkdir -p "$(dirname -- "${OUTPUT}")"
     ninja-build
   )
   dpkg-query -W "${PACKAGES[@]}"
+  echo
+  echo "[all-packages]"
+  dpkg-query -W -f='${binary:Package}=${Version}\n' | LC_ALL=C sort
+  echo
+  echo "[python-packages]"
+  python3 -m pip freeze --all | LC_ALL=C sort
+  echo
+  echo "[python-check]"
+  python3 -m pip check
   echo
   echo "[cuda-files]"
   CUDA_FILES=(

@@ -11,10 +11,12 @@ PHANTOM_DIR=""
 BUILD_IMAGE=1
 PRESERVE_EXISTING=0
 PRESERVE_RUNNING=0
+EXPECTED_IMAGE_ID=""
 
 usage() {
   echo "usage: $0 --models-dir DIR --dataset-dir DIR --phantom-dir DIR [options]"
   echo "  --skip-image-build       use the already-built pinned development image"
+  echo "  --expected-image-id ID   require this immutable image ID when skipping a build"
   echo "  --preserve-existing      rename an existing stopped container before creation"
   echo "  --preserve-running       allow preserving an existing running container by rename"
 }
@@ -36,6 +38,10 @@ while [[ $# -gt 0 ]]; do
     --skip-image-build)
       BUILD_IMAGE=0
       shift
+      ;;
+    --expected-image-id)
+      EXPECTED_IMAGE_ID="$2"
+      shift 2
       ;;
     --preserve-existing)
       PRESERVE_EXISTING=1
@@ -60,6 +66,10 @@ done
 
 if [[ -z "${MODELS_DIR}" || -z "${DATASET_DIR}" || -z "${PHANTOM_DIR}" ]]; then
   usage >&2
+  exit 2
+fi
+if [[ ${BUILD_IMAGE} -eq 0 && -z "${EXPECTED_IMAGE_ID}" ]]; then
+  echo "--skip-image-build requires --expected-image-id" >&2
   exit 2
 fi
 
@@ -97,10 +107,26 @@ if [[ "$(git -C "${PHANTOM_DIR}" rev-parse HEAD)" != "${PHANTOM_COMMIT}" ]]; the
   exit 1
 fi
 
+DEFINITION_FILES=(
+  "${REPO_DIR}/docker/phantom-a100/Dockerfile"
+  "${REPO_DIR}/docker/phantom-a100/.dockerignore"
+  "${REPO_DIR}/docker/phantom-a100/python-requirements.lock"
+  "${SCRIPT_DIR}/configs/dependencies.env"
+  "${SCRIPT_DIR}/configs/toolchain.env"
+)
+DEFINITION_SHA256="$(
+  for FILE_PATH in "${DEFINITION_FILES[@]}"; do
+    RELATIVE_PATH="${FILE_PATH#"${REPO_DIR}/"}"
+    printf '%s  %s\n' "$(sha256sum "${FILE_PATH}" | awk '{print $1}')" \
+      "${RELATIVE_PATH}"
+  done | sha256sum | awk '{print $1}'
+)"
+
 if [[ ${BUILD_IMAGE} -eq 1 ]]; then
   BUILD_ARGUMENTS=(
     --platform linux/amd64
     --pull
+    --build-arg "ACE_PHANTOM_DEFINITION_SHA256=${DEFINITION_SHA256}"
     --file "${REPO_DIR}/docker/phantom-a100/Dockerfile"
     --tag "${DEVELOPMENT_IMAGE}"
     "${REPO_DIR}/docker/phantom-a100"
@@ -108,6 +134,23 @@ if [[ ${BUILD_IMAGE} -eq 1 ]]; then
   docker build "${BUILD_ARGUMENTS[@]}"
 elif ! docker image inspect "${DEVELOPMENT_IMAGE}" >/dev/null 2>&1; then
   echo "development image is absent: ${DEVELOPMENT_IMAGE}" >&2
+  exit 1
+fi
+
+IMAGE_ID="$(
+  docker image inspect --format '{{.Id}}' "${DEVELOPMENT_IMAGE}"
+)"
+IMAGE_DEFINITION_SHA256="$(
+  docker image inspect --format \
+    '{{index .Config.Labels "org.ace.phantom.definition-sha256"}}' \
+    "${DEVELOPMENT_IMAGE}"
+)"
+if [[ "${IMAGE_DEFINITION_SHA256}" != "${DEFINITION_SHA256}" ]]; then
+  echo "development image definition label does not match the repository" >&2
+  exit 1
+fi
+if [[ -n "${EXPECTED_IMAGE_ID}" && "${IMAGE_ID}" != "${EXPECTED_IMAGE_ID}" ]]; then
+  echo "development image ID does not match --expected-image-id" >&2
   exit 1
 fi
 
@@ -145,9 +188,19 @@ RUN_ARGUMENTS=(
   --mount "type=bind,src=${DATASET_DIR},dst=/inputs/dataset,readonly"
   --env ACE_DATASET_DIR=/inputs/dataset
   --env CIFAR10_DIR=/inputs/dataset
+  --env "ACE_PHANTOM_IMAGE_ID=${IMAGE_ID}"
+  --env "ACE_PHANTOM_DEFINITION_SHA256=${DEFINITION_SHA256}"
   "${DEVELOPMENT_IMAGE}"
 )
 docker run "${RUN_ARGUMENTS[@]}"
+
+CONTAINER_IMAGE_ID="$(
+  docker inspect --format '{{.Image}}' "${CONTAINER_NAME}"
+)"
+if [[ "${CONTAINER_IMAGE_ID}" != "${IMAGE_ID}" ]]; then
+  echo "created container does not use the inspected image ID" >&2
+  exit 1
+fi
 
 for TARGET in /deps/phantom-ant /inputs/models /inputs/dataset; do
   RW_FLAG="$(
@@ -163,6 +216,8 @@ docker exec "${CONTAINER_NAME}" bash -lc '
   set -euo pipefail
   test "${ACE_PHANTOM_TOOLCHAIN}" = "12.4.1-sm80"
   test "${CMAKE_CUDA_ARCHITECTURES}" = "80"
+  test -n "${ACE_PHANTOM_IMAGE_ID}"
+  test -n "${ACE_PHANTOM_DEFINITION_SHA256}"
   for target in /deps/phantom-ant /inputs/models /inputs/dataset; do
     findmnt -T "${target}" -n -o OPTIONS |
       tr "," "\n" |

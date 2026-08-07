@@ -17,6 +17,8 @@ from typing import Any
 
 
 PIN_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+IMAGE_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def fail(message: str) -> None:
@@ -70,6 +72,68 @@ def git(path: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def command_output(*arguments: str) -> str:
+    result = subprocess.run(
+        list(arguments), check=False, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        fail(
+            f"{' '.join(arguments)} failed with exit {result.returncode}: "
+            f"{result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
+def verify_toolchain(tools_root: Path, repo_root: Path) -> dict[str, Any]:
+    expected = read_lock(tools_root / "configs/toolchain.env")
+    required = {
+        "NVCC_VERSION",
+        "CMAKE_VERSION",
+        "CXX_VERSION",
+        "PYTHON_VERSION",
+        "NTL_PACKAGE_VERSION",
+        "GMP_PACKAGE_VERSION",
+    }
+    if set(expected) != required:
+        fail("toolchain expectation keys do not match the frozen schema")
+
+    nvcc_output = command_output("/usr/local/cuda/bin/nvcc", "--version")
+    nvcc_match = re.search(r"\bV([0-9]+\.[0-9]+\.[0-9]+)\b", nvcc_output)
+    actual = {
+        "NVCC_VERSION": nvcc_match.group(1) if nvcc_match else "",
+        "CMAKE_VERSION": command_output("cmake", "--version")
+        .splitlines()[0]
+        .split()[-1],
+        "CXX_VERSION": command_output("c++", "-dumpfullversion", "-dumpversion"),
+        "PYTHON_VERSION": command_output(
+            "python3", "-c", "import platform; print(platform.python_version())"
+        ),
+        "NTL_PACKAGE_VERSION": command_output(
+            "dpkg-query", "-W", "-f=${Version}", "libntl-dev"
+        ),
+        "GMP_PACKAGE_VERSION": command_output(
+            "dpkg-query", "-W", "-f=${Version}", "libgmp-dev"
+        ),
+    }
+    for key, value in expected.items():
+        if actual[key] != value:
+            fail(f"{key} is {actual[key]!r}, expected {value!r}")
+
+    python_lock = repo_root / "docker/phantom-a100/python-requirements.lock"
+    expected_python = python_lock.read_text(encoding="utf-8").splitlines()
+    installed_python = sorted(
+        command_output("python3", "-m", "pip", "freeze", "--all").splitlines()
+    )
+    if installed_python != expected_python:
+        fail("resolved Python environment differs from its lock file")
+    command_output("python3", "-m", "pip", "check")
+    return {
+        "versions": actual,
+        "python_lock_path": os.fspath(python_lock),
+        "python_lock_sha256": sha256(python_lock),
+    }
+
+
 def require_path_below(directory: Path, relative: str) -> Path:
     root = directory.resolve(strict=True)
     candidate = (root / relative).resolve(strict=True)
@@ -105,6 +169,8 @@ def verify_profile(repo_root: Path, profile: dict[str, Any]) -> None:
     data_q = profile["data_q"]
     if data_q["count"] != len(data_q["bit_sizes"]):
         fail("data-Q count does not match its bit-size list")
+    if data_q["count"] != profile["depth"]["data_multiplication_depth"] + 1:
+        fail("data-Q count does not match the declared multiplication depth")
     if data_q["bit_sizes"] != [60] + [56] * 26:
         fail("data-Q bit sizes do not match the frozen chain")
 
@@ -143,6 +209,50 @@ def verify_profile(repo_root: Path, profile: dict[str, Any]) -> None:
         fail("Phantom profile must target CUDA architecture 80")
 
 
+def profile_codegen_parameters(profile: dict[str, Any]) -> dict[str, Any]:
+    """Map the shared profile to the EDSL configuration contract."""
+    return {
+        "poly_degree": profile["ring"]["polynomial_degree"],
+        "mul_level": profile["depth"]["data_multiplication_depth"],
+        "input_level": profile["levels"]["input"]["logical_level"],
+        "security_level": profile["security"]["validation_level_bits"],
+        "scaling_factor_bits": profile["data_q"]["scaling_modulus_bits"],
+        "first_prime_bits": profile["data_q"]["first_modulus_bits"],
+        "hamming_weight": profile["security"]["secret_key_hamming_weight"],
+        "ct_encode": profile["transforms"]["ciphertext_encoded_constants"],
+    }
+
+
+def render_cpp_profile_header(
+    profile: dict[str, Any], profile_sha256: str
+) -> str:
+    """Render native Phantom parameters from the verified JSON profile."""
+    if not SHA256_PATTERN.fullmatch(profile_sha256):
+        fail("profile SHA-256 is malformed")
+
+    def cpp_array(values: list[int]) -> str:
+        return ", ".join(str(value) for value in values)
+
+    data_q = profile["data_q"]["bit_sizes"]
+    special_p = profile["special_p"]["bit_sizes"]
+    return f"""#pragma once
+
+#include <array>
+#include <cstddef>
+
+namespace ace::phantom_profile {{
+inline constexpr char kProfileSha256[] = "{profile_sha256}";
+inline constexpr std::size_t kPolynomialDegree = {profile['ring']['polynomial_degree']};
+inline constexpr std::size_t kActiveSlotCount = {profile['ring']['active_slot_count']};
+inline constexpr int kCudaArchitecture = {profile['phantom']['cuda_architecture']};
+inline constexpr int kScalingModulusBits = {profile['data_q']['scaling_modulus_bits']};
+inline constexpr int kSecretKeyHammingWeight = {profile['security']['secret_key_hamming_weight']};
+inline constexpr std::array<int, {len(data_q)}> kDataQBitSizes = {{{cpp_array(data_q)}}};
+inline constexpr std::array<int, {len(special_p)}> kSpecialPBitSizes = {{{cpp_array(special_p)}}};
+}}  // namespace ace::phantom_profile
+"""
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", type=Path, default=Path("/app"))
@@ -150,6 +260,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--dataset-dir", type=Path, default=Path("/inputs/dataset"))
     parser.add_argument("--phantom-dir", type=Path, default=Path("/deps/phantom-ant"))
     parser.add_argument("--json-output", type=Path)
+    parser.add_argument("--cpp-header-output", type=Path)
     return parser.parse_args()
 
 
@@ -174,6 +285,7 @@ def main() -> int:
         fail("dependency lock must target CUDA architecture 80")
     if "@sha256:" not in lock["CUDA_IMAGE"]:
         fail("CUDA image is not digest-pinned")
+    toolchain = verify_toolchain(tools_root, repo_root)
 
     ace_branch = git(repo_root, "branch", "--show-current")
     if ace_branch != lock["ACE_BRANCH"]:
@@ -203,6 +315,19 @@ def main() -> int:
     )
     profile = read_json(profile_path)
     verify_profile(repo_root, profile)
+    profile_sha256 = sha256(profile_path)
+    if arguments.cpp_header_output:
+        arguments.cpp_header_output.parent.mkdir(parents=True, exist_ok=True)
+        arguments.cpp_header_output.write_text(
+            render_cpp_profile_header(profile, profile_sha256), encoding="utf-8"
+        )
+
+    image_id = os.environ.get("ACE_PHANTOM_IMAGE_ID", "")
+    definition_sha256 = os.environ.get("ACE_PHANTOM_DEFINITION_SHA256", "")
+    if not IMAGE_ID_PATTERN.fullmatch(image_id):
+        fail("development image ID is absent or malformed")
+    if not SHA256_PATTERN.fullmatch(definition_sha256):
+        fail("development image definition hash is absent or malformed")
 
     fixture_path = tools_root / "configs/resnet20_cifar10_pre.json"
     fixture = read_json(fixture_path)
@@ -239,9 +364,14 @@ def main() -> int:
             "build_source_policy": "clone the pinned commit; never build the mounted worktree",
         },
         "cuda_architecture": 80,
+        "development_image": {
+            "id": image_id,
+            "definition_sha256": definition_sha256,
+        },
+        "toolchain": toolchain,
         "profile": {
             "path": os.fspath(profile_path),
-            "sha256": sha256(profile_path),
+            "sha256": profile_sha256,
         },
         "fixture": {
             "path": os.fspath(fixture_path),
