@@ -115,7 +115,7 @@ extract_sources() {
     >"${RESULT_DIR}/phantom-source-audit.json"
 }
 
-run_qualification() {
+configure_qualification_environment() {
   local ace_commit source_manifest_sha bootstrap_sha
   ace_commit="$(jq -er .commit "${INPUT}/ace-source.manifest.json")"
   export SOURCE_DATE_EPOCH
@@ -137,6 +137,9 @@ run_qualification() {
   export ACE_PHANTOM_SOURCE_MANIFEST_SHA256="${source_manifest_sha}"
   export ACE_RUNPOD_BOOTSTRAP_SHA256="${bootstrap_sha}"
   export ACE_PHANTOM_BUILD_JOBS="${ACE_PHANTOM_BUILD_JOBS:-$(nproc)}"
+}
+
+run_qualification() {
   local poly_degree mul_level input_level security_level scaling_bits first_prime_bits hamming_weight
   poly_degree="$(jq -er '.compiler_context_options.poly_degree' "${INPUT}/payload.json")"
   mul_level="$(jq -er '.compiler_context_options.mul_level' "${INPUT}/payload.json")"
@@ -407,6 +410,7 @@ phase payload_verification verify_outer_payload
 phase environment_bootstrap bootstrap
 export PATH="/opt/ace-runpod-venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 phase source_audit_and_extraction extract_sources
+configure_qualification_environment
 phase qualification run_qualification
 phase frozen_ordinary_reference verify_frozen_ordinary_reference
 if [[ "${MODE}" == "runpod" ]]; then

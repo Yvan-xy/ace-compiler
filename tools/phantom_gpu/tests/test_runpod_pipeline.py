@@ -181,6 +181,11 @@ bash -c "${remote_command}"
 
 def test_remote_pipeline_uses_the_packaged_frozen_cpu_reference() -> None:
     source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    assert (
+        "phase source_audit_and_extraction extract_sources\n"
+        "configure_qualification_environment\n"
+        "phase qualification"
+    ) in source
     assert 'cmp "${generated_context}" "${INPUT}/ordinary-context-manifest.json"' in source
     assert 'cmp "${generated_resources}" "${INPUT}/ordinary-resource-manifest.json"' in source
     assert 'cpu_reference="${INPUT}/ordinary-cpu-reference.json"' in source
