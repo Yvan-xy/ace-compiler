@@ -388,11 +388,16 @@ CaseResult RunEncodeCase(const std::string& family_id, const Json& fixture,
 
 Json RunConformance(const Json& fixture) {
   Json records = Json::array();
+  // Keep every wrapper object alive for the duration of the prepared runtime
+  // context.  The runtime deliberately remembers freed wrapper addresses to
+  // diagnose double-free and use-after-free.  Destroying an arena after each
+  // case allowed the host allocator to reuse an address for a new wrapper,
+  // which is indistinguishable from reusing the freed object itself.
+  ObjectArena arena;
   for (const auto& family : fixture.at("case_families")) {
     const std::string family_id = family.at("id").get<std::string>();
     for (const auto& alias_value : family.at("aliases")) {
       const std::string alias = alias_value.get<std::string>();
-      ObjectArena arena;
       CaseResult result = family_id.rfind("encode_", 0) == 0
                               ? RunEncodeCase(family_id, fixture, arena)
                               : RunCipherCase(family_id, alias, fixture, arena);

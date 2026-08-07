@@ -193,6 +193,21 @@ def test_remote_pipeline_uses_the_packaged_frozen_cpu_reference() -> None:
     assert 'fixture="${INPUT}/ordinary-fixture.json"' in source
 
 
+def test_gpu_conformance_keeps_wrapper_addresses_unique() -> None:
+    source = (TOOLS / "harness/ordinary_ckks_gpu_runner.cu").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("Json RunConformance(const Json& fixture)")
+    end = source.index("double MaximumError", start)
+    body = source[start:end]
+
+    assert body.count("ObjectArena arena;") == 1
+    assert body.index("ObjectArena arena;") < body.index(
+        'for (const auto& family : fixture.at("case_families"))'
+    )
+    assert "ObjectArena arena;\n      CaseResult result" not in body
+
+
 def test_source_packaging_requires_local_ordinary_evidence() -> None:
     source = (TOOLS / "package_runpod_sources.sh").read_text(encoding="utf-8")
     assert "--ordinary-run-root" in source
