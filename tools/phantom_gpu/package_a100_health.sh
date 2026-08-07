@@ -120,8 +120,12 @@ mkdir -p "${OUTPUT_ROOT}"
 STAGING_ROOT="$(mktemp -d "${OUTPUT_ROOT}/.bundle.XXXXXX")"
 STAGING_DIR="${STAGING_ROOT}/${RUN_ID}"
 mkdir "${STAGING_DIR}"
+ARCHIVE_TEMP=""
 cleanup_staging() {
   rm -rf -- "${STAGING_ROOT}"
+  if [[ -n "${ARCHIVE_TEMP}" && -e "${ARCHIVE_TEMP}" ]]; then
+    rm -f -- "${ARCHIVE_TEMP}"
+  fi
 }
 trap cleanup_staging EXIT
 PACKAGE_DIR="${STAGING_DIR}"
@@ -187,11 +191,14 @@ jq -n \
 ARCHIVE_PATH="${OUTPUT_ROOT}/${RUN_ID}.tar.gz"
 ARCHIVE_TEMP="$(mktemp "${OUTPUT_ROOT}/.${RUN_ID}.tar.gz.XXXXXX")"
 tar -C "${STAGING_ROOT}" -czf "${ARCHIVE_TEMP}" "${RUN_ID}"
+chmod 0644 "${ARCHIVE_TEMP}"
 mv "${PACKAGE_DIR}" "${BUNDLE_DIR}"
 mv "${ARCHIVE_TEMP}" "${ARCHIVE_PATH}"
+ARCHIVE_TEMP=""
 ARCHIVE_SHA256="$(sha256sum "${ARCHIVE_PATH}" | awk '{print $1}')"
 printf '%s  %s\n' "${ARCHIVE_SHA256}" "$(basename -- "${ARCHIVE_PATH}")" \
   >"${ARCHIVE_PATH}.sha256"
+chmod 0644 "${ARCHIVE_PATH}.sha256"
 trap - EXIT
 cleanup_staging
 echo "bundle_dir=${BUNDLE_DIR}"

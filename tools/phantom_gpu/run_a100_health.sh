@@ -88,8 +88,11 @@ archive_on_exit() {
   if [[ ${RESULT_ACTIVE} -eq 1 ]]; then
     write_state failed "${exit_code}"
   fi
-  if ! tar -C "$(dirname -- "${RESULT_DIR}")" -czf "${ARCHIVE_PATH}" \
-    "$(basename -- "${RESULT_DIR}")"; then
+  if ! (
+    umask 022
+    tar -C "$(dirname -- "${RESULT_DIR}")" -czf "${ARCHIVE_PATH}" \
+      "$(basename -- "${RESULT_DIR}")"
+  ); then
     if [[ ${exit_code} -eq 0 ]]; then
       exit_code=1
       write_state failed "${exit_code}"

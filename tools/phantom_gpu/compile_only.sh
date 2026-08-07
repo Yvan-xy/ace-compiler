@@ -552,6 +552,7 @@ run_compiler_tests() {
   local codegen_tests=(
     ace_edsl/tests/test_air_pass_pipeline.py
     ace_edsl/tests/test_ckks2c_codegen.py
+    tools/phantom_gpu/tests/test_a100_evidence_archives.py
     tools/phantom_gpu/tests/test_codegen_tools.py
   )
   (
