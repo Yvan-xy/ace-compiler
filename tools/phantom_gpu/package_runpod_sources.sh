@@ -92,22 +92,38 @@ for required in \
   fi
 done
 EXPECTED_DATA_Q_COUNT="$((MUL_LEVEL + 1))"
-jq -e \
-  --argjson polynomial_degree "${POLY_DEGREE}" \
-  --argjson data_q_count "${EXPECTED_DATA_Q_COUNT}" \
-  --argjson input_level "${INPUT_LEVEL}" \
-  --argjson security_level "${SECURITY_LEVEL}" \
-  --argjson scaling_bits "${SCALING_BITS}" \
-  --argjson first_prime_bits "${FIRST_PRIME_BITS}" \
-  --argjson hamming_weight "${HAMMING_WEIGHT}" \
-  '.polynomial_degree == $polynomial_degree
-   and (.data_q_bit_sizes | length) == $data_q_count
-   and .input_level == $input_level
-   and .security_level == $security_level
-   and .scaling_modulus_bits == $scaling_bits
-   and .first_modulus_bits == $first_prime_bits
-   and .hamming_weight == $hamming_weight' \
-  "${FROZEN_CONTEXT}" >/dev/null
+python3 - "${FROZEN_CONTEXT}" "${POLY_DEGREE}" \
+  "${EXPECTED_DATA_Q_COUNT}" "${INPUT_LEVEL}" "${SECURITY_LEVEL}" \
+  "${SCALING_BITS}" "${FIRST_PRIME_BITS}" "${HAMMING_WEIGHT}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+context = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = {
+    "polynomial_degree": int(sys.argv[2]),
+    "data_q_count": int(sys.argv[3]),
+    "input_level": int(sys.argv[4]),
+    "security_level": int(sys.argv[5]),
+    "scaling_modulus_bits": int(sys.argv[6]),
+    "first_modulus_bits": int(sys.argv[7]),
+    "hamming_weight": int(sys.argv[8]),
+}
+observed = {
+    "polynomial_degree": context.get("polynomial_degree"),
+    "data_q_count": len(context.get("data_q_bit_sizes", [])),
+    "input_level": context.get("input_level"),
+    "security_level": context.get("security_level"),
+    "scaling_modulus_bits": context.get("scaling_modulus_bits"),
+    "first_modulus_bits": context.get("first_modulus_bits"),
+    "hamming_weight": context.get("hamming_weight"),
+}
+if observed != expected:
+    raise SystemExit(
+        f"frozen compiler context does not match requested options: "
+        f"expected={expected}, observed={observed}"
+    )
+PY
 
 DEPENDENCY_LOCK="$(
   git -C "${REPO_ROOT}" show \
