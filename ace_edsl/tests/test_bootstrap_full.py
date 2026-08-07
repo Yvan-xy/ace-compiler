@@ -674,17 +674,33 @@ finally:
         not IMPORTS_AVAILABLE,
         f"Imports not available: {IMPORT_ERROR if not IMPORTS_AVAILABLE else ''}",
     )
-    def test_primitive_raw_air_has_no_bootstrap_op(self):
-        """Primitive mode must not emit CKKS.bootstrap in raw AIR."""
-        raw_air = os.path.join(BOOTSTRAP_OUTPUT_DIR, "bootstrap_full_raw.air")
-        self.assertTrue(os.path.isfile(raw_air), f"Missing raw AIR dump: {raw_air}")
-        with open(raw_air, "r", encoding="utf-8") as f:
-            raw_ir = f.read().lower()
-        self.assertNotIn(
-            "ckks.bootstrap",
-            raw_ir,
-            "primitive mode must keep the decomposition visible in raw AIR",
+    def test_primitive_air_invariants_before_and_after_ckks_driver(self):
+        """Raw and post-driver AIR retain primitives and no opaque stages."""
+        artifacts = (
+            "bootstrap_full_raw.air",
+            "bootstrap_full_ckks_driver.air",
         )
+        forbidden = (
+            "ckks.bootstrap(",
+            "ckks.bootstrap_coeffs_to_slots",
+            "ckks.bootstrap_eval_mod",
+            "ckks.bootstrap_slots_to_coeffs",
+        )
+        retained = (
+            "ckks.conjugate",
+            "ckks.rotate_batch",
+            "ckks.raise_mod",
+            "ckks.mul_mono",
+        )
+        for artifact in artifacts:
+            path = os.path.join(BOOTSTRAP_OUTPUT_DIR, artifact)
+            self.assertTrue(os.path.isfile(path), f"Missing AIR dump: {path}")
+            with open(path, "r", encoding="utf-8") as f:
+                ir = f.read().lower()
+            for token in forbidden:
+                self.assertNotIn(token, ir, f"{artifact} contains {token}")
+            for token in retained:
+                self.assertIn(token, ir, f"{artifact} lost retained op {token}")
 
     @unittest.skipIf(
         not IMPORTS_AVAILABLE,
@@ -708,14 +724,16 @@ finally:
             self.c_code,
             "Primitive mode must not lower to runtime Eval_bootstrap_ciph(...) call",
         )
-        has_stage_ops = (
-            "Eval_bootstrap_coeffs_to_slots_ciph(" in self.c_code
-            and "Eval_bootstrap_eval_mod_ciph(" in self.c_code
-            and "Eval_bootstrap_slots_to_coeffs_ciph(" in self.c_code
-        )
-        if has_stage_ops:
-            self.assertGreater(len(self.c_code), 500, "Generated bootstrap C code should be non-trivial")
-            return
+        for stage_call in (
+            "Eval_bootstrap_coeffs_to_slots_ciph(",
+            "Eval_bootstrap_eval_mod_ciph(",
+            "Eval_bootstrap_slots_to_coeffs_ciph(",
+        ):
+            self.assertNotIn(
+                stage_call,
+                self.c_code,
+                f"Primitive mode must not emit stage call {stage_call}",
+            )
         # Rotations: poly-level Rotate
         has_rotate = "Rotate_ciph" in self.c_code or "Rotate(" in self.c_code
         self.assertTrue(has_rotate, "Bootstrap uses rotations (DFT/iDFT)")

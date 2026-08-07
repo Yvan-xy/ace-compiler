@@ -16,6 +16,7 @@ from ace_edsl.edsl.compiler import (
 )
 from ace_edsl.edsl.pipeline import (
     AcePipeline,
+    FHEConfig,
     Pipeline,
     PipelineTarget,
 )
@@ -91,6 +92,10 @@ class _RunnerGlob:
 
     def run_poly2c(self, **kwargs):
         self.native_phases.append("poly2c")
+        return True
+
+    def run_ckks2c(self, **kwargs):
+        self.native_phases.append("ckks2c")
         return True
 
     def get_c_code(self):
@@ -245,6 +250,70 @@ def _run_compile(glob, config):
         ),
     )
     return result, glob.native_phases
+
+
+def test_codegen_ir_selects_exactly_one_terminal_in_all_public_runners(
+    monkeypatch,
+):
+    ace_glob = _RunnerGlob()
+    ace = AcePipeline(
+        ace_glob,
+        FHEConfig(provider="phantom", codegen_ir="ckks", data_file=""),
+    )
+    ace.run_ckks_driver = lambda: {"success": True}
+    ace_result = ace.run(start_domain="fhe::ckks", verbose=False)
+    assert ace_result.success
+    assert ace_result.stages_completed == ["ckks_driver", "ckks2c"]
+    assert ace_glob.native_phases == ["ckks2c"]
+
+    pipeline_glob = _RunnerGlob()
+    pipeline = Pipeline(dump_ir=False, verbose=False).set_glob(pipeline_glob)
+    pipeline.config = FHEConfig(
+        provider="phantom", codegen_ir="ckks", data_file=""
+    )
+    selected = []
+    pipeline._run_phase = lambda phase: selected.append(phase) or True
+    pipeline_result = pipeline.run(target=PipelineTarget.C)
+    assert pipeline_result.success
+    assert selected[-1] == "ckks2c"
+    assert "poly_driver" not in selected and "poly2c" not in selected
+
+    class Kernel:
+        _ace_domain = "fhe::ckks"
+        air_module = _RunnerGlob()
+
+    monkeypatch.setattr(
+        "ace_edsl.edsl.compiler._run_ckks_driver",
+        lambda glob: glob.native_phases.append("ckks_driver") or True,
+    )
+    compile_result = ace_compile(
+        Kernel(),
+        CompilerOptions(
+            target=Target.C,
+            provider="phantom",
+            codegen_ir="ckks",
+            skip_cpp_for_registered_ops=False,
+        ),
+    )
+    assert compile_result.pipeline == ["ckks_driver", "ckks2c"]
+    assert compile_result.glob_scope.native_phases == [
+        "ckks_driver", "ckks2c"
+    ]
+
+
+def test_codegen_configuration_rejects_conflicts_and_phantom_rewrite():
+    with pytest.raises(ValueError, match="conflicts"):
+        FHEConfig(codegen_ir="ckks", enable_poly=True)
+    with pytest.raises(ValueError, match="requires codegen_ir='ckks'"):
+        FHEConfig(provider="phantom", codegen_ir="poly")
+
+    pipeline = AcePipeline(
+        _RunnerGlob(),
+        FHEConfig(provider="phantom", codegen_ir="ckks", data_file=""),
+    ).set_ckks_extended_op_rewrite(True)
+    result = pipeline.run(start_domain="fhe::ckks", verbose=False)
+    assert not result.success
+    assert "prohibited" in result.error
 
 
 def test_pass_runs_exactly_once_and_results_share_one_schema_in_all_three_runners():
