@@ -524,7 +524,12 @@ public:
            "compiler-declared batches",
            count, _resources->_rotation_batch_count);
     }
-    std::vector<int> provider_steps(steps, steps + count);
+    std::vector<int> provider_steps;
+    provider_steps.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+      provider_steps.push_back(
+          NormalizeRotation(steps[index], _logical_slots));
+    }
     std::vector<Ciphertext> provider_outputs;
     PhantomGaloisKey empty_key;
     const PhantomGaloisKey& key = _galois_key ? *_galois_key : empty_key;
@@ -638,7 +643,11 @@ public:
     const double source_scale = source->scale();
     const bool source_ntt = source->is_ntt_form();
     ProviderCall("MUL_MONO_PROVIDER", [&] {
-      multiply_by_monomial(*_context, *source, power, *result);
+      if (result == source) {
+        multiply_by_monomial_inplace(*_context, *result, power);
+      } else {
+        multiply_by_monomial(*_context, *source, power, *result);
+      }
     });
     const size_t result_q = ActiveQ(result, "MUL_MONO_RESULT");
     if (result_q != source_q || result->chain_index() != source_chain ||
