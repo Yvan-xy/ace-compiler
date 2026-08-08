@@ -2,6 +2,7 @@
 
 #include "ckks/cipher.h"
 #include "ckks/ciphertext.h"
+#include "ckks/key_gen.h"
 #include "ckks/plain.h"
 #include "ckks/plaintext.h"
 #include "common/rt_api.h"
@@ -359,6 +360,19 @@ void ValidateManifest(const Json &context, const Json &resources,
               required_rotation_keys,
           "resource rotation key list differs from normalized nonzero batch "
           "steps");
+}
+
+void ProvisionAntConjugationKey(const Json &context, const Json &resources) {
+  Require(resources.at("conjugation_key").get<bool>(),
+          "ANT conjugation key was not authorized by the resource manifest");
+  const std::uint32_t degree =
+      context.at("polynomial_degree").get<std::uint32_t>();
+  const std::int32_t ant_conjugation_index =
+      static_cast<std::int32_t>(2U * degree - 1U);
+  auto *key_generator = reinterpret_cast<CKKS_KEY_GENERATOR *>(Keygen());
+  Require(key_generator != nullptr, "ANT key generator is unavailable");
+  Require(Insert_rot_map(key_generator, ant_conjugation_index) != nullptr,
+          "ANT failed to provision its internal conjugation key");
 }
 
 void VerifyPrimeChain(const Json &manifest) {
@@ -756,6 +770,7 @@ int main(int argc, char **argv) {
     ValidateManifest(context, resources, fixture);
     setenv("RTLIB_DISABLE_BOOTSTRAP_PRECOM", "1", 1);
     Prepare_context();
+    ProvisionAntConjugationKey(context, resources);
     VerifyPrimeChain(context);
     const auto source_values =
         LoadSource(analytic, analytic_binary,

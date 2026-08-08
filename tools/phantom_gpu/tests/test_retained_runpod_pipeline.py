@@ -255,6 +255,28 @@ def test_retained_harnesses_share_the_sha256_constant_table() -> None:
     assert "0x4ed8aa4aU" in ant
 
 
+def test_ant_oracle_provisions_only_its_internal_conjugation_sentinel() -> None:
+    harness = (
+        TOOLS / "harness/retained_ckks_ant_oracle.cxx"
+    ).read_text(encoding="utf-8")
+    provision = harness[
+        harness.index("void ProvisionAntConjugationKey(") : harness.index(
+            "\nvoid VerifyPrimeChain("
+        )
+    ]
+    assert 'resources.at("conjugation_key").get<bool>()' in provision
+    assert "2U * degree - 1U" in provision
+    assert "Insert_rot_map(key_generator, ant_conjugation_index)" in provision
+    assert harness.index("Prepare_context();") < harness.index(
+        "ProvisionAntConjugationKey(context, resources);"
+    )
+    assert "ant_conjugation_index" not in harness[
+        harness.index("void ValidateManifest(") : harness.index(
+            "void ProvisionAntConjugationKey("
+        )
+    ]
+
+
 def test_a100_gate_executes_fixture_owned_adapter_aliases() -> None:
     runner = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
     retained_function = runner[
