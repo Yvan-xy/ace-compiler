@@ -301,23 +301,33 @@ TEST_F(TEST_CKKS_EXTENDED_OPS,
 TEST_F(TEST_CKKS_EXTENDED_OPS, MonomialIdentityNegationInverseAndInPlace) {
   CIPHERTEXT source = MakeCoefficientCipher(_full_q_count);
   const auto signed_values = FillSignedPattern(&source);
+  const auto coefficient_source = Snapshot(&source);
   CIPHERTEXT identity{};
   Mul_mono_ciph(&identity, &source, 0);
-  EXPECT_EQ(Snapshot(&identity), Snapshot(&source));
+  EXPECT_TRUE(Is_ntt(Get_c0(&source)));
+  Conv_ntt2poly_inplace(Get_c0(&identity));
+  Conv_ntt2poly_inplace(Get_c1(&identity));
+  EXPECT_EQ(Snapshot(&identity), coefficient_source);
 
   CIPHERTEXT negated{};
   Mul_mono_ciph(&negated, &source, _degree);
+  Conv_ntt2poly_inplace(Get_c0(&negated));
+  Conv_ntt2poly_inplace(Get_c1(&negated));
   ExpectNegacyclic(&negated, signed_values, _degree);
 
   CIPHERTEXT inverse_first{};
   CIPHERTEXT inverse_result{};
   Mul_mono_ciph(&inverse_first, &source, 2U * _degree - 1U);
   Mul_mono_ciph(&inverse_result, &inverse_first, 1U);
-  EXPECT_EQ(Snapshot(&inverse_result), Snapshot(&source));
+  Conv_ntt2poly_inplace(Get_c0(&inverse_result));
+  Conv_ntt2poly_inplace(Get_c1(&inverse_result));
+  EXPECT_EQ(Snapshot(&inverse_result), coefficient_source);
 
   CIPHERTEXT in_place{};
   Copy_ciphertext(&in_place, &source);
   Mul_mono_ciph(&in_place, &in_place, _degree);
+  Conv_ntt2poly_inplace(Get_c0(&in_place));
+  Conv_ntt2poly_inplace(Get_c1(&in_place));
   ExpectNegacyclic(&in_place, signed_values, _degree);
 
   Zero_ciph(&in_place);
