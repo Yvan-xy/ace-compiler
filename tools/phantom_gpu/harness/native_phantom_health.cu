@@ -8,6 +8,7 @@
 #include <cmath>
 #include <complex>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -35,7 +36,11 @@ void RequireCuda(cudaError_t result, const char* operation) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc != 2) {
+    std::cerr << "usage: native_phantom_health OUTPUT.json\n";
+    return 2;
+  }
   try {
     const PHANTOM_CONTEXT_MANIFEST* manifest = Get_phantom_context_manifest();
     if (manifest == nullptr || manifest->_data_q_bit_sizes == nullptr ||
@@ -114,11 +119,15 @@ int main() {
       return 1;
     }
 
-    std::cout << "{\"status\":\"pass\",\"gpu\":\""
-              << properties.name << "\",\"device_count\":" << device_count
-              << ",\"max_error\":" << max_error
-              << ",\"context_manifest_sha256\":\""
-              << ACE_CONTEXT_MANIFEST_SHA256 << "\"}\n";
+    std::ofstream result(argv[1], std::ios::out | std::ios::trunc);
+    if (!result) throw std::runtime_error("cannot open JSON output");
+    result << "{\"status\":\"pass\",\"gpu\":\"" << properties.name
+           << "\",\"device_count\":" << device_count
+           << ",\"max_error\":" << max_error
+           << ",\"context_manifest_sha256\":\""
+           << ACE_CONTEXT_MANIFEST_SHA256 << "\"}\n";
+    result.close();
+    if (!result) throw std::runtime_error("cannot write JSON output");
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "native Phantom health failed: " << error.what() << '\n';

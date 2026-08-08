@@ -131,6 +131,20 @@ if (
     or not isinstance(pipeline["completed_utc"], str)
 ):
     raise SystemExit("pipeline result does not match the observed invocation")
+if expected_exit == 0:
+    completeness_path = results / "result-completeness.json"
+    if not completeness_path.is_file():
+        raise SystemExit("successful result archive lacks its completeness record")
+    completeness = json.loads(
+        completeness_path.read_text(encoding="utf-8"),
+        object_pairs_hook=reject_duplicates,
+    )
+    if completeness != {
+        "schema_version": "ace.phantom.result-completeness/1.0.0",
+        "status": "pass",
+        "mode": expected_mode,
+    }:
+        raise SystemExit("result completeness record is invalid")
 print(
     json.dumps(
         {

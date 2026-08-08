@@ -43,6 +43,8 @@ TIMINGS="${RESULT_DIR}/phase-timings.tsv"
 : >"${TIMINGS}"
 STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 PIPELINE_EXIT=1
+CURRENT_PHASE=initialization
+FAILED_PHASE=""
 
 finalize() {
   local incoming="$?"
@@ -52,6 +54,11 @@ finalize() {
   fi
   local status=failed
   [[ ${incoming} -eq 0 ]] && status=pass
+  if [[ "${status}" == failed ]]; then
+    local failure_phase="${FAILED_PHASE:-${CURRENT_PHASE:-pipeline}}"
+    printf '{"schema_version":"1.0.0","status":"failed","phase":"%s","exit_code":%d}\n' \
+      "${failure_phase}" "${incoming}" >"${RESULT_DIR}/pipeline-failure.json"
+  fi
   printf '{"schema_version":"1.0.0","status":"%s","mode":"%s","exit_code":%d,"started_utc":"%s","completed_utc":"%s"}\n' \
     "${status}" "${MODE}" "${incoming}" "${STARTED_UTC}" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${RESULT_DIR}/pipeline-result.json"
@@ -80,7 +87,27 @@ trap 'exit 130' INT
 trap 'exit 124' TERM
 
 phase() {
+  local phase_name="$1"
+  local phase_exit
+  local caller_errexit=false
+  [[ $- == *e* ]] && caller_errexit=true
+  CURRENT_PHASE="${phase_name}"
+  set +e
   run_timed_phase "${TIMINGS}" "$@"
+  phase_exit=$?
+  if [[ "${caller_errexit}" == true ]]; then
+    set -e
+  else
+    set +e
+  fi
+  if [[ ${phase_exit} -eq 0 ]]; then
+    CURRENT_PHASE=""
+    return 0
+  else
+    FAILED_PHASE="${phase_name}"
+    CURRENT_PHASE=""
+    return "${phase_exit}"
+  fi
 }
 
 verify_outer_payload() {
@@ -393,9 +420,12 @@ if compiler_invocation_path is not None:
     }:
         raise SystemExit("payload does not bind the packaged compiler invocation")
 PY
+  local qualification_arguments_output
+  qualification_arguments_output="$(
+    jq -er '.argv[1:][]' "${INPUT}/qualification-invocation.json"
+  )"
   local -a qualification_arguments
-  mapfile -t qualification_arguments \
-    < <(jq -er '.argv[1:][]' "${INPUT}/qualification-invocation.json")
+  mapfile -t qualification_arguments <<<"${qualification_arguments_output}"
   local -a qualification_status
   local qualification_exit
   set +e
@@ -433,12 +463,17 @@ PY
     cp "${cache}" "${RESULT_DIR}/$(echo "${cache#${ACE_PHANTOM_STATE_ROOT}/}" | tr / _)"
   done
   : >"${RESULT_DIR}/public-dependency-commits.txt"
-  while IFS= read -r git_dir; do
-    local checkout
+  local dependency_git_dirs="${WORK}/public-dependency-git-dirs.list"
+  find "${ACE_PHANTOM_STATE_ROOT}" -type d -name .git -print0 |
+    LC_ALL=C sort -z >"${dependency_git_dirs}"
+  while IFS= read -r -d '' git_dir; do
+    local checkout checkout_commit
     checkout="${git_dir%/.git}"
-    printf '%s\t%s\n' "${checkout#${WORK}/}" "$(git -C "${checkout}" rev-parse HEAD)" \
+    checkout_commit="$(git -C "${checkout}" rev-parse HEAD)"
+    printf '%s\t%s\n' "${checkout#${WORK}/}" "${checkout_commit}" \
       >>"${RESULT_DIR}/public-dependency-commits.txt"
-  done < <(find "${ACE_PHANTOM_STATE_ROOT}" -type d -name .git -print | LC_ALL=C sort)
+  done <"${dependency_git_dirs}"
+  rm "${dependency_git_dirs}"
   if [[ "${MODE}" == "freeze-host" ]]; then
     local qualification_manifest_sha qualification_sums_sha
     qualification_manifest_sha="$(sha256sum "${run_root}/manifest.json" | awk '{print $1}')"
@@ -687,44 +722,70 @@ run_ordinary_gpu_qualification() {
   ' "${RESULT_DIR}/ordinary_ckks_diagnostics.json" >/dev/null
   rm "${diagnostics}"
 
+  local sanitizer_stdout="${RESULT_DIR}/ordinary_ckks_sanitizer.stdout.txt"
+  local sanitizer_stderr="${RESULT_DIR}/ordinary_ckks_sanitizer.stderr.txt"
+  local sanitizer_log="${RESULT_DIR}/ordinary_ckks_sanitizer.log.txt"
+  local sanitizer_version="${RESULT_DIR}/ordinary_ckks_sanitizer.version.txt"
+  local ownership_json="${RESULT_DIR}/ordinary_ckks_ownership.json"
+  compute-sanitizer --version >"${sanitizer_version}" 2>&1
+  [[ -s "${sanitizer_version}" ]]
+  rm -f "${sanitizer_log}" "${ownership_json}"
   set +e
   timeout 900 compute-sanitizer --tool memcheck --error-exitcode=99 \
+    --log-file "${sanitizer_log}" \
     "${runner}" ownership "${fixture}" "${expected_gpu}" \
-    >"${RESULT_DIR}/ordinary_ckks_sanitizer.stdout.txt" \
-    2>"${RESULT_DIR}/ordinary_ckks_sanitizer.stderr.txt"
+    "${ownership_json}" >"${sanitizer_stdout}" 2>"${sanitizer_stderr}"
   local sanitizer_exit=$?
   set -e
   if [[ ${sanitizer_exit} -ne 0 ]]; then
     echo "Compute Sanitizer exited ${sanitizer_exit}" >&2
     return "${sanitizer_exit}"
   fi
-  rg -Fq 'ERROR SUMMARY: 0 errors' \
-    "${RESULT_DIR}/ordinary_ckks_sanitizer.stderr.txt"
-  local ownership_json="${RESULT_DIR}/ordinary_ckks_ownership.json"
-  tail -n 1 "${RESULT_DIR}/ordinary_ckks_sanitizer.stdout.txt" \
-    >"${ownership_json}"
-  jq -e --slurpfile fixture "${fixture}" '
-    .schema_version == "ace.phantom.ordinary_ckks.ownership/1.0.0"
-    and .status == "pass"
-    and ([.cases[] | {id, iterations, array_length:(.array_length // null)}]
-         == [$fixture[0].ownership_cases[]
-             | {id, iterations, array_length:(.array_length // null)}])
-    and .total_iterations == ([$fixture[0].ownership_cases[].iterations] | add)
-  ' "${ownership_json}" >/dev/null
-  local ownership_iterations
-  ownership_iterations="$(jq -er '.total_iterations' "${ownership_json}")"
+  local zero_summary_count total_summary_count
+  zero_summary_count="$(
+    rg -c '^========= ERROR SUMMARY: 0 errors$' "${sanitizer_log}" || true
+  )"
+  total_summary_count="$(
+    rg -c '^========= ERROR SUMMARY:' "${sanitizer_log}" || true
+  )"
+  if [[ "${zero_summary_count:-0}" != 1 ||
+        "${total_summary_count:-0}" != 1 ]]; then
+    echo "Compute Sanitizer log does not contain one exact zero-error summary" >&2
+    return 1
+  fi
+  local ownership_validation ownership_iterations
+  ownership_validation="$(
+    python3 \
+      "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/ordinary_ckks_fixture.py" \
+      validate-ownership --fixture "${fixture}" \
+      --ownership-json "${ownership_json}"
+  )"
+  printf '%s\n' "${ownership_validation}" \
+    >"${RESULT_DIR}/ordinary_ckks_ownership.validation.json"
+  ownership_iterations="$(
+    jq -er '.total_iterations | select(. > 0)' <<<"${ownership_validation}"
+  )"
+  local sanitizer_log_sha256 sanitizer_version_sha256
+  sanitizer_log_sha256="$(sha256sum "${sanitizer_log}" | awk '{print $1}')"
+  sanitizer_version_sha256="$(
+    sha256sum "${sanitizer_version}" | awk '{print $1}'
+  )"
   jq -n --arg status pass --arg tool memcheck --argjson exit_code 0 \
     --argjson ownership_iterations "${ownership_iterations}" \
+    --arg sanitizer_log_sha256 "${sanitizer_log_sha256}" \
+    --arg sanitizer_version_sha256 "${sanitizer_version_sha256}" \
     '{schema_version:"1.0.0", status:$status, tool:$tool,
       error_summary:0, exit_code:$exit_code,
-      ownership_iterations:$ownership_iterations}' \
+      ownership_iterations:$ownership_iterations,
+      sanitizer_log_sha256:$sanitizer_log_sha256,
+      sanitizer_version_sha256:$sanitizer_version_sha256}' \
     >"${RESULT_DIR}/ordinary_ckks_sanitizer.json"
   rm "${raw_results}"
 }
 
 run_native_health() {
   local expected_gpu query gpu_count gpu_name current run_root health_binary
-  local context_manifest context_sha health_json health_exit
+  local context_manifest context_sha health_raw health_exit
   expected_gpu="${ACE_RUNPOD_EXPECTED_GPU_NAME:-}"
   case "${expected_gpu}" in
     "NVIDIA A100 80GB PCIe"|"NVIDIA A100-SXM4-80GB") ;;
@@ -750,27 +811,69 @@ run_native_health() {
   [[ -x "${health_binary}" ]]
   [[ -s "${context_manifest}" ]]
   context_sha="$(sha256sum "${context_manifest}" | awk '{print $1}')"
+  health_raw="${RESULT_DIR}/native-health.raw.json"
   set +e
-  timeout 300 "${health_binary}" \
+  timeout 300 "${health_binary}" "${health_raw}" \
     >"${RESULT_DIR}/native-health.stdout.txt" \
     2>"${RESULT_DIR}/native-health.stderr.txt"
   health_exit=$?
   set -e
   [[ ${health_exit} -eq 0 ]]
-  health_json="$(tail -n 1 "${RESULT_DIR}/native-health.stdout.txt")"
   jq -e --arg context_sha "${context_sha}" --arg expected_gpu "${expected_gpu}" \
     'select(.status == "pass" and .device_count == 1
      and .gpu == $expected_gpu
      and (.max_error | type == "number") and .max_error <= 0.0001
-     and .context_manifest_sha256 == $context_sha)' <<<"${health_json}" \
+     and .context_manifest_sha256 == $context_sha)' "${health_raw}" \
     >"${RESULT_DIR}/native-health.json"
+}
+
+verify_success_evidence() {
+  jq -e '
+    .gate == "ordinary" and .status == "pass" and .exit_code == 0
+  ' "${RESULT_DIR}/qualification-current.json" >/dev/null
+  case "${MODE}" in
+    freeze-host)
+      jq -e '
+        .schema_version == "ace.phantom.host-freeze-candidate/1.0.0"
+        and .status == "candidate"
+      ' "${RESULT_DIR}/host-freeze-candidate.json" >/dev/null
+      ;;
+    local)
+      jq -e '.status == "pass"' \
+        "${RESULT_DIR}/ordinary-frozen-reference.json" >/dev/null
+      jq -e '.status == "skipped"' \
+        "${RESULT_DIR}/native-health.json" >/dev/null
+      ;;
+    runpod)
+      jq -e '.status == "pass" and .device_count == 1' \
+        "${RESULT_DIR}/native-health.json" >/dev/null
+      jq -e '
+        .status == "pass" and .case_count > 0
+        and .passing_case_count == .case_count
+      ' "${RESULT_DIR}/ordinary_ckks_compare.json" >/dev/null
+      jq -e '.status == "pass" and (.cases | length) > 0' \
+        "${RESULT_DIR}/ordinary_ckks_diagnostics.json" >/dev/null
+      jq -e '
+        .schema_version == "ace.phantom.ordinary_ckks.ownership/1.0.0"
+        and .status == "pass" and .total_iterations > 0
+      ' "${RESULT_DIR}/ordinary_ckks_ownership.json" >/dev/null
+      jq -e '.status == "pass" and .exit_code == 0' \
+        "${RESULT_DIR}/ordinary_ckks_sanitizer.json" >/dev/null
+      ;;
+  esac
+  jq -n --arg mode "${MODE}" \
+    '{schema_version:"ace.phantom.result-completeness/1.0.0",
+      status:"pass", mode:$mode}' \
+    >"${RESULT_DIR}/result-completeness.json"
 }
 
 phase payload_verification verify_outer_payload
 phase environment_bootstrap bootstrap
 export PATH="/opt/ace-runpod-venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 phase source_audit_and_extraction extract_sources
+CURRENT_PHASE=qualification_environment
 configure_qualification_environment
+CURRENT_PHASE=""
 phase qualification run_qualification
 if [[ "${MODE}" != "freeze-host" ]]; then
   phase frozen_ordinary_reference verify_frozen_ordinary_reference
@@ -782,4 +885,5 @@ if [[ "${MODE}" != "freeze-host" ]]; then
       >"${RESULT_DIR}/native-health.json"
   fi
 fi
+phase result_completeness verify_success_evidence
 PIPELINE_EXIT=0

@@ -1301,13 +1301,15 @@ link_generated_probe() {
 
   local contract_binary="${CKKS2C_RESULTS}/ordinary_contract_test"
   local -a contract_context_arguments
-  mapfile -t contract_context_arguments < <(
+  local contract_context_output
+  contract_context_output="$(
     jq -er '
       [.polynomial_degree, .logical_slot_capacity,
        (.data_q_bit_sizes | length), .scaling_modulus_bits]
       | .[] | tostring
     ' "${context_manifest}"
-  )
+  )"
+  mapfile -t contract_context_arguments <<<"${contract_context_output}"
   [[ ${#contract_context_arguments[@]} -eq 4 ]]
   c++ -std=c++17 \
     -I"${REPO_ROOT}/fhe-cmplr/rtlib/phantom/include" \

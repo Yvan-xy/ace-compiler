@@ -150,6 +150,7 @@ test "$(sha256sum "${HEALTH_BINARY}" | awk '{print $1}')" = \
 
 set +e
 timeout "${HEALTH_TIMEOUT_SECONDS}" "${HEALTH_BINARY}" \
+  "${RESULT_DIR}/native_health.raw.json" \
   >"${RESULT_DIR}/native_health.stdout.txt" \
   2>"${RESULT_DIR}/native_health.stderr.txt"
 HEALTH_EXIT_CODE="$?"
@@ -159,15 +160,15 @@ if [[ ${HEALTH_EXIT_CODE} -ne 0 ]]; then
   exit "${HEALTH_EXIT_CODE}"
 fi
 
-HEALTH_JSON="$(tail -n 1 "${RESULT_DIR}/native_health.stdout.txt")"
-echo "${HEALTH_JSON}" | jq -e \
+jq -e \
   --arg context_manifest_sha256 "${EXPECTED_CONTEXT_MANIFEST_SHA256}" \
-  '.status == "pass"
+  'select(.status == "pass"
    and .device_count == 1
    and .gpu == "NVIDIA A100 80GB PCIe"
+   and (.max_error | type == "number")
    and .max_error <= 0.0001
-   and .context_manifest_sha256 == $context_manifest_sha256' >/dev/null
-echo "${HEALTH_JSON}" >"${RESULT_DIR}/native_health.json"
+   and .context_manifest_sha256 == $context_manifest_sha256)' \
+  "${RESULT_DIR}/native_health.raw.json" >"${RESULT_DIR}/native_health.json"
 COMPLETED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 atomic_json "${RESULT_DIR}/result.json" -n \
@@ -181,7 +182,7 @@ atomic_json "${RESULT_DIR}/result.json" -n \
   --arg context_manifest_sha256 "${EXPECTED_CONTEXT_MANIFEST_SHA256}" \
   --arg health_binary_sha256 "${EXPECTED_BINARY_SHA256}" \
   --argjson health_exit_code "${HEALTH_EXIT_CODE}" \
-  --argjson max_error "$(echo "${HEALTH_JSON}" | jq '.max_error')" \
+  --argjson max_error "$(jq '.max_error' "${RESULT_DIR}/native_health.json")" \
   '{
     status: $status,
     started_utc: $started_utc,

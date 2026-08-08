@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+source "${SCRIPT_DIR}/phase_helpers.sh"
 APT_LOCK="${ACE_APT_LOCK:-${SCRIPT_DIR}/configs/apt-packages.lock}"
 PYTHON_LOCK="${ACE_PYTHON_LOCK:-${SCRIPT_DIR}/configs/python-requirements-hashed.lock}"
 BASE_FILES_LOCK="${ACE_BASE_FILES_LOCK:-${SCRIPT_DIR}/configs/base-files.sha256}"
@@ -24,17 +25,7 @@ TIMINGS="${EVIDENCE}/bootstrap-timings.tsv"
 : >"${TIMINGS}"
 
 phase() {
-  local name="$1"
-  shift
-  local started ended status
-  started="$(date +%s)"
-  set +e
-  "$@"
-  status=$?
-  set -e
-  ended="$(date +%s)"
-  printf '%s\t%s\t%s\t%s\n' "${name}" "${started}" "${ended}" "$((ended - started))" >>"${TIMINGS}"
-  return "${status}"
+  run_timed_phase "${TIMINGS}" "$@"
 }
 
 verify_base() {

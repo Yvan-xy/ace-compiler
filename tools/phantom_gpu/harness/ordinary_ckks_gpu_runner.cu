@@ -761,7 +761,7 @@ double MaximumError(const std::vector<Complex>& left,
   return maximum;
 }
 
-void RunOwnership(const Json& fixture) {
+Json RunOwnership(const Json& fixture) {
   const LevelCoordinates levels = ContextLevelCoordinates();
   const std::size_t slots = Get_phantom_context_manifest()->_logical_slots;
   const auto x = ExpandInput(fixture.at("inputs").at("complex_x"), slots);
@@ -864,15 +864,12 @@ void RunOwnership(const Json& fixture) {
   }
   arena.FreeLiveObjects();
   RequireCuda(cudaDeviceSynchronize(), "ownership cudaDeviceSynchronize");
-  std::cout << Json({
-                        {"schema_version",
-                         "ace.phantom.ordinary_ckks.ownership/1.0.0"},
-                        {"status", "pass"},
-                        {"total_iterations", total_iterations},
-                        {"cases", std::move(reports)},
-                    })
-                   .dump()
-            << std::endl;
+  return {
+      {"schema_version", "ace.phantom.ordinary_ckks.ownership/1.0.0"},
+      {"status", "pass"},
+      {"total_iterations", total_iterations},
+      {"cases", std::move(reports)},
+  };
 }
 
 void RunRejection(const std::string& rejection_id, const Json& fixture) {
@@ -963,8 +960,8 @@ int main(int argc, char** argv) {
       if (argc != 5) Fail("conformance mode requires an output path");
       WriteJson(argv[4], RunConformance(fixture));
     } else if (mode == "ownership") {
-      if (argc != 4) Fail("ownership mode takes no fourth argument");
-      RunOwnership(fixture);
+      if (argc != 5) Fail("ownership mode requires an output path");
+      WriteJson(argv[4], RunOwnership(fixture));
     } else if (mode == "reject") {
       if (argc != 5) Fail("reject mode requires a rejection identifier");
       RunRejection(argv[4], fixture);

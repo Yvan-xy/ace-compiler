@@ -187,6 +187,7 @@ def result_archive(
     *,
     recorded_data_digest: str | None = None,
     include_nested_checksum: bool = False,
+    include_completeness: bool = True,
 ) -> Path:
     root = tmp_path / "archive-root"
     results = root / "results"
@@ -210,6 +211,21 @@ def result_archive(
         encoding="utf-8",
     )
     covered_paths = [data, pipeline]
+    if include_completeness:
+        completeness = results / "result-completeness.json"
+        completeness.write_text(
+            json.dumps(
+                {
+                    "schema_version": "ace.phantom.result-completeness/1.0.0",
+                    "status": "pass",
+                    "mode": "local",
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        covered_paths.append(completeness)
     if include_nested_checksum:
         nested_data = results / "qualification" / "inner.txt"
         nested_data.parent.mkdir()
@@ -261,7 +277,7 @@ def test_result_archive_verifier_checks_every_internal_entry(
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout)
     assert report["status"] == "pass"
-    assert report["verified_file_count"] == 2
+    assert report["verified_file_count"] == 3
 
 
 def test_result_archive_verifier_rejects_internal_hash_mismatch(
@@ -279,18 +295,29 @@ def test_result_archive_covers_nested_qualification_checksum(
     archive = result_archive(tmp_path, include_nested_checksum=True)
     result = run_result_archive_verifier(archive, tmp_path / "verified")
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["verified_file_count"] == 4
+    assert json.loads(result.stdout)["verified_file_count"] == 5
 
     source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
     assert "find . -type f ! -path ./SHA256SUMS -print0" in source
     assert "find . -type f ! -name SHA256SUMS -print0" not in source
 
 
+def test_result_archive_verifier_requires_success_completeness(
+    tmp_path: Path,
+) -> None:
+    archive = result_archive(tmp_path, include_completeness=False)
+    result = run_result_archive_verifier(archive, tmp_path / "rejected")
+    assert result.returncode != 0
+    assert "lacks its completeness record" in result.stderr
+
+
 def test_remote_pipeline_uses_the_packaged_frozen_cpu_reference() -> None:
     source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
     assert (
         "phase source_audit_and_extraction extract_sources\n"
+        "CURRENT_PHASE=qualification_environment\n"
         "configure_qualification_environment\n"
+        'CURRENT_PHASE=""\n'
         "phase qualification"
     ) in source
     assert 'cmp "${generated_context}" "${INPUT}/ordinary-context-manifest.json"' in source
@@ -370,6 +397,53 @@ def test_gpu_conformance_keeps_wrapper_addresses_unique() -> None:
         'for (const auto& family : fixture.at("case_families"))'
     )
     assert "ObjectArena arena;\n      CaseResult result" not in body
+
+
+def test_gpu_ownership_uses_explicit_json_and_dedicated_sanitizer_log() -> None:
+    runner = (TOOLS / "harness/ordinary_ckks_gpu_runner.cu").read_text(
+        encoding="utf-8"
+    )
+    ownership_start = runner.index("Json RunOwnership(const Json& fixture)")
+    ownership_end = runner.index("void RunRejection", ownership_start)
+    ownership_body = runner[ownership_start:ownership_end]
+    main_start = runner.index("int main(int argc, char** argv)")
+    main = runner[main_start:]
+    assert "std::cout" not in ownership_body
+    assert 'Fail("ownership mode requires an output path")' in main
+    assert "WriteJson(argv[4], RunOwnership(fixture));" in main
+
+    pipeline = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    start = pipeline.index("run_ordinary_gpu_qualification() {")
+    end = pipeline.index("\nrun_native_health() {", start)
+    body = pipeline[start:end]
+    assert 'compute-sanitizer --version >"${sanitizer_version}" 2>&1' in body
+    assert '--log-file "${sanitizer_log}"' in body
+    assert '"${ownership_json}" >"${sanitizer_stdout}"' in body
+    assert '2>"${sanitizer_stderr}"' in body
+    assert "tail -n 1" not in body
+    assert "ordinary_ckks_sanitizer.stdout.txt" in body
+    assert "ordinary_ckks_sanitizer.stderr.txt" in body
+    assert "ordinary_ckks_sanitizer.log.txt" in body
+    assert "validate-ownership" in body
+
+
+def test_nonzero_sanitizer_exit_precedes_evidence_acceptance() -> None:
+    source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    start = source.index("run_ordinary_gpu_qualification() {")
+    end = source.index("\nrun_native_health() {", start)
+    body = source[start:end]
+    exit_capture = body.index("local sanitizer_exit=$?")
+    nonzero_gate = body.index("if [[ ${sanitizer_exit} -ne 0 ]]", exit_capture)
+    exit_return = body.index('return "${sanitizer_exit}"', nonzero_gate)
+    summary_gate = body.index("zero_summary_count=", exit_return)
+    ownership_gate = body.index("validate-ownership", summary_gate)
+    assert (
+        exit_capture
+        < nonzero_gate
+        < exit_return
+        < summary_gate
+        < ownership_gate
+    )
 
 
 def test_source_packaging_requires_local_ordinary_evidence() -> None:
@@ -532,3 +606,148 @@ def test_host_freeze_packager_rejects_missing_required_arguments() -> None:
     )
     assert result.returncode == 2
     assert "--qualification-invocation FILE" in result.stderr
+
+
+def test_bootstrap_uses_failure_preserving_timed_phases() -> None:
+    source = (TOOLS / "bootstrap_environment.sh").read_text(encoding="utf-8")
+    phase_start = source.index("phase() {")
+    phase_end = source.index("\n}", phase_start) + 2
+    phase_body = source[phase_start:phase_end]
+
+    assert 'source "${SCRIPT_DIR}/phase_helpers.sh"' in source
+    assert 'run_timed_phase "${TIMINGS}" "$@"' in phase_body
+    assert "set +e" not in phase_body
+
+
+def test_pipeline_phase_wrapper_stops_at_first_failure(tmp_path: Path) -> None:
+    source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    phase_start = source.index("phase() {")
+    phase_end = source.index("\n}\n\nverify_outer_payload", phase_start) + 2
+    phase_function = source[phase_start:phase_end]
+    timings = tmp_path / "timings.tsv"
+    marker = tmp_path / "continued"
+    script = (
+        "set -euo pipefail\n"
+        f"source {TOOLS / 'phase_helpers.sh'}\n"
+        'TIMINGS="$1"\n'
+        "CURRENT_PHASE=initialization\nFAILED_PHASE=\"\"\n"
+        + phase_function
+        + "\nfail_then_continue() { false; touch \"$1\"; }\n"
+        + "set +e\nphase deliberate_failure fail_then_continue \"$2\"\n"
+        + "phase_exit=$?\nset -e\n"
+        + "[[ ${phase_exit} -ne 0 ]]\n[[ ! -e \"$2\" ]]\n"
+        + "[[ ${FAILED_PHASE} == deliberate_failure ]]\n"
+    )
+    subprocess.run(
+        ["bash", "-c", script, "phase-wrapper", str(timings), str(marker)],
+        check=True,
+    )
+    fields = timings.read_text(encoding="utf-8").strip().split("\t")
+    assert fields[0] == "deliberate_failure"
+    assert fields[-1] != "0"
+
+
+def test_shell_array_and_dependency_producers_have_checked_status() -> None:
+    pipeline = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    compile_only = (TOOLS / "compile_only.sh").read_text(encoding="utf-8")
+
+    assert "< <(" not in pipeline
+    assert "< <(" not in compile_only
+    assert 'qualification_arguments_output="$(' in pipeline
+    assert '-name .git -print0 |' in pipeline
+    assert 'done <"${dependency_git_dirs}"' in pipeline
+    assert 'checkout_commit="$(git -C "${checkout}" rev-parse HEAD)"' in pipeline
+    assert 'contract_context_output="$(' in compile_only
+
+
+def test_native_health_uses_an_explicit_json_artifact() -> None:
+    pipeline = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    legacy = (TOOLS / "run_a100_health.sh").read_text(encoding="utf-8")
+    harness = (TOOLS / "harness/native_phantom_health.cu").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'timeout 300 "${health_binary}" "${health_raw}"' in pipeline
+    assert '"${RESULT_DIR}/native_health.raw.json"' in legacy
+    assert "tail -n 1" not in pipeline[pipeline.index("run_native_health() {") :]
+    assert "tail -n 1" not in legacy
+    assert "usage: native_phantom_health OUTPUT.json" in harness
+    assert "std::ofstream result(argv[1]" in harness
+
+
+def test_runpod_success_completeness_requires_every_terminal_record(
+    tmp_path: Path,
+) -> None:
+    source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    start = source.index("verify_success_evidence() {")
+    end = source.index("\nphase payload_verification", start)
+    function = source[start:end]
+    results = tmp_path / "results"
+    results.mkdir()
+
+    records = {
+        "qualification-current.json": {
+            "gate": "ordinary",
+            "status": "pass",
+            "exit_code": 0,
+        },
+        "native-health.json": {"status": "pass", "device_count": 1},
+        "ordinary_ckks_compare.json": {
+            "status": "pass",
+            "case_count": 43,
+            "passing_case_count": 43,
+        },
+        "ordinary_ckks_diagnostics.json": {
+            "status": "pass",
+            "cases": [{"case_id": "expected-rejection"}],
+        },
+        "ordinary_ckks_ownership.json": {
+            "schema_version": "ace.phantom.ordinary_ckks.ownership/1.0.0",
+            "status": "pass",
+            "total_iterations": 500,
+        },
+        "ordinary_ckks_sanitizer.json": {
+            "status": "pass",
+            "exit_code": 0,
+        },
+    }
+    for name, record in records.items():
+        (results / name).write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    script = (
+        "set -euo pipefail\n"
+        + function
+        + '\nMODE=runpod\nRESULT_DIR="$1"\nverify_success_evidence\n'
+    )
+    passed = subprocess.run(
+        ["bash", "-c", script, "completeness-test", str(results)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert passed.returncode == 0, passed.stderr
+    assert json.loads(
+        (results / "result-completeness.json").read_text(encoding="utf-8")
+    ) == {
+        "schema_version": "ace.phantom.result-completeness/1.0.0",
+        "status": "pass",
+        "mode": "runpod",
+    }
+
+    (results / "ordinary_ckks_sanitizer.json").unlink()
+    (results / "result-completeness.json").unlink()
+    failed = subprocess.run(
+        ["bash", "-c", script, "completeness-test", str(results)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode != 0
+    assert not (results / "result-completeness.json").exists()
+
+
+def test_pipeline_failure_record_names_the_failed_phase() -> None:
+    source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    assert "FAILED_PHASE=\"\"" in source
+    assert 'FAILED_PHASE="${phase_name}"' in source
+    assert '"${RESULT_DIR}/pipeline-failure.json"' in source

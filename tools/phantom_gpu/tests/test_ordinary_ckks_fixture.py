@@ -287,6 +287,73 @@ def test_duplicate_json_keys_and_unknown_fixture_fields_are_rejected(
         ordinary.validate_fixture(fixture)
 
 
+def ownership_result(fixture: dict[str, object]) -> dict[str, object]:
+    cases = []
+    for expected in fixture["ownership_cases"]:  # type: ignore[index]
+        case = {
+            "id": expected["id"],
+            "iterations": expected["iterations"],
+            "status": "pass",
+        }
+        if "array_length" in expected:
+            case["array_length"] = expected["array_length"]
+        cases.append(case)
+    return {
+        "schema_version": ordinary.OWNERSHIP_SCHEMA,
+        "status": "pass",
+        "total_iterations": sum(case["iterations"] for case in cases),
+        "cases": cases,
+    }
+
+
+def test_ownership_result_is_strictly_bound_to_the_fixture() -> None:
+    fixture = ordinary.load_json(FIXTURE_PATH)
+    result = ownership_result(fixture)
+    assert ordinary.validate_ownership_result(result, fixture) == 500
+
+    missing = copy.deepcopy(result)
+    missing.pop("status")
+    with pytest.raises(ordinary.OrdinaryCkksError, match="missing keys"):
+        ordinary.validate_ownership_result(missing, fixture)
+
+    duplicated_case = copy.deepcopy(result)
+    duplicated_case["cases"][-1] = duplicated_case["cases"][0]
+    with pytest.raises(
+        ordinary.OrdinaryCkksError, match="does not match the fixture order"
+    ):
+        ordinary.validate_ownership_result(duplicated_case, fixture)
+
+    unexpected = copy.deepcopy(result)
+    unexpected["cases"][0]["unexpected"] = True
+    with pytest.raises(ordinary.OrdinaryCkksError, match="unknown keys"):
+        ordinary.validate_ownership_result(unexpected, fixture)
+
+    missing_array_length = copy.deepcopy(result)
+    del missing_array_length["cases"][2]["array_length"]
+    with pytest.raises(ordinary.OrdinaryCkksError, match="missing keys"):
+        ordinary.validate_ownership_result(missing_array_length, fixture)
+
+
+@pytest.mark.parametrize(
+    "text, diagnostic",
+    [
+        (
+            '{"schema_version":"one","schema_version":"two"}\n',
+            "duplicate JSON key",
+        ),
+        ('{"schema_version":\n', "cannot read JSON"),
+        ('{}\n{}\n', "cannot read JSON"),
+    ],
+)
+def test_ownership_json_parser_rejects_ambiguous_documents(
+    tmp_path: Path, text: str, diagnostic: str
+) -> None:
+    path = tmp_path / "ordinary_ckks_ownership.json"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ordinary.OrdinaryCkksError, match=diagnostic):
+        ordinary.load_json(path)
+
+
 def test_ownership_and_runtime_diagnostic_contracts_are_closed() -> None:
     fixture = ordinary.load_json(FIXTURE_PATH)
     ordinary.validate_fixture(fixture)

@@ -212,3 +212,97 @@ def test_failed_health_result_archive_is_readable_under_private_umask(
     with tarfile.open(archive_path, "r:gz") as archive:
         archived_state = json.load(archive.extractfile("result/state.json"))
     assert archived_state == {"status": "failed", "exit_code": 1}
+
+
+def test_health_runner_reads_the_explicit_json_artifact_not_stdout_tail(
+    tmp_path: Path,
+) -> None:
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    image_id = "sha256:" + "4" * 64
+    definition_sha = "5" * 64
+    context_sha = "6" * 64
+    registry_image = "registry.invalid/health@sha256:" + "8" * 64
+    health_binary = bundle_dir / "native_phantom_health_sm80"
+    health_binary.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' "
+        "'{\"status\":\"pass\",\"gpu\":\"NVIDIA A100 80GB PCIe\",'"
+        "'\"device_count\":1,\"max_error\":0.000001,'"
+        f"'\"context_manifest_sha256\":\"{context_sha}\"}}' >\"$1\"\n"
+        "echo 'health diagnostic before footer'\n"
+        "echo 'non-JSON footer'\n",
+        encoding="utf-8",
+    )
+    health_binary.chmod(0o755)
+    write_json(
+        bundle_dir / "bundle_manifest.json",
+        {
+            "development_image_id": image_id,
+            "development_definition_sha256": definition_sha,
+            "compiler_context_manifest_sha256": context_sha,
+            "health_binary_sha256": sha256(health_binary),
+            "registry_image": registry_image,
+            "health_timeout_seconds": 300,
+        },
+    )
+    (bundle_dir / "SHA256SUMS").write_text(
+        "".join(
+            f"{sha256(path)}  ./{path.name}\n"
+            for path in (
+                bundle_dir / "bundle_manifest.json",
+                health_binary,
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    nvidia_smi = fake_bin / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == -L ]]; then\n"
+        "  echo 'GPU 0: NVIDIA A100 80GB PCIe (UUID: GPU-test)'\n"
+        "else\n"
+        "  echo 'NVIDIA A100 80GB PCIe, GPU-test, 81920 MiB, 550.90, P0, 250 W'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "ACE_PHANTOM_IMAGE_ID": image_id,
+            "ACE_PHANTOM_DEFINITION_SHA256": definition_sha,
+            "ACE_PHANTOM_REGISTRY_IMAGE": registry_image,
+        }
+    )
+    result_dir = tmp_path / "result"
+    archive_path = tmp_path / "result.tar.gz"
+    result = run_with_private_umask(
+        [
+            "bash",
+            str(TOOLS_ROOT / "run_a100_health.sh"),
+            "--bundle-dir",
+            str(bundle_dir),
+            "--result-dir",
+            str(result_dir),
+            "--archive",
+            str(archive_path),
+        ],
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "non-JSON footer" in (
+        result_dir / "native_health.stdout.txt"
+    ).read_text(encoding="utf-8")
+    assert json.loads(
+        (result_dir / "native_health.json").read_text(encoding="utf-8")
+    )["status"] == "pass"
+    assert json.loads((result_dir / "state.json").read_text(encoding="utf-8")) == {
+        "status": "pass",
+        "exit_code": 0,
+    }

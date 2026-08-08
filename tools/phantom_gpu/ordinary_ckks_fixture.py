@@ -26,6 +26,7 @@ REFERENCE_SCHEMA = "ace.phantom.ordinary_ckks.cpu-reference/1.0.0"
 PROVIDER_SCHEMA = "ace.phantom.ordinary_ckks.provider-result/1.0.0"
 RAW_PROVIDER_SCHEMA = "ace.phantom.ordinary_ckks.raw-provider/1.0.0"
 COMPARE_SCHEMA = "ace.phantom.ordinary_ckks.compare/1.0.0"
+OWNERSHIP_SCHEMA = "ace.phantom.ordinary_ckks.ownership/1.0.0"
 INVOCATION_SCHEMA = "ace.phantom.compiler-invocation/1.0.0"
 QUALIFICATION_INVOCATION_SCHEMA = (
     "ace.phantom.qualification-invocation/1.0.0"
@@ -987,6 +988,59 @@ def validate_fixture(fixture: dict[str, Any]) -> None:
             fail(f"{context} static rejection cannot select a runtime diagnostic or runner")
     if rejection_ids != set(expected_rejections):
         fail("fixture.rejections does not contain the complete rejection contract")
+
+
+def validate_ownership_result(
+    ownership: dict[str, Any], fixture: dict[str, Any]
+) -> int:
+    """Validate the GPU ownership report against the complete frozen contract."""
+    validate_fixture(fixture)
+    value = _expect_keys(
+        ownership,
+        {"schema_version", "status", "total_iterations", "cases"},
+        "ownership result",
+    )
+    if value["schema_version"] != OWNERSHIP_SCHEMA:
+        fail("unsupported ownership result schema")
+    if value["status"] != "pass":
+        fail("ownership result status must be pass")
+    total_iterations = _integer(
+        value["total_iterations"], "ownership result.total_iterations", 1
+    )
+    cases = value["cases"]
+    expected_cases = fixture["ownership_cases"]
+    if not isinstance(cases, list):
+        fail("ownership result.cases must be an array")
+    if len(cases) != len(expected_cases):
+        fail("ownership result must contain every fixture case exactly once")
+
+    observed_total = 0
+    for position, (case, expected) in enumerate(zip(cases, expected_cases)):
+        context = f"ownership result.cases[{position}]"
+        required = {"id", "iterations", "status"}
+        if "array_length" in expected:
+            required.add("array_length")
+        report = _expect_keys(
+            case, required, context
+        )
+        if report["id"] != expected["id"]:
+            fail(f"{context}.id does not match the fixture order")
+        iterations = _integer(report["iterations"], f"{context}.iterations", 1)
+        if iterations != expected["iterations"]:
+            fail(f"{context}.iterations does not match the fixture")
+        if report["status"] != "pass":
+            fail(f"{context}.status must be pass")
+        if "array_length" in expected:
+            array_length = _integer(
+                report["array_length"], f"{context}.array_length", 1
+            )
+            if array_length != expected["array_length"]:
+                fail(f"{context}.array_length does not match the fixture")
+        observed_total += iterations
+
+    if total_iterations != observed_total:
+        fail("ownership result.total_iterations does not match its cases")
+    return total_iterations
 
 
 def load_fixture(
@@ -2087,6 +2141,12 @@ def parse_arguments() -> argparse.Namespace:
     verify_ant.add_argument("--cpu-json", required=True, type=Path)
     verify_ant.add_argument("--cpu-bin", required=True, type=Path)
     verify_ant.add_argument("--output-json", required=True, type=Path)
+
+    validate_ownership = subparsers.add_parser("validate-ownership")
+    validate_ownership.add_argument("--fixture", required=True, type=Path)
+    validate_ownership.add_argument(
+        "--ownership-json", required=True, type=Path
+    )
     return parser.parse_args()
 
 
@@ -2224,6 +2284,19 @@ def main() -> int:
                 )
             )
             return 0 if result["status"] == "pass" else 1
+        elif arguments.command == "validate-ownership":
+            fixture = load_json(arguments.fixture)
+            ownership = load_json(arguments.ownership_json)
+            total_iterations = validate_ownership_result(ownership, fixture)
+            print(
+                json.dumps(
+                    {
+                        "status": "pass",
+                        "total_iterations": total_iterations,
+                    },
+                    sort_keys=True,
+                )
+            )
         else:
             result = compare_results(
                 arguments.fixture,
