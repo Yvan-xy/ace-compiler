@@ -10,7 +10,7 @@ WORK=""
 RESULT_ARCHIVE=""
 
 usage() {
-  echo "usage: $0 --mode <local|runpod> --input-dir DIR --work-dir DIR --result-archive FILE" >&2
+  echo "usage: $0 --mode <freeze-host|local|runpod> --input-dir DIR --work-dir DIR --result-archive FILE" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -22,7 +22,8 @@ while [[ $# -gt 0 ]]; do
     *) usage; exit 2 ;;
   esac
 done
-if [[ "${MODE}" != "local" && "${MODE}" != "runpod" ]] ||
+if [[ "${MODE}" != "freeze-host" && "${MODE}" != "local" &&
+      "${MODE}" != "runpod" ]] ||
    [[ -z "${INPUT}" || -z "${WORK}" || -z "${RESULT_ARCHIVE}" ]]; then
   usage
   exit 2
@@ -56,7 +57,7 @@ finalize() {
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${RESULT_DIR}/pipeline-result.json"
   (
     cd "${RESULT_DIR}"
-    find . -type f ! -name SHA256SUMS -print0 |
+    find . -type f ! -path ./SHA256SUMS -print0 |
       LC_ALL=C sort -z |
       xargs -0 -r sha256sum >SHA256SUMS
   )
@@ -98,9 +99,71 @@ bootstrap() {
 }
 
 extract_sources() {
-  local ace_archive phantom_archive
+  local ace_archive phantom_archive ace_manifest_sha phantom_manifest_sha
+  python3 - "${INPUT}/payload.json" \
+    "${INPUT}/ace-source.manifest.json" \
+    "${INPUT}/phantom-source.manifest.json" <<'PY'
+import hashlib
+import json
+from pathlib import Path, PurePosixPath
+import re
+import sys
+
+payload_path, ace_path, phantom_path = map(Path, sys.argv[1:4])
+
+def reject_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise SystemExit(f"duplicate JSON key in source payload: {key}")
+        value[key] = item
+    return value
+
+def load(path):
+    value = json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicates
+    )
+    if not isinstance(value, dict):
+        raise SystemExit(f"source payload record is not an object: {path.name}")
+    return value
+
+payload = load(payload_path)
+manifests = {"ace": (ace_path, load(ace_path)),
+             "phantom": (phantom_path, load(phantom_path))}
+expected_source_bindings = {}
+for kind, (path, manifest) in manifests.items():
+    commit = manifest.get("commit")
+    archive = manifest.get("archive")
+    if (
+        manifest.get("schema_version") != "1.0.0"
+        or manifest.get("kind") != kind
+        or not isinstance(commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+        or archive != f"{kind}-source-{commit}.tar.gz"
+        or PurePosixPath(archive).name != archive
+    ):
+        raise SystemExit(f"invalid {kind} source manifest identity")
+    if payload.get(f"{kind}_commit") != commit:
+        raise SystemExit(f"payload does not bind the {kind} source commit")
+    expected_source_bindings[f"{kind}_manifest_sha256"] = hashlib.sha256(
+        path.read_bytes()
+    ).hexdigest()
+if payload.get("source_snapshots") != expected_source_bindings:
+    raise SystemExit("payload does not bind the exact source manifests")
+PY
   ace_archive="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "${INPUT}/ace-source.manifest.json")"
   phantom_archive="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "${INPUT}/phantom-source.manifest.json")"
+  ace_manifest_sha="$(sha256sum "${INPUT}/ace-source.manifest.json" | awk '{print $1}')"
+  phantom_manifest_sha="$(sha256sum "${INPUT}/phantom-source.manifest.json" | awk '{print $1}')"
+  jq -e \
+    --arg ace_commit "$(jq -er .commit "${INPUT}/ace-source.manifest.json")" \
+    --arg phantom_commit "$(jq -er .commit "${INPUT}/phantom-source.manifest.json")" \
+    --arg ace_manifest_sha "${ace_manifest_sha}" \
+    --arg phantom_manifest_sha "${phantom_manifest_sha}" \
+    '.ace_commit == $ace_commit and .phantom_commit == $phantom_commit
+     and .source_snapshots.ace_manifest_sha256 == $ace_manifest_sha
+     and .source_snapshots.phantom_manifest_sha256 == $phantom_manifest_sha' \
+    "${INPUT}/payload.json" >/dev/null
   python3 "${INPUT}/source_archive.py" audit \
     --kind ace \
     --archive "${INPUT}/${ace_archive}" \
@@ -116,11 +179,12 @@ extract_sources() {
 }
 
 configure_qualification_environment() {
-  local ace_commit source_manifest_sha bootstrap_sha
+  local ace_commit source_manifest_sha provider_manifest_sha bootstrap_sha
   ace_commit="$(jq -er .commit "${INPUT}/ace-source.manifest.json")"
   export SOURCE_DATE_EPOCH
   SOURCE_DATE_EPOCH="$(jq -er .commit_timestamp "${INPUT}/ace-source.manifest.json")"
   source_manifest_sha="$(sha256sum "${INPUT}/ace-source.manifest.json" | awk '{print $1}')"
+  provider_manifest_sha="$(sha256sum "${INPUT}/phantom-source.manifest.json" | awk '{print $1}')"
   bootstrap_sha="$(sha256sum "${INPUT}/bootstrap_environment.sh" | awk '{print $1}')"
   export PATH="/opt/ace-runpod-venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   export LD_LIBRARY_PATH="/usr/local/cuda/lib64"
@@ -135,32 +199,146 @@ configure_qualification_environment() {
   export ACE_PHANTOM_ACE_COMMIT="${ace_commit}"
   export ACE_PHANTOM_SOURCE_MANIFEST="${INPUT}/ace-source.manifest.json"
   export ACE_PHANTOM_SOURCE_MANIFEST_SHA256="${source_manifest_sha}"
+  export ACE_PHANTOM_PROVIDER_SOURCE_MANIFEST="${INPUT}/phantom-source.manifest.json"
+  export ACE_PHANTOM_PROVIDER_SOURCE_MANIFEST_SHA256="${provider_manifest_sha}"
   export ACE_RUNPOD_BOOTSTRAP_SHA256="${bootstrap_sha}"
   export ACE_PHANTOM_BUILD_JOBS="${ACE_PHANTOM_BUILD_JOBS:-$(nproc)}"
 }
 
 run_qualification() {
-  local poly_degree mul_level input_level security_level scaling_bits first_prime_bits hamming_weight
-  poly_degree="$(jq -er '.compiler_context_options.poly_degree' "${INPUT}/payload.json")"
-  mul_level="$(jq -er '.compiler_context_options.mul_level' "${INPUT}/payload.json")"
-  input_level="$(jq -er '.compiler_context_options.input_level' "${INPUT}/payload.json")"
-  security_level="$(jq -er '.compiler_context_options.security_level' "${INPUT}/payload.json")"
-  scaling_bits="$(jq -er '.compiler_context_options.scaling_factor_bits' "${INPUT}/payload.json")"
-  first_prime_bits="$(jq -er '.compiler_context_options.first_prime_bits' "${INPUT}/payload.json")"
-  hamming_weight="$(jq -er '.compiler_context_options.hamming_weight' "${INPUT}/payload.json")"
-  bash "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/compile_only.sh" --gate ordinary \
-    --poly-degree "${poly_degree}" \
-    --mul-level "${mul_level}" \
-    --input-level "${input_level}" \
-    --security-level "${security_level}" \
-    --scaling-factor-bits "${scaling_bits}" \
-    --first-prime-bits "${first_prime_bits}" \
-    --hamming-weight "${hamming_weight}" \
+  local -a invocation_validation_arguments=(
+    "${INPUT}/qualification-invocation.json"
+    "${INPUT}/payload.json"
+  )
+  if [[ "${MODE}" != "freeze-host" ]]; then
+    invocation_validation_arguments+=("${INPUT}/compiler-invocation.json")
+  fi
+  python3 - "${invocation_validation_arguments[@]}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+invocation_path = Path(sys.argv[1])
+payload_path = Path(sys.argv[2])
+compiler_invocation_path = Path(sys.argv[3]) if len(sys.argv) == 4 else None
+def reject_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise SystemExit(f"duplicate JSON key in packaged evidence: {key}")
+        value[key] = item
+    return value
+
+invocation = json.loads(
+    invocation_path.read_text(encoding="utf-8"),
+    object_pairs_hook=reject_duplicates,
+)
+payload = json.loads(
+    payload_path.read_text(encoding="utf-8"),
+    object_pairs_hook=reject_duplicates,
+)
+if not isinstance(payload, dict):
+    raise SystemExit("packaged payload must be a JSON object")
+if compiler_invocation_path is None:
+    if set(payload) != {
+        "schema_version", "ace_commit", "phantom_commit", "source_snapshots",
+        "qualification_invocation", "contents", "files",
+    }:
+        raise SystemExit("host-freeze payload has an invalid shape")
+    if (
+        payload["schema_version"]
+        != "ace.phantom.host-freeze-payload/1.0.0"
+        or payload["contents"]
+        != "audited-source-snapshots-and-qualification-invocation-only"
+    ):
+        raise SystemExit("host-freeze payload has an invalid schema or contents")
+if not isinstance(invocation, dict) or set(invocation) != {
+    "schema_version", "argv", "normalized_argv_sha256"
+}:
+    raise SystemExit("packaged qualification invocation has an invalid shape")
+if invocation["schema_version"] != "ace.phantom.qualification-invocation/1.0.0":
+    raise SystemExit("packaged qualification invocation has an unsupported schema")
+argv = invocation["argv"]
+if not isinstance(argv, list) or not all(
+    isinstance(value, str) and value for value in argv
+):
+    raise SystemExit("packaged qualification invocation argv must be a nonempty string array")
+normalized = json.dumps(
+    argv, ensure_ascii=False, separators=(",", ":")
+).encode("utf-8")
+normalized_sha = hashlib.sha256(normalized).hexdigest()
+record_sha = hashlib.sha256(invocation_path.read_bytes()).hexdigest()
+if normalized_sha != invocation["normalized_argv_sha256"]:
+    raise SystemExit("packaged qualification invocation normalized hash mismatch")
+payload_invocation = payload.get("qualification_invocation", {})
+if payload_invocation != {
+    "sha256": record_sha,
+    "normalized_argv_sha256": normalized_sha,
+}:
+    raise SystemExit("payload does not bind the packaged qualification invocation")
+if not argv or argv[0] != "tools/phantom_gpu/compile_only.sh":
+    raise SystemExit("packaged compiler invocation has an unexpected executable")
+arguments = argv[1:]
+if len(arguments) % 2:
+    raise SystemExit("packaged compiler invocation has an argument without a value")
+pairs = dict(zip(arguments[0::2], arguments[1::2]))
+expected_options = {
+    "--gate", "--poly-degree", "--mul-level", "--input-level",
+    "--security-level", "--scaling-factor-bits", "--first-prime-bits",
+    "--hamming-weight",
+}
+if len(pairs) != len(arguments) // 2 or set(pairs) != expected_options:
+    raise SystemExit("packaged compiler invocation options are incomplete or duplicated")
+if pairs["--gate"] != "ordinary":
+    raise SystemExit("packaged compiler invocation is not the ordinary qualification")
+for option in expected_options - {"--gate"}:
+    if re.fullmatch(r"[0-9]+", pairs[option]) is None:
+        raise SystemExit(f"packaged compiler invocation {option} is not an integer")
+
+if compiler_invocation_path is not None:
+    compiler_invocation = json.loads(
+        compiler_invocation_path.read_text(encoding="utf-8"),
+        object_pairs_hook=reject_duplicates,
+    )
+    if not isinstance(compiler_invocation, dict):
+        raise SystemExit("packaged compiler invocation must be a JSON object")
+    compiler_argv = compiler_invocation.get("argv")
+    compiler_normalized = json.dumps(
+        compiler_argv, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    compiler_normalized_sha = hashlib.sha256(compiler_normalized).hexdigest()
+    if (
+        set(compiler_invocation)
+        != {"schema_version", "argv", "normalized_argv_sha256"}
+        or compiler_invocation.get("schema_version")
+        != "ace.phantom.compiler-invocation/1.0.0"
+        or compiler_invocation.get("normalized_argv_sha256")
+        != compiler_normalized_sha
+        or not isinstance(compiler_argv, list)
+        or not compiler_argv
+        or compiler_argv[0] != "tools/phantom_gpu/generate_ckks2c_probe.py"
+    ):
+        raise SystemExit("packaged compiler invocation is invalid")
+    if payload.get("compiler_invocation") != {
+        "sha256": hashlib.sha256(compiler_invocation_path.read_bytes()).hexdigest(),
+        "normalized_argv_sha256": compiler_normalized_sha,
+    }:
+        raise SystemExit("payload does not bind the packaged compiler invocation")
+PY
+  local -a qualification_arguments
+  mapfile -t qualification_arguments \
+    < <(jq -er '.argv[1:][]' "${INPUT}/qualification-invocation.json")
+  bash "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/compile_only.sh" \
+    "${qualification_arguments[@]}" \
     2>&1 | tee "${RESULT_DIR}/qualification.log"
   local current run_root
   current="${ACE_PHANTOM_STATE_ROOT}/compile_only_results/current-ordinary.json"
   run_root="$(jq -er '.run_root' "${current}")"
   [[ "$(jq -er '.status' "${current}")" == pass ]]
+  cmp "${run_root}/qualification_invocation.json" \
+    "${INPUT}/qualification-invocation.json"
   cp -a "${run_root}" "${RESULT_DIR}/qualification"
   cp "${current}" "${RESULT_DIR}/qualification-current.json"
   for cache in \
@@ -179,20 +357,59 @@ run_qualification() {
     printf '%s\t%s\n' "${checkout#${WORK}/}" "$(git -C "${checkout}" rev-parse HEAD)" \
       >>"${RESULT_DIR}/public-dependency-commits.txt"
   done < <(find "${ACE_PHANTOM_STATE_ROOT}" -type d -name .git -print | LC_ALL=C sort)
+  if [[ "${MODE}" == "freeze-host" ]]; then
+    local qualification_manifest_sha qualification_sums_sha
+    qualification_manifest_sha="$(sha256sum "${run_root}/manifest.json" | awk '{print $1}')"
+    qualification_sums_sha="$(sha256sum "${run_root}/SHA256SUMS" | awk '{print $1}')"
+    jq -n \
+      --arg status candidate \
+      --arg ace_commit "$(jq -er .commit "${INPUT}/ace-source.manifest.json")" \
+      --arg phantom_commit "$(jq -er .commit "${INPUT}/phantom-source.manifest.json")" \
+      --arg qualification_manifest_sha256 "${qualification_manifest_sha}" \
+      --arg qualification_sha256_manifest_sha256 "${qualification_sums_sha}" \
+      '{schema_version:"ace.phantom.host-freeze-candidate/1.0.0",
+        status:$status, evidence_path:"qualification",
+        ace_commit:$ace_commit, phantom_commit:$phantom_commit,
+        qualification_manifest_sha256:$qualification_manifest_sha256,
+        qualification_sha256_manifest_sha256:$qualification_sha256_manifest_sha256}' \
+      >"${RESULT_DIR}/host-freeze-candidate.json"
+  fi
 }
 
 verify_frozen_ordinary_reference() {
   local run_root ordinary_dir generated_context generated_resources
   local context_sha resources_sha fixture_sha cpu_reference_sha cpu_values_sha
-  local ant_verification_sha
+  local ant_verification_sha expected_case_count
   run_root="$(jq -er '.run_root' \
     "${ACE_PHANTOM_STATE_ROOT}/compile_only_results/current-ordinary.json")"
   ordinary_dir="${run_root}/ordinary_ckks"
   generated_context="${run_root}/ckks2c/compiler_context_manifest.json"
   generated_resources="${run_root}/ckks2c/compiler_resource_manifest.json"
+  cmp "${run_root}/qualification_invocation.json" \
+    "${INPUT}/qualification-invocation.json"
+  cmp "${run_root}/compiler_invocation.json" \
+    "${INPUT}/compiler-invocation.json"
   cmp "${generated_context}" "${INPUT}/ordinary-context-manifest.json"
   cmp "${generated_resources}" "${INPUT}/ordinary-resource-manifest.json"
+  cmp "${run_root}/ckks2c/ordinary_ckks_post_ckks.air" \
+    "${INPUT}/ordinary-post-ckks.air"
   cmp "${ordinary_dir}/ordinary_ckks_v1.json" "${INPUT}/ordinary-fixture.json"
+  local relative expected_sha actual_sha
+  for relative in \
+    ckks2c/add_mul_rotate.cu \
+    ckks2c/ordinary_runtime_symbols.cu \
+    ordinary_ckks/ordinary_ckks_keyless_probe.cu \
+    ordinary_ckks/ordinary_ckks_analytic_reference.json \
+    ordinary_ckks/ordinary_ckks_analytic_values.bin; do
+    expected_sha="$(jq -er --arg path "${relative}" \
+      '.files[$path] | select(type == "string")' \
+      "${INPUT}/ordinary-artifact-manifest.json")"
+    actual_sha="$(sha256sum "${run_root}/${relative}" | awk '{print $1}')"
+    if [[ "${actual_sha}" != "${expected_sha}" ]]; then
+      echo "regenerated production source differs from frozen evidence: ${relative}" >&2
+      return 1
+    fi
+  done
 
   context_sha="$(sha256sum "${INPUT}/ordinary-context-manifest.json" | awk '{print $1}')"
   resources_sha="$(sha256sum "${INPUT}/ordinary-resource-manifest.json" | awk '{print $1}')"
@@ -200,6 +417,15 @@ verify_frozen_ordinary_reference() {
   cpu_reference_sha="$(sha256sum "${INPUT}/ordinary-cpu-reference.json" | awk '{print $1}')"
   cpu_values_sha="$(sha256sum "${INPUT}/ordinary-cpu-values.bin" | awk '{print $1}')"
   ant_verification_sha="$(sha256sum "${INPUT}/ordinary-ant-verification.json" | awk '{print $1}')"
+  local post_ckks_air_sha artifact_manifest_sha run_manifest_sha
+  local host_qualification_sha
+  post_ckks_air_sha="$(sha256sum "${INPUT}/ordinary-post-ckks.air" | awk '{print $1}')"
+  artifact_manifest_sha="$(sha256sum "${INPUT}/ordinary-artifact-manifest.json" | awk '{print $1}')"
+  run_manifest_sha="$(sha256sum "${INPUT}/ordinary-run-manifest.json" | awk '{print $1}')"
+  host_qualification_sha="$(sha256sum "${INPUT}/ordinary-host-qualification.json" | awk '{print $1}')"
+  expected_case_count="$(jq -er \
+    '[.case_families[].aliases | length] | add | select(. > 0)' \
+    "${INPUT}/ordinary-fixture.json")"
   jq -e \
     --arg context_sha "${context_sha}" \
     --arg resources_sha "${resources_sha}" \
@@ -207,15 +433,27 @@ verify_frozen_ordinary_reference() {
     --arg cpu_reference_sha "${cpu_reference_sha}" \
     --arg cpu_values_sha "${cpu_values_sha}" \
     --arg ant_verification_sha "${ant_verification_sha}" \
+    --arg post_ckks_air_sha "${post_ckks_air_sha}" \
+    --arg artifact_manifest_sha "${artifact_manifest_sha}" \
+    --arg run_manifest_sha "${run_manifest_sha}" \
+    --arg host_qualification_sha "${host_qualification_sha}" \
     '.frozen_ordinary_reference.context_manifest_sha256 == $context_sha
      and .frozen_ordinary_reference.resource_manifest_sha256 == $resources_sha
      and .frozen_ordinary_reference.fixture_sha256 == $fixture_sha
      and .frozen_ordinary_reference.cpu_reference_sha256 == $cpu_reference_sha
      and .frozen_ordinary_reference.cpu_values_sha256 == $cpu_values_sha
-     and .frozen_ordinary_reference.ant_verification_sha256 == $ant_verification_sha' \
+     and .frozen_ordinary_reference.ant_verification_sha256 == $ant_verification_sha
+     and .frozen_ordinary_reference.post_ckks_air_sha256 == $post_ckks_air_sha
+     and .frozen_ordinary_reference.artifact_manifest_sha256 == $artifact_manifest_sha
+     and .frozen_ordinary_reference.run_manifest_sha256 == $run_manifest_sha
+     and .frozen_ordinary_reference.host_qualification_sha256 == $host_qualification_sha' \
     "${INPUT}/payload.json" >/dev/null
-  jq -e '.status == "pass" and .case_count == 43' \
+  jq -e --argjson expected_case_count "${expected_case_count}" \
+    '.status == "pass" and .case_count == $expected_case_count' \
     "${INPUT}/ordinary-ant-verification.json" >/dev/null
+  jq -e --argjson expected_case_count "${expected_case_count}" \
+    '.status == "pass" and .case_count == $expected_case_count' \
+    "${ordinary_dir}/ordinary_ckks_ant_verification.json" >/dev/null
   python3 "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/ordinary_ckks_fixture.py" \
     verify-ant-reference \
     --fixture "${INPUT}/ordinary-fixture.json" \
@@ -223,7 +461,8 @@ verify_frozen_ordinary_reference() {
     --cpu-json "${INPUT}/ordinary-cpu-reference.json" \
     --cpu-bin "${INPUT}/ordinary-cpu-values.bin" \
     --output-json "${RESULT_DIR}/ordinary-frozen-ant-verification.json"
-  jq -e '.status == "pass" and .case_count == 43' \
+  jq -e --argjson expected_case_count "${expected_case_count}" \
+    '.status == "pass" and .case_count == $expected_case_count' \
     "${RESULT_DIR}/ordinary-frozen-ant-verification.json" >/dev/null
   jq -n \
     --arg status pass \
@@ -250,7 +489,7 @@ verify_frozen_ordinary_reference() {
 run_ordinary_gpu_qualification() {
   local expected_gpu run_root ordinary_dir context_manifest fixture
   local cpu_reference cpu_values runner keyless_runner raw_results
-  local gpu_results gpu_values comparison
+  local gpu_results gpu_values comparison expected_case_count
   expected_gpu="${ACE_RUNPOD_EXPECTED_GPU_NAME:-}"
   case "${expected_gpu}" in
     "NVIDIA A100 80GB PCIe"|"NVIDIA A100-SXM4-80GB") ;;
@@ -278,6 +517,9 @@ run_ordinary_gpu_qualification() {
   gpu_results="${RESULT_DIR}/ordinary_ckks_gpu_results.json"
   gpu_values="${RESULT_DIR}/ordinary_ckks_gpu_values.bin"
   comparison="${RESULT_DIR}/ordinary_ckks_compare.json"
+  expected_case_count="$(jq -er \
+    '[.case_families[].aliases | length] | add | select(. > 0)' \
+    "${fixture}")"
   cp "${context_manifest}" "${RESULT_DIR}/compiler_context_manifest.json"
   cp "${INPUT}/ordinary-resource-manifest.json" \
     "${RESULT_DIR}/compiler_resource_manifest.json"
@@ -300,13 +542,32 @@ run_ordinary_gpu_qualification() {
     --cpu-json "${cpu_reference}" --cpu-bin "${cpu_values}" \
     --gpu-json "${gpu_results}" --gpu-bin "${gpu_values}" \
     --output-json "${comparison}"
-  jq -e '.status == "pass" and .case_count == 43 and .passing_case_count == 43' \
+  jq -e --argjson expected_case_count "${expected_case_count}" \
+    '.status == "pass"
+     and .case_count == $expected_case_count
+     and .passing_case_count == $expected_case_count' \
     "${comparison}" >/dev/null
 
   local diagnostics="${RESULT_DIR}/ordinary_ckks_diagnostics.jsonl"
+  local runtime_rejections="${RESULT_DIR}/ordinary_runtime_rejections.tsv"
   : >"${diagnostics}"
-  local case_id expected_token selected_runner exit_code stdout_file stderr_file
-  while IFS=$'\t' read -r case_id expected_token selected_runner; do
+  jq -er '
+    .rejections[]
+    | select(.phase == "runtime")
+    | [.id, .diagnostic_id, .provider_diagnostic, .runner_profile]
+    | @tsv
+  ' "${fixture}" >"${runtime_rejections}"
+  local case_id diagnostic_id expected_token runner_profile selected_runner
+  local exit_code stdout_file stderr_file
+  while IFS=$'\t' read -r case_id diagnostic_id expected_token runner_profile; do
+    case "${runner_profile}" in
+      ordinary) selected_runner="${runner}" ;;
+      keyless) selected_runner="${keyless_runner}" ;;
+      *)
+        echo "unsupported runtime rejection runner profile ${runner_profile}" >&2
+        return 1
+        ;;
+    esac
     stdout_file="${RESULT_DIR}/reject-${case_id}.stdout.txt"
     stderr_file="${RESULT_DIR}/reject-${case_id}.stderr.txt"
     ulimit -c 0
@@ -324,24 +585,24 @@ run_ordinary_gpu_qualification() {
       echo "runtime rejection ${case_id} missed ${expected_token}" >&2
       return 1
     fi
-    jq -cn --arg case_id "${case_id}" --arg diagnostic "${expected_token}" \
+    jq -cn --arg case_id "${case_id}" --arg diagnostic_id "${diagnostic_id}" \
+      --arg provider_diagnostic "${expected_token}" \
       --argjson exit_code "${exit_code}" \
-      '{case_id:$case_id, diagnostic:$diagnostic, exit_code:$exit_code, status:"pass"}' \
+      '{case_id:$case_id, diagnostic_id:$diagnostic_id,
+        provider_diagnostic:$provider_diagnostic,
+        exit_code:$exit_code, status:"pass"}' \
       >>"${diagnostics}"
-  done <<EOF
-bottom_modswitch	MODSWITCH_BOTTOM_CHAIN	${runner}
-bottom_rescale	RESCALE_BOTTOM_CHAIN	${runner}
-double_free	DOUBLE_FREE_CIPHER	${runner}
-invalid_ciphertext_size	QUERY_SIZE	${runner}
-missing_loaded_relin_key	RELIN_KEY_MISSING	${keyless_runner}
-missing_loaded_rotation_key	ROTATE_KEY_MISSING	${keyless_runner}
-relinearize_size2	RELIN_SIZE	${runner}
-runtime_level_mismatch	ADD_COMPAT	${runner}
-runtime_scale_mismatch	ADD_COMPAT	${runner}
-use_after_free	USE_AFTER_FREE_CIPHER	${runner}
-EOF
+  done <"${runtime_rejections}"
   jq -s '{schema_version:"1.0.0", status:"pass", cases:.}' \
     "${diagnostics}" >"${RESULT_DIR}/ordinary_ckks_diagnostics.json"
+  jq -e --slurpfile fixture "${fixture}" '
+    .status == "pass"
+    and ([.cases[]
+          | {case_id, diagnostic_id, provider_diagnostic}]
+         == [$fixture[0].rejections[]
+             | select(.phase == "runtime")
+             | {case_id:.id, diagnostic_id, provider_diagnostic}])
+  ' "${RESULT_DIR}/ordinary_ckks_diagnostics.json" >/dev/null
   rm "${diagnostics}"
 
   set +e
@@ -357,9 +618,24 @@ EOF
   fi
   rg -Fq 'ERROR SUMMARY: 0 errors' \
     "${RESULT_DIR}/ordinary_ckks_sanitizer.stderr.txt"
+  local ownership_json="${RESULT_DIR}/ordinary_ckks_ownership.json"
+  tail -n 1 "${RESULT_DIR}/ordinary_ckks_sanitizer.stdout.txt" \
+    >"${ownership_json}"
+  jq -e --slurpfile fixture "${fixture}" '
+    .schema_version == "ace.phantom.ordinary_ckks.ownership/1.0.0"
+    and .status == "pass"
+    and ([.cases[] | {id, iterations, array_length:(.array_length // null)}]
+         == [$fixture[0].ownership_cases[]
+             | {id, iterations, array_length:(.array_length // null)}])
+    and .total_iterations == ([$fixture[0].ownership_cases[].iterations] | add)
+  ' "${ownership_json}" >/dev/null
+  local ownership_iterations
+  ownership_iterations="$(jq -er '.total_iterations' "${ownership_json}")"
   jq -n --arg status pass --arg tool memcheck --argjson exit_code 0 \
+    --argjson ownership_iterations "${ownership_iterations}" \
     '{schema_version:"1.0.0", status:$status, tool:$tool,
-      error_summary:0, exit_code:$exit_code, ownership_iterations:100}' \
+      error_summary:0, exit_code:$exit_code,
+      ownership_iterations:$ownership_iterations}' \
     >"${RESULT_DIR}/ordinary_ckks_sanitizer.json"
   rm "${raw_results}"
 }
@@ -412,12 +688,14 @@ export PATH="/opt/ace-runpod-venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/l
 phase source_audit_and_extraction extract_sources
 configure_qualification_environment
 phase qualification run_qualification
-phase frozen_ordinary_reference verify_frozen_ordinary_reference
-if [[ "${MODE}" == "runpod" ]]; then
-  phase native_a100_health run_native_health
-  phase ordinary_gpu_qualification run_ordinary_gpu_qualification
-else
-  printf '{"status":"skipped","reason":"local host has no GPU"}\n' \
-    >"${RESULT_DIR}/native-health.json"
+if [[ "${MODE}" != "freeze-host" ]]; then
+  phase frozen_ordinary_reference verify_frozen_ordinary_reference
+  if [[ "${MODE}" == "runpod" ]]; then
+    phase native_a100_health run_native_health
+    phase ordinary_gpu_qualification run_ordinary_gpu_qualification
+  else
+    printf '{"status":"skipped","reason":"local host has no GPU"}\n' \
+      >"${RESULT_DIR}/native-health.json"
+  fi
 fi
 PIPELINE_EXIT=0

@@ -19,6 +19,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--context-manifest", required=True, type=Path)
     parser.add_argument("--resource-manifest", required=True, type=Path)
+    parser.add_argument("--post-ckks-air", type=Path)
     parser.add_argument("--poly-degree", required=True, type=int)
     parser.add_argument("--mul-level", required=True, type=int)
     parser.add_argument("--input-level", required=True, type=int)
@@ -48,7 +49,10 @@ def main() -> int:
         arguments.output,
         arguments.context_manifest,
         arguments.resource_manifest,
+        arguments.post_ckks_air,
     ):
+        if output_path is None:
+            continue
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fhe_parameters = {
@@ -105,6 +109,13 @@ def main() -> int:
     if not source:
         raise SystemExit("CKKS2C returned empty source")
 
+    if arguments.post_ckks_air is not None:
+        if arguments.post_ckks_air.suffix != ".air":
+            raise SystemExit("post-CKKS AIR output must use the .air suffix")
+        post_ckks_air = result.air_dumps.get("ckks_driver", "")
+        if not post_ckks_air:
+            raise SystemExit("CKKS2C returned no post-CKKS AIR dump")
+        arguments.post_ckks_air.write_text(post_ckks_air, encoding="utf-8")
     arguments.output.write_text(source, encoding="utf-8")
     print(f"generated {arguments.output} ({len(source.encode('utf-8'))} bytes)")
     return 0

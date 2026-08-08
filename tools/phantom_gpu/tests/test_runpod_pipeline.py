@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
+import tarfile
 
 import pytest
 
@@ -179,6 +182,110 @@ bash -c "${remote_command}"
     assert result.stdout == expected
 
 
+def result_archive(
+    tmp_path: Path,
+    *,
+    recorded_data_digest: str | None = None,
+    include_nested_checksum: bool = False,
+) -> Path:
+    root = tmp_path / "archive-root"
+    results = root / "results"
+    results.mkdir(parents=True)
+    data = results / "data.txt"
+    data.write_text("qualified\n", encoding="utf-8")
+    pipeline = results / "pipeline-result.json"
+    pipeline.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0.0",
+                "status": "pass",
+                "mode": "local",
+                "exit_code": 0,
+                "started_utc": "2026-08-07T00:00:00Z",
+                "completed_utc": "2026-08-07T00:00:01Z",
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    covered_paths = [data, pipeline]
+    if include_nested_checksum:
+        nested_data = results / "qualification" / "inner.txt"
+        nested_data.parent.mkdir()
+        nested_data.write_bytes(b"inner")
+        nested_checksum = results / "qualification" / "SHA256SUMS"
+        nested_checksum.write_text(
+            f"{hashlib.sha256(b'inner').hexdigest()}  inner.txt\n",
+            encoding="utf-8",
+        )
+        covered_paths.extend((nested_data, nested_checksum))
+    entries = []
+    for path in covered_paths:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if path == data and recorded_data_digest is not None:
+            digest = recorded_data_digest
+        entries.append(f"{digest}  {path.relative_to(results)}\n")
+    (results / "SHA256SUMS").write_text("".join(entries), encoding="utf-8")
+    archive = tmp_path / "result.tar.gz"
+    with tarfile.open(archive, "w:gz") as output:
+        output.add(results, arcname="results")
+    return archive
+
+
+def run_result_archive_verifier(
+    archive: Path, extraction: Path
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'set -euo pipefail; source "$1"; '
+            'verify_result_archive "$2" local 0 "$3"',
+            "result-verifier",
+            str(TOOLS / "transport_helpers.sh"),
+            str(archive),
+            str(extraction),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_result_archive_verifier_checks_every_internal_entry(
+    tmp_path: Path,
+) -> None:
+    archive = result_archive(tmp_path)
+    result = run_result_archive_verifier(archive, tmp_path / "verified")
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["status"] == "pass"
+    assert report["verified_file_count"] == 2
+
+
+def test_result_archive_verifier_rejects_internal_hash_mismatch(
+    tmp_path: Path,
+) -> None:
+    archive = result_archive(tmp_path, recorded_data_digest="0" * 64)
+    result = run_result_archive_verifier(archive, tmp_path / "rejected")
+    assert result.returncode != 0
+    assert "incomplete or a result file hash mismatched" in result.stderr
+
+
+def test_result_archive_covers_nested_qualification_checksum(
+    tmp_path: Path,
+) -> None:
+    archive = result_archive(tmp_path, include_nested_checksum=True)
+    result = run_result_archive_verifier(archive, tmp_path / "verified")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["verified_file_count"] == 4
+
+    source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    assert "find . -type f ! -path ./SHA256SUMS -print0" in source
+    assert "find . -type f ! -name SHA256SUMS -print0" not in source
+
+
 def test_remote_pipeline_uses_the_packaged_frozen_cpu_reference() -> None:
     source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
     assert (
@@ -191,6 +298,12 @@ def test_remote_pipeline_uses_the_packaged_frozen_cpu_reference() -> None:
     assert 'cpu_reference="${INPUT}/ordinary-cpu-reference.json"' in source
     assert 'cpu_values="${INPUT}/ordinary-cpu-values.bin"' in source
     assert 'fixture="${INPUT}/ordinary-fixture.json"' in source
+    assert '"${qualification_arguments[@]}"' in source
+    assert ".compiler_context_options" not in source
+    assert 'cmp "${run_root}/compiler_invocation.json"' in source
+    assert '"${INPUT}/compiler-invocation.json"' in source
+    assert 'cmp "${ordinary_dir}/ordinary_ckks_cpu_reference.json"' not in source
+    assert '"${ordinary_dir}/ordinary_ckks_ant_verification.json"' in source
 
 
 def test_gpu_conformance_keeps_wrapper_addresses_unique() -> None:
@@ -211,9 +324,121 @@ def test_gpu_conformance_keeps_wrapper_addresses_unique() -> None:
 def test_source_packaging_requires_local_ordinary_evidence() -> None:
     source = (TOOLS / "package_runpod_sources.sh").read_text(encoding="utf-8")
     assert "--ordinary-run-root" in source
-    assert 'EXPECTED_DATA_Q_COUNT="${MUL_LEVEL}"' in source
+    assert "--poly-degree)" not in source
+    assert "--mul-level)" not in source
+    assert "compiler-invocation.json" in source
+    assert "qualification-invocation.json" in source
+    assert "normalized_argv_sha256" in source
+    assert 'run_manifest.get("source_mode") != "snapshot"' in source
+    assert "frozen SHA256SUMS does not enumerate the complete run root" in source
+    assert "frozen evidence ACE producer does not match" in source
+    assert "frozen CPU/ANT producer does not match" in source
     assert "ordinary-context-manifest.json" in source
     assert "ordinary-resource-manifest.json" in source
     assert "ordinary-cpu-reference.json" in source
     assert "ordinary-cpu-values.bin" in source
     assert "ordinary-ant-verification.json" in source
+    assert "ordinary-post-ckks.air" in source
+    assert "ordinary-run-manifest.json" in source
+    assert "ordinary-host-qualification.json" in source
+    assert "ordinary-artifact-manifest.json" in source
+
+
+def test_local_reproduction_does_not_restate_compiler_context() -> None:
+    source = (TOOLS / "run_local_reproduction.sh").read_text(encoding="utf-8")
+    for option in (
+        "--poly-degree",
+        "--mul-level",
+        "--input-level",
+        "--security-level",
+        "--scaling-factor-bits",
+        "--first-prime-bits",
+        "--hamming-weight",
+    ):
+        assert option not in source
+
+
+def test_host_freeze_runner_returns_fresh_candidate_without_frozen_checks() -> None:
+    source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    assert "<freeze-host|local|runpod>" in source
+    assert (
+        'if [[ "${MODE}" != "freeze-host" ]]; then\n'
+        "  phase frozen_ordinary_reference verify_frozen_ordinary_reference"
+    ) in source
+    assert 'if [[ "${MODE}" == "freeze-host" ]]; then' in source
+    assert "ace.phantom.host-freeze-candidate/1.0.0" in source
+    assert 'cmp "${run_root}/qualification_invocation.json"' in source
+    assert 'phase qualification run_qualification' in source
+
+
+def test_host_freeze_payload_is_source_only_and_commit_addressed() -> None:
+    script = TOOLS / "package_host_freeze_sources.sh"
+    source = script.read_text(encoding="utf-8")
+    assert os.access(script, os.X_OK)
+    assert "--qualification-invocation" in source
+    assert "source_archive.py\" create" in source
+    assert '--kind ace' in source
+    assert '--kind phantom' in source
+    assert "ace.phantom.host-freeze-payload/1.0.0" in source
+    assert "audited-source-snapshots-and-qualification-invocation-only" in source
+    assert "does not implement the host-freeze runner mode" in source
+    assert "--ordinary-run-root" not in source
+    assert "ordinary-cpu-reference" not in source
+    assert "compiler-invocation.json" not in source
+    assert "source commits must be full lowercase 40-character object IDs" in source
+
+
+def test_host_freeze_wrapper_owns_and_cleans_only_its_exact_container() -> None:
+    script = TOOLS / "freeze_ordinary_host_evidence.sh"
+    source = script.read_text(encoding="utf-8")
+    assert os.access(script, os.X_OK)
+    assert "docker create --name" in source
+    assert 'docker start -a "${CONTAINER_ID}"' in source
+    assert 'docker rm -f "${exact_id}"' in source
+    assert 'docker inspect --type container "${exact_id}"' in source
+    assert "removed-and-absent" in source
+    assert '--label "ace.phantom.task=${TASK_LABEL}"' in source
+    assert '--mode freeze-host' in source
+    assert (
+        '"${BASE_IMAGE}" \\\n'
+        "  bash /workspace/input/run_build_and_health.sh"
+    ) in source
+    for forbidden in (
+        "docker run",
+        "docker image tag",
+        "docker image rm",
+        "docker ps",
+        "docker system prune",
+        "ace-compiler-dev",
+    ):
+        assert forbidden not in source
+
+
+def test_host_freeze_candidate_comes_only_from_verified_archive() -> None:
+    source = (TOOLS / "freeze_ordinary_host_evidence.sh").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        'VERIFIED_RESULTS="${OUTPUT}/verified-host-freeze-result/results"'
+        in source
+    )
+    assert 'CANDIDATE="${VERIFIED_RESULTS}/qualification"' in source
+    assert '"${VERIFIED_RESULTS}/host-freeze-candidate.json"' in source
+    assert '${OUTPUT}/work/results/qualification' not in source
+    assert '${OUTPUT}/work/results/host-freeze-candidate.json' not in source
+    assert "diff --no-dereference --recursive" not in source
+    assert "live host-freeze candidate" not in source
+    assert "jq -e" not in source
+    assert "object_pairs_hook=reject_duplicates" in source
+    assert "hashlib.sha256(" in source
+
+
+def test_host_freeze_packager_rejects_missing_required_arguments() -> None:
+    result = subprocess.run(
+        [str(TOOLS / "package_host_freeze_sources.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "--qualification-invocation FILE" in result.stderr

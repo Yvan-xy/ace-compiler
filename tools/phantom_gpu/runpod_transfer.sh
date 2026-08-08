@@ -158,6 +158,10 @@ record_timing result_retrieval "${started}" "${ended}" "${retrieve_exit}"
   cd "${OUTPUT}"
   sha256sum -c runpod-result.tar.gz.sha256
 )
+verify_result_archive \
+  "${OUTPUT}/runpod-result.tar.gz" runpod "${remote_exit}" \
+  "${OUTPUT}/verified-runpod-result" \
+  >"${OUTPUT}/runpod-result-verification.json"
 
 if [[ ${remote_exit} -ne 0 ]]; then
   echo "remote pipeline failed with exit ${remote_exit}" >&2
