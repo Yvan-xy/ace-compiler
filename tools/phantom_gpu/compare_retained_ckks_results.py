@@ -77,8 +77,15 @@ def hex_digest(value: Any, length: int, context: str) -> str:
     return value
 
 
-def load_binary(path: Path, descriptor: dict[str, Any], magic: bytes) -> bytes:
+def load_binary(
+    path: Path,
+    descriptor: dict[str, Any],
+    magic: bytes,
+    expected_format: str,
+) -> bytes:
     expect_keys(descriptor, {"format", "size_bytes", "sha256"}, "binary descriptor")
+    if descriptor["format"] != expected_format:
+        fail(f"binary {path} format does not match {expected_format}")
     try:
         data = path.read_bytes()
     except OSError as error:
@@ -197,7 +204,11 @@ def validate_metadata(
 
 
 def load_analytic(
-    path: Path, binary_path: Path, fixture_sha256: str, slots: int
+    path: Path,
+    binary_path: Path,
+    fixture_sha256: str,
+    bindings: dict[str, Any],
+    slots: int,
 ) -> tuple[dict[str, list[complex]], list[dict[str, Any]]]:
     value = expect_keys(
         load_json(path),
@@ -216,7 +227,14 @@ def load_analytic(
     )
     if value["schema_version"] != ANALYTIC_SCHEMA or value["fixture_sha256"] != fixture_sha256:
         fail("analytic reference schema or fixture binding mismatch")
-    data = load_binary(binary_path, value["binary"], DECODED_MAGIC)
+    if value["qualification_bindings"] != bindings:
+        fail("analytic reference qualification bindings mismatch")
+    data = load_binary(
+        binary_path,
+        value["binary"],
+        DECODED_MAGIC,
+        "ace.retained_ckks.complex_float64le/1.0.0",
+    )
     inputs: dict[str, list[complex]] = {}
     descriptors: list[dict[str, Any]] = []
     for index, item in enumerate(value["inputs"]):
@@ -294,7 +312,12 @@ def load_provider(
         or first_data_chain_index < 0
     ):
         fail(f"{provider_name} first_data_chain_index must be nonnegative")
-    data = load_binary(binary_path, value["binary"], DECODED_MAGIC)
+    data = load_binary(
+        binary_path,
+        value["binary"],
+        DECODED_MAGIC,
+        "ace.retained_ckks.complex_float64le/1.0.0",
+    )
     records: list[dict[str, Any]] = []
     observed_order: list[str] = []
     ownership_tokens: set[str] = set()
@@ -429,7 +452,12 @@ def compare_exact(
             or modulus.bit_length() != resolved["data_q_bit_sizes"][index]
         ):
             fail(f"exact runtime modulus {index} disagrees with the context manifest")
-    observed_data = load_binary(observed_binary, observed["binary"], EXACT_MAGIC)
+    observed_data = load_binary(
+        observed_binary,
+        observed["binary"],
+        EXACT_MAGIC,
+        "ace.retained_ckks.rns_uint64le/1.0.0",
+    )
     observed_records = observed["records"]
     expected_case_ids = ["exact_runtime.raise_mod"] + [
         f"exact_runtime.mul_mono.{label}"
@@ -624,7 +652,13 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
     )
     fixture_sha256 = sha256_path(arguments.fixture)
     context_sha256 = sha256_path(arguments.context_manifest)
-    inputs, analytic_records = load_analytic(arguments.analytic_json, arguments.analytic_bin, fixture_sha256, resolved["logical_slots"])
+    inputs, analytic_records = load_analytic(
+        arguments.analytic_json,
+        arguments.analytic_bin,
+        fixture_sha256,
+        fixture["qualification_bindings"],
+        resolved["logical_slots"],
+    )
     analytic_ids = [record["case_id"] for record in analytic_records]
     expected_order = analytic_ids + [
         record["id"]
