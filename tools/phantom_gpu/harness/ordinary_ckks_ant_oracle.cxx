@@ -16,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -37,11 +38,24 @@ namespace {
 using Json = nlohmann::json;
 using Complex = std::complex<double>;
 
-constexpr std::size_t kArithmeticLevel = 4;
 CKKS_PARAMS* context_parameters = nullptr;
 
 [[noreturn]] void Fail(const std::string& message) {
   throw std::runtime_error(message);
+}
+
+struct LevelCoordinates {
+  std::size_t _full;
+  std::size_t _after_one_drop;
+  std::size_t _middle;
+  std::size_t _bottom;
+};
+
+LevelCoordinates ContextLevelCoordinates(std::size_t data_q_count) {
+  if (data_q_count < 2) {
+    Fail("ordinary CKKS requires at least two compiler-emitted data-Q primes");
+  }
+  return {data_q_count, data_q_count - 1, (data_q_count + 1) / 2, 1};
 }
 
 Json LoadJson(const std::string& path) {
@@ -94,6 +108,68 @@ void ConfigureContext(const Json& manifest, const Json& resources) {
   for (std::size_t index = 0; index < rotations.size(); ++index) {
     context_parameters->_rot_idxs[index] =
         rotations.at(index).get<std::int32_t>();
+  }
+}
+
+std::uint32_t AntPrimeSize(std::uint64_t prime) {
+  if (prime < 2) Fail("ANT context returned an invalid prime");
+  // ANT searches on both sides of 2^size, so primes generated for the same
+  // requested size can have adjacent conventional bit widths.  Recover the
+  // requested size as the exponent of the nearest power of two, exactly and
+  // without floating point.
+  const std::uint64_t original = prime;
+  std::uint32_t floor_log2 = 0;
+  while (prime > 1) {
+    ++floor_log2;
+    prime >>= 1;
+  }
+  if (floor_log2 >= 63) Fail("ANT prime exceeds supported modulus size");
+  const std::uint64_t lower = std::uint64_t{1} << floor_log2;
+  const std::uint64_t upper = lower << 1;
+  return original - lower <= upper - original ? floor_log2 : floor_log2 + 1;
+}
+
+void VerifyPrimeChain(const Json& manifest) {
+  const auto& expected_q = manifest.at("data_q_bit_sizes");
+  const auto& expected_p = manifest.at("special_p_bit_sizes");
+  CRT_CONTEXT* crt = Get_crt_context();
+  if (crt == nullptr) Fail("ANT context has no CRT parameters");
+  CRT_PRIMES* q_primes = Get_q(crt);
+  CRT_PRIMES* p_primes = Get_p(crt);
+  if (q_primes == nullptr || p_primes == nullptr) {
+    Fail("ANT context has an incomplete Q/P chain");
+  }
+  if (Get_primes_cnt(q_primes) != expected_q.size() ||
+      Get_primes_cnt(p_primes) != expected_p.size()) {
+    Fail("ANT Q/P counts disagree with the compiler context manifest");
+  }
+  for (std::size_t index = 0; index < expected_q.size(); ++index) {
+    const std::uint64_t prime = static_cast<std::uint64_t>(
+        Get_modulus_val(Get_prime_at(q_primes, index)));
+    const std::uint32_t observed_size = AntPrimeSize(prime);
+    const std::uint32_t expected_size =
+        expected_q.at(index).get<std::uint32_t>();
+    if (observed_size != expected_size) {
+      Fail("ANT data-Q prime size disagrees with the compiler manifest "
+           "at index " +
+           std::to_string(index) + ": expected " +
+           std::to_string(expected_size) + ", got " +
+           std::to_string(observed_size));
+    }
+  }
+  for (std::size_t index = 0; index < expected_p.size(); ++index) {
+    const std::uint64_t prime = static_cast<std::uint64_t>(
+        Get_modulus_val(Get_prime_at(p_primes, index)));
+    const std::uint32_t observed_size = AntPrimeSize(prime);
+    const std::uint32_t expected_size =
+        expected_p.at(index).get<std::uint32_t>();
+    if (observed_size != expected_size) {
+      Fail("ANT special-P prime size disagrees with the compiler manifest "
+           "at index " +
+           std::to_string(index) + ": expected " +
+           std::to_string(expected_size) + ", got " +
+           std::to_string(observed_size));
+    }
   }
 }
 
@@ -191,8 +267,40 @@ std::vector<Complex> Broadcast(std::size_t slots, double value) {
   return std::vector<Complex>(slots, Complex(value, 0.0));
 }
 
-std::vector<Complex> CipherCase(const std::string& family_id,
-                                const Json& fixture, std::size_t slots) {
+void RequireInputExpression(const Json& expression,
+                            const std::string& input_name) {
+  if (!expression.is_object() || expression.size() != 1 ||
+      !expression.contains("input") ||
+      expression.at("input").get<std::string>() != input_name) {
+    Fail("fixture expression does not name expected input " + input_name);
+  }
+}
+
+const Json& RequireBinaryExpression(const Json& family,
+                                    const std::string& operation) {
+  const Json& expected = family.at("expected");
+  if (!expected.is_object() || expected.size() != 2 ||
+      expected.at("op").get<std::string>() != operation ||
+      !expected.at("args").is_array() || expected.at("args").size() != 2) {
+    Fail("fixture binary expression disagrees with " + operation);
+  }
+  RequireInputExpression(expected.at("args").at(0), "complex_x");
+  return expected;
+}
+
+double RequireRealScalar(const Json& expression) {
+  const Json& scalar = expression.at("scalar");
+  if (!scalar.is_array() || scalar.size() != 2 ||
+      scalar.at(1).get<double>() != 0.0) {
+    Fail("ordinary scalar fixture must contain a real scalar");
+  }
+  return scalar.at(0).get<double>();
+}
+
+std::vector<Complex> CipherCase(const Json& family, const Json& fixture,
+                                std::size_t slots,
+                                const LevelCoordinates& levels) {
+  const std::string family_id = family.at("id").get<std::string>();
   const auto x = ExpandInput(fixture.at("inputs").at("complex_x"), slots);
   const auto y = ExpandInput(fixture.at("inputs").at("complex_y"), slots);
   CIPHER left = nullptr;
@@ -203,8 +311,15 @@ std::vector<Complex> CipherCase(const std::string& family_id,
 
   if (family_id == "add_ct_ct" || family_id == "sub_ct_ct" ||
       family_id == "mul_ct_ct") {
-    left = EncryptComplex(x, kArithmeticLevel);
-    right = EncryptComplex(y, kArithmeticLevel);
+    const std::string operation = family_id == "add_ct_ct"
+                                      ? "add"
+                                      : (family_id == "sub_ct_ct"
+                                             ? "subtract"
+                                             : "multiply");
+    const Json& expected = RequireBinaryExpression(family, operation);
+    RequireInputExpression(expected.at("args").at(1), "complex_y");
+    left = EncryptComplex(x, levels._full);
+    right = EncryptComplex(y, levels._full);
     result = Alloc_ciphertext();
     if (family_id == "add_ct_ct") Add_ciph(result, left, right);
     if (family_id == "sub_ct_ct") Sub_ciph(result, left, right);
@@ -212,9 +327,16 @@ std::vector<Complex> CipherCase(const std::string& family_id,
   } else if (family_id == "add_ct_plain" ||
              family_id == "sub_ct_plain" ||
              family_id == "mul_ct_plain") {
-    left = EncryptComplex(x, kArithmeticLevel);
+    const std::string operation = family_id == "add_ct_plain"
+                                      ? "add"
+                                      : (family_id == "sub_ct_plain"
+                                             ? "subtract"
+                                             : "multiply");
+    const Json& expected = RequireBinaryExpression(family, operation);
+    RequireInputExpression(expected.at("args").at(1), "complex_y");
+    left = EncryptComplex(x, levels._full);
     plain = EncodeComplex(family_id == "sub_ct_plain" ? Negated(y) : y,
-                          kArithmeticLevel);
+                          levels._full);
     result = Alloc_ciphertext();
     if (family_id == "mul_ct_plain") {
       Mul_plain(result, left, plain);
@@ -224,10 +346,16 @@ std::vector<Complex> CipherCase(const std::string& family_id,
   } else if (family_id == "add_ct_scalar" ||
              family_id == "sub_ct_scalar" ||
              family_id == "mul_ct_scalar") {
-    left = EncryptComplex(x, kArithmeticLevel);
-    double scalar = family_id == "mul_ct_scalar" ? -0.75 : 0.5;
+    const std::string operation = family_id == "add_ct_scalar"
+                                      ? "add"
+                                      : (family_id == "sub_ct_scalar"
+                                             ? "subtract"
+                                             : "multiply");
+    const Json& expected = RequireBinaryExpression(family, operation);
+    double scalar = RequireRealScalar(expected.at("args").at(1));
+    left = EncryptComplex(x, levels._full);
     if (family_id == "sub_ct_scalar") scalar = -scalar;
-    plain = EncodeComplex(Broadcast(slots, scalar), kArithmeticLevel);
+    plain = EncodeComplex(Broadcast(slots, scalar), levels._full);
     result = Alloc_ciphertext();
     if (family_id == "mul_ct_scalar") {
       Mul_plain(result, left, plain);
@@ -235,24 +363,30 @@ std::vector<Complex> CipherCase(const std::string& family_id,
       Add_plain(result, left, plain);
     }
   } else if (family_id == "copy" || family_id == "query_all") {
-    left = EncryptComplex(x, kArithmeticLevel);
+    RequireInputExpression(family.at("expected"), "complex_x");
+    left = EncryptComplex(x, levels._full);
     result = Alloc_ciphertext();
     Copy_ciph(result, left);
   } else if (family_id == "modswitch") {
-    left = EncryptComplex(x, kArithmeticLevel);
+    RequireInputExpression(family.at("expected"), "complex_x");
+    left = EncryptComplex(x, levels._full);
     result = Alloc_ciphertext();
     Copy_ciph(result, left);
     Modswitch_ciph(result);
   } else if (family_id == "relinearize") {
-    left = EncryptComplex(x, kArithmeticLevel);
-    right = EncryptComplex(y, kArithmeticLevel);
+    const Json& expected = RequireBinaryExpression(family, "multiply");
+    RequireInputExpression(expected.at("args").at(1), "complex_y");
+    left = EncryptComplex(x, levels._full);
+    right = EncryptComplex(y, levels._full);
     product3 = Alloc_ciphertext3();
     result = Alloc_ciphertext();
     Mul_ciph3(product3, left, right);
     Relin(result, product3);
   } else if (family_id == "rescale") {
-    left = EncryptComplex(x, kArithmeticLevel);
-    right = EncryptComplex(y, kArithmeticLevel);
+    const Json& expected = RequireBinaryExpression(family, "multiply");
+    RequireInputExpression(expected.at("args").at(1), "complex_y");
+    left = EncryptComplex(x, levels._full);
+    right = EncryptComplex(y, levels._full);
     CIPHER product = Alloc_ciphertext();
     result = Alloc_ciphertext();
     Mul_ciph(product, left, right);
@@ -261,11 +395,19 @@ std::vector<Complex> CipherCase(const std::string& family_id,
   } else if (family_id == "rotate_negative" ||
              family_id == "rotate_positive" ||
              family_id == "rotate_zero") {
-    left = EncryptComplex(x, kArithmeticLevel);
+    const Json& expected = family.at("expected");
+    if (expected.at("op").get<std::string>() != "rotate") {
+      Fail("fixture rotate expression has the wrong operation");
+    }
+    RequireInputExpression(expected.at("arg"), "complex_x");
+    const std::int64_t step64 = expected.at("step").get<std::int64_t>();
+    if (step64 < std::numeric_limits<int>::min() ||
+        step64 > std::numeric_limits<int>::max()) {
+      Fail("fixture rotation step exceeds runtime integer range");
+    }
+    const int step = static_cast<int>(step64);
+    left = EncryptComplex(x, levels._full);
     result = Alloc_ciphertext();
-    const int step = family_id == "rotate_negative"
-                         ? -3
-                         : (family_id == "rotate_positive" ? 3 : 0);
     if (step == 0) {
       Copy_ciph(result, left);
     } else {
@@ -284,45 +426,51 @@ std::vector<Complex> CipherCase(const std::string& family_id,
   return values;
 }
 
-std::vector<Complex> EncodeCase(const std::string& family_id,
-                                const Json& fixture, std::size_t slots,
-                                std::size_t data_q_count) {
+std::vector<Complex> EncodeCase(const Json& family, const Json& fixture,
+                                std::size_t slots,
+                                const LevelCoordinates& levels) {
+  const std::string family_id = family.at("id").get<std::string>();
   PLAIN plain = Alloc_plaintext();
-  if (family_id == "encode_complex_q4") {
+  if (family_id == "encode_complex_full") {
+    RequireInputExpression(family.at("expected"), "complex_x");
     const auto values =
         ExpandInput(fixture.at("inputs").at("complex_x"), slots);
     std::vector<DCMPLX> input(values.begin(), values.end());
-    Encode_dcmplx(plain, input.data(), input.size(), 1, kArithmeticLevel);
-  } else if (family_id == "encode_mask_f32_q4") {
+    Encode_dcmplx(plain, input.data(), input.size(), 1, levels._full);
+  } else if (family_id == "encode_mask_f32_full") {
+    RequireInputExpression(family.at("expected"), "mask_f32");
     const auto& specification = fixture.at("inputs").at("mask_f32");
     Encode_float_mask(
         plain, specification.at("segments").at(0).at(2).get<float>(),
-        MaskLength(specification), 1, kArithmeticLevel);
-  } else if (family_id == "encode_mask_f64_q4") {
+        MaskLength(specification), 1, levels._full);
+  } else if (family_id == "encode_mask_f64_full") {
+    RequireInputExpression(family.at("expected"), "mask_f64");
     const auto& specification = fixture.at("inputs").at("mask_f64");
     Encode_double_mask(
         plain, specification.at("segments").at(0).at(2).get<double>(),
-        MaskLength(specification), 1, kArithmeticLevel);
-  } else if (family_id == "encode_real_f32_q4") {
+        MaskLength(specification), 1, levels._full);
+  } else if (family_id == "encode_real_f32_full") {
+    RequireInputExpression(family.at("expected"), "real_f32");
     const auto values =
         ExpandInput(fixture.at("inputs").at("real_f32"), slots);
     std::vector<float> input;
     input.reserve(values.size());
     for (const auto& value : values) input.push_back(value.real());
-    Encode_float(plain, input.data(), input.size(), 1, kArithmeticLevel);
+    Encode_float(plain, input.data(), input.size(), 1, levels._full);
   } else if (family_id == "encode_real_f64_bottom" ||
              family_id == "encode_real_f64_middle" ||
              family_id == "encode_real_f64_full") {
+    RequireInputExpression(family.at("expected"), "real_f64");
     const auto values =
         ExpandInput(fixture.at("inputs").at("real_f64"), slots);
     std::vector<double> input;
     input.reserve(values.size());
     for (const auto& value : values) input.push_back(value.real());
     const std::size_t level = family_id == "encode_real_f64_bottom"
-                                  ? 1
+                                  ? levels._bottom
                                   : (family_id == "encode_real_f64_middle"
-                                         ? (data_q_count + 1) / 2
-                                         : data_q_count);
+                                         ? levels._middle
+                                         : levels._full);
     Encode_double(plain, input.data(), input.size(), 1, level);
   } else {
     Fail("unsupported ANT encode case family " + family_id);
@@ -334,13 +482,13 @@ std::vector<Complex> EncodeCase(const std::string& family_id,
 
 Json RunOracle(const Json& fixture, std::size_t slots,
                std::size_t data_q_count) {
+  const LevelCoordinates levels = ContextLevelCoordinates(data_q_count);
   Json records = Json::array();
   for (const auto& family : fixture.at("case_families")) {
     const std::string family_id = family.at("id").get<std::string>();
     const auto values = family_id.rfind("encode_", 0) == 0
-                            ? EncodeCase(family_id, fixture, slots,
-                                         data_q_count)
-                            : CipherCase(family_id, fixture, slots);
+                            ? EncodeCase(family, fixture, slots, levels)
+                            : CipherCase(family, fixture, slots, levels);
     if (values.size() != slots) {
       Fail("ANT decoded length disagrees with compiler logical slots");
     }
@@ -396,10 +544,7 @@ int main(int argc, char** argv) {
     ConfigureContext(manifest, resources);
     setenv("RTLIB_DISABLE_BOOTSTRAP_PRECOM", "1", 1);
     Prepare_context();
-    if (Get_q_cnt() != manifest.at("data_q_bit_sizes").size() ||
-        Get_p_cnt() != manifest.at("special_p_bit_sizes").size()) {
-      Fail("ANT Q/P counts disagree with the compiler context manifest");
-    }
+    VerifyPrimeChain(manifest);
     const std::size_t slots =
         manifest.at("logical_slot_capacity").get<std::size_t>();
     WriteJson(argv[4],

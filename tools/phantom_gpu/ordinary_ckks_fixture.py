@@ -26,11 +26,19 @@ REFERENCE_SCHEMA = "ace.phantom.ordinary_ckks.cpu-reference/1.0.0"
 PROVIDER_SCHEMA = "ace.phantom.ordinary_ckks.provider-result/1.0.0"
 RAW_PROVIDER_SCHEMA = "ace.phantom.ordinary_ckks.raw-provider/1.0.0"
 COMPARE_SCHEMA = "ace.phantom.ordinary_ckks.compare/1.0.0"
+INVOCATION_SCHEMA = "ace.phantom.compiler-invocation/1.0.0"
+QUALIFICATION_INVOCATION_SCHEMA = (
+    "ace.phantom.qualification-invocation/1.0.0"
+)
 BINARY_FORMAT = "ace.ordinary_ckks.complex_float64le/1.0.0"
 MAGIC = b"ACECKK01"
 HEADER = struct.Struct("<8sHHIQQ32s32s32s")
 PAIR = struct.Struct("<dd")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+PHANTOM_POLY_DEGREE_MAX = 131072
+PHANTOM_USER_MODULUS_BITS_MIN = 2
+PHANTOM_USER_MODULUS_BITS_MAX = 60
+PHANTOM_COEFF_MODULUS_COUNT_MAX = 64
 
 
 class OrdinaryCkksError(ValueError):
@@ -126,6 +134,230 @@ def _sha256(value: Any, context: str) -> str:
     return value
 
 
+def _validate_qualification_bindings(value: Any) -> dict[str, Any]:
+    bindings = _expect_keys(
+        value,
+        {
+            "status",
+            "deterministic_seed",
+            "deterministic_generator",
+            "normalized_compiler_command_sha256",
+            "post_ckks_air_sha256",
+        },
+        "fixture.qualification_bindings",
+    )
+    seed = _integer(
+        bindings["deterministic_seed"],
+        "fixture.qualification_bindings.deterministic_seed",
+        0,
+    )
+    if seed > (1 << 64) - 1:
+        fail("fixture.qualification_bindings.deterministic_seed exceeds uint64")
+    if bindings["deterministic_generator"] != "splitmix64-float53-complex-v1":
+        fail("fixture deterministic input generator is unsupported")
+    status = bindings["status"]
+    digest_keys = (
+        "normalized_compiler_command_sha256",
+        "post_ckks_air_sha256",
+    )
+    if status == "unbound":
+        if any(bindings[key] is not None for key in digest_keys):
+            fail("unbound fixture qualification hashes must be null")
+    elif status == "bound":
+        for key in digest_keys:
+            _sha256(bindings[key], f"fixture.qualification_bindings.{key}")
+    else:
+        fail("fixture.qualification_bindings.status must be 'unbound' or 'bound'")
+    return bindings
+
+
+def _seeded_complex_values(seed: int, count: int) -> list[complex]:
+    mask = (1 << 64) - 1
+    state = seed
+    components: list[float] = []
+    for _ in range(count * 2):
+        state = (state + 0x9E3779B97F4A7C15) & mask
+        value = state
+        value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask
+        value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask
+        value ^= value >> 31
+        components.append(((value >> 11) / float(1 << 53)) * 2.0 - 1.0)
+    return [
+        complex(components[index], components[index + 1])
+        for index in range(0, len(components), 2)
+    ]
+
+
+def _validate_seeded_fixture_input(fixture: dict[str, Any]) -> None:
+    specification = fixture["inputs"].get("complex_y")
+    if not isinstance(specification, dict):
+        fail("fixture.inputs.complex_y must contain the seeded input")
+    overrides = specification.get("overrides")
+    if not isinstance(overrides, list) or len(overrides) != 8:
+        fail("fixture.inputs.complex_y must contain eight seeded overrides")
+    expected = _seeded_complex_values(
+        fixture["qualification_bindings"]["deterministic_seed"],
+        len(overrides),
+    )
+    for index, (entry, expected_value) in enumerate(zip(overrides, expected)):
+        if (
+            entry[0] != index
+            or float(entry[1]) != expected_value.real
+            or float(entry[2]) != expected_value.imag
+        ):
+            fail(
+                "fixture.inputs.complex_y does not match deterministic seed "
+                f"at override {index}"
+            )
+
+
+def _load_normalized_invocation(
+    path: Path,
+) -> tuple[dict[str, Any], str, dict[str, str]]:
+    invocation = _expect_keys(
+        load_json(path),
+        {"schema_version", "argv", "normalized_argv_sha256"},
+        "compiler invocation",
+    )
+    if invocation["schema_version"] != INVOCATION_SCHEMA:
+        fail("compiler invocation schema is unsupported")
+    argv = invocation["argv"]
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or any(not isinstance(argument, str) or not argument for argument in argv)
+    ):
+        fail("compiler invocation argv must be a non-empty string array")
+    recorded = _sha256(
+        invocation["normalized_argv_sha256"],
+        "compiler invocation.normalized_argv_sha256",
+    )
+    observed = sha256_bytes(canonical_bytes(argv))
+    if recorded != observed:
+        fail(
+            "normalized compiler command hash mismatch: "
+            f"expected {recorded}, got {observed}"
+        )
+    if argv[0] != "tools/phantom_gpu/generate_ckks2c_probe.py":
+        fail("compiler invocation has an unexpected executable")
+    arguments = argv[1:]
+    if len(arguments) % 2:
+        fail("compiler invocation has an option without a value")
+    pairs = dict(zip(arguments[0::2], arguments[1::2]))
+    artifact_paths = {
+        "--output": "ckks2c/add_mul_rotate.cu",
+        "--post-ckks-air": "ckks2c/ordinary_ckks_post_ckks.air",
+        "--context-manifest": "ckks2c/compiler_context_manifest.json",
+        "--resource-manifest": "ckks2c/compiler_resource_manifest.json",
+    }
+    context_options = {
+        "--poly-degree",
+        "--mul-level",
+        "--input-level",
+        "--security-level",
+        "--scaling-factor-bits",
+        "--first-prime-bits",
+        "--hamming-weight",
+    }
+    if (
+        len(pairs) != len(arguments) // 2
+        or set(pairs) != set(artifact_paths) | context_options
+    ):
+        fail("compiler invocation options are incomplete or duplicated")
+    for option, expected in artifact_paths.items():
+        if pairs[option] != expected:
+            fail(f"compiler invocation {option} has a noncanonical artifact path")
+    for option in context_options:
+        if re.fullmatch(r"[0-9]+", pairs[option]) is None:
+            fail(f"compiler invocation {option} must be a nonnegative integer")
+    return invocation, observed, pairs
+
+
+def verify_invocation_context(
+    compiler_pairs: dict[str, str], context_manifest: dict[str, Any]
+) -> None:
+    validate_context_manifest(context_manifest)
+    expected = {
+        "--poly-degree": context_manifest["polynomial_degree"],
+        "--mul-level": len(context_manifest["data_q_bit_sizes"]),
+        "--input-level": context_manifest["input_level"],
+        "--security-level": context_manifest["security_level"],
+        "--scaling-factor-bits": context_manifest["scaling_modulus_bits"],
+        "--first-prime-bits": context_manifest["first_modulus_bits"],
+        "--hamming-weight": context_manifest["hamming_weight"],
+    }
+    for option, context_value in expected.items():
+        if int(compiler_pairs[option]) != context_value:
+            fail(
+                f"compiler invocation {option} disagrees with the emitted "
+                "context manifest"
+            )
+
+
+def verify_qualification_bindings(
+    fixture: dict[str, Any],
+    context_manifest_path: Path,
+    compiler_invocation_path: Path,
+    post_ckks_air_path: Path,
+) -> None:
+    bindings = _validate_qualification_bindings(fixture["qualification_bindings"])
+    if bindings["status"] != "bound":
+        fail("ordinary CKKS fixture is not bound to qualification artifacts")
+    _, invocation_sha256, compiler_pairs = _load_normalized_invocation(
+        compiler_invocation_path
+    )
+    verify_invocation_context(
+        compiler_pairs, load_json(context_manifest_path)
+    )
+    if invocation_sha256 != bindings["normalized_compiler_command_sha256"]:
+        fail("fixture normalized compiler command binding does not match")
+    try:
+        if post_ckks_air_path.stat().st_size == 0:
+            fail("post-CKKS AIR artifact must be non-empty")
+    except OSError as error:
+        fail(f"cannot inspect post-CKKS AIR {post_ckks_air_path}: {error}")
+    if sha256_path(post_ckks_air_path) != bindings["post_ckks_air_sha256"]:
+        fail("fixture post-CKKS AIR binding does not match")
+
+
+def bind_fixture(
+    fixture_path: Path,
+    context_manifest_path: Path,
+    compiler_invocation_path: Path,
+    post_ckks_air_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    fixture = load_json(fixture_path)
+    validate_fixture(fixture)
+    bindings = fixture["qualification_bindings"]
+    if bindings["status"] != "unbound":
+        fail("fixture template must be unbound before qualification binding")
+    context_manifest = load_json(context_manifest_path)
+    validate_context_manifest(context_manifest)
+    context_manifest_sha256 = sha256_path(context_manifest_path)
+    _, invocation_sha256, compiler_pairs = _load_normalized_invocation(
+        compiler_invocation_path
+    )
+    verify_invocation_context(compiler_pairs, context_manifest)
+    try:
+        if post_ckks_air_path.stat().st_size == 0:
+            fail("post-CKKS AIR artifact must be non-empty")
+    except OSError as error:
+        fail(f"cannot inspect post-CKKS AIR {post_ckks_air_path}: {error}")
+    fixture["qualification_bindings"] = {
+        **bindings,
+        "status": "bound",
+        "normalized_compiler_command_sha256": invocation_sha256,
+        "post_ckks_air_sha256": sha256_path(post_ckks_air_path),
+    }
+    fixture["compiler_context_manifest"] = {
+        "sha256": context_manifest_sha256,
+    }
+    validate_fixture(fixture)
+    write_json(output_path, fixture)
+    return fixture
+
+
 def _complex_pair(value: Any, context: str) -> complex:
     if not isinstance(value, list) or len(value) != 2:
         fail(f"{context} must be [real, imaginary]")
@@ -163,6 +395,8 @@ def validate_context_manifest(value: Any) -> dict[str, int]:
     )
     if degree & (degree - 1):
         fail("compiler context manifest polynomial degree must be a power of two")
+    if degree > PHANTOM_POLY_DEGREE_MAX:
+        fail("compiler context manifest polynomial degree exceeds provider limits")
     slots = _integer(
         manifest["logical_slot_capacity"],
         "compiler context manifest.logical_slot_capacity",
@@ -186,15 +420,38 @@ def validate_context_manifest(value: Any) -> dict[str, int]:
         "compiler context manifest.scaling_modulus_bits",
         1,
     )
-    if first_bits > 60 or scale_bits > 60:
+    if not (
+        PHANTOM_USER_MODULUS_BITS_MIN
+        <= first_bits
+        <= PHANTOM_USER_MODULUS_BITS_MAX
+        and PHANTOM_USER_MODULUS_BITS_MIN
+        <= scale_bits
+        <= PHANTOM_USER_MODULUS_BITS_MAX
+    ):
         fail("compiler context manifest data-Q bit sizes exceed provider limits")
     for index, bits in enumerate(data_q):
         expected = first_bits if index == 0 else scale_bits
-        if _integer(bits, f"compiler context manifest.data_q_bit_sizes[{index}]", 1) != expected:
+        if (
+            _integer(
+                bits,
+                f"compiler context manifest.data_q_bit_sizes[{index}]",
+                PHANTOM_USER_MODULUS_BITS_MIN,
+            )
+            != expected
+        ):
             fail("compiler context manifest data-Q list disagrees with its prime policy")
     for index, bits in enumerate(special_p):
-        if _integer(bits, f"compiler context manifest.special_p_bit_sizes[{index}]", 1) > 60:
+        if (
+            _integer(
+                bits,
+                f"compiler context manifest.special_p_bit_sizes[{index}]",
+                PHANTOM_USER_MODULUS_BITS_MIN,
+            )
+            > PHANTOM_USER_MODULUS_BITS_MAX
+        ):
             fail("compiler context manifest special-P bit size exceeds provider limits")
+    if len(data_q) + len(special_p) > PHANTOM_COEFF_MODULUS_COUNT_MAX:
+        fail("compiler context manifest combined Q/P count exceeds provider limits")
     input_level = _integer(
         manifest["input_level"], "compiler context manifest.input_level", 1
     )
@@ -236,12 +493,13 @@ def resolve_active_q_count(value: Any, fixture: dict[str, Any], context: str) ->
         return 1
     if value == "middle":
         return (data_q_count + 1) // 2
+    if value == "after_one_drop":
+        if data_q_count < 2:
+            fail(f"{context} requires at least two compiler context data-Q primes")
+        return data_q_count - 1
     if value == "full":
         return data_q_count
-    result = _integer(value, context, 1)
-    if result > data_q_count:
-        fail(f"{context} exceeds the compiler context data-Q count")
-    return result
+    fail(f"{context} must use a symbolic compiler-context coordinate")
 
 
 def _validate_expression(value: Any, inputs: set[str], context: str) -> None:
@@ -274,6 +532,7 @@ def validate_fixture(fixture: dict[str, Any]) -> None:
         "schema_version",
         "fixture_id",
         "description",
+        "qualification_bindings",
         "compiler_context_manifest",
         "coordinate_rules",
         "tolerances",
@@ -292,21 +551,30 @@ def validate_fixture(fixture: dict[str, Any]) -> None:
         fail("unexpected fixture identifier")
     if not isinstance(fixture["description"], str) or not fixture["description"]:
         fail("fixture.description must be non-empty")
+    qualification_bindings = _validate_qualification_bindings(
+        fixture["qualification_bindings"]
+    )
 
     context_manifest = _expect_keys(
         fixture["compiler_context_manifest"],
         {"sha256"},
         "fixture.compiler_context_manifest",
     )
-    _sha256(
-        context_manifest["sha256"],
-        "fixture.compiler_context_manifest.sha256",
-    )
+    context_sha256 = context_manifest["sha256"]
+    if qualification_bindings["status"] == "unbound":
+        if context_sha256 is not None:
+            fail("unbound fixture compiler context manifest hash must be null")
+    else:
+        _sha256(
+            context_sha256,
+            "fixture.compiler_context_manifest.sha256",
+        )
     coordinate_rules = _expect_keys(
         fixture["coordinate_rules"],
         {
             "input_length",
-            "first_level",
+            "full_level",
+            "after_one_drop_level",
             "middle_level",
             "bottom_level",
             "chain_index_formula",
@@ -316,7 +584,8 @@ def validate_fixture(fixture: dict[str, Any]) -> None:
     )
     if coordinate_rules != {
         "input_length": "compiler_context.logical_slot_capacity",
-        "first_level": "compiler_context.data_q_count",
+        "full_level": "compiler_context.data_q_count",
+        "after_one_drop_level": "compiler_context.data_q_count - 1",
         "middle_level": "ceil(compiler_context.data_q_count / 2)",
         "bottom_level": "1",
         "chain_index_formula": (
@@ -440,6 +709,7 @@ def validate_fixture(fixture: dict[str, Any]) -> None:
                     fail(f"{entry_context} mask values must be real")
         else:
             fail(f"{context}.storage is unsupported")
+    _validate_seeded_fixture_input(fixture)
 
     contracts = fixture["metadata_contracts"]
     if not isinstance(contracts, dict) or not contracts:
@@ -458,8 +728,8 @@ def validate_fixture(fixture: dict[str, Any]) -> None:
         if contract["object_kind"] not in {"ciphertext", "plaintext"}:
             fail(f"{context}.object_kind is unsupported")
         active_q = contract["active_q_count"]
-        if active_q not in {"bottom", "middle", "full"}:
-            _integer(active_q, f"{context}.active_q_count", 1)
+        if active_q not in {"bottom", "middle", "after_one_drop", "full"}:
+            fail(f"{context}.active_q_count must use a symbolic coordinate")
         _integer(contract["scale_degree"], f"{context}.scale_degree", 1)
         if not isinstance(contract["ntt"], bool):
             fail(f"{context} has invalid NTT state")
@@ -488,14 +758,35 @@ def validate_fixture(fixture: dict[str, Any]) -> None:
             fail(f"{context}.raw_scale kind is unsupported")
 
     alias_matrix = fixture["alias_matrix"]
-    if not isinstance(alias_matrix, dict) or not alias_matrix:
-        fail("fixture.alias_matrix must be a non-empty object")
-    for form, aliases in alias_matrix.items():
-        if not isinstance(aliases, dict) or not aliases:
-            fail(f"fixture.alias_matrix.{form} must be a non-empty object")
-        for alias, disposition in aliases.items():
-            if not isinstance(alias, str) or disposition not in {"supported", "rejected", "not_applicable"}:
-                fail(f"fixture.alias_matrix.{form}.{alias} has an invalid disposition")
+    expected_alias_matrix = {
+        "ct_ct": {
+            "distinct": "supported",
+            "lhs": "supported",
+            "rhs": "supported",
+        },
+        "ct_plain": {
+            "distinct": "supported",
+            "lhs": "supported",
+            "rhs": "not_applicable",
+        },
+        "ct_scalar": {
+            "distinct": "supported",
+            "lhs": "supported",
+            "rhs": "not_applicable",
+        },
+        "cipher_unary": {"distinct": "supported", "inplace": "supported"},
+        "copy": {"distinct": "supported", "self": "supported"},
+        "encode": {"distinct": "supported", "inplace": "not_applicable"},
+        "query": {"distinct": "supported", "inplace": "not_applicable"},
+        "zero": {"destination_source": "not_applicable"},
+        "free": {"destination_source": "not_applicable"},
+        "free_array": {"destination_source": "not_applicable"},
+    }
+    if alias_matrix != expected_alias_matrix:
+        fail(
+            "fixture.alias_matrix must exactly describe the ordinary CKKS "
+            "type-valid and structurally inapplicable relations"
+        )
 
     families = fixture["case_families"]
     if not isinstance(families, list) or not families:
@@ -518,6 +809,21 @@ def validate_fixture(fixture: dict[str, Any]) -> None:
         "rotate",
         "subtract",
     }
+    operations_by_form = {
+        "ct_ct": {"add", "subtract", "multiply"},
+        "ct_plain": {"add", "subtract", "multiply"},
+        "ct_scalar": {"add", "subtract", "multiply"},
+        "cipher_unary": {"modswitch", "relinearize", "rescale", "rotate"},
+        "copy": {"copy"},
+        "encode": {
+            "encode_complex",
+            "encode_mask_f32",
+            "encode_mask_f64",
+            "encode_real_f32",
+            "encode_real_f64",
+        },
+        "query": {"query_all"},
+    }
     for position, family in enumerate(families):
         context = f"fixture.case_families[{position}]"
         _expect_keys(family, {"id", "operation", "form", "aliases", "expected", "metadata"}, context)
@@ -525,10 +831,32 @@ def validate_fixture(fixture: dict[str, Any]) -> None:
         if not isinstance(family_id, str) or not family_id or family_id in family_ids:
             fail(f"{context}.id must be non-empty and unique")
         family_ids.add(family_id)
-        if family["operation"] not in allowed_operations:
+        operation = family["operation"]
+        if operation not in allowed_operations:
             fail(f"{context}.operation is unsupported")
+        if family_id.endswith("_ct_ct"):
+            expected_form = "ct_ct"
+        elif family_id.endswith("_ct_plain"):
+            expected_form = "ct_plain"
+        elif family_id.endswith("_ct_scalar"):
+            expected_form = "ct_scalar"
+        elif operation.startswith("encode_"):
+            expected_form = "encode"
+        elif operation == "query_all":
+            expected_form = "query"
+        elif operation == "copy":
+            expected_form = "copy"
+        else:
+            expected_form = "cipher_unary"
+        if family["form"] != expected_form:
+            fail(
+                f"{context}.form must be {expected_form} for ordinary API "
+                f"{family_id}"
+            )
         if family["form"] not in alias_matrix:
             fail(f"{context}.form is absent from the alias matrix")
+        if operation not in operations_by_form[family["form"]]:
+            fail(f"{context}.operation does not belong to form {family['form']}")
         if family["metadata"] not in contracts:
             fail(f"{context}.metadata references an unknown contract")
         aliases = family["aliases"]
@@ -546,36 +874,94 @@ def validate_fixture(fixture: dict[str, Any]) -> None:
             if case_id in case_ids:
                 fail(f"duplicate expanded case identifier: {case_id}")
             case_ids.add(case_id)
+        supported_aliases = [
+            alias
+            for alias, disposition in alias_matrix[family["form"]].items()
+            if disposition == "supported"
+        ]
+        if aliases != supported_aliases:
+            fail(
+                f"{context}.aliases must exercise every supported relation "
+                f"for form {family['form']} in matrix order"
+            )
         _validate_expression(family["expected"], set(inputs), f"{context}.expected")
 
     ownership = fixture["ownership_cases"]
     if not isinstance(ownership, list) or not ownership:
         fail("fixture.ownership_cases must be a non-empty array")
     ownership_ids: set[str] = set()
+    expected_ownership = {
+        "copy_independence": None,
+        "destination_reuse": None,
+        "free_array_1": 1,
+        "free_array_4": 4,
+        "zero_then_free": None,
+    }
     for position, item in enumerate(ownership):
         context = f"fixture.ownership_cases[{position}]"
         value = _expect_keys(item, {"id", "iterations"}, context, {"array_length"})
         if not isinstance(value["id"], str) or not value["id"] or value["id"] in ownership_ids:
             fail(f"{context}.id must be non-empty and unique")
         ownership_ids.add(value["id"])
+        if value["id"] not in expected_ownership:
+            fail(f"{context}.id is not a supported ownership contract")
         if _integer(value["iterations"], f"{context}.iterations", 1) != 100:
             fail(f"{context}.iterations must be 100")
-        if "array_length" in value:
-            _integer(value["array_length"], f"{context}.array_length", 1)
+        expected_array_length = expected_ownership[value["id"]]
+        if expected_array_length is None:
+            if "array_length" in value:
+                fail(f"{context}.array_length is only valid for array ownership cases")
+        elif _integer(
+            value.get("array_length"), f"{context}.array_length", 1
+        ) != expected_array_length:
+            fail(
+                f"{context}.array_length must be {expected_array_length} for "
+                f"{value['id']}"
+            )
+    if ownership_ids != set(expected_ownership):
+        fail("fixture.ownership_cases does not contain the complete ownership contract")
 
     rejections = fixture["rejections"]
     if not isinstance(rejections, list) or not rejections:
         fail("fixture.rejections must be a non-empty array")
+    expected_rejections = {
+        "encode_invalid_length": "static",
+        "encode_invalid_level": "static",
+        "encode_invalid_scale": "static",
+        "incompatible_level": "static",
+        "incompatible_scale": "static",
+        "missing_declared_relin_key": "static",
+        "missing_declared_rotation_key": "static",
+        "reverse_scalar_subtraction": "static",
+        "bottom_modswitch": "runtime",
+        "bottom_rescale": "runtime",
+        "double_free": "runtime",
+        "invalid_ciphertext_size": "runtime",
+        "missing_loaded_relin_key": "runtime",
+        "missing_loaded_rotation_key": "runtime",
+        "relinearize_size2": "runtime",
+        "runtime_level_mismatch": "runtime",
+        "runtime_scale_mismatch": "runtime",
+        "use_after_free": "runtime",
+    }
     rejection_ids: set[str] = set()
     diagnostics: set[str] = set()
     for position, item in enumerate(rejections):
         context = f"fixture.rejections[{position}]"
-        value = _expect_keys(item, {"id", "phase", "diagnostic_id"}, context)
+        value = _expect_keys(
+            item,
+            {"id", "phase", "diagnostic_id"},
+            context,
+            {"provider_diagnostic", "runner_profile"},
+        )
         if not isinstance(value["id"], str) or not value["id"] or value["id"] in rejection_ids:
             fail(f"{context}.id must be non-empty and unique")
         rejection_ids.add(value["id"])
-        if value["phase"] not in {"static", "runtime"}:
-            fail(f"{context}.phase is unsupported")
+        expected_phase = expected_rejections.get(value["id"])
+        if expected_phase is None:
+            fail(f"{context}.id is not a supported rejection contract")
+        if value["phase"] != expected_phase:
+            fail(f"{context}.phase must be {expected_phase} for {value['id']}")
         diagnostic = value["diagnostic_id"]
         if (
             not isinstance(diagnostic, str)
@@ -584,14 +970,38 @@ def validate_fixture(fixture: dict[str, Any]) -> None:
         ):
             fail(f"{context}.diagnostic_id must be prefixed and unique")
         diagnostics.add(diagnostic)
+        if value["phase"] == "runtime":
+            provider_diagnostic = value.get("provider_diagnostic")
+            if (
+                not isinstance(provider_diagnostic, str)
+                or not provider_diagnostic
+                or any(
+                    character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+                    for character in provider_diagnostic
+                )
+            ):
+                fail(f"{context}.provider_diagnostic must be an uppercase token")
+            if value.get("runner_profile") not in {"ordinary", "keyless"}:
+                fail(f"{context}.runner_profile must be ordinary or keyless")
+        elif "provider_diagnostic" in value or "runner_profile" in value:
+            fail(f"{context} static rejection cannot select a runtime diagnostic or runner")
+    if rejection_ids != set(expected_rejections):
+        fail("fixture.rejections does not contain the complete rejection contract")
 
 
 def load_fixture(
-    path: Path, context_manifest_path: Path | None = None
+    path: Path,
+    context_manifest_path: Path | None = None,
+    require_qualification_bindings: bool = True,
 ) -> tuple[dict[str, Any], str]:
     fixture_bytes = path.read_bytes()
     fixture = load_json(path)
     validate_fixture(fixture)
+    if (
+        require_qualification_bindings
+        and fixture["qualification_bindings"]["status"] != "bound"
+    ):
+        fail("ordinary CKKS fixture is not bound to qualification artifacts")
     if context_manifest_path is not None:
         observed = sha256_path(context_manifest_path)
         expected = fixture["compiler_context_manifest"]["sha256"]
@@ -715,6 +1125,46 @@ def _atomic_write(path: Path, data: bytes) -> None:
 def write_json(path: Path, value: Any) -> None:
     rendered = json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n"
     _atomic_write(path, rendered.encode("utf-8"))
+
+
+def record_qualification_invocation(
+    output_path: Path, argv: Sequence[str]
+) -> dict[str, Any]:
+    arguments = list(argv)
+    if arguments and arguments[0] == "--":
+        arguments = arguments[1:]
+    if not arguments or arguments[0] != "tools/phantom_gpu/compile_only.sh":
+        fail("qualification invocation must name tools/phantom_gpu/compile_only.sh")
+    options = arguments[1:]
+    if len(options) % 2:
+        fail("qualification invocation has an option without a value")
+    pairs = dict(zip(options[0::2], options[1::2]))
+    expected = {
+        "--gate",
+        "--poly-degree",
+        "--mul-level",
+        "--input-level",
+        "--security-level",
+        "--scaling-factor-bits",
+        "--first-prime-bits",
+        "--hamming-weight",
+    }
+    if len(pairs) != len(options) // 2 or set(pairs) != expected:
+        fail("qualification invocation options are incomplete or duplicated")
+    if pairs["--gate"] != "ordinary":
+        fail("qualification invocation gate must be ordinary")
+    for option in expected - {"--gate"}:
+        if re.fullmatch(r"[0-9]+", pairs[option]) is None:
+            fail(
+                f"qualification invocation {option} must be a nonnegative integer"
+            )
+    record = {
+        "schema_version": QUALIFICATION_INVOCATION_SCHEMA,
+        "argv": arguments,
+        "normalized_argv_sha256": sha256_bytes(canonical_bytes(arguments)),
+    }
+    write_json(output_path, record)
+    return record
 
 
 def _case_manifest(records: Sequence[dict[str, Any]]) -> str:
@@ -1570,9 +2020,24 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    record_invocation = subparsers.add_parser(
+        "record-qualification-invocation"
+    )
+    record_invocation.add_argument("--output-json", required=True, type=Path)
+    record_invocation.add_argument("argv", nargs=argparse.REMAINDER)
+
+    bind = subparsers.add_parser("bind-fixture")
+    bind.add_argument("--fixture", required=True, type=Path)
+    bind.add_argument("--context-manifest", required=True, type=Path)
+    bind.add_argument("--compiler-invocation", required=True, type=Path)
+    bind.add_argument("--post-ckks-air", required=True, type=Path)
+    bind.add_argument("--output-json", required=True, type=Path)
+
     validate = subparsers.add_parser("validate-fixture")
     validate.add_argument("--fixture", required=True, type=Path)
     validate.add_argument("--context-manifest", required=True, type=Path)
+    validate.add_argument("--compiler-invocation", required=True, type=Path)
+    validate.add_argument("--post-ckks-air", required=True, type=Path)
 
     analytic = subparsers.add_parser("generate-analytic")
     analytic.add_argument("--fixture", required=True, type=Path)
@@ -1628,9 +2093,50 @@ def parse_arguments() -> argparse.Namespace:
 def main() -> int:
     arguments = parse_arguments()
     try:
-        if arguments.command == "validate-fixture":
+        if arguments.command == "record-qualification-invocation":
+            record = record_qualification_invocation(
+                arguments.output_json, arguments.argv
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": "pass",
+                        "normalized_argv_sha256": record[
+                            "normalized_argv_sha256"
+                        ],
+                    },
+                    sort_keys=True,
+                )
+            )
+        elif arguments.command == "bind-fixture":
+            fixture = bind_fixture(
+                arguments.fixture,
+                arguments.context_manifest,
+                arguments.compiler_invocation,
+                arguments.post_ckks_air,
+                arguments.output_json,
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": "pass",
+                        "fixture_id": fixture["fixture_id"],
+                        "qualification_bindings": fixture[
+                            "qualification_bindings"
+                        ],
+                    },
+                    sort_keys=True,
+                )
+            )
+        elif arguments.command == "validate-fixture":
             fixture, digest = load_fixture(
                 arguments.fixture, arguments.context_manifest
+            )
+            verify_qualification_bindings(
+                fixture,
+                arguments.context_manifest,
+                arguments.compiler_invocation,
+                arguments.post_ckks_air,
             )
             print(
                 json.dumps(

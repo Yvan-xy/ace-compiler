@@ -16,9 +16,18 @@ GENERATOR_PATH = (
     / "phantom_gpu"
     / "generate_ordinary_runtime_symbols.py"
 )
+GPU_RUNNER_PATH = (
+    REPO_ROOT
+    / "tools"
+    / "phantom_gpu"
+    / "harness"
+    / "ordinary_ckks_gpu_runner.cu"
+)
 
 BEGIN_MARKER = "// ORDINARY_RUNTIME_CALLS_BEGIN"
 END_MARKER = "// ORDINARY_RUNTIME_CALLS_END"
+PRESERVATION_BEGIN_MARKER = "// EXACT_SOURCE_PRESERVATION_BEGIN"
+PRESERVATION_END_MARKER = "// EXACT_SOURCE_PRESERVATION_END"
 
 
 @dataclass(frozen=True)
@@ -275,6 +284,71 @@ def audit_source(path: Path) -> None:
     assert not INTERNAL_LABEL_PATTERN.search(source)
 
 
+def audit_gpu_runner_source(path: Path) -> None:
+    source = path.read_text(encoding="utf-8")
+    assert source.count(PRESERVATION_BEGIN_MARKER) == 1
+    assert source.count(PRESERVATION_END_MARKER) == 1
+    start = source.index(PRESERVATION_BEGIN_MARKER) + len(
+        PRESERVATION_BEGIN_MARKER
+    )
+    end = source.index(PRESERVATION_END_MARKER)
+    assert start < end
+    preservation = source[start:end]
+
+    required_exact_contract = (
+        "CheckedElementProduct",
+        "std::numeric_limits<std::size_t>::max() / left",
+        "cudaDeviceSynchronize()",
+        "cudaMemcpy(",
+        "cudaMemcpyDeviceToHost",
+        "CipherMetadata(value)",
+        "PlainMetadata(value)",
+        "ExactDoubleBits(value->scale())",
+        "value->parms_id()",
+        "value->GetNoiseScaleDeg()",
+        "value->is_asymmetric()",
+        "before._coefficients",
+        "if (destination != left)",
+        "if (destination != right)",
+        "if (destination != source)",
+        "RequirePlainPreserved(right_before, right",
+    )
+    for required in required_exact_contract:
+        assert required in preservation, required
+    for forbidden in ("cudaMemcpyAsync", "MaximumError", "tolerance", "fabs"):
+        assert forbidden not in preservation, forbidden
+
+    guarded_calls = {
+        "InvokeCipherBinaryPreservingOperands": (
+            "Add_ciph",
+            "Sub_ciph",
+            "Mul_ciph",
+        ),
+        "InvokeCipherPlainPreservingOperands": (
+            "Add_plain",
+            "Sub_plain",
+            "Mul_plain",
+        ),
+        "InvokeCipherUnaryPreservingSource": (
+            "Add_scalar",
+            "Sub_scalar",
+            "Mul_scalar",
+            "Copy_ciph",
+            "Mod_switch",
+            "Relin",
+            "Rescale_ciph",
+            "Rotate_ciph",
+        ),
+    }
+    for guard, calls in guarded_calls.items():
+        for call in calls:
+            pattern = re.compile(
+                rf"\b{guard}\s*\(.{{0,320}}?\[&\]\s*\{{\s*{call}\s*\(",
+                re.DOTALL,
+            )
+            assert pattern.search(source), f"{call} is not guarded by {guard}"
+
+
 def test_ordinary_runtime_source_contract(tmp_path: Path) -> None:
     source_path = tmp_path / "ordinary_runtime_symbols.cu"
     subprocess.run(
@@ -284,9 +358,18 @@ def test_ordinary_runtime_source_contract(tmp_path: Path) -> None:
     audit_source(source_path)
 
 
+def test_gpu_runner_exact_source_preservation_contract() -> None:
+    audit_gpu_runner_source(GPU_RUNNER_PATH)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--gpu-runner-source", type=Path, default=GPU_RUNNER_PATH)
     arguments = parser.parse_args()
     audit_source(arguments.source)
-    print(f"ordinary runtime source audit passed: {arguments.source}")
+    audit_gpu_runner_source(arguments.gpu_runner_source)
+    print(
+        "ordinary runtime source audits passed: "
+        f"{arguments.source}, {arguments.gpu_runner_source}"
+    )

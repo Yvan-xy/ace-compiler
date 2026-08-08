@@ -2,12 +2,20 @@
   "schema_version": "ace.phantom.ordinary_ckks.fixture/1.0.0",
   "fixture_id": "ordinary_ckks_v1",
   "description": "Deterministic full-packed ordinary CKKS conformance fixture",
+  "qualification_bindings": {
+    "status": "bound",
+    "deterministic_seed": 20260807,
+    "deterministic_generator": "splitmix64-float53-complex-v1",
+    "normalized_compiler_command_sha256": "e966e89fb34bab0c760909b76940cc4d8a6020320bb676705cde30a190097170",
+    "post_ckks_air_sha256": "c2779617970d793abcae1a5ca6acc82a715a333595e1376a81409d616cefa3b9"
+  },
   "compiler_context_manifest": {
     "sha256": "2a2927711c260f72257abebffd9f74f3cb9aeaffd5a8f44c4d7efa5764e6569f"
   },
   "coordinate_rules": {
     "input_length": "compiler_context.logical_slot_capacity",
-    "first_level": "compiler_context.data_q_count",
+    "full_level": "compiler_context.data_q_count",
+    "after_one_drop_level": "compiler_context.data_q_count - 1",
     "middle_level": "ceil(compiler_context.data_q_count / 2)",
     "bottom_level": "1",
     "chain_index_formula": "adapter_first_data_chain_index + compiler_context.data_q_count - active_q_count",
@@ -49,14 +57,14 @@
       "storage": "default_overrides",
       "default": [0.0, 0.0],
       "overrides": [
-        [0, -0.5, 0.125],
-        [1, 0.25, -1.0],
-        [2, -1.25, 0.75],
-        [3, 2.0, 0.5],
-        [4, -0.125, -0.25],
-        [5, 0.75, 1.25],
-        [6, 1.5, -0.5],
-        [7, -0.25, 2.0]
+        [0, 0.1311532586415569, 0.7806974978824561],
+        [1, -0.2908904259379408, -0.5157875076602927],
+        [2, -0.5888139597887063, 0.3873198732425711],
+        [3, -0.5583771625462657, -0.560853864757294],
+        [4, 0.6935910488417658, -0.4064302767510053],
+        [5, 0.7569042487435944, -0.8378383424408686],
+        [6, -0.2488249592799059, -0.17233338616356053],
+        [7, -0.38866082390798296, -0.3174430082888844]
       ]
     },
     "real_f32": {
@@ -99,41 +107,41 @@
     }
   },
   "metadata_contracts": {
-    "cipher_q4_sd1_size2": {
+    "cipher_full_sd1_size2": {
       "object_kind": "ciphertext",
-      "active_q_count": 4,
+      "active_q_count": "full",
       "scale_degree": 1,
       "raw_scale": {"kind": "exact_scale_degree"},
       "ciphertext_size": 2,
       "ntt": true
     },
-    "cipher_q4_sd2_size2": {
+    "cipher_full_sd2_size2": {
       "object_kind": "ciphertext",
-      "active_q_count": 4,
+      "active_q_count": "full",
       "scale_degree": 2,
       "raw_scale": {"kind": "exact_scale_degree"},
       "ciphertext_size": 2,
       "ntt": true
     },
-    "cipher_q4_sd2_size3": {
+    "cipher_full_sd2_size3": {
       "object_kind": "ciphertext",
-      "active_q_count": 4,
+      "active_q_count": "full",
       "scale_degree": 2,
       "raw_scale": {"kind": "exact_scale_degree"},
       "ciphertext_size": 3,
       "ntt": true
     },
-    "cipher_q3_modswitch": {
+    "cipher_after_one_drop_modswitch": {
       "object_kind": "ciphertext",
-      "active_q_count": 3,
+      "active_q_count": "after_one_drop",
       "scale_degree": 1,
       "raw_scale": {"kind": "exact_scale_degree"},
       "ciphertext_size": 2,
       "ntt": true
     },
-    "cipher_q3_rescaled": {
+    "cipher_after_one_drop_rescaled": {
       "object_kind": "ciphertext",
-      "active_q_count": 3,
+      "active_q_count": "after_one_drop",
       "scale_degree": 1,
       "raw_scale": {
         "kind": "divide_by_reported_dropped_modulus",
@@ -145,14 +153,6 @@
     "plain_bottom_sd1": {
       "object_kind": "plaintext",
       "active_q_count": "bottom",
-      "scale_degree": 1,
-      "raw_scale": {"kind": "exact_scale_degree"},
-      "ciphertext_size": null,
-      "ntt": true
-    },
-    "plain_q4_sd1": {
-      "object_kind": "plaintext",
-      "active_q_count": 4,
       "scale_degree": 1,
       "raw_scale": {"kind": "exact_scale_degree"},
       "ciphertext_size": null,
@@ -179,34 +179,39 @@
     "ct_ct": {"distinct": "supported", "lhs": "supported", "rhs": "supported"},
     "ct_plain": {"distinct": "supported", "lhs": "supported", "rhs": "not_applicable"},
     "ct_scalar": {"distinct": "supported", "lhs": "supported", "rhs": "not_applicable"},
-    "unary": {"distinct": "supported", "inplace": "supported"},
-    "copy": {"distinct": "supported", "self": "supported"}
+    "cipher_unary": {"distinct": "supported", "inplace": "supported"},
+    "copy": {"distinct": "supported", "self": "supported"},
+    "encode": {"distinct": "supported", "inplace": "not_applicable"},
+    "query": {"distinct": "supported", "inplace": "not_applicable"},
+    "zero": {"destination_source": "not_applicable"},
+    "free": {"destination_source": "not_applicable"},
+    "free_array": {"destination_source": "not_applicable"}
   },
   "case_families": [
-    {"id": "add_ct_ct", "operation": "add", "form": "ct_ct", "aliases": ["distinct", "lhs", "rhs"], "expected": {"op": "add", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_q4_sd1_size2"},
-    {"id": "add_ct_plain", "operation": "add", "form": "ct_plain", "aliases": ["distinct", "lhs"], "expected": {"op": "add", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_q4_sd1_size2"},
-    {"id": "add_ct_scalar", "operation": "add", "form": "ct_scalar", "aliases": ["distinct", "lhs"], "expected": {"op": "add", "args": [{"input": "complex_x"}, {"scalar": [0.5, 0.0]}]}, "metadata": "cipher_q4_sd1_size2"},
-    {"id": "copy", "operation": "copy", "form": "copy", "aliases": ["distinct", "self"], "expected": {"input": "complex_x"}, "metadata": "cipher_q4_sd1_size2"},
-    {"id": "encode_complex_q4", "operation": "encode_complex", "form": "unary", "aliases": ["distinct"], "expected": {"input": "complex_x"}, "metadata": "plain_q4_sd1"},
-    {"id": "encode_mask_f32_q4", "operation": "encode_mask_f32", "form": "unary", "aliases": ["distinct"], "expected": {"input": "mask_f32"}, "metadata": "plain_q4_sd1"},
-    {"id": "encode_mask_f64_q4", "operation": "encode_mask_f64", "form": "unary", "aliases": ["distinct"], "expected": {"input": "mask_f64"}, "metadata": "plain_q4_sd1"},
-    {"id": "encode_real_f32_q4", "operation": "encode_real_f32", "form": "unary", "aliases": ["distinct"], "expected": {"input": "real_f32"}, "metadata": "plain_q4_sd1"},
-    {"id": "encode_real_f64_bottom", "operation": "encode_real_f64", "form": "unary", "aliases": ["distinct"], "expected": {"input": "real_f64"}, "metadata": "plain_bottom_sd1"},
-    {"id": "encode_real_f64_middle", "operation": "encode_real_f64", "form": "unary", "aliases": ["distinct"], "expected": {"input": "real_f64"}, "metadata": "plain_middle_sd1"},
-    {"id": "encode_real_f64_full", "operation": "encode_real_f64", "form": "unary", "aliases": ["distinct"], "expected": {"input": "real_f64"}, "metadata": "plain_full_sd1"},
-    {"id": "modswitch", "operation": "modswitch", "form": "unary", "aliases": ["distinct", "inplace"], "expected": {"input": "complex_x"}, "metadata": "cipher_q3_modswitch"},
-    {"id": "mul_ct_ct", "operation": "multiply", "form": "ct_ct", "aliases": ["distinct", "lhs", "rhs"], "expected": {"op": "multiply", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_q4_sd2_size3"},
-    {"id": "mul_ct_plain", "operation": "multiply", "form": "ct_plain", "aliases": ["distinct", "lhs"], "expected": {"op": "multiply", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_q4_sd2_size2"},
-    {"id": "mul_ct_scalar", "operation": "multiply", "form": "ct_scalar", "aliases": ["distinct", "lhs"], "expected": {"op": "multiply", "args": [{"input": "complex_x"}, {"scalar": [-0.75, 0.0]}]}, "metadata": "cipher_q4_sd2_size2"},
-    {"id": "query_all", "operation": "query_all", "form": "unary", "aliases": ["distinct"], "expected": {"input": "complex_x"}, "metadata": "cipher_q4_sd1_size2"},
-    {"id": "relinearize", "operation": "relinearize", "form": "unary", "aliases": ["distinct", "inplace"], "expected": {"op": "multiply", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_q4_sd2_size2"},
-    {"id": "rescale", "operation": "rescale", "form": "unary", "aliases": ["distinct", "inplace"], "expected": {"op": "multiply", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_q3_rescaled"},
-    {"id": "rotate_negative", "operation": "rotate", "form": "unary", "aliases": ["distinct", "inplace"], "expected": {"op": "rotate", "arg": {"input": "complex_x"}, "step": -3}, "metadata": "cipher_q4_sd1_size2"},
-    {"id": "rotate_positive", "operation": "rotate", "form": "unary", "aliases": ["distinct", "inplace"], "expected": {"op": "rotate", "arg": {"input": "complex_x"}, "step": 3}, "metadata": "cipher_q4_sd1_size2"},
-    {"id": "rotate_zero", "operation": "rotate", "form": "unary", "aliases": ["distinct", "inplace"], "expected": {"op": "rotate", "arg": {"input": "complex_x"}, "step": 0}, "metadata": "cipher_q4_sd1_size2"},
-    {"id": "sub_ct_ct", "operation": "subtract", "form": "ct_ct", "aliases": ["distinct", "lhs", "rhs"], "expected": {"op": "subtract", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_q4_sd1_size2"},
-    {"id": "sub_ct_plain", "operation": "subtract", "form": "ct_plain", "aliases": ["distinct", "lhs"], "expected": {"op": "subtract", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_q4_sd1_size2"},
-    {"id": "sub_ct_scalar", "operation": "subtract", "form": "ct_scalar", "aliases": ["distinct", "lhs"], "expected": {"op": "subtract", "args": [{"input": "complex_x"}, {"scalar": [0.5, 0.0]}]}, "metadata": "cipher_q4_sd1_size2"}
+    {"id": "add_ct_ct", "operation": "add", "form": "ct_ct", "aliases": ["distinct", "lhs", "rhs"], "expected": {"op": "add", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_full_sd1_size2"},
+    {"id": "add_ct_plain", "operation": "add", "form": "ct_plain", "aliases": ["distinct", "lhs"], "expected": {"op": "add", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_full_sd1_size2"},
+    {"id": "add_ct_scalar", "operation": "add", "form": "ct_scalar", "aliases": ["distinct", "lhs"], "expected": {"op": "add", "args": [{"input": "complex_x"}, {"scalar": [0.5, 0.0]}]}, "metadata": "cipher_full_sd1_size2"},
+    {"id": "copy", "operation": "copy", "form": "copy", "aliases": ["distinct", "self"], "expected": {"input": "complex_x"}, "metadata": "cipher_full_sd1_size2"},
+    {"id": "encode_complex_full", "operation": "encode_complex", "form": "encode", "aliases": ["distinct"], "expected": {"input": "complex_x"}, "metadata": "plain_full_sd1"},
+    {"id": "encode_mask_f32_full", "operation": "encode_mask_f32", "form": "encode", "aliases": ["distinct"], "expected": {"input": "mask_f32"}, "metadata": "plain_full_sd1"},
+    {"id": "encode_mask_f64_full", "operation": "encode_mask_f64", "form": "encode", "aliases": ["distinct"], "expected": {"input": "mask_f64"}, "metadata": "plain_full_sd1"},
+    {"id": "encode_real_f32_full", "operation": "encode_real_f32", "form": "encode", "aliases": ["distinct"], "expected": {"input": "real_f32"}, "metadata": "plain_full_sd1"},
+    {"id": "encode_real_f64_bottom", "operation": "encode_real_f64", "form": "encode", "aliases": ["distinct"], "expected": {"input": "real_f64"}, "metadata": "plain_bottom_sd1"},
+    {"id": "encode_real_f64_middle", "operation": "encode_real_f64", "form": "encode", "aliases": ["distinct"], "expected": {"input": "real_f64"}, "metadata": "plain_middle_sd1"},
+    {"id": "encode_real_f64_full", "operation": "encode_real_f64", "form": "encode", "aliases": ["distinct"], "expected": {"input": "real_f64"}, "metadata": "plain_full_sd1"},
+    {"id": "modswitch", "operation": "modswitch", "form": "cipher_unary", "aliases": ["distinct", "inplace"], "expected": {"input": "complex_x"}, "metadata": "cipher_after_one_drop_modswitch"},
+    {"id": "mul_ct_ct", "operation": "multiply", "form": "ct_ct", "aliases": ["distinct", "lhs", "rhs"], "expected": {"op": "multiply", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_full_sd2_size3"},
+    {"id": "mul_ct_plain", "operation": "multiply", "form": "ct_plain", "aliases": ["distinct", "lhs"], "expected": {"op": "multiply", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_full_sd2_size2"},
+    {"id": "mul_ct_scalar", "operation": "multiply", "form": "ct_scalar", "aliases": ["distinct", "lhs"], "expected": {"op": "multiply", "args": [{"input": "complex_x"}, {"scalar": [-0.75, 0.0]}]}, "metadata": "cipher_full_sd2_size2"},
+    {"id": "query_all", "operation": "query_all", "form": "query", "aliases": ["distinct"], "expected": {"input": "complex_x"}, "metadata": "cipher_full_sd1_size2"},
+    {"id": "relinearize", "operation": "relinearize", "form": "cipher_unary", "aliases": ["distinct", "inplace"], "expected": {"op": "multiply", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_full_sd2_size2"},
+    {"id": "rescale", "operation": "rescale", "form": "cipher_unary", "aliases": ["distinct", "inplace"], "expected": {"op": "multiply", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_after_one_drop_rescaled"},
+    {"id": "rotate_negative", "operation": "rotate", "form": "cipher_unary", "aliases": ["distinct", "inplace"], "expected": {"op": "rotate", "arg": {"input": "complex_x"}, "step": -3}, "metadata": "cipher_full_sd1_size2"},
+    {"id": "rotate_positive", "operation": "rotate", "form": "cipher_unary", "aliases": ["distinct", "inplace"], "expected": {"op": "rotate", "arg": {"input": "complex_x"}, "step": 3}, "metadata": "cipher_full_sd1_size2"},
+    {"id": "rotate_zero", "operation": "rotate", "form": "cipher_unary", "aliases": ["distinct", "inplace"], "expected": {"op": "rotate", "arg": {"input": "complex_x"}, "step": 0}, "metadata": "cipher_full_sd1_size2"},
+    {"id": "sub_ct_ct", "operation": "subtract", "form": "ct_ct", "aliases": ["distinct", "lhs", "rhs"], "expected": {"op": "subtract", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_full_sd1_size2"},
+    {"id": "sub_ct_plain", "operation": "subtract", "form": "ct_plain", "aliases": ["distinct", "lhs"], "expected": {"op": "subtract", "args": [{"input": "complex_x"}, {"input": "complex_y"}]}, "metadata": "cipher_full_sd1_size2"},
+    {"id": "sub_ct_scalar", "operation": "subtract", "form": "ct_scalar", "aliases": ["distinct", "lhs"], "expected": {"op": "subtract", "args": [{"input": "complex_x"}, {"scalar": [0.5, 0.0]}]}, "metadata": "cipher_full_sd1_size2"}
   ],
   "ownership_cases": [
     {"id": "copy_independence", "iterations": 100},
@@ -219,21 +224,20 @@
     {"id": "encode_invalid_length", "phase": "static", "diagnostic_id": "ORDINARY_CKKS_ENCODE_LENGTH"},
     {"id": "encode_invalid_level", "phase": "static", "diagnostic_id": "ORDINARY_CKKS_ENCODE_LEVEL"},
     {"id": "encode_invalid_scale", "phase": "static", "diagnostic_id": "ORDINARY_CKKS_ENCODE_SCALE"},
-    {"id": "encode_phantom_num_p", "phase": "static", "diagnostic_id": "ORDINARY_CKKS_PHANTOM_NUM_P"},
     {"id": "incompatible_level", "phase": "static", "diagnostic_id": "ORDINARY_CKKS_LEVEL_MISMATCH"},
     {"id": "incompatible_scale", "phase": "static", "diagnostic_id": "ORDINARY_CKKS_SCALE_MISMATCH"},
     {"id": "missing_declared_relin_key", "phase": "static", "diagnostic_id": "ORDINARY_CKKS_RELIN_KEY_REQUIREMENT"},
     {"id": "missing_declared_rotation_key", "phase": "static", "diagnostic_id": "ORDINARY_CKKS_ROTATION_KEY_REQUIREMENT"},
     {"id": "reverse_scalar_subtraction", "phase": "static", "diagnostic_id": "ORDINARY_CKKS_REVERSE_SCALAR_UNSUPPORTED"},
-    {"id": "bottom_modswitch", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_BOTTOM_MODSWITCH"},
-    {"id": "bottom_rescale", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_BOTTOM_RESCALE"},
-    {"id": "double_free", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_DOUBLE_FREE"},
-    {"id": "invalid_ciphertext_size", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_INVALID_CIPHERTEXT_SIZE"},
-    {"id": "missing_loaded_relin_key", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_RELIN_KEY_MISSING"},
-    {"id": "missing_loaded_rotation_key", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_ROTATION_KEY_MISSING"},
-    {"id": "relinearize_size2", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_RELIN_SIZE"},
-    {"id": "runtime_level_mismatch", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_RUNTIME_LEVEL_MISMATCH"},
-    {"id": "runtime_scale_mismatch", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_RUNTIME_SCALE_MISMATCH"},
-    {"id": "use_after_free", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_USE_AFTER_FREE"}
+    {"id": "bottom_modswitch", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_BOTTOM_MODSWITCH", "provider_diagnostic": "MODSWITCH_BOTTOM_CHAIN", "runner_profile": "ordinary"},
+    {"id": "bottom_rescale", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_BOTTOM_RESCALE", "provider_diagnostic": "RESCALE_BOTTOM_CHAIN", "runner_profile": "ordinary"},
+    {"id": "double_free", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_DOUBLE_FREE", "provider_diagnostic": "DOUBLE_FREE_CIPHER", "runner_profile": "ordinary"},
+    {"id": "invalid_ciphertext_size", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_INVALID_CIPHERTEXT_SIZE", "provider_diagnostic": "QUERY_SIZE", "runner_profile": "ordinary"},
+    {"id": "missing_loaded_relin_key", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_RELIN_KEY_MISSING", "provider_diagnostic": "RELIN_KEY_MISSING", "runner_profile": "keyless"},
+    {"id": "missing_loaded_rotation_key", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_ROTATION_KEY_MISSING", "provider_diagnostic": "ROTATE_KEY_MISSING", "runner_profile": "keyless"},
+    {"id": "relinearize_size2", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_RELIN_SIZE", "provider_diagnostic": "RELIN_SIZE", "runner_profile": "ordinary"},
+    {"id": "runtime_level_mismatch", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_RUNTIME_LEVEL_MISMATCH", "provider_diagnostic": "ADD_COMPAT", "runner_profile": "ordinary"},
+    {"id": "runtime_scale_mismatch", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_RUNTIME_SCALE_MISMATCH", "provider_diagnostic": "ADD_COMPAT", "runner_profile": "ordinary"},
+    {"id": "use_after_free", "phase": "runtime", "diagnostic_id": "ORDINARY_CKKS_USE_AFTER_FREE", "provider_diagnostic": "USE_AFTER_FREE_CIPHER", "runner_profile": "ordinary"}
   ]
 }

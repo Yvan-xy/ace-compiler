@@ -10,9 +10,11 @@
 #include <complex>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -42,10 +44,28 @@ namespace {
 using Json = nlohmann::json;
 using Complex = std::complex<double>;
 
-constexpr int kArithmeticLevel = 4;
-
 [[noreturn]] void Fail(const std::string& message) {
   throw std::runtime_error(message);
+}
+
+struct LevelCoordinates {
+  int _full;
+  int _after_one_drop;
+  int _middle;
+  int _bottom;
+};
+
+LevelCoordinates ContextLevelCoordinates() {
+  const auto* manifest = Get_phantom_context_manifest();
+  if (manifest == nullptr || manifest->_data_q_count < 2) {
+    Fail("ordinary CKKS requires at least two compiler-emitted data-Q primes");
+  }
+  if (manifest->_data_q_count >
+      static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    Fail("compiler-emitted data-Q count exceeds the runtime level type");
+  }
+  const int full = static_cast<int>(manifest->_data_q_count);
+  return {full, full - 1, (full + 1) / 2, 1};
 }
 
 void RequireCuda(cudaError_t status, const char* operation) {
@@ -236,6 +256,188 @@ Json PlainMetadata(PLAIN value) {
   };
 }
 
+// EXACT_SOURCE_PRESERVATION_BEGIN
+std::size_t CheckedElementProduct(std::size_t left, std::size_t right,
+                                  const std::string& context) {
+  if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left) {
+    Fail(context + " coefficient element count overflows size_t");
+  }
+  return left * right;
+}
+
+std::uint64_t ExactDoubleBits(double value) {
+  static_assert(sizeof(double) == sizeof(std::uint64_t));
+  std::uint64_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+std::vector<std::uint64_t> CopyDeviceCoefficients(
+    const std::uint64_t* device_data, std::size_t element_count,
+    const std::string& context) {
+  if (element_count == 0 || device_data == nullptr) {
+    Fail(context + " has no device coefficient buffer");
+  }
+  const std::size_t byte_count = CheckedElementProduct(
+      element_count, sizeof(std::uint64_t), context + " byte count");
+  std::vector<std::uint64_t> coefficients(element_count);
+  RequireCuda(cudaDeviceSynchronize(),
+              "source preservation cudaDeviceSynchronize");
+  RequireCuda(cudaMemcpy(coefficients.data(), device_data, byte_count,
+                         cudaMemcpyDeviceToHost),
+              "source preservation cudaMemcpy");
+  return coefficients;
+}
+
+struct CipherSnapshot {
+  CIPHER _identity;
+  phantom::parms_id_type _parameters;
+  std::size_t _chain_index;
+  std::size_t _ciphertext_size;
+  std::size_t _polynomial_degree;
+  std::size_t _coefficient_modulus_size;
+  std::size_t _noise_scale_degree;
+  std::uint64_t _scale_bits;
+  bool _ntt;
+  bool _asymmetric;
+  Json _logical_metadata;
+  std::vector<std::uint64_t> _coefficients;
+};
+
+struct PlainSnapshot {
+  PLAIN _identity;
+  phantom::parms_id_type _parameters;
+  std::size_t _chain_index;
+  std::size_t _polynomial_degree;
+  std::size_t _coefficient_modulus_size;
+  std::uint64_t _scale_bits;
+  Json _logical_metadata;
+  std::vector<std::uint64_t> _coefficients;
+};
+
+CipherSnapshot CaptureCipher(CIPHER value, const std::string& context) {
+  if (value == nullptr) Fail(context + " ciphertext is null");
+  const std::size_t polynomial_count = CheckedElementProduct(
+      value->size(), value->coeff_modulus_size(), context);
+  const std::size_t element_count = CheckedElementProduct(
+      polynomial_count, value->poly_modulus_degree(), context);
+  return {
+      value,
+      value->parms_id(),
+      value->chain_index(),
+      value->size(),
+      value->poly_modulus_degree(),
+      value->coeff_modulus_size(),
+      value->GetNoiseScaleDeg(),
+      ExactDoubleBits(value->scale()),
+      value->is_ntt_form(),
+      value->is_asymmetric(),
+      CipherMetadata(value),
+      CopyDeviceCoefficients(value->data(), element_count, context),
+  };
+}
+
+PlainSnapshot CapturePlain(PLAIN value, const std::string& context) {
+  if (value == nullptr) Fail(context + " plaintext is null");
+  const std::size_t element_count = CheckedElementProduct(
+      value->coeff_modulus_size(), value->poly_modulus_degree(), context);
+  return {
+      value,
+      value->parms_id(),
+      value->chain_index(),
+      value->poly_modulus_degree(),
+      value->coeff_modulus_size(),
+      ExactDoubleBits(value->scale()),
+      PlainMetadata(value),
+      CopyDeviceCoefficients(value->data(), element_count, context),
+  };
+}
+
+void RequireCipherPreserved(const CipherSnapshot& before, CIPHER value,
+                            const std::string& context) {
+  if (value != before._identity || value->parms_id() != before._parameters ||
+      value->chain_index() != before._chain_index ||
+      value->size() != before._ciphertext_size ||
+      value->poly_modulus_degree() != before._polynomial_degree ||
+      value->coeff_modulus_size() != before._coefficient_modulus_size ||
+      value->GetNoiseScaleDeg() != before._noise_scale_degree ||
+      ExactDoubleBits(value->scale()) != before._scale_bits ||
+      value->is_ntt_form() != before._ntt ||
+      value->is_asymmetric() != before._asymmetric ||
+      CipherMetadata(value) != before._logical_metadata) {
+    Fail(context + " changed non-destination ciphertext metadata");
+  }
+  const std::size_t polynomial_count = CheckedElementProduct(
+      value->size(), value->coeff_modulus_size(), context);
+  const std::size_t element_count = CheckedElementProduct(
+      polynomial_count, value->poly_modulus_degree(), context);
+  if (CopyDeviceCoefficients(value->data(), element_count, context) !=
+      before._coefficients) {
+    Fail(context + " changed non-destination ciphertext coefficients");
+  }
+}
+
+void RequirePlainPreserved(const PlainSnapshot& before, PLAIN value,
+                           const std::string& context) {
+  if (value != before._identity || value->parms_id() != before._parameters ||
+      value->chain_index() != before._chain_index ||
+      value->poly_modulus_degree() != before._polynomial_degree ||
+      value->coeff_modulus_size() != before._coefficient_modulus_size ||
+      ExactDoubleBits(value->scale()) != before._scale_bits ||
+      PlainMetadata(value) != before._logical_metadata) {
+    Fail(context + " changed non-destination plaintext metadata");
+  }
+  const std::size_t element_count = CheckedElementProduct(
+      value->coeff_modulus_size(), value->poly_modulus_degree(), context);
+  if (CopyDeviceCoefficients(value->data(), element_count, context) !=
+      before._coefficients) {
+    Fail(context + " changed non-destination plaintext coefficients");
+  }
+}
+
+template <typename Operation>
+void InvokeCipherBinaryPreservingOperands(CIPHER destination, CIPHER left,
+                                          CIPHER right,
+                                          const std::string& context,
+                                          Operation&& operation) {
+  const CipherSnapshot left_before = CaptureCipher(left, context + " lhs");
+  const CipherSnapshot right_before = CaptureCipher(right, context + " rhs");
+  std::forward<Operation>(operation)();
+  if (destination != left) {
+    RequireCipherPreserved(left_before, left, context + " lhs");
+  }
+  if (destination != right) {
+    RequireCipherPreserved(right_before, right, context + " rhs");
+  }
+}
+
+template <typename Operation>
+void InvokeCipherPlainPreservingOperands(CIPHER destination, CIPHER left,
+                                         PLAIN right,
+                                         const std::string& context,
+                                         Operation&& operation) {
+  const CipherSnapshot left_before = CaptureCipher(left, context + " lhs");
+  const PlainSnapshot right_before = CapturePlain(right, context + " rhs");
+  std::forward<Operation>(operation)();
+  if (destination != left) {
+    RequireCipherPreserved(left_before, left, context + " lhs");
+  }
+  RequirePlainPreserved(right_before, right, context + " rhs");
+}
+
+template <typename Operation>
+void InvokeCipherUnaryPreservingSource(CIPHER destination, CIPHER source,
+                                       const std::string& context,
+                                       Operation&& operation) {
+  const CipherSnapshot source_before =
+      CaptureCipher(source, context + " source");
+  std::forward<Operation>(operation)();
+  if (destination != source) {
+    RequireCipherPreserved(source_before, source, context + " source");
+  }
+}
+// EXACT_SOURCE_PRESERVATION_END
+
 struct CaseResult {
   std::vector<Complex> _values;
   Json _metadata;
@@ -249,67 +451,175 @@ CIPHER Destination(ObjectArena& arena, const std::string& alias, CIPHER left,
   Fail("unsupported alias " + alias);
 }
 
-CaseResult RunCipherCase(const std::string& family_id,
-                         const std::string& alias, const Json& fixture,
+void RequireInputExpression(const Json& expression,
+                            const std::string& input_name) {
+  if (!expression.is_object() || expression.size() != 1 ||
+      !expression.contains("input") ||
+      expression.at("input").get<std::string>() != input_name) {
+    Fail("fixture expression does not name expected input " + input_name);
+  }
+}
+
+const Json& RequireBinaryExpression(const Json& family,
+                                    const std::string& operation) {
+  const Json& expected = family.at("expected");
+  if (!expected.is_object() || expected.size() != 2 ||
+      expected.at("op").get<std::string>() != operation ||
+      !expected.at("args").is_array() || expected.at("args").size() != 2) {
+    Fail("fixture binary expression disagrees with " + operation);
+  }
+  RequireInputExpression(expected.at("args").at(0), "complex_x");
+  return expected;
+}
+
+double RequireRealScalar(const Json& expression) {
+  const Json& scalar = expression.at("scalar");
+  if (!scalar.is_array() || scalar.size() != 2 ||
+      scalar.at(1).get<double>() != 0.0) {
+    Fail("ordinary scalar fixture must contain a real scalar");
+  }
+  return scalar.at(0).get<double>();
+}
+
+CaseResult RunCipherCase(const Json& family, const std::string& alias,
+                         const Json& fixture,
                          ObjectArena& arena) {
+  const std::string family_id = family.at("id").get<std::string>();
   const auto* manifest = Get_phantom_context_manifest();
+  const LevelCoordinates levels = ContextLevelCoordinates();
   const std::size_t slots = manifest->_logical_slots;
   const auto x = ExpandInput(fixture.at("inputs").at("complex_x"), slots);
   const auto y = ExpandInput(fixture.at("inputs").at("complex_y"), slots);
   CIPHER result = nullptr;
   std::uint64_t dropped_modulus = 0;
+  const std::string case_label = family_id + "." + alias;
 
   if (family_id == "add_ct_ct" || family_id == "sub_ct_ct" ||
       family_id == "mul_ct_ct") {
-    CIPHER left = EncryptComplex(arena, x, kArithmeticLevel);
-    CIPHER right = EncryptComplex(arena, y, kArithmeticLevel);
+    const std::string operation = family_id == "add_ct_ct"
+                                      ? "add"
+                                      : (family_id == "sub_ct_ct"
+                                             ? "subtract"
+                                             : "multiply");
+    const Json& expected = RequireBinaryExpression(family, operation);
+    RequireInputExpression(expected.at("args").at(1), "complex_y");
+    CIPHER left = EncryptComplex(arena, x, levels._full);
+    CIPHER right = EncryptComplex(arena, y, levels._full);
     result = Destination(arena, alias, left, right);
-    if (family_id == "add_ct_ct") Add_ciph(result, left, right);
-    if (family_id == "sub_ct_ct") Sub_ciph(result, left, right);
-    if (family_id == "mul_ct_ct") Mul_ciph(result, left, right);
+    if (family_id == "add_ct_ct") {
+      InvokeCipherBinaryPreservingOperands(
+          result, left, right, case_label,
+          [&] { Add_ciph(result, left, right); });
+    }
+    if (family_id == "sub_ct_ct") {
+      InvokeCipherBinaryPreservingOperands(
+          result, left, right, case_label,
+          [&] { Sub_ciph(result, left, right); });
+    }
+    if (family_id == "mul_ct_ct") {
+      InvokeCipherBinaryPreservingOperands(
+          result, left, right, case_label,
+          [&] { Mul_ciph(result, left, right); });
+    }
   } else if (family_id == "add_ct_plain" ||
              family_id == "sub_ct_plain" ||
              family_id == "mul_ct_plain") {
-    CIPHER left = EncryptComplex(arena, x, kArithmeticLevel);
-    PLAIN right = EncodeComplex(arena, y, kArithmeticLevel);
+    const std::string operation = family_id == "add_ct_plain"
+                                      ? "add"
+                                      : (family_id == "sub_ct_plain"
+                                             ? "subtract"
+                                             : "multiply");
+    const Json& expected = RequireBinaryExpression(family, operation);
+    RequireInputExpression(expected.at("args").at(1), "complex_y");
+    CIPHER left = EncryptComplex(arena, x, levels._full);
+    PLAIN right = EncodeComplex(arena, y, levels._full);
     result = Destination(arena, alias, left);
-    if (family_id == "add_ct_plain") Add_plain(result, left, right);
-    if (family_id == "sub_ct_plain") Sub_plain(result, left, right);
-    if (family_id == "mul_ct_plain") Mul_plain(result, left, right);
+    if (family_id == "add_ct_plain") {
+      InvokeCipherPlainPreservingOperands(
+          result, left, right, case_label,
+          [&] { Add_plain(result, left, right); });
+    }
+    if (family_id == "sub_ct_plain") {
+      InvokeCipherPlainPreservingOperands(
+          result, left, right, case_label,
+          [&] { Sub_plain(result, left, right); });
+    }
+    if (family_id == "mul_ct_plain") {
+      InvokeCipherPlainPreservingOperands(
+          result, left, right, case_label,
+          [&] { Mul_plain(result, left, right); });
+    }
   } else if (family_id == "add_ct_scalar" ||
              family_id == "sub_ct_scalar" ||
              family_id == "mul_ct_scalar") {
-    CIPHER left = EncryptComplex(arena, x, kArithmeticLevel);
+    const std::string operation = family_id == "add_ct_scalar"
+                                      ? "add"
+                                      : (family_id == "sub_ct_scalar"
+                                             ? "subtract"
+                                             : "multiply");
+    const Json& expected = RequireBinaryExpression(family, operation);
+    const double scalar = RequireRealScalar(expected.at("args").at(1));
+    CIPHER left = EncryptComplex(arena, x, levels._full);
     result = Destination(arena, alias, left);
-    if (family_id == "add_ct_scalar") Add_scalar(result, left, 0.5);
-    if (family_id == "sub_ct_scalar") Sub_scalar(result, left, 0.5);
-    if (family_id == "mul_ct_scalar") Mul_scalar(result, left, -0.75);
+    if (family_id == "add_ct_scalar") {
+      InvokeCipherUnaryPreservingSource(
+          result, left, case_label,
+          [&] { Add_scalar(result, left, scalar); });
+    }
+    if (family_id == "sub_ct_scalar") {
+      InvokeCipherUnaryPreservingSource(
+          result, left, case_label,
+          [&] { Sub_scalar(result, left, scalar); });
+    }
+    if (family_id == "mul_ct_scalar") {
+      InvokeCipherUnaryPreservingSource(
+          result, left, case_label,
+          [&] { Mul_scalar(result, left, scalar); });
+    }
   } else if (family_id == "copy") {
-    CIPHER source = EncryptComplex(arena, x, kArithmeticLevel);
+    RequireInputExpression(family.at("expected"), "complex_x");
+    CIPHER source = EncryptComplex(arena, x, levels._full);
     result = Destination(arena, alias, source);
-    Copy_ciph(result, source);
+    InvokeCipherUnaryPreservingSource(
+        result, source, case_label, [&] { Copy_ciph(result, source); });
   } else if (family_id == "query_all") {
-    result = EncryptComplex(arena, x, kArithmeticLevel);
+    RequireInputExpression(family.at("expected"), "complex_x");
+    result = EncryptComplex(arena, x, levels._full);
   } else if (family_id == "modswitch") {
-    CIPHER source = EncryptComplex(arena, x, kArithmeticLevel);
+    RequireInputExpression(family.at("expected"), "complex_x");
+    CIPHER source = EncryptComplex(arena, x, levels._full);
     result = Destination(arena, alias, source);
-    Mod_switch(result, source);
+    InvokeCipherUnaryPreservingSource(
+        result, source, case_label, [&] { Mod_switch(result, source); });
   } else if (family_id == "relinearize") {
-    CIPHER left = EncryptComplex(arena, x, kArithmeticLevel);
-    CIPHER right = EncryptComplex(arena, y, kArithmeticLevel);
+    const Json& expected = RequireBinaryExpression(family, "multiply");
+    RequireInputExpression(expected.at("args").at(1), "complex_y");
+    CIPHER left = EncryptComplex(arena, x, levels._full);
+    CIPHER right = EncryptComplex(arena, y, levels._full);
     CIPHER product = arena.NewCipher();
-    Mul_ciph(product, left, right);
+    InvokeCipherBinaryPreservingOperands(
+        product, left, right, case_label + " setup multiply",
+        [&] { Mul_ciph(product, left, right); });
     result = Destination(arena, alias, product);
-    Relin(result, product);
+    InvokeCipherUnaryPreservingSource(
+        result, product, case_label, [&] { Relin(result, product); });
   } else if (family_id == "rescale") {
-    CIPHER left = EncryptComplex(arena, x, kArithmeticLevel);
-    CIPHER right = EncryptComplex(arena, y, kArithmeticLevel);
+    const Json& expected = RequireBinaryExpression(family, "multiply");
+    RequireInputExpression(expected.at("args").at(1), "complex_y");
+    CIPHER left = EncryptComplex(arena, x, levels._full);
+    CIPHER right = EncryptComplex(arena, y, levels._full);
     CIPHER product = arena.NewCipher();
     CIPHER relinearized = arena.NewCipher();
-    Mul_ciph(product, left, right);
-    Relin(relinearized, product);
+    InvokeCipherBinaryPreservingOperands(
+        product, left, right, case_label + " setup multiply",
+        [&] { Mul_ciph(product, left, right); });
+    InvokeCipherUnaryPreservingSource(
+        relinearized, product, case_label + " setup relinearize",
+        [&] { Relin(relinearized, product); });
     result = Destination(arena, alias, relinearized);
-    Rescale_ciph(result, relinearized);
+    InvokeCipherUnaryPreservingSource(
+        result, relinearized, case_label,
+        [&] { Rescale_ciph(result, relinearized); });
     const long double numerator = std::ldexp(
         static_cast<long double>(1.0),
         2 * static_cast<int>(manifest->_scaling_modulus_bits));
@@ -318,12 +628,22 @@ CaseResult RunCipherCase(const std::string& family_id,
   } else if (family_id == "rotate_negative" ||
              family_id == "rotate_positive" ||
              family_id == "rotate_zero") {
-    CIPHER source = EncryptComplex(arena, x, kArithmeticLevel);
+    const Json& expected = family.at("expected");
+    if (expected.at("op").get<std::string>() != "rotate") {
+      Fail("fixture rotate expression has the wrong operation");
+    }
+    RequireInputExpression(expected.at("arg"), "complex_x");
+    const std::int64_t step64 = expected.at("step").get<std::int64_t>();
+    if (step64 < std::numeric_limits<int>::min() ||
+        step64 > std::numeric_limits<int>::max()) {
+      Fail("fixture rotation step exceeds runtime integer range");
+    }
+    const int step = static_cast<int>(step64);
+    CIPHER source = EncryptComplex(arena, x, levels._full);
     result = Destination(arena, alias, source);
-    const int step = family_id == "rotate_negative"
-                         ? -3
-                         : (family_id == "rotate_positive" ? 3 : 0);
-    Rotate_ciph(result, source, step);
+    InvokeCipherUnaryPreservingSource(
+        result, source, case_label,
+        [&] { Rotate_ciph(result, source, step); });
   } else {
     Fail("unsupported ciphertext case family " + family_id);
   }
@@ -334,49 +654,55 @@ CaseResult RunCipherCase(const std::string& family_id,
   return output;
 }
 
-CaseResult RunEncodeCase(const std::string& family_id, const Json& fixture,
+CaseResult RunEncodeCase(const Json& family, const Json& fixture,
                          ObjectArena& arena) {
+  const std::string family_id = family.at("id").get<std::string>();
   const auto* manifest = Get_phantom_context_manifest();
+  const LevelCoordinates levels = ContextLevelCoordinates();
   const std::size_t slots = manifest->_logical_slots;
   PLAIN plain = arena.NewPlain();
-  if (family_id == "encode_complex_q4") {
+  if (family_id == "encode_complex_full") {
+    RequireInputExpression(family.at("expected"), "complex_x");
     const auto values =
         ExpandInput(fixture.at("inputs").at("complex_x"), slots);
     std::vector<DCMPLX> input(values.begin(), values.end());
-    Encode_dcmplx(plain, input.data(), input.size(), 1.0, kArithmeticLevel);
-  } else if (family_id == "encode_mask_f32_q4") {
+    Encode_dcmplx(plain, input.data(), input.size(), 1.0, levels._full);
+  } else if (family_id == "encode_mask_f32_full") {
+    RequireInputExpression(family.at("expected"), "mask_f32");
     const auto& specification = fixture.at("inputs").at("mask_f32");
     const float value =
         specification.at("segments").at(0).at(2).get<float>();
     Encode_float_mask(plain, value, MaskLength(specification), 1.0,
-                      kArithmeticLevel);
-  } else if (family_id == "encode_mask_f64_q4") {
+                      levels._full);
+  } else if (family_id == "encode_mask_f64_full") {
+    RequireInputExpression(family.at("expected"), "mask_f64");
     const auto& specification = fixture.at("inputs").at("mask_f64");
     const double value =
         specification.at("segments").at(0).at(2).get<double>();
     Encode_double_mask(plain, value, MaskLength(specification), 1.0,
-                       kArithmeticLevel);
-  } else if (family_id == "encode_real_f32_q4") {
+                       levels._full);
+  } else if (family_id == "encode_real_f32_full") {
+    RequireInputExpression(family.at("expected"), "real_f32");
     const auto values =
         ExpandInput(fixture.at("inputs").at("real_f32"), slots);
     std::vector<float> input;
     input.reserve(values.size());
     for (const auto& value : values) input.push_back(value.real());
-    Encode_float(plain, input.data(), input.size(), 1.0, kArithmeticLevel);
+    Encode_float(plain, input.data(), input.size(), 1.0, levels._full);
   } else if (family_id == "encode_real_f64_bottom" ||
              family_id == "encode_real_f64_middle" ||
              family_id == "encode_real_f64_full") {
+    RequireInputExpression(family.at("expected"), "real_f64");
     const auto values =
         ExpandInput(fixture.at("inputs").at("real_f64"), slots);
     std::vector<double> input;
     input.reserve(values.size());
     for (const auto& value : values) input.push_back(value.real());
     const int level = family_id == "encode_real_f64_bottom"
-                          ? 1
+                          ? levels._bottom
                           : (family_id == "encode_real_f64_middle"
-                                 ? static_cast<int>(
-                                       (manifest->_data_q_count + 1) / 2)
-                                 : static_cast<int>(manifest->_data_q_count));
+                                 ? levels._middle
+                                 : levels._full);
     Encode_double(plain, input.data(), input.size(), 1.0, level);
   } else {
     Fail("unsupported encode case family " + family_id);
@@ -399,8 +725,8 @@ Json RunConformance(const Json& fixture) {
     for (const auto& alias_value : family.at("aliases")) {
       const std::string alias = alias_value.get<std::string>();
       CaseResult result = family_id.rfind("encode_", 0) == 0
-                              ? RunEncodeCase(family_id, fixture, arena)
-                              : RunCipherCase(family_id, alias, fixture, arena);
+                              ? RunEncodeCase(family, fixture, arena)
+                              : RunCipherCase(family, alias, fixture, arena);
       if (result._values.size() !=
           Get_phantom_context_manifest()->_logical_slots) {
         Fail("decoded result length disagrees with compiler logical slots");
@@ -436,57 +762,134 @@ double MaximumError(const std::vector<Complex>& left,
 }
 
 void RunOwnership(const Json& fixture) {
+  const LevelCoordinates levels = ContextLevelCoordinates();
   const std::size_t slots = Get_phantom_context_manifest()->_logical_slots;
   const auto x = ExpandInput(fixture.at("inputs").at("complex_x"), slots);
+  const double hard_maximum_absolute =
+      fixture.at("tolerances").at("hard_maximum_absolute").get<double>();
   std::vector<std::unique_ptr<CIPHERTEXT[]>> retained_arrays;
-  retained_arrays.reserve(200);
+  std::size_t retained_array_count = 0;
+  for (const auto& ownership_case : fixture.at("ownership_cases")) {
+    const std::string case_id = ownership_case.at("id").get<std::string>();
+    if (case_id == "free_array_1" || case_id == "free_array_4") {
+      const int iterations = ownership_case.at("iterations").get<int>();
+      if (iterations < 1) Fail("ownership iterations must be positive");
+      retained_array_count += static_cast<std::size_t>(iterations);
+    }
+  }
+  retained_arrays.reserve(retained_array_count);
   ObjectArena arena;
+  std::set<std::string> seen_cases;
+  Json reports = Json::array();
+  std::size_t total_iterations = 0;
 
-  for (int iteration = 0; iteration < 100; ++iteration) {
-    CIPHER source = EncryptComplex(arena, x, kArithmeticLevel);
-    CIPHER copy = arena.NewCipher();
-    Copy_ciph(copy, source);
-    Add_scalar(source, source, 0.25);
-    if (MaximumError(DecodeCipher(copy), x) > 5.0e-3) {
-      Fail("copy independence failed");
+  for (const auto& ownership_case : fixture.at("ownership_cases")) {
+    const std::string case_id = ownership_case.at("id").get<std::string>();
+    const int iterations = ownership_case.at("iterations").get<int>();
+    if (!seen_cases.insert(case_id).second) {
+      Fail("duplicate ownership case " + case_id);
     }
-    arena.FreeCipher(source);
-    arena.FreeCipher(copy);
-  }
+    if (iterations < 1) Fail("ownership iterations must be positive");
+    total_iterations += static_cast<std::size_t>(iterations);
 
-  CIPHER reusable = arena.NewCipher();
-  for (int iteration = 0; iteration < 100; ++iteration) {
-    CIPHER source = EncryptComplex(arena, x, kArithmeticLevel);
-    Copy_ciph(reusable, source);
-    Add_scalar(reusable, reusable, 0.125);
-    arena.FreeCipher(source);
-  }
-  arena.FreeCipher(reusable);
-
-  for (std::size_t length : {std::size_t{1}, std::size_t{4}}) {
-    for (int iteration = 0; iteration < 100; ++iteration) {
-      auto array = std::make_unique<CIPHERTEXT[]>(length);
-      PLAIN plain = EncodeComplex(arena, x, kArithmeticLevel);
-      for (std::size_t index = 0; index < length; ++index) {
-        Phantom_encrypt_plain(&array[index], plain);
+    Json report = {
+        {"id", case_id},
+        {"iterations", iterations},
+        {"status", "pass"},
+    };
+    if (case_id == "copy_independence") {
+      if (ownership_case.contains("array_length")) {
+        Fail("copy_independence cannot specify array_length");
       }
-      Free_ciph_array(array.get(), length);
-      arena.FreePlain(plain);
-      retained_arrays.push_back(std::move(array));
+      for (int iteration = 0; iteration < iterations; ++iteration) {
+        CIPHER source = EncryptComplex(arena, x, levels._full);
+        CIPHER copy = arena.NewCipher();
+        Copy_ciph(copy, source);
+        Add_scalar(source, source, 0.25);
+        if (MaximumError(DecodeCipher(copy), x) > hard_maximum_absolute) {
+          Fail("copy independence failed");
+        }
+        arena.FreeCipher(source);
+        arena.FreeCipher(copy);
+      }
+    } else if (case_id == "destination_reuse") {
+      if (ownership_case.contains("array_length")) {
+        Fail("destination_reuse cannot specify array_length");
+      }
+      std::vector<Complex> expected_reuse = x;
+      for (Complex& value : expected_reuse) value += Complex(0.125, 0.0);
+      CIPHER reusable = arena.NewCipher();
+      for (int iteration = 0; iteration < iterations; ++iteration) {
+        CIPHER source = EncryptComplex(arena, x, levels._full);
+        Copy_ciph(reusable, source);
+        Add_scalar(reusable, reusable, 0.125);
+        if (MaximumError(DecodeCipher(reusable), expected_reuse) >
+            hard_maximum_absolute) {
+          Fail("destination reuse result failed");
+        }
+        arena.FreeCipher(source);
+      }
+      arena.FreeCipher(reusable);
+    } else if (case_id == "free_array_1" || case_id == "free_array_4") {
+      const std::size_t length =
+          ownership_case.at("array_length").get<std::size_t>();
+      const std::size_t required_length = case_id == "free_array_1" ? 1 : 4;
+      if (length != required_length) {
+        Fail(case_id + " has an unexpected array_length");
+      }
+      report["array_length"] = length;
+      for (int iteration = 0; iteration < iterations; ++iteration) {
+        auto array = std::make_unique<CIPHERTEXT[]>(length);
+        PLAIN plain = EncodeComplex(arena, x, levels._full);
+        for (std::size_t index = 0; index < length; ++index) {
+          Phantom_encrypt_plain(&array[index], plain);
+        }
+        Free_ciph_array(array.get(), length);
+        arena.FreePlain(plain);
+        retained_arrays.push_back(std::move(array));
+      }
+    } else if (case_id == "zero_then_free") {
+      if (ownership_case.contains("array_length")) {
+        Fail("zero_then_free cannot specify array_length");
+      }
+      for (int iteration = 0; iteration < iterations; ++iteration) {
+        CIPHER value = arena.NewCipher();
+        Zero_ciph(value);
+        arena.FreeCipher(value);
+      }
+    } else {
+      Fail("unknown ownership case " + case_id);
     }
-  }
-
-  for (int iteration = 0; iteration < 100; ++iteration) {
-    CIPHER value = arena.NewCipher();
-    Zero_ciph(value);
-    arena.FreeCipher(value);
+    reports.push_back(std::move(report));
   }
   arena.FreeLiveObjects();
   RequireCuda(cudaDeviceSynchronize(), "ownership cudaDeviceSynchronize");
-  std::cout << "{\"status\":\"pass\",\"iterations\":100}" << std::endl;
+  std::cout << Json({
+                        {"schema_version",
+                         "ace.phantom.ordinary_ckks.ownership/1.0.0"},
+                        {"status", "pass"},
+                        {"total_iterations", total_iterations},
+                        {"cases", std::move(reports)},
+                    })
+                   .dump()
+            << std::endl;
 }
 
 void RunRejection(const std::string& rejection_id, const Json& fixture) {
+  bool declared_runtime_rejection = false;
+  for (const auto& rejection : fixture.at("rejections")) {
+    if (rejection.at("id").get<std::string>() == rejection_id) {
+      if (rejection.at("phase").get<std::string>() != "runtime") {
+        Fail("rejection case is not a runtime contract: " + rejection_id);
+      }
+      declared_runtime_rejection = true;
+      break;
+    }
+  }
+  if (!declared_runtime_rejection) {
+    Fail("runtime rejection is absent from the fixture: " + rejection_id);
+  }
+  const LevelCoordinates levels = ContextLevelCoordinates();
   const std::size_t slots = Get_phantom_context_manifest()->_logical_slots;
   const auto x = ExpandInput(fixture.at("inputs").at("complex_x"), slots);
   const auto y = ExpandInput(fixture.at("inputs").at("complex_y"), slots);
@@ -494,46 +897,46 @@ void RunRejection(const std::string& rejection_id, const Json& fixture) {
 
   if (rejection_id == "bottom_modswitch" ||
       rejection_id == "bottom_rescale") {
-    CIPHER source = EncryptComplex(arena, x, 1);
+    CIPHER source = EncryptComplex(arena, x, levels._bottom);
     CIPHER result = arena.NewCipher();
     if (rejection_id == "bottom_modswitch") Mod_switch(result, source);
     Rescale_ciph(result, source);
   } else if (rejection_id == "double_free") {
-    CIPHER value = EncryptComplex(arena, x, kArithmeticLevel);
+    CIPHER value = EncryptComplex(arena, x, levels._full);
     Free_ciph(value);
     Free_ciph(value);
   } else if (rejection_id == "use_after_free") {
-    CIPHER value = EncryptComplex(arena, x, kArithmeticLevel);
+    CIPHER value = EncryptComplex(arena, x, levels._full);
     Free_ciph(value);
     (void)Level(value);
   } else if (rejection_id == "relinearize_size2") {
-    CIPHER value = EncryptComplex(arena, x, kArithmeticLevel);
+    CIPHER value = EncryptComplex(arena, x, levels._full);
     CIPHER result = arena.NewCipher();
     Relin(result, value);
   } else if (rejection_id == "missing_loaded_relin_key") {
-    CIPHER left = EncryptComplex(arena, x, kArithmeticLevel);
-    CIPHER right = EncryptComplex(arena, y, kArithmeticLevel);
+    CIPHER left = EncryptComplex(arena, x, levels._full);
+    CIPHER right = EncryptComplex(arena, y, levels._full);
     CIPHER product = arena.NewCipher();
     CIPHER result = arena.NewCipher();
     Mul_ciph(product, left, right);
     Relin(result, product);
   } else if (rejection_id == "missing_loaded_rotation_key") {
-    CIPHER value = EncryptComplex(arena, x, kArithmeticLevel);
+    CIPHER value = EncryptComplex(arena, x, levels._full);
     CIPHER result = arena.NewCipher();
     Rotate_ciph(result, value, 3);
   } else if (rejection_id == "invalid_ciphertext_size") {
-    CIPHER value = EncryptComplex(arena, x, kArithmeticLevel);
+    CIPHER value = EncryptComplex(arena, x, levels._full);
     value->resize(4, value->coeff_modulus_size(),
                   value->poly_modulus_degree(), nullptr);
     (void)Get_ciph_size(value);
   } else if (rejection_id == "runtime_level_mismatch") {
-    CIPHER left = EncryptComplex(arena, x, kArithmeticLevel);
-    CIPHER right = EncryptComplex(arena, y, kArithmeticLevel - 1);
+    CIPHER left = EncryptComplex(arena, x, levels._full);
+    CIPHER right = EncryptComplex(arena, y, levels._after_one_drop);
     CIPHER result = arena.NewCipher();
     Add_ciph(result, left, right);
   } else if (rejection_id == "runtime_scale_mismatch") {
-    CIPHER left = EncryptComplex(arena, x, kArithmeticLevel, 1.0);
-    CIPHER right = EncryptComplex(arena, y, kArithmeticLevel, 2.0);
+    CIPHER left = EncryptComplex(arena, x, levels._full, 1.0);
+    CIPHER right = EncryptComplex(arena, y, levels._full, 2.0);
     CIPHER result = arena.NewCipher();
     Add_ciph(result, left, right);
   } else {
