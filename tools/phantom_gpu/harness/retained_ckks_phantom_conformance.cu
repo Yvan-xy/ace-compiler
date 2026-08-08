@@ -953,6 +953,28 @@ Json RunExact(const Json &exact_reference,
     }
     const auto source_after = export_ciphertext_coefficients(*context, source);
     const auto actual = export_ciphertext_coefficients(*context, result);
+
+    PhantomCiphertext ntt_source =
+        copy_ciphertext_to_ntt_form(*context, source);
+    const Json ntt_source_metadata = ExactMetadata(ntt_source);
+    const auto ntt_source_before =
+        export_ciphertext_coefficients(*context, ntt_source);
+    const auto *ntt_source_storage = ntt_source.data();
+    PhantomCiphertext ntt_result;
+    raise_modulus(*context, ntt_source, ordered_moduli.size(), ntt_result);
+    const auto ntt_source_after =
+        export_ciphertext_coefficients(*context, ntt_source);
+    const auto ntt_actual =
+        export_ciphertext_coefficients(*context, ntt_result);
+    Require(ntt_source.is_ntt_form() && ntt_result.is_ntt_form(),
+            "EXACT_NTT_RAISE", runtime_id + " did not preserve valid NTT form");
+    Require(ExactMetadata(ntt_source) == ntt_source_metadata &&
+                ntt_source.data() == ntt_source_storage &&
+                ntt_source_before == ntt_source_after,
+            "EXACT_NTT_RAISE", runtime_id + " mutated its NTT source");
+    Require(ntt_source_before == source_before && ntt_actual == actual,
+            "EXACT_NTT_RAISE",
+            runtime_id + " NTT and coefficient-form exact residues disagree");
     records.push_back(AppendExactRecord(
         output, runtime_id, operation, normalized_power, before,
         ExactMetadata(source), ExactMetadata(result), source_before,

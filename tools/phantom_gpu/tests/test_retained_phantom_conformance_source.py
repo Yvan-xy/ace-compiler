@@ -63,6 +63,9 @@ def test_exact_path_imports_and_observes_both_representations() -> None:
     assert "copy_ciphertext_to_ntt_form(" in body
     assert body.count("export_ciphertext_coefficients(") >= 6
     assert "NTT and coefficient paths disagree" in body
+    assert "EXACT_NTT_RAISE" in body
+    assert "mutated its NTT source" in body
+    assert "NTT and coefficient-form exact residues disagree" in body
     for wrapper in (
         "Conjugate_ciph",
         "Rotate_batch_ciph",
