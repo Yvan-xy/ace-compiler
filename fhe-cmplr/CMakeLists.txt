@@ -49,7 +49,7 @@ option(EXTERNAL_URL_SSH    "Control choose external URL for repository"       OF
 set(FHE_WITH_SRC "" CACHE STRING "The default compilation depends")
 set(PHANTOM_SOURCE_DIR "" CACHE PATH
     "Local Git repository used to clone the pinned Phantom source")
-set(PHANTOM_GIT_TAG "5a1c9d954800e4634f0195a5849a339f74bd7c38" CACHE STRING
+set(PHANTOM_GIT_TAG "4f3334e37eece1696a60d18a5f9abfaebb6b381a" CACHE STRING
     "Exact Phantom Git commit used by the runtime")
 option(PHANTOM_SOURCE_SNAPSHOT
        "Use a preverified source-only Phantom snapshot" OFF)
