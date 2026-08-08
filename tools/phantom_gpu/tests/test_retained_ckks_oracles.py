@@ -23,6 +23,9 @@ def _load(name: str, filename: str):
 
 fixture_tool = _load("retained_fixture_tool", "generate_retained_ckks_fixtures.py")
 comparator = _load("retained_comparator", "compare_retained_ckks_results.py")
+runpod_evidence = _load(
+    "retained_runpod_evidence", "retained_runpod_evidence.py"
+)
 
 
 def _write_json(path: Path, value) -> None:
@@ -272,6 +275,225 @@ def test_generator_consumes_seed_and_is_binary_deterministic(tmp_path: Path) -> 
         )
 
 
+def _write_synthetic_ant_reference(
+    *,
+    fixture: dict,
+    fixture_path: Path,
+    context_path: Path,
+    analytic_json: Path,
+    analytic_binary: Path,
+    output_json: Path,
+    output_binary: Path,
+    executable_sha256: str,
+    jitter: float,
+) -> None:
+    resolved = fixture_tool.validate_context_manifest(
+        fixture_tool.load_json(context_path)
+    )
+    inputs, analytic_records = comparator.load_analytic(
+        analytic_json,
+        analytic_binary,
+        fixture_tool.sha256_path(fixture_path),
+        fixture,
+        resolved,
+    )
+    analytic_by_id = {
+        record["case_id"]: record["decoded_values"]
+        for record in analytic_records
+    }
+    source = inputs["bounded_nonperiodic"]
+    provider_order = comparator.expected_provider_order(fixture)
+    buffer = bytearray(fixture_tool.DECODED_MAGIC)
+    records = []
+
+    def full_metadata(raised: bool) -> dict:
+        metadata = fixture_tool.expected_metadata(resolved, raised=raised)
+        metadata["chain_index"] = (
+            resolved["full_data_q_count"] - metadata["active_q_count"]
+        )
+        metadata["raw_scale"] = float(1 << resolved["scaling_modulus_bits"])
+        return metadata
+
+    for index, case_id in enumerate(provider_order):
+        operation = comparator.expected_provider_operation(case_id)
+        raised = operation in {"raise_mod", "composite"}
+        if case_id in analytic_by_id:
+            values = analytic_by_id[case_id]
+        elif case_id == "mul_mono.N.bounded_nonperiodic":
+            values = [-value for value in source]
+        else:
+            values = source
+        materialized = [
+            complex(value.real + jitter, value.imag - jitter) for value in values
+        ]
+        packed = b"".join(
+            struct.pack("<dd", value.real, value.imag) for value in materialized
+        )
+        descriptor = {
+            "offset_bytes": len(buffer),
+            "count": len(materialized),
+            "byte_length": len(packed),
+            "sha256": hashlib.sha256(packed).hexdigest(),
+        }
+        buffer.extend(packed)
+        source_hash = f"{index + 1:064x}"
+        records.append(
+            {
+                "case_id": case_id,
+                "operation": operation,
+                "metadata": full_metadata(raised),
+                "source_metadata_before": full_metadata(False),
+                "source_metadata_after": full_metadata(False),
+                "source_values_sha256_before": source_hash,
+                "source_values_sha256_after": source_hash,
+                "ownership_token": (
+                    f"ownership-{index}" if operation == "rotate_batch" else None
+                ),
+                "decoded_projection": (
+                    {"kind": "strict_q0_prefix_drop", "active_q_count": 1}
+                    if raised
+                    else None
+                ),
+                "values": descriptor,
+            }
+        )
+    binary = bytes(buffer)
+    output_binary.write_bytes(binary)
+    _write_json(
+        output_json,
+        {
+            "schema_version": comparator.PROVIDER_SCHEMA,
+            "provider": "ant",
+            "fixture_sha256": fixture_tool.sha256_path(fixture_path),
+            "context_manifest_sha256": fixture_tool.sha256_path(context_path),
+            "qualification_bindings": fixture["qualification_bindings"],
+            "identifiers": {
+                "ace_commit": "1" * 40,
+                "phantom_commit": "2" * 40,
+                "executable_sha256": executable_sha256,
+            },
+            "first_data_chain_index": 0,
+            "binary": {
+                "format": "ace.retained_ckks.complex_float64le/1.0.0",
+                "size_bytes": len(binary),
+                "sha256": hashlib.sha256(binary).hexdigest(),
+            },
+            "records": records,
+        },
+    )
+
+
+def test_ant_replay_uses_closed_semantics_not_randomized_decoded_bytes(
+    tmp_path: Path,
+) -> None:
+    template, context, invocation, air = _qualification_files(tmp_path)
+    bound = fixture_tool.bind_fixture(template, context, invocation, air)
+    fixture_path = tmp_path / "bound.json"
+    _write_json(fixture_path, bound)
+    analytic_json = tmp_path / "analytic.json"
+    analytic_binary = tmp_path / "analytic.bin"
+    fixture_tool.generate_analytic(
+        fixture_path,
+        context,
+        invocation,
+        air,
+        analytic_json,
+        analytic_binary,
+        production_air_path=air,
+    )
+    summaries = []
+    for label, executable, jitter in (
+        ("frozen", "a" * 64, 0.0),
+        ("regenerated", "b" * 64, 1e-8),
+    ):
+        ant_json = tmp_path / f"{label}.json"
+        ant_binary = tmp_path / f"{label}.bin"
+        build = tmp_path / f"{label}-build.json"
+        _write_synthetic_ant_reference(
+            fixture=bound,
+            fixture_path=fixture_path,
+            context_path=context,
+            analytic_json=analytic_json,
+            analytic_binary=analytic_binary,
+            output_json=ant_json,
+            output_binary=ant_binary,
+            executable_sha256=executable,
+            jitter=jitter,
+        )
+        _write_json(
+            build,
+            {
+                "ace_commit": "1" * 40,
+                "phantom_commit": "2" * 40,
+                "executables": {"ant_oracle": executable},
+            },
+        )
+        summary = runpod_evidence.ant_semantic_summary(
+            fixture_path=fixture_path,
+            context_path=context,
+            generation_path=invocation,
+            post_ckks_air_path=air,
+            production_post_ckks_air_path=air,
+            analytic_json_path=analytic_json,
+            analytic_binary_path=analytic_binary,
+            ant_json_path=ant_json,
+            ant_binary_path=ant_binary,
+            build_attestation_path=build,
+            label=label,
+        )
+        summaries.append(summary)
+    assert summaries[0] == summaries[1]
+
+    frozen_json = tmp_path / "frozen.json"
+    frozen_binary = tmp_path / "frozen.bin"
+    frozen_build = tmp_path / "frozen-build.json"
+    original_json = fixture_tool.load_json(frozen_json)
+    original_binary = frozen_binary.read_bytes()
+
+    frozen_binary.write_bytes(original_binary[:-1] + bytes([original_binary[-1] ^ 1]))
+    with pytest.raises(runpod_evidence.EvidenceError, match="binary"):
+        runpod_evidence.ant_semantic_summary(
+            fixture_path=fixture_path,
+            context_path=context,
+            generation_path=invocation,
+            post_ckks_air_path=air,
+            production_post_ckks_air_path=air,
+            analytic_json_path=analytic_json,
+            analytic_binary_path=analytic_binary,
+            ant_json_path=frozen_json,
+            ant_binary_path=frozen_binary,
+            build_attestation_path=frozen_build,
+            label="mutated",
+        )
+    frozen_binary.write_bytes(original_binary)
+
+    for mutation in ("metadata", "order"):
+        invalid = json.loads(json.dumps(original_json))
+        if mutation == "metadata":
+            invalid["records"][0]["metadata"]["unexpected"] = 1
+        else:
+            invalid["records"][0], invalid["records"][1] = (
+                invalid["records"][1],
+                invalid["records"][0],
+            )
+        _write_json(frozen_json, invalid)
+        with pytest.raises(runpod_evidence.EvidenceError):
+            runpod_evidence.ant_semantic_summary(
+                fixture_path=fixture_path,
+                context_path=context,
+                generation_path=invocation,
+                post_ckks_air_path=air,
+                production_post_ckks_air_path=air,
+                analytic_json_path=analytic_json,
+                analytic_binary_path=analytic_binary,
+                ant_json_path=frozen_json,
+                ant_binary_path=frozen_binary,
+                build_attestation_path=frozen_build,
+                label=f"mutated-{mutation}",
+            )
+    _write_json(frozen_json, original_json)
+
+
 def test_exact_centered_lift_and_negacyclic_normalization() -> None:
     assert fixture_tool.centered_lift([0, 8, 9, 16], [17, 19]) == [
         [0, 8, 9, 16],
@@ -425,7 +647,8 @@ def test_identity_chain_hashes_sources_generation_build_run_and_artifacts(
         }
     )
     _write_json(generation_path, generation)
-    build_path = tmp_path / "build.json"
+    frozen_build_path = tmp_path / "frozen-build.json"
+    remote_build_path = tmp_path / "remote-build.json"
     build = {
         "schema_version": comparator.BUILD_ATTESTATION_SCHEMA,
         "status": "pass",
@@ -468,7 +691,10 @@ def test_identity_chain_hashes_sources_generation_build_run_and_artifacts(
         "host_ant_oracle_was_run": True,
         "gpu_executables_were_run": False,
     }
-    _write_json(build_path, build)
+    _write_json(frozen_build_path, build)
+    remote_build = json.loads(json.dumps(build))
+    remote_build["executables"]["ant_oracle"] = "9" * 64
+    _write_json(remote_build_path, remote_build)
     run_path = tmp_path / "run.json"
     run = {
         "schema_version": comparator.RUN_ATTESTATION_SCHEMA,
@@ -478,11 +704,19 @@ def test_identity_chain_hashes_sources_generation_build_run_and_artifacts(
         "ace_source_manifest_sha256": fixture_tool.sha256_path(ace_source),
         "phantom_source_manifest_sha256": fixture_tool.sha256_path(phantom_source),
         "generation_attestation_sha256": fixture_tool.sha256_path(generation_path),
-        "build_attestation_sha256": fixture_tool.sha256_path(build_path),
+        "frozen_build_attestation_sha256": fixture_tool.sha256_path(
+            frozen_build_path
+        ),
+        "remote_build_attestation_sha256": fixture_tool.sha256_path(
+            remote_build_path
+        ),
         "fixture_sha256": fixture_tool.sha256_path(fixture),
         "compiler_context_manifest_sha256": fixture_tool.sha256_path(context),
         "compiler_resource_manifest_sha256": fixture_tool.sha256_path(resource),
-        "executables": build["executables"],
+        "executables": {
+            "ant_oracle": build["executables"]["ant_oracle"],
+            "phantom_sm80": remote_build["executables"]["phantom_sm80"],
+        },
         "provider_results": {
             "ant": {
                 "json_sha256": fixture_tool.sha256_path(ant_json),
@@ -513,9 +747,9 @@ def test_identity_chain_hashes_sources_generation_build_run_and_artifacts(
         fixture=fixture,
         generated_ant_source=generated_ant,
         generated_phantom_source=generated_phantom,
-        ant_executable=ant_executable,
         phantom_executable=phantom_executable,
-        build_attestation=build_path,
+        frozen_build_attestation=frozen_build_path,
+        remote_build_attestation=remote_build_path,
         run_attestation=run_path,
         ant_json=ant_json,
         ant_bin=ant_bin,
@@ -541,12 +775,14 @@ def test_identity_chain_hashes_sources_generation_build_run_and_artifacts(
         comparator.load_identity_chain(arguments)
     _write_json(run_path, run)
 
-    invalid_build = dict(build, phantom_commit="c" * 40)
-    _write_json(build_path, invalid_build)
+    invalid_build = dict(remote_build, phantom_commit="c" * 40)
+    _write_json(remote_build_path, invalid_build)
     with pytest.raises(comparator.ComparisonError, match="phantom_commit mismatch"):
         comparator.load_identity_chain(arguments)
-    _write_json(build_path, build)
-    run["build_attestation_sha256"] = fixture_tool.sha256_path(build_path)
+    _write_json(remote_build_path, remote_build)
+    run["remote_build_attestation_sha256"] = fixture_tool.sha256_path(
+        remote_build_path
+    )
     _write_json(run_path, run)
 
     generated_phantom.write_bytes(b"mutated generated phantom\n")
@@ -591,7 +827,8 @@ def test_provider_attestation_binds_identifiers_and_all_result_artifacts(
         "compiler_invocation_sha256": fixture_tool.sha256_path(
             artifacts["compiler-invocation.json"]
         ),
-        "build_attestation_sha256": "5" * 64,
+        "frozen_build_attestation_sha256": "5" * 64,
+        "remote_build_attestation_sha256": "7" * 64,
         "run_attestation_sha256": "6" * 64,
         "providers": [
             {
@@ -621,7 +858,8 @@ def test_provider_attestation_binds_identifiers_and_all_result_artifacts(
         fixture_sha256=fixture_sha,
         context_sha256=context_sha,
         generation_sha256=attestation["compiler_invocation_sha256"],
-        build_sha256=attestation["build_attestation_sha256"],
+        frozen_build_sha256=attestation["frozen_build_attestation_sha256"],
+        remote_build_sha256=attestation["remote_build_attestation_sha256"],
         run_sha256=attestation["run_attestation_sha256"],
         expected_identifiers=identifiers,
         ant_json=artifacts["ant.json"],
@@ -643,7 +881,12 @@ def test_provider_attestation_binds_identifiers_and_all_result_artifacts(
             fixture_sha256=fixture_sha,
             context_sha256=context_sha,
             generation_sha256=attestation["compiler_invocation_sha256"],
-            build_sha256=attestation["build_attestation_sha256"],
+            frozen_build_sha256=attestation[
+                "frozen_build_attestation_sha256"
+            ],
+            remote_build_sha256=attestation[
+                "remote_build_attestation_sha256"
+            ],
             run_sha256=attestation["run_attestation_sha256"],
             expected_identifiers=identifiers,
             ant_json=artifacts["ant.json"],

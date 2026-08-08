@@ -39,13 +39,13 @@ from generate_retained_ckks_fixtures import (  # noqa: E402
 
 PROVIDER_SCHEMA = "ace.phantom.retained_ckks.provider-result/3.0.0"
 EXACT_OBSERVED_SCHEMA = "ace.phantom.retained_ckks.exact-observed/2.0.0"
-COMPARISON_SCHEMA = "ace.phantom.retained_ckks.comparison/1.0.0"
+COMPARISON_SCHEMA = "ace.phantom.retained_ckks.comparison/2.0.0"
 EXACT_EVIDENCE_SCHEMA = "ace.phantom.retained_ckks.exact-evidence/2.0.0"
 PROVIDER_ATTESTATION_SCHEMA = (
-    "ace.phantom.retained_ckks.provider-attestation/1.0.0"
+    "ace.phantom.retained_ckks.provider-attestation/2.0.0"
 )
 BUILD_ATTESTATION_SCHEMA = "ace.phantom.retained_ckks.build-attestation/1.0.0"
-RUN_ATTESTATION_SCHEMA = "ace.phantom.retained_ckks.run-attestation/1.0.0"
+RUN_ATTESTATION_SCHEMA = "ace.phantom.retained_ckks.run-attestation/2.0.0"
 
 
 class ComparisonError(ValueError):
@@ -360,7 +360,8 @@ def load_run_attestation(path: Path, *, expected: dict[str, Any]) -> dict[str, A
             "ace_source_manifest_sha256",
             "phantom_source_manifest_sha256",
             "generation_attestation_sha256",
-            "build_attestation_sha256",
+            "frozen_build_attestation_sha256",
+            "remote_build_attestation_sha256",
             "fixture_sha256",
             "compiler_context_manifest_sha256",
             "compiler_resource_manifest_sha256",
@@ -983,7 +984,6 @@ def load_identity_chain(arguments: argparse.Namespace) -> dict[str, Any]:
     fixture_sha256 = sha256_path(arguments.fixture)
     context_sha256 = sha256_path(arguments.context_manifest)
     resource_sha256 = sha256_path(arguments.resource_manifest)
-    ant_executable_sha256 = sha256_path(arguments.ant_executable)
     phantom_executable_sha256 = sha256_path(arguments.phantom_executable)
     build_expected = {
         "ace_commit": ace_source["commit"],
@@ -999,13 +999,17 @@ def load_identity_chain(arguments: argparse.Namespace) -> dict[str, Any]:
             arguments.generated_phantom_source
         ),
     }
-    build = load_build_attestation(arguments.build_attestation, expected=build_expected)
-    if build["executables"] != {
-        "ant_oracle": ant_executable_sha256,
-        "phantom_sm80": phantom_executable_sha256,
-    }:
-        fail("build attestation executable hashes mismatch")
-    build_sha256 = sha256_path(arguments.build_attestation)
+    frozen_build = load_build_attestation(
+        arguments.frozen_build_attestation, expected=build_expected
+    )
+    remote_build = load_build_attestation(
+        arguments.remote_build_attestation, expected=build_expected
+    )
+    frozen_ant_executable_sha256 = frozen_build["executables"]["ant_oracle"]
+    if remote_build["executables"]["phantom_sm80"] != phantom_executable_sha256:
+        fail("remote build attestation Phantom executable hash mismatch")
+    frozen_build_sha256 = sha256_path(arguments.frozen_build_attestation)
+    remote_build_sha256 = sha256_path(arguments.remote_build_attestation)
 
     run_expected = {
         "ace_commit": ace_source["commit"],
@@ -1013,14 +1017,19 @@ def load_identity_chain(arguments: argparse.Namespace) -> dict[str, Any]:
         "ace_source_manifest_sha256": ace_source_sha256,
         "phantom_source_manifest_sha256": phantom_source_sha256,
         "generation_attestation_sha256": generation_sha256,
-        "build_attestation_sha256": build_sha256,
+        "frozen_build_attestation_sha256": frozen_build_sha256,
+        "remote_build_attestation_sha256": remote_build_sha256,
         "fixture_sha256": fixture_sha256,
         "compiler_context_manifest_sha256": context_sha256,
         "compiler_resource_manifest_sha256": resource_sha256,
     }
     run = load_run_attestation(arguments.run_attestation, expected=run_expected)
-    if run["executables"] != build["executables"]:
-        fail("run and build executable hashes differ")
+    expected_run_executables = {
+        "ant_oracle": frozen_ant_executable_sha256,
+        "phantom_sm80": phantom_executable_sha256,
+    }
+    if run["executables"] != expected_run_executables:
+        fail("run executable hashes differ from frozen ANT and remote Phantom builds")
     expected_provider_results = {
         "ant": {
             "json_sha256": sha256_path(arguments.ant_json),
@@ -1044,13 +1053,14 @@ def load_identity_chain(arguments: argparse.Namespace) -> dict[str, Any]:
         "ace_source_manifest_sha256": ace_source_sha256,
         "phantom_source_manifest_sha256": phantom_source_sha256,
         "generation_sha256": generation_sha256,
-        "build_sha256": build_sha256,
+        "frozen_build_sha256": frozen_build_sha256,
+        "remote_build_sha256": remote_build_sha256,
         "run_sha256": sha256_path(arguments.run_attestation),
         "identifiers": {
             "ant": {
                 "ace_commit": ace_source["commit"],
                 "phantom_commit": phantom_source["commit"],
-                "executable_sha256": ant_executable_sha256,
+                "executable_sha256": frozen_ant_executable_sha256,
             },
             "phantom": {
                 "ace_commit": ace_source["commit"],
@@ -1067,7 +1077,8 @@ def load_provider_attestation(
     fixture_sha256: str,
     context_sha256: str,
     generation_sha256: str,
-    build_sha256: str,
+    frozen_build_sha256: str,
+    remote_build_sha256: str,
     run_sha256: str,
     expected_identifiers: dict[str, dict[str, Any]],
     ant_json: Path,
@@ -1084,7 +1095,8 @@ def load_provider_attestation(
             "fixture_sha256",
             "context_manifest_sha256",
             "compiler_invocation_sha256",
-            "build_attestation_sha256",
+            "frozen_build_attestation_sha256",
+            "remote_build_attestation_sha256",
             "run_attestation_sha256",
             "providers",
             "exact_observed",
@@ -1097,7 +1109,8 @@ def load_provider_attestation(
         "fixture_sha256": fixture_sha256,
         "context_manifest_sha256": context_sha256,
         "compiler_invocation_sha256": generation_sha256,
-        "build_attestation_sha256": build_sha256,
+        "frozen_build_attestation_sha256": frozen_build_sha256,
+        "remote_build_attestation_sha256": remote_build_sha256,
         "run_attestation_sha256": run_sha256,
     }
     for field, expected in expected_bindings.items():
@@ -1756,7 +1769,8 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
         fixture_sha256=fixture_sha256,
         context_sha256=context_sha256,
         generation_sha256=identity["generation_sha256"],
-        build_sha256=identity["build_sha256"],
+        frozen_build_sha256=identity["frozen_build_sha256"],
+        remote_build_sha256=identity["remote_build_sha256"],
         run_sha256=identity["run_sha256"],
         expected_identifiers=identity["identifiers"],
         ant_json=arguments.ant_json,
@@ -1895,7 +1909,12 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
                 "phantom_source_manifest_sha256"
             ],
             "generation_attestation_sha256": identity["generation_sha256"],
-            "build_attestation_sha256": identity["build_sha256"],
+            "frozen_build_attestation_sha256": identity[
+                "frozen_build_sha256"
+            ],
+            "remote_build_attestation_sha256": identity[
+                "remote_build_sha256"
+            ],
             "run_attestation_sha256": identity["run_sha256"],
             "analytic_json_sha256": sha256_path(arguments.analytic_json),
             "ant_json_sha256": sha256_path(arguments.ant_json),
@@ -1925,8 +1944,8 @@ def parse_arguments() -> argparse.Namespace:
         "generation-attestation", "generation-fixture",
         "emitted-context-manifest", "resource-manifest",
         "generated-ant-source", "generated-phantom-source",
-        "ant-executable", "phantom-executable",
-        "build-attestation", "run-attestation",
+        "phantom-executable", "frozen-build-attestation",
+        "remote-build-attestation", "run-attestation",
         "provider-attestation",
         "analytic-json", "analytic-bin", "ant-json", "ant-bin", "gpu-json", "gpu-bin",
         "exact-source-json", "exact-source-bin",
