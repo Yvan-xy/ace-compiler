@@ -17,6 +17,8 @@ TOOLS = Path(__file__).resolve().parents[1]
 FREEZE = TOOLS / "freeze_retained_host_evidence.sh"
 PACKAGE = TOOLS / "package_retained_host_freeze_sources.sh"
 SNAPSHOT = TOOLS / "run_retained_host_freeze_snapshot.sh"
+DEPENDENCIES = TOOLS / "configs/dependencies.env"
+FHE_ROOT = TOOLS.parents[1] / "fhe-cmplr"
 
 
 def source(path: Path) -> str:
@@ -26,6 +28,23 @@ def source(path: Path) -> str:
 def test_scripts_are_valid_shell() -> None:
     for script in (FREEZE, PACKAGE, SNAPSHOT):
         subprocess.run(["bash", "-n", str(script)], check=True)
+
+
+def test_phantom_pin_is_consistent_across_qualification_and_cmake() -> None:
+    matches = re.findall(
+        r"^PHANTOM_COMMIT=([0-9a-f]{40})$",
+        source(DEPENDENCIES),
+        re.MULTILINE,
+    )
+    assert len(matches) == 1
+    expected = matches[0]
+    for cmake in (
+        FHE_ROOT / "CMakeLists.txt",
+        FHE_ROOT / "rtlib/cmake/modules/phantom.cmake",
+    ):
+        assert re.findall(
+            r'set\(PHANTOM_GIT_TAG "([0-9a-f]{40})"', source(cmake)
+        ) == [expected]
 
 
 def test_payload_comes_only_from_exact_commit_objects() -> None:
