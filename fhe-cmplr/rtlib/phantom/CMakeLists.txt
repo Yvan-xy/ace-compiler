@@ -57,27 +57,6 @@ if(BUILD_STATIC)
   add_dependencies(fhert_phantom_all FHErt_phantom)
 endif()
 
-set(FHERT_PHANTOM_EGAPP "")
-if(RTLIB_BUILD_EXAMPLE)
-  file(GLOB FHERT_PHANTOM_EXAMPLE_SRC_FILES CONFIGURE_DEPENDS example/*.cu)
-  foreach(app ${FHERT_PHANTOM_EXAMPLE_SRC_FILES})
-    get_filename_component(exe ${app} NAME_WE)
-    add_executable(${exe} ${app})
-    set_property(TARGET ${exe} PROPERTY RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/example)
-    set(FHERT_PHANTOM_EGAPP ${FHERT_PHANTOM_EGAPP} ${exe})
-    target_link_libraries(${exe}
-      ${FHERT_PHANTOM_LIB}
-      ${NN_LIBS}
-      ${CUDA_LIBRARIES}
-    )
-  endforeach()
-
-  add_custom_target(fhert_phantom_example)
-  add_dependencies(fhert_phantom_example ${FHERT_PHANTOM_EGAPP})
-  add_dependencies(fhert_phantom_all fhert_phantom_example)
-endif()
-
 if(RTLIB_INSTALL_APP)
   install(TARGETS ${FHERT_PHANTOM_UTAPP} RUNTIME DESTINATION unittest)
-  install(TARGETS ${FHERT_PHANTOM_EGAPP} RUNTIME DESTINATION example)
 endif()
