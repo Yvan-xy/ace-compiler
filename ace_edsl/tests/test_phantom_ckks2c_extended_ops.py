@@ -142,6 +142,8 @@ def test_rotation_batches_survive_driver_and_source_emission(tmp_path: Path) -> 
                 context_path = Path({str(context)!r})
                 fixture_path = Path({str(FIXTURE)!r})
                 manifest = json.loads(context_path.read_text(encoding="utf-8"))
+                expected_full_q = len(manifest["data_q_bit_sizes"])
+                assert expected_full_q < 10
                 fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
                 batches = [fixture["rotate_batch_steps"]] + fixture["production_rotation_batches"]
                 AceEDSL._get_dsl.cache_clear()
@@ -152,7 +154,7 @@ def test_rotation_batches_survive_driver_and_source_emission(tmp_path: Path) -> 
                 module = AceEDSL._get_dsl().current_air_module
                 pipeline = AcePipeline(module).configure_fhe(
                     poly_degree=manifest["polynomial_degree"],
-                    mul_level=len(manifest["data_q_bit_sizes"]),
+                    mul_level=expected_full_q,
                     input_level=manifest["input_level"],
                     security_level=manifest["security_level"],
                     scaling_factor_bits=manifest["scaling_modulus_bits"],
@@ -166,6 +168,7 @@ def test_rotation_batches_survive_driver_and_source_emission(tmp_path: Path) -> 
                     start_domain="fhe::ckks", dump_stages=True, verbose=False
                 )
                 assert compiled.success, compiled.error
+                assert module.get_fhe_params()["mul_level"] == expected_full_q
                 post_air = compiled.air_dumps["ckks_driver"].lower()
                 assert post_air.count("ckks.rotate_batch") == len(batches)
                 source = compiled.c_code or ""
@@ -187,6 +190,79 @@ def test_rotation_batches_survive_driver_and_source_emission(tmp_path: Path) -> 
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "RETAINED_ROTATION_SOURCE_OK" in result.stdout
+
+
+def test_binding_driver_keeps_configured_and_default_full_q_counts(
+    tmp_path: Path,
+) -> None:
+    context = tmp_path / "context.json"
+    _context(context)
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(REPOSITORY), str(EXAMPLES), environment.get("PYTHONPATH", ""))
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                f"""
+                import json
+                from pathlib import Path
+                from ace_bindings import air_builder
+                from ace_edsl.edsl import AceEDSL, CkksCiphertext
+                from ckks_retained_ops import create_retained_ckks_micrographs
+
+                context_path = Path({str(context)!r})
+                fixture_path = Path({str(FIXTURE)!r})
+                manifest = json.loads(context_path.read_text(encoding="utf-8"))
+                expected_full_q = len(manifest["data_q_bit_sizes"])
+                assert expected_full_q < 10
+
+                def module_with_conjugate():
+                    AceEDSL._get_dsl.cache_clear()
+                    graphs = create_retained_ckks_micrographs(
+                        context_path, fixture_path
+                    )
+                    graphs.conjugate(
+                        CkksCiphertext(
+                            shape=(graphs.polynomial_degree,), name="input_ct"
+                        )
+                    )
+                    return AceEDSL._get_dsl().current_air_module
+
+                configured = module_with_conjugate()
+                configured.configure_fhe_params(
+                    poly_degree=manifest["polynomial_degree"],
+                    mul_level=expected_full_q,
+                    input_level=manifest["input_level"],
+                    security_level=manifest["security_level"],
+                    scaling_factor_bits=manifest["scaling_modulus_bits"],
+                    first_prime_bits=manifest["first_modulus_bits"],
+                    hamming_weight=manifest["hamming_weight"],
+                )
+                configured_result = air_builder.run_ckks_driver(configured)
+                assert configured_result["success"], configured_result["message"]
+                assert (
+                    configured.get_fhe_params()["mul_level"] == expected_full_q
+                )
+
+                defaulted = module_with_conjugate()
+                default_result = air_builder.run_ckks_driver(defaulted)
+                assert default_result["success"], default_result["message"]
+                assert defaulted.get_fhe_params()["mul_level"] == 10
+                print("RETAINED_FULL_Q_AUTHORITY_OK")
+                """
+            ),
+        ],
+        cwd=REPOSITORY,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RETAINED_FULL_Q_AUTHORITY_OK" in result.stdout
 
 
 def test_micrograph_dimensions_are_manifest_derived(tmp_path: Path) -> None:
@@ -368,6 +444,9 @@ def test_same_conformance_module_generates_both_terminal_sources(
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(outputs["emitted_context"].read_text(encoding="utf-8")) == (
+        manifest
+    )
     assert outputs["ant_air"].read_bytes() == outputs["phantom_air"].read_bytes()
     functions = (
         "retained_ckks_conjugate",
@@ -391,10 +470,12 @@ def test_same_conformance_module_generates_both_terminal_sources(
     assert record["invocation"] == (
         "CIPHERTEXT output = retained_ckks_composite(*input_cipher);"
     )
-    assert record["ant_post_ckks_air_sha256"] == (
-        record["phantom_post_ckks_air_sha256"]
-        == record["post_ckks_air_sha256"]
-    )
+    assert record["ant_post_ckks_air_sha256"] == record[
+        "phantom_post_ckks_air_sha256"
+    ]
+    assert record["ant_post_ckks_air_sha256"] == record[
+        "post_ckks_air_sha256"
+    ]
     phantom = outputs["phantom_source"].read_text(encoding="utf-8")
     for call in ("Conjugate_ciph", "Rotate_batch_ciph", "Raise_mod", "Mul_mono_ciph"):
         assert f"{call}(" in phantom

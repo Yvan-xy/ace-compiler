@@ -7443,7 +7443,9 @@ private:
             // Set up CTX_PARAM with reasonable FHE/CKKS defaults
             auto& ctx_param = lower_ctx->Get_ctx_param();
             ctx_param.Set_poly_degree(16384, false);               // N = 2^14
-            ctx_param.Set_mul_level(10, true);              // 10 multiplication levels
+            // Type registration must not choose the ciphertext-chain length.
+            // The CKKS driver establishes it later from configure_fhe_params()
+            // (the compiler invocation authority) or from its default path.
             ctx_param.Set_security_level(128);              // 128-bit security
             ctx_param.Set_first_prime_bit_num(60);          // First prime bits
             ctx_param.Set_scaling_factor_bit_num(40);       // Scale factor bits
