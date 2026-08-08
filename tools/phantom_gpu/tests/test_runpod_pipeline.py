@@ -4,7 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import tarfile
 
@@ -18,6 +18,13 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 SOURCE_ARCHIVE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SOURCE_ARCHIVE)
+
+PHANTOM_REQUIRED_TEST_PATHS = {
+    "tests/CMakeLists.txt",
+    "tests/ckks_retained_primitives.cu",
+    "tests/compiler_context_manifest.h",
+    "tests/native_bts_oracle_link.cu",
+}
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -64,6 +71,53 @@ def create(repo: Path, commit: str, output: Path) -> tuple[Path, Path]:
     return archive, manifest
 
 
+def phantom_repository(tmp_path: Path) -> tuple[Path, str]:
+    repo = tmp_path / "phantom"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.name", "Pipeline Test")
+    git(repo, "config", "user.email", "pipeline@example.invalid")
+    tracked = {
+        "CMakeLists.txt": "add_subdirectory(src)\nadd_subdirectory(tests)\n",
+        "cmake/Dependencies.cmake": "# build dependencies\n",
+        "include/phantom.h": "#pragma once\n",
+        "src/phantom.cu": "// Phantom implementation\n",
+        "tests/CMakeLists.txt": "# retained test targets\n",
+        "tests/ckks_retained_primitives.cu": "// retained gate\n",
+        "tests/compiler_context_manifest.h": "#pragma once\n",
+        "tests/native_bts_oracle_link.cu": "// configure-source closure\n",
+        "tests/add.cu": "// unrelated test\n",
+        "tests/._ckks_retained_primitives.cu": "AppleDouble\n",
+        "outputs/generated.cu": "// generated output\n",
+        "models/checkpoint.onnx": "model data\n",
+    }
+    for relative, content in tracked.items():
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "phantom test tree")
+    return repo, git(repo, "rev-parse", "HEAD")
+
+
+def create_phantom(repo: Path, commit: str, output: Path) -> tuple[Path, Path]:
+    archive = output / "phantom.tar.gz"
+    manifest = output / "phantom.json"
+    arguments = type(
+        "Arguments",
+        (),
+        {
+            "repo": repo,
+            "commit": commit,
+            "kind": "phantom",
+            "output": archive,
+            "manifest": manifest,
+        },
+    )()
+    SOURCE_ARCHIVE.create_archive(arguments)
+    return archive, manifest
+
+
 def test_commit_archive_is_deterministic_and_excludes_dirty_data(tmp_path: Path) -> None:
     repo, commit = repository(tmp_path)
     dirty = repo / "tools/phantom_gpu/untracked-secret.pem"
@@ -82,6 +136,52 @@ def test_commit_archive_is_deterministic_and_excludes_dirty_data(tmp_path: Path)
     assert "ace-source/tools/phantom_gpu/script.sh" in paths
     assert not any("dataset" in path for path in paths)
     assert not any("untracked-secret.pem" in path for path in paths)
+
+
+def test_phantom_archive_includes_only_retained_test_source_closure(
+    tmp_path: Path,
+) -> None:
+    repo, commit = phantom_repository(tmp_path)
+    output = tmp_path / "output"
+    output.mkdir()
+    archive, manifest_path = create_phantom(repo, commit, output)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    member_paths = {record["path"] for record in manifest["members"]}
+    required_members = {
+        f"phantom-source/{path}" for path in PHANTOM_REQUIRED_TEST_PATHS
+    }
+    archived_test_files = {
+        path
+        for path in member_paths
+        if path.startswith("phantom-source/tests/")
+    }
+
+    assert PHANTOM_REQUIRED_TEST_PATHS <= set(manifest["allowed_paths"])
+    assert archived_test_files == required_members
+    assert manifest["member_count"] == len(manifest["members"])
+    with tarfile.open(archive, "r:gz") as source:
+        archive_paths = {member.name.rstrip("/") for member in source.getmembers()}
+    assert archive_paths == member_paths
+    assert not any("._" in path for path in member_paths)
+    assert not any("outputs" in path or "models" in path for path in member_paths)
+    SOURCE_ARCHIVE.audit_archive(archive, "phantom", manifest)
+
+
+@pytest.mark.parametrize(
+    ("member", "message"),
+    (
+        ("phantom-source/tests/add.cu", "outside the phantom allowlist"),
+        ("phantom-source/tests/._CMakeLists.txt", "outside the phantom allowlist"),
+        ("phantom-source/outputs/generated.cu", "outside the phantom allowlist"),
+        ("phantom-source/src/models/checkpoint.cu", "disallowed source path"),
+        ("phantom-source/include/._phantom.h", "AppleDouble file"),
+        ("phantom-source/src/checkpoint.onnx", "sensitive or data file"),
+        ("phantom-source/include/id_ed25519", "sensitive filename"),
+    ),
+)
+def test_phantom_policy_rejects_non_source_members(member: str, message: str) -> None:
+    with pytest.raises(SystemExit, match=message):
+        SOURCE_ARCHIVE.policy_path(PurePosixPath(member), "phantom")
 
 
 def test_audit_rejects_corruption(tmp_path: Path) -> None:

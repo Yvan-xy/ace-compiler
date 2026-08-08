@@ -75,7 +75,16 @@ ARCHIVE_POLICIES = {
     },
     "phantom": {
         "prefix": "phantom-source",
-        "allowed": ("CMakeLists.txt", "cmake", "include", "src"),
+        "allowed": (
+            "CMakeLists.txt",
+            "cmake",
+            "include",
+            "src",
+            "tests/CMakeLists.txt",
+            "tests/ckks_retained_primitives.cu",
+            "tests/compiler_context_manifest.h",
+            "tests/native_bts_oracle_link.cu",
+        ),
         "excluded": (),
     },
 }
