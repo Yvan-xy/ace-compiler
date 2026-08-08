@@ -1064,6 +1064,21 @@ TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
   fhe::ckks::CKKS2C_DRIVER::Verify_source_or_throw(source,
                                                    PROVIDER::PHANTOM);
 
+  const std::size_t input_registration =
+      source.find("Register_ciph_lifetime(&input)");
+  const std::size_t first_retained_call = source.find("Conjugate_ciph(");
+  ASSERT_NE(input_registration, std::string::npos);
+  ASSERT_NE(first_retained_call, std::string::npos);
+  EXPECT_LT(input_registration, first_retained_call);
+  EXPECT_NE(source.find("Register_ciph_lifetime(&conjugated)"),
+            std::string::npos);
+  EXPECT_NE(source.find("Register_ciph_lifetime(&raised)"),
+            std::string::npos);
+  EXPECT_NE(source.find("Register_ciph_lifetime(&monomial)"),
+            std::string::npos);
+  EXPECT_NE(source.find("Register_ciph_array_lifetime(rotated, "
+                        "sizeof(rotated) / sizeof(rotated[0]))"),
+            std::string::npos);
   EXPECT_NE(source.find("Conjugate_ciph(&conjugated, &input)"),
             std::string::npos);
   EXPECT_NE(source.find(

@@ -348,6 +348,18 @@ def audit_gpu_runner_source(path: Path) -> None:
             )
             assert pattern.search(source), f"{call} is not guarded by {guard}"
 
+    reclaimed_address_contract = (
+        "new (cipher_storage) CIPHERTEXT()",
+        "Register_ciph_lifetime(local_cipher)",
+        "new (plain_storage) PLAINTEXT()",
+        "Register_plain_lifetime(local_plain)",
+        "VerifyReclaimedGeneratedObjectAddresses(arena, x, levels,",
+    )
+    for required in reclaimed_address_contract:
+        assert required in source, required
+    assert source.count("RunReclaimedGeneratedObjectInvocation(") == 3
+    assert "Free_ciph(value);\n    Free_ciph(value);" in source
+
 
 def test_ordinary_runtime_source_contract(tmp_path: Path) -> None:
     source_path = tmp_path / "ordinary_runtime_symbols.cu"

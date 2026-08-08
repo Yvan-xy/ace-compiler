@@ -202,6 +202,49 @@ public:
           Emit_get_input_data(parm);
         }
       }
+      if (Provider() == fhe::core::PROVIDER::PHANTOM) {
+        for (auto it = func->Begin_addr_datum(); it != func->End_addr_datum();
+             ++it) {
+          air::base::TYPE_PTR type = (*it)->Type();
+          const bool         is_array = type->Is_array();
+          if (is_array && (*it)->Is_formal() && !is_prg_entry) {
+            // Array formals alias caller-owned elements; their declaring
+            // generated frame registers the element lifetimes.
+            continue;
+          }
+          air::base::TYPE_ID type_id =
+              is_array ? type->Cast_to_arr()->Elem_type_id() : type->Id();
+          const bool is_cipher =
+              Is_cipher_type(type_id) || Is_cipher3_type(type_id);
+          if (!is_cipher && !Is_plain_type(type_id)) continue;
+          _ir2c_util << "  Register_";
+          _ir2c_util << (is_cipher ? "ciph" : "plain");
+          if (is_array) {
+            _ir2c_util << "_array_lifetime(";
+            Emit_var(*it);
+            _ir2c_util << ", sizeof(";
+            Emit_var(*it);
+            _ir2c_util << ") / sizeof(";
+            Emit_var(*it);
+            _ir2c_util << "[0]));" << std::endl;
+          } else {
+            _ir2c_util << "_lifetime(&";
+            Emit_var(*it);
+            _ir2c_util << ");" << std::endl;
+          }
+        }
+        for (auto it = func->Begin_preg(); it != func->End_preg(); ++it) {
+          air::base::TYPE_ID type_id = (*it)->Type_id();
+          const bool is_cipher =
+              Is_cipher_type(type_id) || Is_cipher3_type(type_id);
+          if (!is_cipher && !Is_plain_type(type_id)) continue;
+          _ir2c_util << "  Register_";
+          _ir2c_util << (is_cipher ? "ciph" : "plain");
+          _ir2c_util << "_lifetime(&";
+          Emit_preg_id((*it)->Id());
+          _ir2c_util << ");" << std::endl;
+        }
+      }
       return;
     }
 

@@ -16,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -761,6 +762,49 @@ double MaximumError(const std::vector<Complex>& left,
   return maximum;
 }
 
+void RunReclaimedGeneratedObjectInvocation(
+    std::byte* cipher_storage, std::byte* plain_storage, CIPHER source,
+    const std::vector<Complex>& values, const LevelCoordinates& levels,
+    double hard_maximum_absolute) {
+  CIPHER local_cipher = new (cipher_storage) CIPHERTEXT();
+  Register_ciph_lifetime(local_cipher);
+  Copy_ciph(local_cipher, source);
+  if (MaximumError(DecodeCipher(local_cipher), values) >
+      hard_maximum_absolute) {
+    Fail("reclaimed generated ciphertext address changed its value");
+  }
+  Free_ciph(local_cipher);
+  local_cipher->~CIPHERTEXT();
+
+  PLAIN local_plain = new (plain_storage) PLAINTEXT();
+  Register_plain_lifetime(local_plain);
+  std::vector<Complex> mutable_values(values);
+  Encode_dcmplx(local_plain, mutable_values.data(), mutable_values.size(), 1.0,
+                levels._full);
+  if (MaximumError(DecodePlain(local_plain), values) >
+      hard_maximum_absolute) {
+    Fail("reclaimed generated plaintext address changed its value");
+  }
+  Free_plain(local_plain);
+  local_plain->~PLAINTEXT();
+}
+
+void VerifyReclaimedGeneratedObjectAddresses(
+    ObjectArena& arena, const std::vector<Complex>& values,
+    const LevelCoordinates& levels, double hard_maximum_absolute) {
+  CIPHER source = EncryptComplex(arena, values, levels._full);
+  alignas(CIPHERTEXT) std::byte cipher_storage[sizeof(CIPHERTEXT)];
+  alignas(PLAINTEXT) std::byte plain_storage[sizeof(PLAINTEXT)];
+
+  RunReclaimedGeneratedObjectInvocation(cipher_storage, plain_storage, source,
+                                        values, levels,
+                                        hard_maximum_absolute);
+  RunReclaimedGeneratedObjectInvocation(cipher_storage, plain_storage, source,
+                                        values, levels,
+                                        hard_maximum_absolute);
+  arena.FreeCipher(source);
+}
+
 Json RunOwnership(const Json& fixture) {
   const LevelCoordinates levels = ContextLevelCoordinates();
   const std::size_t slots = Get_phantom_context_manifest()->_logical_slots;
@@ -782,6 +826,9 @@ Json RunOwnership(const Json& fixture) {
   std::set<std::string> seen_cases;
   Json reports = Json::array();
   std::size_t total_iterations = 0;
+
+  VerifyReclaimedGeneratedObjectAddresses(arena, x, levels,
+                                          hard_maximum_absolute);
 
   for (const auto& ownership_case : fixture.at("ownership_cases")) {
     const std::string case_id = ownership_case.at("id").get<std::string>();

@@ -237,6 +237,26 @@ inline void Zero_ciph(CIPHER res) {
   END_TIMER("Zero_ciph")
 }
 
+// Generated functions register each automatic provider object exactly once
+// after C++ construction. This starts a fresh diagnostic lifetime when a later
+// invocation reuses the same stack address, without discarding tombstones for
+// still-existing objects.
+inline void Register_ciph_lifetime(CIPHER value) {
+  Phantom_register_ciph_lifetime(value);
+}
+
+inline void Register_plain_lifetime(PLAIN value) {
+  Phantom_register_plain_lifetime(value);
+}
+
+inline void Register_ciph_array_lifetime(CIPHER values, size_t count) {
+  Phantom_register_ciph_array_lifetime(values, count);
+}
+
+inline void Register_plain_array_lifetime(PLAIN values, size_t count) {
+  Phantom_register_plain_array_lifetime(values, count);
+}
+
 inline SCALE_T Sc_degree(CIPHER ct) {
   START_TIMER
   auto result = Phantom_scale_degree(ct);

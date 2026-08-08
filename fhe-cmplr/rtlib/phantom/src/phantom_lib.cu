@@ -53,7 +53,7 @@ std::unordered_map<std::string, OperationStats> operation_stats;
 
 namespace {
 
-enum class ObjectState : uint8_t { kLive, kZero, kFreed };
+enum class ObjectState : uint8_t { kUninitialized, kLive, kZero, kFreed };
 
 [[noreturn]] void Fail(const char* diagnostic, const char* format, ...) {
   std::fprintf(stderr, "ACE_PHANTOM_ORDINARY_ERROR[%s]: ", diagnostic);
@@ -719,6 +719,46 @@ public:
     }
   }
 
+  void RegisterCipherLifetime(Ciphertext* cipher) {
+    if (cipher == nullptr) {
+      Fail("REGISTER_CIPHER_NULL", "ciphertext pointer is null");
+    }
+    std::lock_guard<std::mutex> lock(_state_mutex);
+    _cipher_states[cipher] =
+        cipher->size() == 0 ? ObjectState::kUninitialized
+                            : ObjectState::kLive;
+  }
+
+  void RegisterPlainLifetime(Plaintext* plain) {
+    if (plain == nullptr) {
+      Fail("REGISTER_PLAIN_NULL", "plaintext pointer is null");
+    }
+    std::lock_guard<std::mutex> lock(_state_mutex);
+    _plain_states[plain] =
+        plain->poly_modulus_degree() == 0 ? ObjectState::kUninitialized
+                                          : ObjectState::kLive;
+  }
+
+  void RegisterCipherArrayLifetime(Ciphertext* array, size_t count) {
+    if (array == nullptr || count == 0) {
+      Fail("REGISTER_CIPHER_ARRAY_ARGUMENT",
+           "array must be non-null and non-empty");
+    }
+    for (size_t index = 0; index < count; ++index) {
+      RegisterCipherLifetime(&array[index]);
+    }
+  }
+
+  void RegisterPlainArrayLifetime(Plaintext* array, size_t count) {
+    if (array == nullptr || count == 0) {
+      Fail("REGISTER_PLAIN_ARRAY_ARGUMENT",
+           "array must be non-null and non-empty");
+    }
+    for (size_t index = 0; index < count; ++index) {
+      RegisterPlainLifetime(&array[index]);
+    }
+  }
+
   double QueryRawScale(Ciphertext* cipher, const char* diagnostic) {
     ValidateCipher(cipher, diagnostic);
     return cipher->scale();
@@ -1222,6 +1262,9 @@ private:
       if (!allow_zero && found->second == ObjectState::kZero) {
         Fail(diagnostic, "zero sentinel is not a valid ciphertext operand");
       }
+      if (found->second == ObjectState::kUninitialized) {
+        Fail(diagnostic, "ciphertext is uninitialized");
+      }
       return found->second;
     }
     if (cipher->size() == 0) Fail(diagnostic, "ciphertext is uninitialized");
@@ -1237,6 +1280,9 @@ private:
     if (found != _plain_states.end()) {
       if (found->second == ObjectState::kFreed && !allow_freed) {
         Fail("USE_AFTER_FREE_PLAIN", "%s used a freed plaintext", diagnostic);
+      }
+      if (found->second == ObjectState::kUninitialized) {
+        Fail(diagnostic, "plaintext is uninitialized");
       }
       return found->second;
     }
@@ -1556,6 +1602,22 @@ void Phantom_copy(CIPHER result, CIPHER source) {
 
 void Phantom_zero(CIPHER result) {
   PHANTOM_CONTEXT::Context()->ZeroCipher(result);
+}
+
+void Phantom_register_ciph_lifetime(CIPHER cipher) {
+  PHANTOM_CONTEXT::Context()->RegisterCipherLifetime(cipher);
+}
+
+void Phantom_register_plain_lifetime(PLAIN plain) {
+  PHANTOM_CONTEXT::Context()->RegisterPlainLifetime(plain);
+}
+
+void Phantom_register_ciph_array_lifetime(CIPHER array, size_t count) {
+  PHANTOM_CONTEXT::Context()->RegisterCipherArrayLifetime(array, count);
+}
+
+void Phantom_register_plain_array_lifetime(PLAIN array, size_t count) {
+  PHANTOM_CONTEXT::Context()->RegisterPlainArrayLifetime(array, count);
 }
 
 void Phantom_free_ciph(CIPHER cipher) {
