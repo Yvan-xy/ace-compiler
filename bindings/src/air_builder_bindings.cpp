@@ -10396,7 +10396,6 @@ py::dict run_ckks_driver(std::shared_ptr<GlobScope> glob) {
                             mul_for_relin, 
                             mul_for_relin->Spos()
                         );
-                        
                         // Find parent of mul_node and replace mul with relin
                         NODE_PTR stmt_node = stmt->Node();
                         std::function<bool(NODE_PTR)> replace_mul = [&](NODE_PTR parent) -> bool {
@@ -10411,7 +10410,12 @@ py::dict run_ckks_driver(std::shared_ptr<GlobScope> glob) {
                             }
                             return false;
                         };
-                        replace_mul(stmt_node);
+                        if (replace_mul(stmt_node)) {
+                            // This binding-owned rewrite runs after
+                            // CTX_PARAM_ANA. Keep the global resource contract
+                            // synchronized with the Relin observed by CKKS2C.
+                            lower_ctx->Get_ctx_param().Require_relin_key();
+                        }
                         
                         // IMPORTANT: If this is an STP (store to preg) statement, update preg type
                         // The preg was created with CIPHERTEXT3 type (mul's return), but now stores

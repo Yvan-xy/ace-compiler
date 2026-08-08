@@ -192,6 +192,54 @@ def test_rotation_batches_survive_driver_and_source_emission(tmp_path: Path) -> 
     assert "RETAINED_ROTATION_SOURCE_OK" in result.stdout
 
 
+def test_binding_inserted_relin_updates_phantom_resource_manifest(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "ordinary_probe.cu"
+    context = tmp_path / "ordinary_context.json"
+    resources = tmp_path / "ordinary_resources.json"
+    post_air = tmp_path / "ordinary_post.air"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPOSITORY / "tools/phantom_gpu/generate_ckks2c_probe.py"),
+            "--output",
+            str(output),
+            "--context-manifest",
+            str(context),
+            "--resource-manifest",
+            str(resources),
+            "--post-ckks-air",
+            str(post_air),
+            "--poly-degree",
+            "16384",
+            "--mul-level",
+            "4",
+            "--input-level",
+            "1",
+            "--security-level",
+            "0",
+            "--scaling-factor-bits",
+            "56",
+            "--first-prime-bits",
+            "60",
+            "--hamming-weight",
+            "192",
+        ],
+        cwd=REPOSITORY,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ckks.relin" in post_air.read_text(encoding="utf-8").lower()
+    source = output.read_text(encoding="utf-8")
+    assert "Relin(" in source
+    assert "PHANTOM_RESOURCE_RELIN_KEY" in source
+    manifest = json.loads(resources.read_text(encoding="utf-8"))
+    assert manifest["relinearization_key"] is True
+
+
 def test_binding_driver_keeps_configured_and_default_full_q_counts(
     tmp_path: Path,
 ) -> None:
