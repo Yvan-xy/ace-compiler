@@ -14,6 +14,7 @@ TOOLS_ROOT = REPO_ROOT / "tools/phantom_gpu"
 sys.path.insert(0, str(TOOLS_ROOT))
 
 from check_configuration import verify_context_manifest  # noqa: E402
+from generate_ckks2c_probe import canonicalize_qualification_air  # noqa: E402
 from generate_native_terminal_probe import build_model  # noqa: E402
 
 
@@ -207,3 +208,103 @@ def test_native_terminal_model_is_deterministic_and_checked() -> None:
     assert node.op_type == "Add"
     assert list(node.input) == ["x", "y"]
     assert list(node.output) == ["z"]
+
+
+def _qualification_air_for_source(source_path: Path) -> str:
+    source = source_path.resolve().as_posix()
+    source_size = len(source.encode("utf-8"))
+    fixed_string_bytes = 357
+    return (
+        f"STRING TABLE ({fixed_string_bytes + source_size} Bytes)\n"
+        f'  STR[0x18] "{source}" length(0x{source_size:x})\n'
+        "\nTYPE TABLE (0 Bytes)\n"
+    )
+
+
+def test_qualification_air_source_path_is_stable_across_work_roots(
+    tmp_path: Path,
+) -> None:
+    first_source = (
+        tmp_path / "first/work/ace-source/tools/phantom_gpu/"
+        "generate_ckks2c_probe.py"
+    )
+    second_source = (
+        tmp_path / "second/other/ace-source/tools/phantom_gpu/"
+        "generate_ckks2c_probe.py"
+    )
+    first = canonicalize_qualification_air(
+        _qualification_air_for_source(first_source), first_source
+    )
+    second = canonicalize_qualification_air(
+        _qualification_air_for_source(second_source), second_source
+    )
+
+    assert first == second
+    assert first.startswith("STRING TABLE (399 Bytes)\n")
+    assert (
+        '"tools/phantom_gpu/generate_ckks2c_probe.py" length(0x2a)'
+        in first
+    )
+    assert str(tmp_path) not in first
+
+
+def test_qualification_air_rejects_missing_physical_source_entry(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "root/tools/phantom_gpu/generate_ckks2c_probe.py"
+    with pytest.raises(SystemExit, match="exactly one physical probe source"):
+        canonicalize_qualification_air(
+            "STRING TABLE (0 Bytes)\n\nTYPE TABLE (0 Bytes)\n", source
+        )
+
+
+def test_qualification_air_rejects_duplicate_physical_source_entries(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "root/tools/phantom_gpu/generate_ckks2c_probe.py"
+    air_dump = _qualification_air_for_source(source)
+    source_entry = air_dump.splitlines()[1]
+    duplicate = air_dump.replace(
+        "\n\nTYPE TABLE", f"\n{source_entry}\n\nTYPE TABLE"
+    )
+    with pytest.raises(SystemExit, match="exactly one physical probe source"):
+        canonicalize_qualification_air(duplicate, source)
+
+
+def test_qualification_air_rejects_duplicate_logical_source_entries(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "root/tools/phantom_gpu/generate_ckks2c_probe.py"
+    logical_entry = (
+        '  STR[0x19] "tools/phantom_gpu/generate_ckks2c_probe.py" '
+        "length(0x2a)"
+    )
+    duplicate = _qualification_air_for_source(source).replace(
+        "\n\nTYPE TABLE", f"\n{logical_entry}\n\nTYPE TABLE"
+    )
+    with pytest.raises(SystemExit, match="exactly one logical probe source"):
+        canonicalize_qualification_air(duplicate, source)
+
+
+def test_qualification_air_rejects_malformed_string_table_header(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "root/tools/phantom_gpu/generate_ckks2c_probe.py"
+    malformed = _qualification_air_for_source(source).replace(
+        "STRING TABLE (", "STRING TABLE (not-decimal-"
+    )
+    with pytest.raises(SystemExit, match="size is not decimal"):
+        canonicalize_qualification_air(malformed, source)
+
+
+def test_qualification_air_rejects_another_absolute_source_path(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "root/tools/phantom_gpu/generate_ckks2c_probe.py"
+    air_dump = _qualification_air_for_source(source).replace(
+        "\n\nTYPE TABLE",
+        '\n  STR[0x19] "/another/work/root.py" length(0x15)'
+        "\n\nTYPE TABLE",
+    )
+    with pytest.raises(SystemExit, match="absolute source path remains"):
+        canonicalize_qualification_air(air_dump, source)

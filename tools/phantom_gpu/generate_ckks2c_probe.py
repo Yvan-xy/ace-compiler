@@ -115,10 +115,71 @@ def main() -> int:
         post_ckks_air = result.air_dumps.get("ckks_driver", "")
         if not post_ckks_air:
             raise SystemExit("CKKS2C returned no post-CKKS AIR dump")
+        post_ckks_air = canonicalize_qualification_air(
+            post_ckks_air, Path(__file__)
+        )
         arguments.post_ckks_air.write_text(post_ckks_air, encoding="utf-8")
     arguments.output.write_text(source, encoding="utf-8")
     print(f"generated {arguments.output} ({len(source.encode('utf-8'))} bytes)")
     return 0
+
+
+def canonicalize_qualification_air(
+    air_dump: str, physical_source_path: Path
+) -> str:
+    """Replace the probe's checkout path with its stable repository path."""
+    logical_source = "tools/phantom_gpu/generate_ckks2c_probe.py"
+    physical_source = physical_source_path.resolve().as_posix()
+    physical_size = len(physical_source.encode("utf-8"))
+    logical_size = len(logical_source.encode("utf-8"))
+    physical_entry = (
+        f'"{physical_source}" length(0x{physical_size:x})'
+    )
+    logical_entry = f'"{logical_source}" length(0x{logical_size:x})'
+    if air_dump.count(physical_entry) != 1:
+        raise SystemExit(
+            "post-CKKS AIR must contain exactly one physical probe source entry"
+        )
+
+    header_prefix = "STRING TABLE ("
+    header_suffix = " Bytes)\n"
+    if not air_dump.startswith(header_prefix):
+        raise SystemExit("post-CKKS AIR is missing its string-table header")
+    header_end = air_dump.find(header_suffix, len(header_prefix))
+    if header_end < 0:
+        raise SystemExit("post-CKKS AIR has a malformed string-table header")
+    size_text = air_dump[len(header_prefix):header_end]
+    if not size_text.isdecimal():
+        raise SystemExit("post-CKKS AIR string-table size is not decimal")
+    canonical_size = int(size_text) - physical_size + logical_size
+    if canonical_size < 0:
+        raise SystemExit("post-CKKS AIR string-table size is inconsistent")
+
+    canonical = (
+        f"{header_prefix}{canonical_size}{header_suffix}"
+        + air_dump[header_end + len(header_suffix):]
+    )
+    canonical = canonical.replace(physical_entry, logical_entry, 1)
+    if physical_source in canonical:
+        raise SystemExit("physical probe source path remains in post-CKKS AIR")
+    if canonical.count(logical_entry) != 1:
+        raise SystemExit(
+            "canonical post-CKKS AIR must contain exactly one logical probe "
+            "source entry"
+        )
+    for line in canonical.splitlines():
+        stripped = line.lstrip()
+        if not stripped.startswith("STR["):
+            continue
+        value_start = stripped.find('"')
+        value_end = stripped.rfind('" length(')
+        if value_start < 0 or value_end <= value_start:
+            raise SystemExit("post-CKKS AIR has a malformed string entry")
+        if stripped[value_start + 1:value_end].startswith("/"):
+            raise SystemExit(
+                "absolute source path remains in canonical post-CKKS AIR"
+            )
+    return canonical
 
 
 if __name__ == "__main__":

@@ -175,7 +175,7 @@ def test_frozen_fixture_derives_coordinates_and_covers_aliases_and_tolerances(
             "e966e89fb34bab0c760909b76940cc4d8a6020320bb676705cde30a190097170"
         ),
         "post_ckks_air_sha256": (
-            "c2779617970d793abcae1a5ca6acc82a715a333595e1376a81409d616cefa3b9"
+            "176eda2e57195873dd1793bd921ccea679750f8b953db4292ac6cbaacc7b46ce"
         ),
     }
     assert fixture["compiler_context_manifest"]["sha256"] == (
