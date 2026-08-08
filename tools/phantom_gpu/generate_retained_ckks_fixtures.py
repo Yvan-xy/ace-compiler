@@ -369,7 +369,7 @@ def validate_template(fixture: dict[str, Any], *, require_bound: bool) -> None:
         },
         {
             "id": "rotate_batch_missing_nonzero_key",
-            "diagnostic": "RESOURCE_ROTATE_BATCH",
+            "diagnostic": "ROTATE_BATCH_RESOURCE",
             "manifest": "keyless-rotation",
         },
         {

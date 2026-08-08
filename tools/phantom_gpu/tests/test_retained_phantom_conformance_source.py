@@ -122,12 +122,14 @@ def test_case_matrix_order_and_strict_artifact_schemas_are_literal() -> None:
 
 def test_batch_contract_and_ownership_stress_are_explicit() -> None:
     source = _source()
-    assert "Json({5, 0, -7, 5})" in source
+    assert "Json({5, 0, -7, 5})" not in source
+    assert "std::vector<std::int32_t>({5, 0, -7, 5})" not in source
     assert 'fixture.at("production_rotation_batches")' in source
     assert "RequireIndependentBatch" in source
     assert "mutating one output changed a sibling output" in source
     assert "retained_batches.push_back" in source
-    assert 'iterations == 100' in source
+    assert 'fixture.at("ownership").at("iterations")' in source
+    assert 'iterations == 100' not in source
     assert 'fixture.at("ownership").at("free_order")' in source
     assert "OwnershipToken" in source
 
@@ -137,6 +139,27 @@ def test_decoded_composite_invokes_the_generated_interface() -> None:
     body = _function_body(source, "RunDecoded")
     assert '#include "retained_ckks_generated_interface.h"' in source
     assert "CIPHERTEXT result = retained_ckks_composite(*source);" in body
+
+
+def test_adapter_alias_gate_is_fixture_owned_and_exact() -> None:
+    source = _source()
+    body = _function_body(source, "RunAliases")
+    assert 'fixture.at("monomial_powers")' in body
+    assert "Conjugate_ciph(alias, alias)" in body
+    assert "Mul_mono_ciph(alias, alias, power)" in body
+    assert "metadata_matches_out_of_place" in body
+    assert "decoded_values_match_out_of_place" in body
+    assert "residues_match_out_of_place" in body
+    assert "identity_matches_source" in body
+    assert '"source_preserved", true' in body
+    assert '"input_metadata", alias_before._metadata' in body
+    assert '"out_of_place_metadata", expected_after._metadata' in body
+    assert '"in_place_metadata", alias_after._metadata' in body
+    assert '"input_decoded_sha256", Sha256(input_values)' in body
+    assert '"out_of_place_decoded_sha256", Sha256(expected_values)' in body
+    assert '"in_place_decoded_sha256", Sha256(alias_values)' in body
+    assert '"input_residues_sha256", alias_before._residues_sha256' in body
+    assert "ace.phantom.retained_ckks.adapter-aliases/1.0.0" in body
 
 
 def test_source_preservation_hashes_exact_device_residues() -> None:
@@ -172,7 +195,7 @@ def test_rejections_publish_stable_identifiers_and_tokens() -> None:
     source = _source()
     expected = {
         "conjugate_missing_key": "CONJUGATE_KEY_MISSING",
-        "rotate_batch_missing_nonzero_key": "RESOURCE_ROTATE_BATCH",
+        "rotate_batch_missing_nonzero_key": "ROTATE_BATCH_RESOURCE",
         "rotate_batch_source_overlap": "ROTATE_BATCH_ALIAS",
         "raise_alias": "RAISE_MOD_ALIAS",
         "raise_size": "RAISE_MOD_SIZE",
@@ -200,7 +223,8 @@ def test_rejections_publish_stable_identifiers_and_tokens() -> None:
     assert "expected_manifest == ACE_REJECTION_MANIFEST_ID" in source
     assert "PHANTOM_RESOURCE_CONJUGATION_KEY" in source
     assert "missing_nonzero_key" in source
-    assert "REJECTION_INITIALIZATION" in source
+    assert "REJECTION_INITIALIZATION" not in source
+    assert "Rotate_batch_ciph(outputs.data(), source, fixture_steps.data()" in source
     assert "REJECTION_RETURNED" in source
     assert "raise_invalid_form" not in source
     assert 'Require(source->is_ntt_form(), "REJECTION_SETUP"' in source
@@ -233,7 +257,7 @@ def test_context_and_resources_have_one_generated_authority() -> None:
     assert "Sha256(bytes)" in authenticated
     assert "CONTEXT_FILE_MISMATCH" in authenticated
     assert "JSON_DUPLICATE_KEY" in source
-    assert source.count("AuthenticateContext(argv[3])") == 3
+    assert source.count("AuthenticateContext(argv[3])") == 4
     assert source.count('{"first_data_chain_index", first_data_chain_index}') == 2
     for profile_literal in ("16384", "8192", "192"):
         assert re.search(rf"\b{profile_literal}\b", source) is None

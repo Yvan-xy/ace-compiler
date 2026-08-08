@@ -93,6 +93,7 @@ def test_four_focused_micrographs_preserve_their_ckks_operations(tmp_path: Path)
 
 def test_composite_preserves_ordered_batch_and_all_retained_operations(tmp_path: Path) -> None:
     air = _emit(tmp_path, "composite")
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
     for token in (
         "ckks.raise_mod",
         "ckks.mul_mono",
@@ -101,7 +102,8 @@ def test_composite_preserves_ordered_batch_and_all_retained_operations(tmp_path:
     ):
         assert token in air
     compact = "".join(air.split())
-    assert "nums=(5,0,-7,5)" in compact
+    steps = ",".join(str(step) for step in fixture["rotate_batch_steps"])
+    assert f"nums=({steps})" in compact
     _assert_no_forbidden_boundary_ops(air)
 
 
@@ -110,7 +112,9 @@ def test_rotation_micrograph_emits_edge_and_every_frozen_production_batch(
 ) -> None:
     air = "".join(_emit(tmp_path, "rotate_batch").split())
     fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    batches = [[5, 0, -7, 5]] + fixture["production_rotation_batches"]
+    batches = [fixture["rotate_batch_steps"]] + fixture[
+        "production_rotation_batches"
+    ]
     assert air.count("ckks.rotate_batch") == len(batches)
     for batch in batches:
         rendered = ",".join(str(step) for step in batch)
@@ -139,7 +143,7 @@ def test_rotation_batches_survive_driver_and_source_emission(tmp_path: Path) -> 
                 fixture_path = Path({str(FIXTURE)!r})
                 manifest = json.loads(context_path.read_text(encoding="utf-8"))
                 fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-                batches = [[5, 0, -7, 5]] + fixture["production_rotation_batches"]
+                batches = [fixture["rotate_batch_steps"]] + fixture["production_rotation_batches"]
                 AceEDSL._get_dsl.cache_clear()
                 graphs = create_retained_ckks_micrographs(context_path, fixture_path)
                 graphs.rotate_batch(
@@ -198,15 +202,18 @@ def test_micrograph_dimensions_are_manifest_derived(tmp_path: Path) -> None:
             "-c",
             textwrap.dedent(
                 f"""
+                import json
                 from pathlib import Path
                 from ckks_retained_ops import create_retained_ckks_micrographs
+                manifest = json.loads(
+                    Path({str(context)!r}).read_text(encoding="utf-8")
+                )
                 graphs = create_retained_ckks_micrographs(
                     Path({str(context)!r}), Path({str(FIXTURE)!r})
                 )
-                assert graphs.polynomial_degree == 16384
-                assert graphs.logical_slots == 8192
-                assert graphs.full_data_q_count == 4
-                assert len(graphs.production_rotation_batches) == 6
+                assert graphs.polynomial_degree == manifest["polynomial_degree"]
+                assert graphs.logical_slots == manifest["logical_slot_capacity"]
+                assert graphs.full_data_q_count == len(manifest["data_q_bit_sizes"])
                 """
             ),
         ],
@@ -226,54 +233,58 @@ def test_phantom_pipeline_rejects_runtime_raise_helper(tmp_path: Path) -> None:
     environment["PYTHONPATH"] = os.pathsep.join(
         (str(REPOSITORY), str(EXAMPLES), environment.get("PYTHONPATH", ""))
     )
+    script = tmp_path / "invalid_dynamic_raise.py"
+    script.write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            from pathlib import Path
+            from ace_edsl.edsl import (
+                AceEDSL, AcePipeline, CkksCiphertext, ckks_kernel,
+            )
+
+            manifest = json.loads(
+                Path({str(context)!r}).read_text(encoding="utf-8")
+            )
+
+            @ckks_kernel
+            def invalid_raise(ct: CkksCiphertext) -> CkksCiphertext:
+                return ct.raise_mod(
+                    len(manifest["data_q_bit_sizes"]),
+                    runtime_raise_level=True,
+                )
+
+            AceEDSL._get_dsl.cache_clear()
+            invalid_raise(
+                CkksCiphertext(
+                    shape=(manifest["polynomial_degree"],), name="input_ct"
+                )
+            )
+            module = AceEDSL._get_dsl().current_air_module
+            pipeline = AcePipeline(module).configure_fhe(
+                poly_degree=manifest["polynomial_degree"],
+                mul_level=len(manifest["data_q_bit_sizes"]),
+                input_level=manifest["input_level"],
+                security_level=manifest["security_level"],
+                scaling_factor_bits=manifest["scaling_modulus_bits"],
+                first_prime_bits=manifest["first_modulus_bits"],
+                hamming_weight=manifest["hamming_weight"],
+                data_file="",
+                provider="phantom",
+                codegen_ir="ckks",
+            )
+            compiled = pipeline.run(start_domain="fhe::ckks", verbose=False)
+            assert not compiled.success
+            assert "forbids runtime target-level helpers" in compiled.error
+            print("RETAINED_DYNAMIC_RAISE_REJECTED")
+            """
+        ),
+        encoding="utf-8",
+    )
     result = subprocess.run(
         [
             sys.executable,
-            "-c",
-            textwrap.dedent(
-                f"""
-                import json
-                from pathlib import Path
-                from ace_edsl.edsl import (
-                    AceEDSL, AcePipeline, CkksCiphertext, ckks_kernel,
-                )
-
-                manifest = json.loads(
-                    Path({str(context)!r}).read_text(encoding="utf-8")
-                )
-
-                @ckks_kernel
-                def invalid_raise(ct: CkksCiphertext) -> CkksCiphertext:
-                    return ct.raise_mod(
-                        len(manifest["data_q_bit_sizes"]),
-                        runtime_raise_level=True,
-                    )
-
-                AceEDSL._get_dsl.cache_clear()
-                invalid_raise(
-                    CkksCiphertext(
-                        shape=(manifest["polynomial_degree"],), name="input_ct"
-                    )
-                )
-                module = AceEDSL._get_dsl().current_air_module
-                pipeline = AcePipeline(module).configure_fhe(
-                    poly_degree=manifest["polynomial_degree"],
-                    mul_level=len(manifest["data_q_bit_sizes"]),
-                    input_level=manifest["input_level"],
-                    security_level=manifest["security_level"],
-                    scaling_factor_bits=manifest["scaling_modulus_bits"],
-                    first_prime_bits=manifest["first_modulus_bits"],
-                    hamming_weight=manifest["hamming_weight"],
-                    data_file="",
-                    provider="phantom",
-                    codegen_ir="ckks",
-                )
-                compiled = pipeline.run(start_domain="fhe::ckks", verbose=False)
-                assert not compiled.success
-                assert "forbids runtime target-level helpers" in compiled.error
-                print("RETAINED_DYNAMIC_RAISE_REJECTED")
-                """
-            ),
+            str(script),
         ],
         cwd=REPOSITORY,
         env=environment,
@@ -326,6 +337,8 @@ def test_same_conformance_module_generates_both_terminal_sources(
     environment["PYTHONPATH"] = os.pathsep.join(
         (str(REPOSITORY), str(EXAMPLES), environment.get("PYTHONPATH", ""))
     )
+    manifest = json.loads(context.read_text(encoding="utf-8"))
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
     result = subprocess.run(
         [
             sys.executable,
@@ -340,6 +353,13 @@ def test_same_conformance_module_generates_both_terminal_sources(
             "--phantom-resource-manifest", str(outputs["emitted_resources"]),
             "--generation-record", str(outputs["record"]),
             "--interface-header", str(outputs["interface"]),
+            "--polynomial-degree", str(manifest["polynomial_degree"]),
+            "--mul-level", str(len(manifest["data_q_bit_sizes"])),
+            "--input-level", str(manifest["input_level"]),
+            "--security-level", str(manifest["security_level"]),
+            "--scaling-modulus-bits", str(manifest["scaling_modulus_bits"]),
+            "--first-modulus-bits", str(manifest["first_modulus_bits"]),
+            "--hamming-weight", str(manifest["hamming_weight"]),
         ],
         cwd=REPOSITORY,
         env=environment,
@@ -390,17 +410,21 @@ def test_same_conformance_module_generates_both_terminal_sources(
         assert forbidden not in phantom
     resources = json.loads(outputs["emitted_resources"].read_text(encoding="utf-8"))
     assert resources["rotation_batches"] == [
-        [5, 0, -7, 5],
+        fixture["rotate_batch_steps"],
         *fixture["production_rotation_batches"],
-        [5, 0, -7, 5],
+        fixture["rotate_batch_steps"],
     ]
-    assert resources["monomial_powers"] == [
-        0,
-        1,
-        8192,
-        16384,
-        24576,
-        32767,
-    ]
+    degree = manifest["polynomial_degree"]
+    expected_powers = {
+        "0": 0,
+        "N/2": degree // 2,
+        "N": degree,
+        "3N/2": degree + degree // 2,
+        "2N-1": 2 * degree - 1,
+        "2N+1": 1,
+    }
+    assert resources["monomial_powers"] == sorted(
+        expected_powers[symbol] for symbol in fixture["monomial_powers"]
+    )
     assert 0 not in resources["rotation_steps"]
     assert len(resources["rotation_steps"]) == len(set(resources["rotation_steps"]))

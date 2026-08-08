@@ -683,6 +683,13 @@ CIPHER Encrypt(RuntimeArena &arena, const std::vector<Complex> &values,
   return cipher;
 }
 
+CIPHER CopyCipher(RuntimeArena &arena, CIPHER source) {
+  CIPHER result = arena.NewCipher();
+  Register_ciph_lifetime(result);
+  Copy_ciph(result, source);
+  return result;
+}
+
 std::vector<Complex> LoadSource(const Json &analytic,
                                 const std::vector<std::uint8_t> &binary) {
   ValidateBinary(binary, analytic.at("binary"), kDecodedMagic, "ANALYTIC");
@@ -820,14 +827,12 @@ Json RunDecoded(const Json &fixture, const std::vector<Complex> &source_values,
           "observed compiler input active-Q count " +
               std::to_string(context._input_level) +
               ", expected bottom active-Q count 1");
-  Require(fixture.at("rotate_batch_steps") == Json({5, 0, -7, 5}),
-          "FIXTURE_BATCH", "edge batch order changed");
-
   Json records = Json::array();
   RuntimeArena arena;
   std::size_t ownership_serial = 0;
   std::vector<std::unique_ptr<CIPHERTEXT[]>> retained_batches;
 
+#ifndef ACE_REJECTION_ONLY
   {
     CIPHER source = Encrypt(arena, source_values, context._input_level);
     const RuntimeSnapshot before = Snapshot(source);
@@ -849,7 +854,10 @@ Json RunDecoded(const Json &fixture, const std::vector<Complex> &source_values,
   }
 
   auto run_batch = [&](const std::vector<std::int32_t> &steps,
-                       const std::string &prefix) {
+                       const std::string &prefix,
+                       bool verify_fixture_ownership) {
+    Require(!steps.empty(), "ROTATE_BATCH_FIXTURE",
+            "rotate_batch_steps must not be empty");
     CIPHER source = Encrypt(arena, source_values, context._input_level);
     const RuntimeSnapshot before = Snapshot(source);
     auto outputs = std::make_unique<CIPHERTEXT[]>(steps.size());
@@ -879,15 +887,28 @@ Json RunDecoded(const Json &fixture, const std::vector<Complex> &source_values,
           OwnershipToken(&outputs[position], ownership_serial++)));
     }
     RequirePreserved(before, source, "ROTATE_BATCH_SOURCE");
-    if (steps == std::vector<std::int32_t>({5, 0, -7, 5})) {
-      const auto zero_before = Decode(&outputs[1]);
-      const auto duplicate_before = Decode(&outputs[3]);
-      Add_scalar(&outputs[0], &outputs[0], 0.125);
-      Require(PackComplex(Decode(&outputs[1])) == PackComplex(zero_before) &&
-                  PackComplex(Decode(&outputs[3])) ==
-                      PackComplex(duplicate_before),
-              "ROTATE_BATCH_OWNERSHIP",
-              "mutating one output changed a sibling output");
+    if (verify_fixture_ownership) {
+      Require(steps.size() > 1U, "ROTATE_BATCH_OWNERSHIP",
+              "ownership verification requires at least two outputs");
+      const auto mutation = std::find_if(
+          steps.begin(), steps.end(), [](std::int32_t step) { return step != 0; });
+      Require(mutation != steps.end(), "ROTATE_BATCH_OWNERSHIP",
+              "ownership verification requires a nonzero step");
+      const std::size_t mutation_index =
+          static_cast<std::size_t>(std::distance(steps.begin(), mutation));
+      std::vector<std::vector<std::uint8_t>> sibling_values(steps.size());
+      for (std::size_t index = 0; index < steps.size(); ++index) {
+        if (index != mutation_index)
+          sibling_values[index] = PackComplex(Decode(&outputs[index]));
+      }
+      Add_scalar(&outputs[mutation_index], &outputs[mutation_index], 0.125);
+      for (std::size_t index = 0; index < steps.size(); ++index) {
+        if (index != mutation_index) {
+          Require(PackComplex(Decode(&outputs[index])) == sibling_values[index],
+                  "ROTATE_BATCH_OWNERSHIP",
+                  "mutating one output changed a sibling output");
+        }
+      }
     }
     if (steps.size() == fixture.at("ownership").at("free_order").size()) {
       FreeBatchInOrder(outputs.get(), steps.size(),
@@ -906,14 +927,15 @@ Json RunDecoded(const Json &fixture, const std::vector<Complex> &source_values,
   for (const auto &step : fixture.at("rotate_batch_steps")) {
     edge_steps.push_back(step.get<std::int32_t>());
   }
-  run_batch(edge_steps, "rotate_batch.bounded_nonperiodic");
+  run_batch(edge_steps, "rotate_batch.bounded_nonperiodic", true);
   std::size_t batch_index = 0;
   for (const auto &batch : fixture.at("production_rotation_batches")) {
     std::vector<std::int32_t> steps;
     for (const auto &step : batch)
       steps.push_back(step.get<std::int32_t>());
     run_batch(steps,
-              "rotate_batch.production_" + std::to_string(batch_index++));
+              "rotate_batch.production_" + std::to_string(batch_index++),
+              false);
   }
 
   {
@@ -959,6 +981,7 @@ Json RunDecoded(const Json &fixture, const std::vector<Complex> &source_values,
                                           nullptr, true));
     Zero_ciph(&result);
   }
+#endif
   arena.FreeAll();
   return records;
 }
@@ -1346,8 +1369,8 @@ void RunOwnership(int argc, char **argv) {
   const auto source_values = LoadSource(analytic, analytic_binary);
   const std::size_t iterations =
       fixture.at("ownership").at("iterations").get<std::size_t>();
-  Require(iterations == 100, "OWNERSHIP_ITERATIONS",
-          "ownership fixture must request exactly 100 iterations");
+  Require(iterations > 0, "OWNERSHIP_ITERATIONS",
+          "ownership fixture must request at least one iteration");
   Prepare_context();
   RuntimeArena arena;
   const auto &context = ContextManifest();
@@ -1356,8 +1379,18 @@ void RunOwnership(int argc, char **argv) {
   for (const auto &step : fixture.at("rotate_batch_steps")) {
     steps.push_back(step.get<std::int32_t>());
   }
-  Require(steps == std::vector<std::int32_t>({5, 0, -7, 5}), "OWNERSHIP_BATCH",
-          "observed ordered steps differ from [5,0,-7,5]");
+  Require(steps.size() > 1U, "OWNERSHIP_STEPS",
+          "ownership fixture requires at least two batch steps");
+  const auto mutation = std::find_if(
+      steps.begin(), steps.end(), [](std::int32_t step) { return step != 0; });
+  Require(mutation != steps.end(), "OWNERSHIP_STEPS",
+          "ownership fixture requires a nonzero batch step");
+  const std::size_t mutation_index =
+      static_cast<std::size_t>(std::distance(steps.begin(), mutation));
+  const bool batch_outputs_are_independent =
+      fixture.at("ownership").at("batch_outputs_are_independent").get<bool>();
+  Require(batch_outputs_are_independent, "OWNERSHIP_CONTRACT",
+          "ownership fixture must require independent batch outputs");
   for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
     CIPHER source = Encrypt(arena, source_values, context._input_level);
     const RuntimeSnapshot before = Snapshot(source);
@@ -1365,12 +1398,18 @@ void RunOwnership(int argc, char **argv) {
     Rotate_batch_ciph(outputs.get(), source, steps.data(), steps.size());
     RequireIndependentBatch(source, outputs.get(), steps.size(),
                             "OWNERSHIP_BUFFERS");
-    const auto zero = PackComplex(Decode(&outputs[1]));
-    const auto duplicate = PackComplex(Decode(&outputs[3]));
-    Add_scalar(&outputs[0], &outputs[0], 0.25);
-    Require(PackComplex(Decode(&outputs[1])) == zero &&
-                PackComplex(Decode(&outputs[3])) == duplicate,
-            "OWNERSHIP_MUTATION", "batch output storage aliases");
+    std::vector<std::vector<std::uint8_t>> sibling_values(steps.size());
+    for (std::size_t index = 0; index < steps.size(); ++index) {
+      if (index != mutation_index)
+        sibling_values[index] = PackComplex(Decode(&outputs[index]));
+    }
+    Add_scalar(&outputs[mutation_index], &outputs[mutation_index], 0.25);
+    for (std::size_t index = 0; index < steps.size(); ++index) {
+      if (index != mutation_index) {
+        Require(PackComplex(Decode(&outputs[index])) == sibling_values[index],
+                "OWNERSHIP_MUTATION", "batch output storage aliases");
+      }
+    }
     RequirePreserved(before, source, "OWNERSHIP_SOURCE");
     FreeBatchInOrder(outputs.get(), steps.size(),
                      fixture.at("ownership").at("free_order"));
@@ -1385,7 +1424,122 @@ void RunOwnership(int argc, char **argv) {
              {"status", "pass"},
              {"iterations", iterations},
              {"ordered_steps", steps},
+             {"batch_outputs_are_independent", batch_outputs_are_independent},
              {"free_order", fixture.at("ownership").at("free_order")}});
+}
+
+void RunAliases(int argc, char **argv) {
+  Require(argc == 8, "ARGUMENTS",
+          "aliases requires fixture, context manifest, analytic json/bin, "
+          "GPU, and output");
+  const Json fixture = LoadJson(argv[2]);
+  const AuthenticatedContext authenticated_context =
+      AuthenticateContext(argv[3]);
+  RequireContextBinding(fixture, authenticated_context);
+  const Json analytic = LoadJson(argv[4]);
+  const auto analytic_binary = ReadBytes(argv[5]);
+  CheckGpu(argv[6]);
+  const std::string fixture_sha256 = Sha256(ReadBytes(argv[2]));
+  Require(fixture.at("fixture_id") == "retained_ckks_v1", "FIXTURE_ID",
+          "alias fixture identifier is unsupported");
+  Require(analytic.at("fixture_sha256") == fixture_sha256 &&
+              analytic.at("context_manifest_sha256") ==
+                  authenticated_context._sha256 &&
+              analytic.at("qualification_bindings") ==
+                  fixture.at("qualification_bindings"),
+          "ALIAS_FIXTURE_BINDING",
+          "analytic alias input uses another fixture");
+  const auto source_values = LoadSource(analytic, analytic_binary);
+
+  Prepare_context();
+  RuntimeArena arena;
+  const auto &context = ContextManifest();
+  Json cases = Json::array();
+  auto append_case = [&](const std::string &case_id,
+                         const std::string &operation, const Json &symbol,
+                         const Json &normalized_power, CIPHER expected,
+                         CIPHER alias, const RuntimeSnapshot &alias_before,
+                         bool alias_returned) {
+    const RuntimeSnapshot expected_after = Snapshot(expected);
+    const RuntimeSnapshot alias_after = Snapshot(alias);
+    const auto input_values = PackComplex(alias_before._values);
+    const auto expected_values = PackComplex(expected_after._values);
+    const auto alias_values = PackComplex(alias_after._values);
+    const bool metadata_matches =
+        expected_after._metadata == alias_after._metadata;
+    const bool decoded_values_match = expected_values == alias_values;
+    const bool residues_match =
+        expected_after._residues_sha256 == alias_after._residues_sha256;
+    const bool is_identity = operation == "mul_mono" &&
+                             symbol.is_string() && symbol == Json("0");
+    const bool identity_matches_source =
+        !is_identity ||
+        (alias_before._metadata == alias_after._metadata &&
+         alias_before._residues_sha256 == alias_after._residues_sha256 &&
+         input_values == alias_values);
+    Require(alias_returned && metadata_matches && decoded_values_match &&
+                residues_match && identity_matches_source,
+            "ADAPTER_ALIAS", case_id + " differs from out-of-place dispatch");
+    cases.push_back(
+        {{"case_id", case_id},
+         {"operation", operation},
+         {"symbol", symbol},
+         {"normalized_power", normalized_power},
+         {"status", "pass"},
+         {"alias_returned", alias_returned},
+         {"source_preserved", true},
+         {"metadata_matches_out_of_place", metadata_matches},
+         {"decoded_values_match_out_of_place", decoded_values_match},
+         {"residues_match_out_of_place", residues_match},
+         {"identity_matches_source",
+          is_identity ? Json(identity_matches_source) : Json(nullptr)},
+         {"input_metadata", alias_before._metadata},
+         {"out_of_place_metadata", expected_after._metadata},
+         {"in_place_metadata", alias_after._metadata},
+         {"input_decoded_sha256", Sha256(input_values)},
+         {"out_of_place_decoded_sha256", Sha256(expected_values)},
+         {"in_place_decoded_sha256", Sha256(alias_values)},
+         {"input_residues_sha256", alias_before._residues_sha256},
+         {"out_of_place_residues_sha256", expected_after._residues_sha256},
+         {"in_place_residues_sha256", alias_after._residues_sha256}});
+  };
+
+  {
+    CIPHER source = Encrypt(arena, source_values, context._input_level);
+    const RuntimeSnapshot source_before = Snapshot(source);
+    CIPHER alias = CopyCipher(arena, source);
+    const RuntimeSnapshot alias_before = Snapshot(alias);
+    CIPHER expected = arena.NewCipher();
+    Conjugate_ciph(expected, source);
+    RequirePreserved(source_before, source, "CONJUGATE_ALIAS_SOURCE");
+    const bool alias_returned = Conjugate_ciph(alias, alias) == alias;
+    append_case("conjugate.in_place", "conjugate", nullptr, nullptr,
+                expected, alias, alias_before, alias_returned);
+  }
+  for (const auto &raw_symbol : fixture.at("monomial_powers")) {
+    const std::string symbol = raw_symbol.get<std::string>();
+    const std::uint32_t power = ResolvePower(symbol, context._poly_degree);
+    CIPHER source = Encrypt(arena, source_values, context._input_level);
+    const RuntimeSnapshot source_before = Snapshot(source);
+    CIPHER alias = CopyCipher(arena, source);
+    const RuntimeSnapshot alias_before = Snapshot(alias);
+    CIPHER expected = arena.NewCipher();
+    Mul_mono_ciph(expected, source, power);
+    RequirePreserved(source_before, source, "MUL_MONO_ALIAS_SOURCE");
+    const bool alias_returned = Mul_mono_ciph(alias, alias, power) == alias;
+    append_case("mul_mono." + PowerLabel(symbol) + ".in_place", "mul_mono",
+                symbol, power, expected, alias, alias_before, alias_returned);
+  }
+  arena.FreeAll();
+  Finalize_context();
+  WriteJson(
+      argv[7],
+      {{"schema_version", "ace.phantom.retained_ckks.adapter-aliases/1.0.0"},
+       {"status", "pass"},
+       {"fixture_sha256", fixture_sha256},
+       {"context_manifest_sha256", authenticated_context._sha256},
+       {"qualification_bindings", fixture.at("qualification_bindings")},
+       {"cases", std::move(cases)}});
 }
 
 void RunRejection(int argc, char **argv) {
@@ -1403,6 +1557,26 @@ void RunRejection(int argc, char **argv) {
   CheckGpu(argv[6]);
   const std::string id = argv[7];
   const auto source_values = LoadSource(analytic, analytic_binary);
+  std::vector<std::int32_t> fixture_steps;
+  for (const auto &step : fixture.at("rotate_batch_steps")) {
+    Require(step.is_number_integer(), "REJECTION_FIXTURE",
+            "rotate_batch_steps must contain integers");
+    const std::int64_t value = step.get<std::int64_t>();
+    Require(value >= std::numeric_limits<std::int32_t>::min() &&
+                value <= std::numeric_limits<std::int32_t>::max(),
+            "REJECTION_FIXTURE", "rotate_batch_steps value is out of range");
+    fixture_steps.push_back(static_cast<std::int32_t>(value));
+  }
+  Require(!fixture_steps.empty(), "REJECTION_FIXTURE",
+          "rotate_batch_steps must not be empty");
+  Require(std::any_of(fixture_steps.begin(), fixture_steps.end(),
+                      [](std::int32_t step) { return step != 0; }),
+          "REJECTION_FIXTURE",
+          "rotate_batch_steps must contain a nonzero step");
+  const auto zero_step =
+      std::find(fixture_steps.begin(), fixture_steps.end(), 0);
+  Require(zero_step != fixture_steps.end(), "REJECTION_FIXTURE",
+          "rotate_batch_steps must contain the zero-step ownership case");
   const Json *rejection = nullptr;
   std::set<std::string> rejection_ids;
   for (const auto &candidate : fixture.at("runtime_rejections")) {
@@ -1435,6 +1609,13 @@ void RunRejection(int argc, char **argv) {
             "keyless rejection binary unexpectedly declares conjugation");
   } else if (id == "rotate_batch_missing_nonzero_key") {
     const auto &resources = ResourceManifest();
+#ifdef ACE_REJECTION_ONLY
+    Require(resources._rotation_count == 0 &&
+                resources._rotation_batch_count == 0,
+            "REJECTION_LINKAGE",
+            "compiler-emitted keyless manifest unexpectedly declares a "
+            "rotation resource");
+#else
     Require(resources._rotation_batch_count != 0 &&
                 resources._rotation_batch_offsets != nullptr &&
                 resources._rotation_batch_steps != nullptr,
@@ -1464,6 +1645,7 @@ void RunRejection(int argc, char **argv) {
     Require(missing_nonzero_key, "REJECTION_LINKAGE",
             "keyless rotation manifest has no unauthorised nonzero batch "
             "step");
+#endif
   }
   std::cerr << "ACE_RETAINED_EXPECT_DIAGNOSTIC[" << diagnostic
             << "] rejection=" << id << " manifest=" << ACE_REJECTION_MANIFEST_ID
@@ -1476,11 +1658,12 @@ void RunRejection(int argc, char **argv) {
   if (id == "conjugate_missing_key") {
     Conjugate_ciph(result, source);
   } else if (id == "rotate_batch_missing_nonzero_key") {
-    Fail("REJECTION_INITIALIZATION",
-         "keyless rotation manifest passed context validation");
+    std::vector<CIPHERTEXT> outputs(fixture_steps.size());
+    Rotate_batch_ciph(outputs.data(), source, fixture_steps.data(),
+                      fixture_steps.size());
   } else if (id == "rotate_batch_source_overlap") {
-    const std::array<std::int32_t, 1> steps = {0};
-    Rotate_batch_ciph(source, source, steps.data(), steps.size());
+    const std::int32_t step = *zero_step;
+    Rotate_batch_ciph(source, source, &step, 1U);
   } else if (id == "raise_alias") {
     Raise_mod(source, source, context._data_q_count);
   } else if (id == "raise_size") {
@@ -1525,12 +1708,14 @@ int main(int argc, char **argv) {
   try {
     if (argc < 2) {
       std::cerr << "usage: retained_ckks_phantom_conformance "
-                   "<conformance|ownership|reject> ...\n";
+                   "<conformance|aliases|ownership|reject> ...\n";
       return 2;
     }
     const std::string mode = argv[1];
     if (mode == "conformance") {
       RunConformance(argc, argv);
+    } else if (mode == "aliases") {
+      RunAliases(argc, argv);
     } else if (mode == "ownership") {
       RunOwnership(argc, argv);
     } else if (mode == "reject") {

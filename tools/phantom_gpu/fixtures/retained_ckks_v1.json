@@ -89,7 +89,7 @@
   },
   "runtime_rejections": [
     {"id": "conjugate_missing_key", "diagnostic": "CONJUGATE_KEY_MISSING", "manifest": "keyless-conjugation"},
-    {"id": "rotate_batch_missing_nonzero_key", "diagnostic": "RESOURCE_ROTATE_BATCH", "manifest": "keyless-rotation"},
+    {"id": "rotate_batch_missing_nonzero_key", "diagnostic": "ROTATE_BATCH_RESOURCE", "manifest": "keyless-rotation"},
     {"id": "rotate_batch_source_overlap", "diagnostic": "ROTATE_BATCH_ALIAS", "manifest": "production"},
     {"id": "raise_alias", "diagnostic": "RAISE_MOD_ALIAS", "manifest": "production"},
     {"id": "raise_size", "diagnostic": "RAISE_MOD_SIZE", "manifest": "production"},
