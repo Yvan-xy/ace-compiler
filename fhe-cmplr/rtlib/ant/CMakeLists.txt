@@ -85,6 +85,10 @@ endif()
 
 if(BUILD_UNITTEST AND NOT RTLIB_SEED_MODE STREQUAL "fixed")
   build_app_unittest(RTLIB_INSTALL_APP "${FHERT_ANT_LIB};${UT_LIBS}" "ut_fhert_ant")
+  add_test(
+    NAME ut_fhert_ant_ckks_extended_ops
+    COMMAND ${CMAKE_BINARY_DIR}/unittest/ut_fhert_ant
+            --gtest_filter=TEST_CKKS_EXTENDED_OPS.*)
 endif()
 
 if(FHE_BUILD_TEST)
