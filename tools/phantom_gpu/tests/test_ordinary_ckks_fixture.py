@@ -179,9 +179,9 @@ def test_frozen_fixture_derives_coordinates_and_covers_aliases_and_tolerances(
         ),
     }
     assert fixture["compiler_context_manifest"]["sha256"] == (
-        "2a2927711c260f72257abebffd9f74f3cb9aeaffd5a8f44c4d7efa5764e6569f"
+        "6635e0582a1e787f7441a806bf4c65dd212013f8bdaf726ccb9d89f62dd2e4b1"
     )
-    assert digest == "a21d2883bec45112ad1ced38e821af0dfbb32414ba585e3e9990119a16350e81"
+    assert digest == "e55c8f0c444dac4377ff5722e8061dfaa6370354364a23669d9b82e72a49fe29"
     assert fixture["coordinate_rules"] == {
         "input_length": "compiler_context.logical_slot_capacity",
         "full_level": "compiler_context.data_q_count",

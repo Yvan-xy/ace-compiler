@@ -10,7 +10,7 @@
     "post_ckks_air_sha256": "176eda2e57195873dd1793bd921ccea679750f8b953db4292ac6cbaacc7b46ce"
   },
   "compiler_context_manifest": {
-    "sha256": "2a2927711c260f72257abebffd9f74f3cb9aeaffd5a8f44c4d7efa5764e6569f"
+    "sha256": "6635e0582a1e787f7441a806bf4c65dd212013f8bdaf726ccb9d89f62dd2e4b1"
   },
   "coordinate_rules": {
     "input_length": "compiler_context.logical_slot_capacity",
