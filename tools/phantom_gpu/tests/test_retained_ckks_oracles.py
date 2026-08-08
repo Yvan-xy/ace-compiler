@@ -353,6 +353,12 @@ def _write_source_manifest(path: Path, kind: str, commit: str) -> None:
             "excluded_paths": [],
             "members": [
                 {
+                    "path": prefix,
+                    "type": "directory",
+                    "mode": "0755",
+                    "size": 0,
+                },
+                {
                     "path": member_path,
                     "type": "file",
                     "mode": "0644",
@@ -360,7 +366,7 @@ def _write_source_manifest(path: Path, kind: str, commit: str) -> None:
                     "sha256": "d" * 64,
                 }
             ],
-            "member_count": 1,
+            "member_count": 2,
             "regular_bytes": 1,
         },
     )

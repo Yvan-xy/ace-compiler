@@ -219,8 +219,9 @@ def load_source_manifest(path: Path, kind: str) -> dict[str, Any]:
         member_path = PurePosixPath(member["path"])
         if (
             member_path.is_absolute()
-            or len(member_path.parts) < 2
+            or not member_path.parts
             or member_path.parts[0] != f"{kind}-source"
+            or (len(member_path.parts) == 1 and member_type != "directory")
             or any(part in {"", ".", ".."} for part in member_path.parts)
         ):
             fail(f"{kind} source member {index} has an unsafe path")
