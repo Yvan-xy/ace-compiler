@@ -608,6 +608,7 @@ std::vector<Complex> DecodeStrictQ0(CIPHER result) {
   const std::vector<std::uint64_t> full_q0 = Q0Tower(result);
 
   CIPHERTEXT projected;
+  Register_ciph_lifetime(&projected);
   Copy_ciph(&projected, result);
   while (Active_q_count(&projected) > 1)
     Mod_switch(&projected, &projected);

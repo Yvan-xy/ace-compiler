@@ -156,6 +156,7 @@ def test_source_preservation_hashes_exact_device_residues() -> None:
 def test_raised_decodes_use_a_verified_temporary_q0_projection() -> None:
     source = _source()
     projection = _function_body(source, "DecodeStrictQ0")
+    assert "Register_ciph_lifetime(&projected)" in projection
     assert "Copy_ciph(&projected, result)" in projection
     assert "while (Active_q_count(&projected) > 1)" in projection
     assert "Mod_switch(&projected, &projected)" in projection

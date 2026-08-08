@@ -228,6 +228,10 @@ def test_generator_consumes_seed_and_is_binary_deterministic(tmp_path: Path) -> 
     expected_order = comparator.expected_provider_order(bound)
     analytic_order = [record["case_id"] for record in first["records"]]
     assert analytic_order == expected_order[: len(analytic_order)]
+    assert analytic_order[-1] == "raise_mod.bounded_nonperiodic"
+    raise_record = first["records"][-1]
+    assert raise_record["operation"] == "raise_mod"
+    assert raise_record["metadata"]["active_q_count"] == 3
     production_ids = [
         case_id for case_id in analytic_order if case_id.startswith("rotate_batch.production_")
     ]
@@ -435,6 +439,31 @@ def test_provider_operation_and_metadata_projection_are_case_driven() -> None:
     }
     assert "chain_index" not in projected
     assert "raw_scale" not in projected
+    marker = comparator.validate_decoded_projection(
+        {"kind": "strict_q0_prefix_drop", "active_q_count": 1},
+        required=True,
+        context="projection",
+    )
+    assert marker == {
+        "kind": "strict_q0_prefix_drop",
+        "active_q_count": 1,
+    }
+    assert (
+        comparator.validate_decoded_projection(
+            None, required=False, context="projection"
+        )
+        is None
+    )
+    with pytest.raises(comparator.ComparisonError, match="keys differ"):
+        comparator.validate_decoded_projection(
+            {
+                "kind": "strict_q0_prefix_drop",
+                "active_q_count": 1,
+                "scale": 32.0,
+            },
+            required=True,
+            context="projection",
+        )
 
     resolved = fixture_tool.validate_context_manifest(_context())
     provider_local = dict(metadata, chain_index=9)

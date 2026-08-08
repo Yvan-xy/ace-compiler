@@ -35,7 +35,7 @@ from generate_retained_ckks_fixtures import (  # noqa: E402
 )
 
 
-PROVIDER_SCHEMA = "ace.phantom.retained_ckks.provider-result/2.0.0"
+PROVIDER_SCHEMA = "ace.phantom.retained_ckks.provider-result/3.0.0"
 EXACT_OBSERVED_SCHEMA = "ace.phantom.retained_ckks.exact-observed/2.0.0"
 COMPARISON_SCHEMA = "ace.phantom.retained_ckks.comparison/1.0.0"
 EXACT_EVIDENCE_SCHEMA = "ace.phantom.retained_ckks.exact-evidence/2.0.0"
@@ -109,6 +109,21 @@ def provider_independent_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
             "ntt",
         )
     }
+
+
+def validate_decoded_projection(
+    value: Any, *, required: bool, context: str
+) -> dict[str, Any] | None:
+    if not required:
+        if value is not None:
+            fail(f"{context} must be null for a bottom-Q result")
+        return None
+    marker = expect_keys(value, {"kind", "active_q_count"}, context)
+    if marker["kind"] != "strict_q0_prefix_drop":
+        fail(f"{context}.kind is unsupported")
+    if marker["active_q_count"] != 1:
+        fail(f"{context}.active_q_count must equal 1")
+    return marker
 
 
 def hex_digest(value: Any, length: int, context: str) -> str:
@@ -220,6 +235,13 @@ def expected_analytic_contracts(fixture: dict[str, Any]) -> list[dict[str, Any]]
                     "batch_step": step,
                 }
             )
+    contracts.append(
+        {
+            "case_id": "raise_mod.bounded_nonperiodic",
+            "operation": "raise_mod",
+            "batch_step": None,
+        }
+    )
     case_ids = [contract["case_id"] for contract in contracts]
     if len(case_ids) != len(set(case_ids)):
         fail("fixture expands to duplicate analytic case identifiers")
@@ -476,12 +498,16 @@ def load_analytic(
             expected_values = [value.conjugate() for value in source_values]
         elif item["operation"] == "conjugate_twice":
             expected_values = list(source_values)
-        else:
+        elif item["operation"] == "rotate_batch":
             step = item["batch_step"]
             expected_values = [
                 source_values[(position + step) % slots]
                 for position in range(slots)
             ]
+        else:
+            if item["operation"] != "raise_mod":
+                fail(f"unsupported analytic operation {item['operation']}")
+            expected_values = list(source_values)
         if item["decoded_values"] != expected_values:
             fail(f"analytic values differ from the fixture oracle for {item['case_id']}")
         records.append(item)
@@ -559,6 +585,7 @@ def load_provider(
                 "source_values_sha256_before",
                 "source_values_sha256_after",
                 "ownership_token",
+                "decoded_projection",
                 "values",
             },
             f"{provider_name} record {index}",
@@ -574,6 +601,11 @@ def load_provider(
                 f"{record['operation']!r}, expected {expected_operation!r}"
             )
         raised = expected_operation in ("raise_mod", "composite")
+        decoded_projection = validate_decoded_projection(
+            record["decoded_projection"],
+            required=raised,
+            context=f"{provider_name}.{case_id}.decoded_projection",
+        )
         metadata = validate_metadata(record["metadata"], resolved, raised=raised, first_data_chain_index=first_data_chain_index, context=f"{provider_name}.{case_id}.metadata")
         source_before = validate_metadata(record["source_metadata_before"], resolved, raised=False, first_data_chain_index=first_data_chain_index, context=f"{provider_name}.{case_id}.source_before")
         source_after = validate_metadata(record["source_metadata_after"], resolved, raised=False, first_data_chain_index=first_data_chain_index, context=f"{provider_name}.{case_id}.source_after")
@@ -597,6 +629,7 @@ def load_provider(
             fail(f"{provider_name}.{case_id} has an unexpected ownership token")
         materialized = dict(record)
         materialized["metadata"] = metadata
+        materialized["decoded_projection"] = decoded_projection
         materialized["decoded_values"] = read_complex(data, record["values"], f"{provider_name}.{case_id}")
         descriptors.append(record["values"])
         if len(materialized["decoded_values"]) != resolved["logical_slots"]:
@@ -1352,6 +1385,7 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
     source = inputs["bounded_nonperiodic"]
     metamorphic: dict[str, bool] = {}
     metamorphic["conjugate_twice_identity"] = metric(gpu_by_id["conjugate_twice.bounded_nonperiodic"]["decoded_values"], source, absolute_tolerance=tolerances["primitive_absolute"], relative_tolerance=tolerances["primitive_relative"], hard_maximum=tolerances["hard_maximum_absolute"], relative_floor=tolerances["relative_metric_floor"])["status"] == "pass"
+    metamorphic["raise_mod_identity"] = metric(gpu_by_id["raise_mod.bounded_nonperiodic"]["decoded_values"], source, absolute_tolerance=tolerances["primitive_absolute"], relative_tolerance=tolerances["primitive_relative"], hard_maximum=tolerances["hard_maximum_absolute"], relative_floor=tolerances["relative_metric_floor"])["status"] == "pass"
     zero_id = "rotate_batch.bounded_nonperiodic.output_1.step_0"
     duplicate_a = "rotate_batch.bounded_nonperiodic.output_0.step_5"
     duplicate_b = "rotate_batch.bounded_nonperiodic.output_3.step_5"
