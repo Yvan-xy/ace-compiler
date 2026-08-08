@@ -65,6 +65,11 @@ def test_checked_fixture_lifecycle_is_accepted_only_when_explicit() -> None:
     )
     assert 'get("status") != "bound"' in formal_gate
     assert "checked fixture differs from the generation fixture" in formal_gate
+    assert (
+        'fixture_bindings.get("compiler_context_manifest_sha256")'
+        in formal_gate
+    )
+    assert 'fixture.get("compiler_context_manifest")' not in formal_gate
 
 
 def test_checkout_path_canonicalization_updates_air_string_sizes() -> None:

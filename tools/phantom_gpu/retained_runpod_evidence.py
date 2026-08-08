@@ -638,7 +638,11 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
             gtest_attestation.get(field), length, f"retained googletest {field}"
         )
 
-    if fixture.get("qualification_bindings", {}).get("status") != "bound":
+    fixture_bindings = fixture.get("qualification_bindings")
+    if (
+        not isinstance(fixture_bindings, dict)
+        or fixture_bindings.get("status") != "bound"
+    ):
         raise EvidenceError("retained checked fixture binding is not bound")
     if fixture_path.read_bytes() != (
         root / FROZEN_FILES["generation_fixture"][0]
@@ -646,9 +650,9 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
         raise EvidenceError(
             "retained checked fixture differs from the generation fixture"
         )
-    if fixture.get("compiler_context_manifest") != {
-        "sha256": sha256_path(context_path)
-    }:
+    if fixture_bindings.get("compiler_context_manifest_sha256") != sha256_path(
+        context_path
+    ):
         raise EvidenceError("retained fixture context binding differs")
     return {
         "schema_version": "ace.phantom.retained_ckks.frozen-validation/1.0.0",
