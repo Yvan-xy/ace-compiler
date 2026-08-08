@@ -93,6 +93,7 @@ class AceEDSL(BaseDSL):
         self.current_domain = None  # Set by decorator
         self._domain_stack = []
         self.current_air_module = None  # Store AIR module after generation
+        self._append_air_functions = False
         self._ret_temp_counter = 0
         self._in_air_context = False  # Track if we're inside AIR generation
         self._scalar_encode_map = {}  # arg_name -> scalar value (encode in kernel body)
@@ -122,6 +123,17 @@ class AceEDSL(BaseDSL):
             self._domain_stack.pop()
             self.current_domain = previous_domain
             set_current_domain(previous_domain)
+
+    @contextmanager
+    def append_air_functions(self):
+        """Append top-level kernel declarations to one AIR global scope."""
+
+        previous = self._append_air_functions
+        self._append_air_functions = True
+        try:
+            yield self
+        finally:
+            self._append_air_functions = previous
 
     def _view_for_domain(self, value, domain):
         """Recursively create non-mutating lexical views of AIR operands."""
@@ -408,8 +420,14 @@ class AceEDSL(BaseDSL):
             # Reset temp counter for flat IR generation
             AIRValue.reset_temp_counter()
             
-            # Create AIR global scope
-            glob_scope = air_builder.create_glob_scope()
+            # A conformance/program module can declare several independently
+            # callable top-level kernels. Ordinary kernel calls retain the
+            # historical fresh-module behavior.
+            glob_scope = (
+                self.current_air_module
+                if self._append_air_functions and self.current_air_module is not None
+                else air_builder.create_glob_scope()
+            )
             
             # Set up source location tracking
             try:
@@ -514,7 +532,7 @@ class AceEDSL(BaseDSL):
                     for param_type in param_types
                 )
             )
-            if uniform_ciphertext_signature:
+            if uniform_ciphertext_signature and not self._append_air_functions:
                 func_scope = glob_scope.new_func_with_type(
                     function_name, num_params, [64], "CIPHERTEXT"
                 )

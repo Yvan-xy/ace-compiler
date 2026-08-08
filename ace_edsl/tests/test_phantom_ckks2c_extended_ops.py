@@ -290,13 +290,20 @@ def test_one_conformance_module_declares_the_complete_retained_matrix(
 ) -> None:
     air = _emit(tmp_path, "conformance")
     fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    assert air.count("ckks.conjugate") == 1
+    assert air.count("ckks.conjugate") == 2
     assert air.count("ckks.rotate_batch") == (
-        1 + len(fixture["production_rotation_batches"])
+        2 + len(fixture["production_rotation_batches"])
     )
-    assert air.count("ckks.raise_mod") == 1
-    assert air.count("ckks.mul_mono") == len(fixture["monomial_powers"])
-    assert "retained_ckks_conformance" in air
+    assert air.count("ckks.raise_mod") == 2
+    assert air.count("ckks.mul_mono") == len(fixture["monomial_powers"]) + 1
+    for function in (
+        "retained_ckks_conjugate",
+        "retained_ckks_rotate_batches",
+        "retained_ckks_raise_mod",
+        "retained_ckks_mul_monomials",
+        "retained_ckks_composite",
+    ):
+        assert function in air
     _assert_no_forbidden_boundary_ops(air)
 
 
@@ -306,7 +313,7 @@ def test_same_conformance_module_generates_both_terminal_sources(
     context = tmp_path / "context.json"
     _context(context)
     outputs = {
-        "ant_source": tmp_path / "retained_ant.c",
+        "ant_source": tmp_path / "retained_ant.cxx",
         "phantom_source": tmp_path / "retained_phantom.cu",
         "ant_air": tmp_path / "retained_ant.air",
         "phantom_air": tmp_path / "retained_phantom.air",
@@ -342,14 +349,31 @@ def test_same_conformance_module_generates_both_terminal_sources(
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert outputs["ant_air"].read_bytes() == outputs["phantom_air"].read_bytes()
-    functions = ("retained_ckks_conformance",)
+    functions = (
+        "retained_ckks_conjugate",
+        "retained_ckks_rotate_batches",
+        "retained_ckks_raise_mod",
+        "retained_ckks_mul_monomials",
+        "retained_ckks_composite",
+    )
     for source_path in (outputs["ant_source"], outputs["phantom_source"]):
         source = source_path.read_text(encoding="utf-8")
         for function in functions:
             assert f"CIPHERTEXT {function}(CIPHERTEXT p0" in source
     interface = outputs["interface"].read_text(encoding="utf-8")
     assert (
-        "CIPHERTEXT retained_ckks_conformance(CIPHERTEXT input);" in interface
+        "CIPHERTEXT retained_ckks_composite(CIPHERTEXT input);" in interface
+    )
+    record = json.loads(outputs["record"].read_text(encoding="utf-8"))
+    assert record["argv"][0] == (
+        "tools/phantom_gpu/generate_retained_ckks_sources.py"
+    )
+    assert record["invocation"] == (
+        "CIPHERTEXT output = retained_ckks_composite(*input_cipher);"
+    )
+    assert record["ant_post_ckks_air_sha256"] == (
+        record["phantom_post_ckks_air_sha256"]
+        == record["post_ckks_air_sha256"]
     )
     phantom = outputs["phantom_source"].read_text(encoding="utf-8")
     for call in ("Conjugate_ciph", "Rotate_batch_ciph", "Raise_mod", "Mul_mono_ciph"):
@@ -368,6 +392,7 @@ def test_same_conformance_module_generates_both_terminal_sources(
     assert resources["rotation_batches"] == [
         [5, 0, -7, 5],
         *fixture["production_rotation_batches"],
+        [5, 0, -7, 5],
     ]
     assert resources["monomial_powers"] == [
         0,

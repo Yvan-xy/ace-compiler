@@ -14,7 +14,11 @@ from ace_edsl.edsl import AceEDSL, CkksCiphertext, ckks_kernel
 
 EDGE_ROTATION_BATCH = [5, 0, -7, 5]
 GENERATED_FUNCTIONS = (
-    "retained_ckks_conformance",
+    "retained_ckks_conjugate",
+    "retained_ckks_rotate_batches",
+    "retained_ckks_raise_mod",
+    "retained_ckks_mul_monomials",
+    "retained_ckks_composite",
 )
 
 
@@ -125,7 +129,6 @@ class RetainedCkksMicrographs:
     raise_mod: Callable[..., Any]
     mul_mono: Callable[..., Any]
     composite: Callable[..., Any]
-    conformance: Callable[..., Any]
 
 
 def _emit_rotation_batches(ct: Any, batches: tuple[tuple[int, ...], ...]) -> list[Any]:
@@ -186,25 +189,6 @@ def create_retained_ckks_micrographs(
         outputs = conjugated.rotate_batch(EDGE_ROTATION_BATCH)
         return (outputs[0] + outputs[1]) + (outputs[2] + outputs[3])
 
-    @ckks_kernel
-    def retained_ckks_conformance(ct: CkksCiphertext) -> CkksCiphertext:
-        """Executable matrix from one bottom-Q input to one ciphertext."""
-
-        raised = ct.raise_mod(full_data_q_count)
-        monomials = [
-            raised.mul_mono(power) for power in normalized_monomial_powers
-        ]
-        multiplied = monomials[normalized_monomial_powers.index(degree // 2)]
-        conjugated = multiplied.conjugate()
-        batches = _emit_rotation_batches(
-            conjugated,
-            (tuple(EDGE_ROTATION_BATCH),) + production_rotation_batches,
-        )
-        accumulator = _combine_first_batch_outputs(batches)
-        for monomial in monomials:
-            accumulator = accumulator + monomial
-        return accumulator
-
     return RetainedCkksMicrographs(
         polynomial_degree=degree,
         logical_slots=slots,
@@ -216,7 +200,6 @@ def create_retained_ckks_micrographs(
         raise_mod=retained_ckks_raise_mod,
         mul_mono=retained_ckks_mul_monomials,
         composite=retained_ckks_composite,
-        conformance=retained_ckks_conformance,
     )
 
 
@@ -228,11 +211,21 @@ def declare_retained_ckks_conformance_module(
 
     AceEDSL._get_dsl.cache_clear()
     graphs = create_retained_ckks_micrographs(context_manifest, retained_fixture)
-    graphs.conformance(
-        CkksCiphertext(
-            shape=(graphs.polynomial_degree,), name="retained_conformance_input"
-        )
-    )
+    dsl = AceEDSL._get_dsl()
+    with dsl.append_air_functions():
+        for name in (
+            "conjugate",
+            "rotate_batch",
+            "raise_mod",
+            "mul_mono",
+            "composite",
+        ):
+            graph = getattr(graphs, name)
+            graph(
+                CkksCiphertext(
+                    shape=(graphs.polynomial_degree,), name=f"retained_{name}_input"
+                )
+            )
     return graphs
 
 

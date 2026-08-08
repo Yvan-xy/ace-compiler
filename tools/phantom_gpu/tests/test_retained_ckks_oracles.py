@@ -46,27 +46,51 @@ def _context() -> dict:
     }
 
 
-def _invocation(context: dict) -> dict:
+def _invocation(context_path: Path, fixture_path: Path, air_path: Path) -> dict:
     argv = [
-        "tools/phantom_gpu/generate_ckks2c_probe.py",
-        "--output", "ckks2c/add_mul_rotate.cu",
-        "--post-ckks-air", "ckks2c/ordinary_ckks_post_ckks.air",
-        "--context-manifest", "ckks2c/compiler_context_manifest.json",
-        "--resource-manifest", "ckks2c/compiler_resource_manifest.json",
-        "--poly-degree", str(context["polynomial_degree"]),
-        "--mul-level", str(len(context["data_q_bit_sizes"])),
-        "--input-level", str(context["input_level"]),
-        "--security-level", str(context["security_level"]),
-        "--scaling-factor-bits", str(context["scaling_modulus_bits"]),
-        "--first-prime-bits", str(context["first_modulus_bits"]),
-        "--hamming-weight", str(context["hamming_weight"]),
+        "tools/phantom_gpu/generate_retained_ckks_sources.py",
+        "--context-manifest", str(context_path),
+        "--fixture", str(fixture_path),
+        "--ant-source", "retained.cxx",
+        "--phantom-source", "retained.cu",
+        "--ant-post-ckks-air", str(air_path),
+        "--phantom-post-ckks-air", str(air_path),
+        "--phantom-context-manifest", "emitted-context.json",
+        "--phantom-resource-manifest", "resources.json",
+        "--generation-record", "generation.json",
+        "--interface-header", "retained.h",
     ]
+    context_sha = hashlib.sha256(context_path.read_bytes()).hexdigest()
+    fixture_sha = hashlib.sha256(fixture_path.read_bytes()).hexdigest()
+    air_sha = hashlib.sha256(air_path.read_bytes()).hexdigest()
     return {
         "schema_version": fixture_tool.INVOCATION_SCHEMA,
         "argv": argv,
         "normalized_argv_sha256": hashlib.sha256(
             fixture_tool.canonical_bytes(argv)
         ).hexdigest(),
+        "canonical_module": "ace_edsl/examples/ckks_retained_ops.py",
+        "ace_commit": "1" * 40,
+        "fixture_sha256": fixture_sha,
+        "input_context_manifest_sha256": context_sha,
+        "emitted_context_manifest_sha256": "2" * 64,
+        "resource_manifest_sha256": "3" * 64,
+        "generated_functions": [
+            "retained_ckks_conjugate", "retained_ckks_rotate_batches",
+            "retained_ckks_raise_mod", "retained_ckks_mul_monomials",
+            "retained_ckks_composite",
+        ],
+        "function_abi": "CIPHERTEXT function(CIPHERTEXT input)",
+        "linkage": "C++ (.cxx for ANT/POLY2C; .cu for Phantom/CKKS2C)",
+        "invocation": "CIPHERTEXT output = retained_ckks_composite(*input_cipher);",
+        "retained_runtime_calls": [
+            "Conjugate_ciph", "Rotate_batch_ciph", "Raise_mod", "Mul_mono_ciph",
+        ],
+        "post_ckks_air_sha256": air_sha,
+        "ant_post_ckks_air_sha256": air_sha,
+        "phantom_post_ckks_air_sha256": air_sha,
+        "ant_source_sha256": "4" * 64,
+        "phantom_source_sha256": "5" * 64,
     }
 
 
@@ -94,11 +118,11 @@ def _qualification_files(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     _write_json(template_path, template)
     context = _context()
     _write_json(context_path, context)
-    _write_json(invocation_path, _invocation(context))
     air_path.write_text(
         "CKKS.rotate_batch ATTR[nums=(2,-1,2)] RTYPE[1](cipher_batch_3)\n"
         "CKKS.rotate_batch ATTR[nums=(3,0)] RTYPE[2](cipher_batch_2)\n"
     )
+    _write_json(invocation_path, _invocation(context_path, template_path, air_path))
     return template_path, context_path, invocation_path, air_path
 
 
@@ -120,11 +144,13 @@ def test_binding_rejects_self_reported_hash_and_context_disagreement(tmp_path: P
     with pytest.raises(fixture_tool.RetainedFixtureError, match="hash"):
         fixture_tool.bind_fixture(template, context, invocation, air)
 
-    _write_json(invocation, _invocation(_context()))
+    _write_json(invocation, _invocation(context, template, air))
     context_record = _context()
     context_record["hamming_weight"] = 5
     _write_json(context, context_record)
-    with pytest.raises(fixture_tool.RetainedFixtureError, match="hamming-weight"):
+    with pytest.raises(
+        fixture_tool.RetainedFixtureError, match="input_context_manifest_sha256"
+    ):
         fixture_tool.bind_fixture(template, context, invocation, air)
 
 
@@ -162,7 +188,7 @@ def test_exact_centered_lift_and_negacyclic_normalization() -> None:
     assert inverse == coefficients
 
 
-def test_exact_generator_uses_explicit_algebraic_source_kind(tmp_path: Path) -> None:
+def test_host_exact_generator_cannot_freeze_provider_moduli(tmp_path: Path) -> None:
     template, context, invocation, air = _qualification_files(tmp_path)
     bound = fixture_tool.bind_fixture(template, context, invocation, air)
     bound_path = tmp_path / "bound.json"
@@ -170,12 +196,13 @@ def test_exact_generator_uses_explicit_algebraic_source_kind(tmp_path: Path) -> 
     moduli = tmp_path / "moduli.json"
     _write_json(moduli, {"ordered_data_q_moduli": [17, 19, 23]})
     output_json, output_bin = tmp_path / "exact.json", tmp_path / "exact.bin"
-    result = fixture_tool.generate_exact(
-        bound_path, context, invocation, air, moduli, output_json, output_bin
-    )
-    assert result["source_contract"].startswith("The harness must import")
-    assert all(record["case_id"].startswith("exact_algebraic.") for record in result["records"])
-    assert all(record["source_kind"] == "deterministic_harness_import" for record in result["records"])
+    with pytest.raises(
+        fixture_tool.RetainedFixtureError,
+        match="provider-observed source residues",
+    ):
+        fixture_tool.generate_exact(
+            bound_path, context, invocation, air, moduli, output_json, output_bin
+        )
 
 
 def test_strict_json_and_metric_reject_invalid_data(tmp_path: Path) -> None:

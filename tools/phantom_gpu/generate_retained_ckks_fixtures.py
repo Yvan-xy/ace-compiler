@@ -18,7 +18,7 @@ from typing import Any, Iterable, Sequence
 FIXTURE_SCHEMA = "ace.phantom.retained_ckks.fixture/1.0.0"
 ANALYTIC_SCHEMA = "ace.phantom.retained_ckks.analytic/1.0.0"
 EXACT_SCHEMA = "ace.phantom.retained_ckks.exact-rns/1.0.0"
-INVOCATION_SCHEMA = "ace.phantom.compiler-invocation/1.0.0"
+INVOCATION_SCHEMA = "ace.retained_ckks.generated-sources/1.0.0"
 DECODED_MAGIC = b"ACERCK01"
 EXACT_MAGIC = b"ACERNS01"
 MASK64 = (1 << 64) - 1
@@ -456,7 +456,16 @@ def _load_invocation(path: Path) -> tuple[dict[str, Any], str, dict[str, str]]:
     invocation = load_json(path)
     _expect_keys(
         invocation,
-        {"schema_version", "argv", "normalized_argv_sha256"},
+        {
+            "schema_version", "argv", "normalized_argv_sha256",
+            "canonical_module", "ace_commit", "fixture_sha256",
+            "input_context_manifest_sha256", "emitted_context_manifest_sha256",
+            "resource_manifest_sha256", "generated_functions", "function_abi",
+            "linkage", "invocation", "retained_runtime_calls",
+            "post_ckks_air_sha256", "ant_post_ckks_air_sha256",
+            "phantom_post_ckks_air_sha256", "ant_source_sha256",
+            "phantom_source_sha256",
+        },
         "compiler invocation",
     )
     if invocation["schema_version"] != INVOCATION_SCHEMA:
@@ -474,63 +483,76 @@ def _load_invocation(path: Path) -> tuple[dict[str, Any], str, dict[str, str]]:
     if recorded != observed:
         fail("normalized compiler command hash does not match argv")
     argv = invocation["argv"]
-    if argv[0] != "tools/phantom_gpu/generate_ckks2c_probe.py":
+    if argv[0] != "tools/phantom_gpu/generate_retained_ckks_sources.py":
         fail("compiler invocation has an unexpected executable")
     arguments = argv[1:]
     if len(arguments) % 2:
         fail("compiler invocation has an option without a value")
     pairs = dict(zip(arguments[0::2], arguments[1::2]))
     artifact_options = {
-        "--output",
-        "--post-ckks-air",
-        "--context-manifest",
-        "--resource-manifest",
-    }
-    context_options = {
-        "--poly-degree",
-        "--mul-level",
-        "--input-level",
-        "--security-level",
-        "--scaling-factor-bits",
-        "--first-prime-bits",
-        "--hamming-weight",
+        "--context-manifest", "--fixture", "--ant-source", "--phantom-source",
+        "--ant-post-ckks-air", "--phantom-post-ckks-air",
+        "--phantom-context-manifest", "--phantom-resource-manifest",
+        "--generation-record", "--interface-header",
     }
     if (
         len(pairs) != len(arguments) // 2
-        or set(pairs) != artifact_options | context_options
+        or set(pairs) != artifact_options
     ):
         fail("compiler invocation options are incomplete or duplicated")
     expected_suffixes = {
-        "--output": ".cu",
-        "--post-ckks-air": ".air",
-        "--context-manifest": ".json",
-        "--resource-manifest": ".json",
+        "--context-manifest": ".json", "--fixture": ".json",
+        "--ant-source": ".cxx", "--phantom-source": ".cu",
+        "--ant-post-ckks-air": ".air", "--phantom-post-ckks-air": ".air",
+        "--phantom-context-manifest": ".json",
+        "--phantom-resource-manifest": ".json",
+        "--generation-record": ".json", "--interface-header": ".h",
     }
     for option, suffix in expected_suffixes.items():
         artifact = Path(pairs[option])
-        if artifact.is_absolute() or ".." in artifact.parts or artifact.suffix != suffix:
+        if ".." in artifact.parts or artifact.suffix != suffix:
             fail(f"compiler invocation {option} has an unsafe artifact path")
-    for option in context_options:
-        if re.fullmatch(r"[0-9]+", pairs[option]) is None:
-            fail(f"compiler invocation {option} must be a nonnegative integer")
+    if invocation["canonical_module"] != "ace_edsl/examples/ckks_retained_ops.py":
+        fail("retained invocation names an unexpected canonical module")
+    if invocation["generated_functions"] != [
+        "retained_ckks_conjugate", "retained_ckks_rotate_batches",
+        "retained_ckks_raise_mod", "retained_ckks_mul_monomials",
+        "retained_ckks_composite",
+    ]:
+        fail("retained invocation function interface changed")
+    if not isinstance(invocation["ace_commit"], str) or re.fullmatch(
+        r"[0-9a-f]{40}", invocation["ace_commit"]
+    ) is None:
+        fail("retained invocation ACE commit is invalid")
+    if invocation["invocation"] != (
+        "CIPHERTEXT output = retained_ckks_composite(*input_cipher);"
+    ):
+        fail("retained invocation composite call changed")
+    if invocation["retained_runtime_calls"] != [
+        "Conjugate_ciph", "Rotate_batch_ciph", "Raise_mod", "Mul_mono_ciph"
+    ]:
+        fail("retained invocation runtime call surface changed")
+    for field, value in invocation.items():
+        if field.endswith("_sha256"):
+            _sha256(value, f"compiler invocation {field}")
     return invocation, observed, pairs
 
 
 def verify_invocation_context(
-    compiler_pairs: dict[str, str], context_manifest: dict[str, Any]
+    invocation: dict[str, Any], context_path: Path, post_air_path: Path,
+    fixture_path: Path | None = None,
 ) -> None:
     expected = {
-        "--poly-degree": context_manifest["polynomial_degree"],
-        "--mul-level": len(context_manifest["data_q_bit_sizes"]),
-        "--input-level": context_manifest["input_level"],
-        "--security-level": context_manifest["security_level"],
-        "--scaling-factor-bits": context_manifest["scaling_modulus_bits"],
-        "--first-prime-bits": context_manifest["first_modulus_bits"],
-        "--hamming-weight": context_manifest["hamming_weight"],
+        "input_context_manifest_sha256": sha256_path(context_path),
+        "post_ckks_air_sha256": sha256_path(post_air_path),
+        "ant_post_ckks_air_sha256": sha256_path(post_air_path),
+        "phantom_post_ckks_air_sha256": sha256_path(post_air_path),
     }
-    for option, manifest_value in expected.items():
-        if int(compiler_pairs[option]) != manifest_value:
-            fail(f"compiler invocation {option} disagrees with context manifest")
+    if fixture_path is not None:
+        expected["fixture_sha256"] = sha256_path(fixture_path)
+    for field, digest in expected.items():
+        if invocation[field] != digest:
+            fail(f"retained generator invocation disagrees with {field}")
 
 
 _ROTATE_BATCH_PATTERN = re.compile(
@@ -567,8 +589,10 @@ def bind_fixture(
         fail("fixture binding requires an unbound reviewed template")
     context = load_json(context_path)
     validate_context_manifest(context)
-    _, invocation_sha256, compiler_pairs = _load_invocation(invocation_path)
-    verify_invocation_context(compiler_pairs, context)
+    invocation, invocation_sha256, _ = _load_invocation(invocation_path)
+    verify_invocation_context(
+        invocation, context_path, post_air_path, template_path
+    )
     if not post_air_path.is_file() or post_air_path.stat().st_size == 0:
         fail("post-CKKS AIR must be a nonempty file")
     bound = copy.deepcopy(fixture)
@@ -604,8 +628,10 @@ def verify_bindings(
     validate_template(fixture, require_bound=True)
     context = load_json(context_path)
     resolved = validate_context_manifest(context)
-    _, invocation_sha256, compiler_pairs = _load_invocation(invocation_path)
-    verify_invocation_context(compiler_pairs, context)
+    invocation, invocation_sha256, _ = _load_invocation(invocation_path)
+    verify_invocation_context(
+        invocation, context_path, post_air_path
+    )
     expected = fixture["qualification_bindings"]
     observed = {
         "compiler_context_manifest_sha256": sha256_path(context_path),
@@ -925,6 +951,11 @@ def generate_exact(
     output_bin: Path,
     production_air_path: Path | None = None,
 ) -> dict[str, Any]:
+    fail(
+        "host modulus-attestation exact generation is retired; exact raise and "
+        "monomial evidence must be recomputed from provider-observed source "
+        "residues and the Phantom runtime modulus attestation"
+    )
     fixture = load_json(fixture_path)
     resolved = verify_bindings(
         fixture,

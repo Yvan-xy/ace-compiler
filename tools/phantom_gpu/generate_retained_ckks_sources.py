@@ -123,6 +123,16 @@ def _audit_phantom_source(source: str) -> None:
 
 
 def generate(arguments: argparse.Namespace) -> None:
+    expected_suffixes = {
+        arguments.ant_source: ".cxx",
+        arguments.phantom_source: ".cu",
+        arguments.interface_header: ".h",
+        arguments.ant_post_ckks_air: ".air",
+        arguments.phantom_post_ckks_air: ".air",
+    }
+    for path, suffix in expected_suffixes.items():
+        if path.suffix != suffix:
+            raise SystemExit(f"{path} must use the {suffix} suffix")
     ace_commit = require_clean_tracked_sources(
         REPOSITORY,
         (
@@ -149,6 +159,9 @@ def generate(arguments: argparse.Namespace) -> None:
     )
     if ant_air != phantom_air:
         raise SystemExit("ANT and Phantom terminal paths received different post-CKKS AIR")
+    emitted_context = _load_context(arguments.phantom_context_manifest)
+    if emitted_context != _load_context(arguments.context_manifest):
+        raise SystemExit("emitted Phantom context differs from the generator input")
     _audit_stable_functions(ant_source, "ANT")
     _audit_phantom_source(phantom_source)
     artifacts = (
@@ -164,26 +177,65 @@ def generate(arguments: argparse.Namespace) -> None:
 #define ACE_RETAINED_CKKS_GENERATED_INTERFACE_H
 
 // Include rt_ant/rt_ant.h or rt_phantom/rt_phantom.h before this file.
+// Both generated sources use C++ linkage; retain the .cxx/.cu suffixes.
 // The input is passed by value exactly as emitted by POLY2C and CKKS2C.
-CIPHERTEXT retained_ckks_conformance(CIPHERTEXT input);
+CIPHERTEXT retained_ckks_conjugate(CIPHERTEXT input);
+CIPHERTEXT retained_ckks_rotate_batches(CIPHERTEXT input);
+CIPHERTEXT retained_ckks_raise_mod(CIPHERTEXT input);
+CIPHERTEXT retained_ckks_mul_monomials(CIPHERTEXT input);
+CIPHERTEXT retained_ckks_composite(CIPHERTEXT input);
 
 #endif
 """
     arguments.interface_header.parent.mkdir(parents=True, exist_ok=True)
     arguments.interface_header.write_text(interface, encoding="utf-8")
+    canonical_argv = [
+        "tools/phantom_gpu/generate_retained_ckks_sources.py",
+        "--context-manifest", str(arguments.context_manifest),
+        "--fixture", str(arguments.fixture),
+        "--ant-source", str(arguments.ant_source),
+        "--phantom-source", str(arguments.phantom_source),
+        "--ant-post-ckks-air", str(arguments.ant_post_ckks_air),
+        "--phantom-post-ckks-air", str(arguments.phantom_post_ckks_air),
+        "--phantom-context-manifest", str(arguments.phantom_context_manifest),
+        "--phantom-resource-manifest", str(arguments.phantom_resource_manifest),
+        "--generation-record", str(arguments.generation_record),
+        "--interface-header", str(arguments.interface_header),
+    ]
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
     write_json(
         arguments.generation_record,
         {
             "schema_version": "ace.retained_ckks.generated-sources/1.0.0",
+            "argv": canonical_argv,
+            "normalized_argv_sha256": hashlib.sha256(
+                json.dumps(
+                    canonical_argv, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest(),
             "canonical_module": "ace_edsl/examples/ckks_retained_ops.py",
             "ace_commit": ace_commit,
+            "fixture_sha256": digest(arguments.fixture),
+            "input_context_manifest_sha256": digest(arguments.context_manifest),
+            "emitted_context_manifest_sha256": digest(
+                arguments.phantom_context_manifest
+            ),
+            "resource_manifest_sha256": digest(
+                arguments.phantom_resource_manifest
+            ),
             "generated_functions": list(GENERATED_FUNCTIONS),
             "function_abi": "CIPHERTEXT function(CIPHERTEXT input)",
+            "linkage": "C++ (.cxx for ANT/POLY2C; .cu for Phantom/CKKS2C)",
             "invocation": (
-                "CIPHERTEXT output = retained_ckks_conformance(*input_cipher);"
+                "CIPHERTEXT output = retained_ckks_composite(*input_cipher);"
             ),
             "retained_runtime_calls": list(RETAINED_CALLS),
             "post_ckks_air_sha256": sha256_text(ant_air),
+            "ant_post_ckks_air_sha256": digest(arguments.ant_post_ckks_air),
+            "phantom_post_ckks_air_sha256": digest(
+                arguments.phantom_post_ckks_air
+            ),
             "ant_source_sha256": hashlib.sha256(ant_source.encode()).hexdigest(),
             "phantom_source_sha256": hashlib.sha256(
                 phantom_source.encode()

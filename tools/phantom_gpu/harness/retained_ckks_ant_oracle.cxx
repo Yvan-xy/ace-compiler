@@ -21,7 +21,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -36,6 +35,8 @@
 #error "PHANTOM_COMMIT_ID must identify the paired Phantom commit"
 #endif
 
+CIPHERTEXT retained_ckks_composite(CIPHERTEXT input);
+
 namespace {
 
 using Complex = std::complex<double>;
@@ -47,8 +48,6 @@ constexpr char kProviderSchema[] =
     "ace.phantom.retained_ckks.provider-result/2.0.0";
 constexpr char kBinaryFormat[] = "ace.retained_ckks.complex_float64le/1.0.0";
 constexpr std::uint32_t kResourceSchemaVersion = 2;
-
-CKKS_PARAMS *context_parameters = nullptr;
 
 [[noreturn]] void Fail(const std::string &message) {
   throw std::runtime_error("ACE_RETAINED_ANT: " + message);
@@ -316,6 +315,7 @@ void ValidateManifest(const Json &context, const Json &resources,
   for (const auto &batch : fixture.at("production_rotation_batches")) {
     required_batches.push_back(batch);
   }
+  required_batches.push_back(fixture.at("rotate_batch_steps"));
   Require(resources.at("rotation_batches") == required_batches,
           "resource manifest rotation batches differ in content or order");
 
@@ -360,44 +360,6 @@ void ValidateManifest(const Json &context, const Json &resources,
               required_rotation_keys,
           "resource rotation key list differs from normalized nonzero batch "
           "steps");
-}
-
-void ConfigureContext(const Json &manifest, const Json &resources) {
-  std::vector<std::int32_t> rotations =
-      resources.at("rotation_steps").get<std::vector<std::int32_t>>();
-  if (resources.at("conjugation_key").get<bool>()) {
-    const std::uint64_t sentinel =
-        2U * manifest.at("polynomial_degree").get<std::uint64_t>() - 1U;
-    Require(sentinel <= static_cast<std::uint64_t>(
-                            std::numeric_limits<std::int32_t>::max()),
-            "ANT conjugation sentinel exceeds int32");
-    rotations.push_back(static_cast<std::int32_t>(sentinel));
-  }
-  std::sort(rotations.begin(), rotations.end());
-  rotations.erase(std::unique(rotations.begin(), rotations.end()),
-                  rotations.end());
-  const std::size_t byte_count =
-      sizeof(CKKS_PARAMS) + rotations.size() * sizeof(std::int32_t);
-  context_parameters = static_cast<CKKS_PARAMS *>(std::calloc(1, byte_count));
-  Require(context_parameters != nullptr, "cannot allocate ANT context view");
-  context_parameters->_provider = LIB_ANT;
-  context_parameters->_poly_degree =
-      manifest.at("polynomial_degree").get<std::uint32_t>();
-  context_parameters->_sec_level =
-      manifest.at("security_level").get<std::size_t>();
-  context_parameters->_mul_depth = manifest.at("data_q_bit_sizes").size() - 1U;
-  context_parameters->_input_level =
-      manifest.at("input_level").get<std::size_t>();
-  context_parameters->_first_mod_size =
-      manifest.at("first_modulus_bits").get<std::size_t>();
-  context_parameters->_scaling_mod_size =
-      manifest.at("scaling_modulus_bits").get<std::size_t>();
-  context_parameters->_num_q_parts =
-      manifest.at("q_part_count").get<std::size_t>();
-  context_parameters->_hamming_weight =
-      manifest.at("hamming_weight").get<std::size_t>();
-  context_parameters->_num_rot_idx = rotations.size();
-  std::copy(rotations.begin(), rotations.end(), context_parameters->_rot_idxs);
 }
 
 void VerifyPrimeChain(const Json &manifest) {
@@ -686,35 +648,11 @@ Json RunDecoded(const Json &fixture, const Json &context,
   {
     CIPHER source = EncryptComplex(source_values, input_level);
     const Snapshot before = TakeSnapshot(source, full_q_count);
-    CIPHER raised = Alloc_ciphertext();
-    CIPHER multiplied = Alloc_ciphertext();
-    CIPHER conjugated = Alloc_ciphertext();
-    Raise_mod(raised, source, static_cast<std::uint32_t>(full_q_count));
-    Mul_mono_ciph(multiplied, raised, degree / 2U);
-    Conjugate_ciph(conjugated, multiplied);
-    const std::vector<std::int32_t> steps =
-        fixture.at("rotate_batch_steps").get<std::vector<std::int32_t>>();
-    Require(steps.size() == 4, "composite requires four edge rotations");
-    CIPHER outputs =
-        static_cast<CIPHER>(std::calloc(steps.size(), sizeof(CIPHERTEXT)));
-    Require(outputs != nullptr, "cannot allocate composite batch");
-    Rotate_batch_ciph(outputs, conjugated, steps.data(), steps.size());
-    CIPHER left = Alloc_ciphertext();
-    CIPHER right = Alloc_ciphertext();
-    CIPHER result = Alloc_ciphertext();
-    Add_ciph(left, &outputs[0], &outputs[1]);
-    Add_ciph(right, &outputs[2], &outputs[3]);
-    Add_ciph(result, left, right);
+    CIPHERTEXT result = retained_ckks_composite(*source);
     records.push_back(AppendRecord(binary, "composite.bounded_nonperiodic",
-                                   "composite", result, before, source,
+                                   "composite", &result, before, source,
                                    full_q_count, slots));
-    Free_ciphertext(result);
-    Free_ciphertext(right);
-    Free_ciphertext(left);
-    FreeBatch(outputs, steps.size());
-    Free_ciphertext(conjugated);
-    Free_ciphertext(multiplied);
-    Free_ciphertext(raised);
+    Zero_ciph(&result);
     Free_ciphertext(source);
   }
   return records;
@@ -729,12 +667,6 @@ Json BinaryDescriptor(const std::vector<std::uint8_t> &bytes) {
 } // namespace
 
 extern "C" {
-CKKS_PARAMS *Get_context_params() {
-  if (context_parameters == nullptr)
-    std::abort();
-  return context_parameters;
-}
-RT_DATA_INFO *Get_rt_data_info() { return nullptr; }
 int Get_input_count() { return 0; }
 int Get_output_count() { return 0; }
 DATA_SCHEME *Get_encode_scheme(int) { return nullptr; }
@@ -773,7 +705,6 @@ int main(int argc, char **argv) {
                     fixture.at("qualification_bindings"),
             "fixture, context, or analytic artifact binding mismatch");
     ValidateManifest(context, resources, fixture);
-    ConfigureContext(context, resources);
     setenv("RTLIB_DISABLE_BOOTSTRAP_PRECOM", "1", 1);
     Prepare_context();
     VerifyPrimeChain(context);
@@ -784,8 +715,6 @@ int main(int argc, char **argv) {
                                             kDecodedMagic.end());
     Json records = RunDecoded(fixture, context, source_values, output_binary);
     Finalize_context();
-    std::free(context_parameters);
-    context_parameters = nullptr;
     WriteBytes(argv[7], output_binary);
     WriteJson(argv[6],
               {{"schema_version", kProviderSchema},
@@ -803,10 +732,6 @@ int main(int argc, char **argv) {
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "retained CKKS ANT oracle failed: " << error.what() << '\n';
-    if (context_parameters != nullptr) {
-      std::free(context_parameters);
-      context_parameters = nullptr;
-    }
     return 1;
   }
 }
