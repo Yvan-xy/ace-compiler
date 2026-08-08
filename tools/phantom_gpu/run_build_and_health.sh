@@ -205,6 +205,72 @@ configure_qualification_environment() {
   export ACE_PHANTOM_BUILD_JOBS="${ACE_PHANTOM_BUILD_JOBS:-$(nproc)}"
 }
 
+capture_failed_qualification() {
+  local current="$1"
+  local qualification_exit="$2"
+  local runs_root run_root canonical_runs_root canonical_run_root
+  local current_gate current_status current_exit run_id file_count sums_sha
+
+  if [[ ! -s "${current}" ]]; then
+    echo "failed qualification did not publish its current-run record" >&2
+    return 1
+  fi
+  cp -- "${current}" "${RESULT_DIR}/qualification-current.json"
+  current_gate="$(jq -er '.gate' "${current}")"
+  current_status="$(jq -er '.status' "${current}")"
+  current_exit="$(jq -er '.exit_code' "${current}")"
+  run_id="$(jq -er '.run_id' "${current}")"
+  run_root="$(jq -er '.run_root' "${current}")"
+  if [[ "${current_gate}" != "ordinary" ||
+        "${current_status}" != "failed" ||
+        "${current_exit}" -ne "${qualification_exit}" ]]; then
+    echo "failed qualification current-run record disagrees with its process exit" >&2
+    return 1
+  fi
+
+  runs_root="${ACE_PHANTOM_STATE_ROOT}/compile_only_results/runs"
+  canonical_runs_root="$(realpath -- "${runs_root}")"
+  canonical_run_root="$(realpath -- "${run_root}")"
+  case "${canonical_run_root}" in
+    "${canonical_runs_root}"/*) ;;
+    *)
+      echo "failed qualification run escaped its state-root runs directory" >&2
+      return 1
+      ;;
+  esac
+  if [[ "${canonical_run_root##*/}" != "${run_id}" ||
+        ! -d "${canonical_run_root}" ]]; then
+    echo "failed qualification run identity is invalid" >&2
+    return 1
+  fi
+
+  cp -a -- "${canonical_run_root}" "${RESULT_DIR}/qualification"
+  (
+    cd "${RESULT_DIR}"
+    find qualification -type f -print0 |
+      LC_ALL=C sort -z |
+      xargs -0 -r sha256sum >qualification-failure-files.sha256
+  )
+  file_count="$(wc -l <"${RESULT_DIR}/qualification-failure-files.sha256" | tr -d ' ')"
+  sums_sha="$(sha256sum "${RESULT_DIR}/qualification-failure-files.sha256" | awk '{print $1}')"
+  jq -n \
+    --arg status captured \
+    --arg run_id "${run_id}" \
+    --arg evidence_path qualification \
+    --arg sha256_manifest qualification-failure-files.sha256 \
+    --arg sha256_manifest_sha256 "${sums_sha}" \
+    --argjson qualification_exit_code "${qualification_exit}" \
+    --argjson captured_file_count "${file_count}" \
+    '{schema_version:"ace.phantom.failed-qualification-evidence/1.0.0",
+      status:$status, run_id:$run_id,
+      qualification_exit_code:$qualification_exit_code,
+      evidence_path:$evidence_path,
+      captured_file_count:$captured_file_count,
+      sha256_manifest:$sha256_manifest,
+      sha256_manifest_sha256:$sha256_manifest_sha256}' \
+    >"${RESULT_DIR}/qualification-failure-evidence.json"
+}
+
 run_qualification() {
   local -a invocation_validation_arguments=(
     "${INPUT}/qualification-invocation.json"
@@ -330,11 +396,27 @@ PY
   local -a qualification_arguments
   mapfile -t qualification_arguments \
     < <(jq -er '.argv[1:][]' "${INPUT}/qualification-invocation.json")
+  local -a qualification_status
+  local qualification_exit
+  set +e
   bash "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/compile_only.sh" \
     "${qualification_arguments[@]}" \
     2>&1 | tee "${RESULT_DIR}/qualification.log"
+  qualification_status=("${PIPESTATUS[@]}")
+  set -e
+  qualification_exit="${qualification_status[0]}"
   local current run_root
   current="${ACE_PHANTOM_STATE_ROOT}/compile_only_results/current-ordinary.json"
+  if [[ ${qualification_exit} -ne 0 ]]; then
+    if ! capture_failed_qualification "${current}" "${qualification_exit}"; then
+      echo "failed qualification evidence capture was incomplete" >&2
+    fi
+    return "${qualification_exit}"
+  fi
+  if [[ "${qualification_status[1]}" -ne 0 ]]; then
+    echo "qualification log capture failed with exit ${qualification_status[1]}" >&2
+    return "${qualification_status[1]}"
+  fi
   run_root="$(jq -er '.run_root' "${current}")"
   [[ "$(jq -er '.status' "${current}")" == pass ]]
   cmp "${run_root}/qualification_invocation.json" \
@@ -641,7 +723,8 @@ run_ordinary_gpu_qualification() {
 }
 
 run_native_health() {
-  local expected_gpu query gpu_count gpu_name health_binary context_manifest context_sha health_json health_exit
+  local expected_gpu query gpu_count gpu_name current run_root health_binary
+  local context_manifest context_sha health_json health_exit
   expected_gpu="${ACE_RUNPOD_EXPECTED_GPU_NAME:-}"
   case "${expected_gpu}" in
     "NVIDIA A100 80GB PCIe"|"NVIDIA A100-SXM4-80GB") ;;
@@ -659,12 +742,13 @@ run_native_health() {
   gpu_name="$(cut -d, -f1 "${query}" | sed 's/[[:space:]]*$//')"
   [[ "${gpu_count}" == 1 ]]
   [[ "${gpu_name}" == "${expected_gpu}" ]]
-  health_binary="$(find "${WORK}/build-state/compile_only_results/runs" \
-    -path '*/ckks2c/native_phantom_health_sm80' -type f -print -quit)"
-  [[ -n "${health_binary}" && -x "${health_binary}" ]]
-  context_manifest="$(find "${WORK}/build-state/compile_only_results/runs" \
-    -path '*/ckks2c/compiler_context_manifest.json' -type f -print -quit)"
-  [[ -n "${context_manifest}" && -s "${context_manifest}" ]]
+  current="${ACE_PHANTOM_STATE_ROOT}/compile_only_results/current-ordinary.json"
+  [[ "$(jq -er '.gate + ":" + .status' "${current}")" == "ordinary:pass" ]]
+  run_root="$(jq -er '.run_root' "${current}")"
+  health_binary="${run_root}/ckks2c/native_phantom_health_sm80"
+  context_manifest="${run_root}/ckks2c/compiler_context_manifest.json"
+  [[ -x "${health_binary}" ]]
+  [[ -s "${context_manifest}" ]]
   context_sha="$(sha256sum "${context_manifest}" | awk '{print $1}')"
   set +e
   timeout 300 "${health_binary}" \

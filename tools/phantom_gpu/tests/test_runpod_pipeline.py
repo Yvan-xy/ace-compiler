@@ -306,6 +306,57 @@ def test_remote_pipeline_uses_the_packaged_frozen_cpu_reference() -> None:
     assert '"${ordinary_dir}/ordinary_ckks_ant_verification.json"' in source
 
 
+def test_failed_qualification_captures_partial_run_before_returning() -> None:
+    source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    capture_start = source.index("capture_failed_qualification() {")
+    qualification_start = source.index("run_qualification() {")
+    capture = source[capture_start:qualification_start]
+    qualification_end = source.index(
+        "\nverify_frozen_ordinary_reference()", qualification_start
+    )
+    qualification = source[qualification_start:qualification_end]
+
+    assert (
+        'cp -a -- "${canonical_run_root}" "${RESULT_DIR}/qualification"'
+        in capture
+    )
+    assert "qualification-failure-files.sha256" in capture
+    assert "ace.phantom.failed-qualification-evidence/1.0.0" in capture
+    assert '"${canonical_runs_root}"/*' in capture
+    assert 'current_gate}" != "ordinary"' in capture
+    assert 'current_status}" != "failed"' in capture
+    assert 'current_exit}" -ne "${qualification_exit}"' in capture
+
+    compile_call = qualification.index(
+        'bash "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/compile_only.sh"'
+    )
+    status_capture = qualification.index(
+        'qualification_status=("${PIPESTATUS[@]}")', compile_call
+    )
+    failure_capture = qualification.index(
+        'capture_failed_qualification "${current}" "${qualification_exit}"',
+        status_capture,
+    )
+    failure_return = qualification.index(
+        'return "${qualification_exit}"', failure_capture
+    )
+    tee_failure = qualification.index(
+        'qualification log capture failed with exit ${qualification_status[1]}',
+        failure_return,
+    )
+    success_copy = qualification.index(
+        'cp -a "${run_root}" "${RESULT_DIR}/qualification"', tee_failure
+    )
+    assert (
+        compile_call
+        < status_capture
+        < failure_capture
+        < failure_return
+        < tee_failure
+        < success_copy
+    )
+
+
 def test_gpu_conformance_keeps_wrapper_addresses_unique() -> None:
     source = (TOOLS / "harness/ordinary_ckks_gpu_runner.cu").read_text(
         encoding="utf-8"
@@ -356,6 +407,45 @@ def test_local_reproduction_does_not_restate_compiler_context() -> None:
         "--hamming-weight",
     ):
         assert option not in source
+
+
+def test_local_reproduction_uses_a_distinct_container_work_root() -> None:
+    local = (TOOLS / "run_local_reproduction.sh").read_text(encoding="utf-8")
+    host_freeze = (TOOLS / "freeze_ordinary_host_evidence.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"${PAYLOAD}:/ordinary-replay/input:ro"' in local
+    assert '"${OUTPUT}:/ordinary-replay/output:rw"' in local
+    assert "--input-dir /ordinary-replay/input" in local
+    assert "--work-dir /ordinary-replay/output/work" in local
+    assert (
+        "--result-archive /ordinary-replay/output/local-result.tar.gz" in local
+    )
+    assert "/ordinary-replay/" not in host_freeze
+    assert "--work-dir /workspace/output/work" in host_freeze
+
+
+def test_native_health_uses_the_exact_current_ordinary_run() -> None:
+    source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    start = source.index("run_native_health() {")
+    end = source.index("\nphase payload_verification", start)
+    body = source[start:end]
+
+    assert (
+        'current="${ACE_PHANTOM_STATE_ROOT}/compile_only_results/'
+        'current-ordinary.json"' in body
+    )
+    assert "ordinary:pass" in body
+    assert 'run_root="$(jq -er \'.run_root\' "${current}")"' in body
+    assert (
+        'health_binary="${run_root}/ckks2c/native_phantom_health_sm80"' in body
+    )
+    assert (
+        'context_manifest="${run_root}/ckks2c/'
+        'compiler_context_manifest.json"' in body
+    )
+    assert "find " not in body
 
 
 def test_host_freeze_runner_returns_fresh_candidate_without_frozen_checks() -> None:

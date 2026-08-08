@@ -149,14 +149,14 @@ CONTAINER_ID="$(docker create --name "${CONTAINER_NAME}" \
   --env ACE_RUNPOD_BASE_IMAGE="${BASE_IMAGE}" \
   --env ACE_RUNPOD_BASE_CONFIG_DIGEST="${BASE_CONFIG}" \
   --env ACE_PHANTOM_BUILD_JOBS="${ACE_PHANTOM_BUILD_JOBS:-$(nproc)}" \
-  --volume "${PAYLOAD}:/workspace/input:ro" \
-  --volume "${OUTPUT}:/workspace/output:rw" \
+  --volume "${PAYLOAD}:/ordinary-replay/input:ro" \
+  --volume "${OUTPUT}:/ordinary-replay/output:rw" \
   "${BASE_IMAGE}" \
-  bash /workspace/input/run_build_and_health.sh \
+  bash /ordinary-replay/input/run_build_and_health.sh \
     --mode local \
-    --input-dir /workspace/input \
-    --work-dir /workspace/output/work \
-    --result-archive /workspace/output/local-result.tar.gz)"
+    --input-dir /ordinary-replay/input \
+    --work-dir /ordinary-replay/output/work \
+    --result-archive /ordinary-replay/output/local-result.tar.gz)"
 docker inspect --type container "${CONTAINER_ID}" \
   >"${DOCKER_EVIDENCE}/disposable-container-created.json"
 set +e
