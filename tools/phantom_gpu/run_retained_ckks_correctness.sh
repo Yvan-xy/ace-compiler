@@ -20,6 +20,8 @@ RESULT_ROOT="${ACE_RETAINED_CKKS_RESULT_ROOT:-${STATE_ROOT}/retained_ckks_host_q
 WORK_ROOT="${ACE_RETAINED_CKKS_WORK_ROOT:-${STATE_ROOT}/retained_ckks_host_work}"
 PHANTOM_SOURCE="${ACE_PHANTOM_SOURCE_DIR:-/deps/phantom-ant}"
 BUILD_JOBS="${ACE_PHANTOM_BUILD_JOBS:-2}"
+PROVISIONAL_FIXTURE_BINDING="${ACE_RETAINED_CKKS_PROVISIONAL_BINDING:-0}"
+FIXTURE_LIFECYCLE=""
 
 # These are compiler CLI arguments, not a second parameter profile.  The
 # compiler-emitted context manifest is checked against them by the retained
@@ -99,7 +101,7 @@ require_environment() {
     fail "the pinned bootstrap hash is absent"
 
   local command
-  for command in ar awk c++ cmake ctest file flock nm ninja python3 \
+  for command in ar awk c++ cmake ctest file flock git jq nm ninja python3 \
     readelf rg sha256sum; do
     command -v "${command}" >/dev/null || fail "required command is absent: ${command}"
   done
@@ -276,11 +278,15 @@ configure_and_build() {
 run_host_tests() {
   local -a python_tests=(
     ace_edsl/tests/test_phantom_ckks2c_extended_ops.py
+    tools/phantom_gpu/tests/test_phantom_legacy_examples_cmake.py
     tools/phantom_gpu/tests/test_retained_ckks_oracles.py
+    tools/phantom_gpu/tests/test_retained_freeze_wrapper.py
     tools/phantom_gpu/tests/test_retained_generation_contracts.py
     tools/phantom_gpu/tests/test_retained_host_qualification.py
     tools/phantom_gpu/tests/test_retained_phantom_conformance_source.py
     tools/phantom_gpu/tests/test_retained_raise_oracle_algebra.py
+    tools/phantom_gpu/tests/test_retained_runpod_pipeline.py
+    tools/phantom_gpu/tests/test_runpod_pipeline.py
   )
   (
     cd "${REPO_ROOT}"
@@ -344,6 +350,37 @@ generate_retained_artifacts() {
     --output-record "${RESULT_ROOT}/outputs/retained_ckks_production_rnums.json" \
     >"${RESULT_ROOT}/build/production-rnum-generation.log" 2>&1
 
+  python3 "${SCRIPT_DIR}/generate_ckks2c_probe.py" \
+    --output "${RESULT_ROOT}/outputs/retained_ckks_keyless.cu" \
+    --context-manifest \
+      "${RESULT_ROOT}/outputs/retained_ckks_keyless_context.json" \
+    --resource-manifest \
+      "${RESULT_ROOT}/outputs/retained_ckks_keyless_resources.json" \
+    --post-ckks-air \
+      "${RESULT_ROOT}/outputs/retained_ckks_keyless_post.air" \
+    --poly-degree "${POLYNOMIAL_DEGREE}" \
+    --mul-level "${MUL_LEVEL}" \
+    --input-level "${INPUT_LEVEL}" \
+    --security-level "${SECURITY_LEVEL}" \
+    --scaling-factor-bits "${SCALING_MODULUS_BITS}" \
+    --first-prime-bits "${FIRST_MODULUS_BITS}" \
+    --hamming-weight "${HAMMING_WEIGHT}" \
+    --resource-mode keyless \
+    >"${RESULT_ROOT}/build/keyless-generation.log" 2>&1
+  cmp "${RESULT_ROOT}/inputs/compiler_context_manifest.json" \
+    "${RESULT_ROOT}/outputs/retained_ckks_keyless_context.json"
+  jq -e '
+    .schema_version == 2 and
+    .context_schema_version == 1 and
+    .relinearization_key == false and
+    .rotation_steps == [] and
+    .conjugation_key == false and
+    .rotate_batch == false and
+    .rotation_batches == [] and
+    .raise_mod == false and
+    .monomial_powers == []
+  ' "${RESULT_ROOT}/outputs/retained_ckks_keyless_resources.json" >/dev/null
+
   local fixture_tool="${SCRIPT_DIR}/generate_retained_ckks_fixtures.py"
   local common=(
     --context-manifest "${RESULT_ROOT}/inputs/compiler_context_manifest.json"
@@ -351,11 +388,32 @@ generate_retained_artifacts() {
     --post-ckks-air "${RESULT_ROOT}/outputs/retained_ckks_phantom_post.air"
     --production-post-ckks-air "${RESULT_ROOT}/outputs/retained_ckks_production_post.air"
   )
-  python3 "${fixture_tool}" bind-fixture \
-    --fixture "${RESULT_ROOT}/inputs/retained_ckks_fixture_template.json" \
-    "${common[@]}" \
-    --output-json "${RESULT_ROOT}/inputs/retained_ckks_fixture.json" \
-    >"${RESULT_ROOT}/build/fixture-binding.log"
+  local checked_binding_status
+  checked_binding_status="$(python3 - \
+    "${RESULT_ROOT}/inputs/retained_ckks_fixture_template.json" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+print(value.get("qualification_bindings", {}).get("status", ""))
+PY
+)"
+  if [[ "${checked_binding_status}" == bound ]]; then
+    FIXTURE_LIFECYCLE="checked-bound"
+    cp -- "${RESULT_ROOT}/inputs/retained_ckks_fixture_template.json" \
+      "${RESULT_ROOT}/inputs/retained_ckks_fixture.json"
+    : >"${RESULT_ROOT}/build/fixture-binding.log"
+  elif [[ "${checked_binding_status}" == unbound &&
+          "${PROVISIONAL_FIXTURE_BINDING}" == 1 ]]; then
+    FIXTURE_LIFECYCLE="provisional-bind"
+    python3 "${fixture_tool}" bind-fixture \
+      --fixture "${RESULT_ROOT}/inputs/retained_ckks_fixture_template.json" \
+      "${common[@]}" \
+      --output-json "${RESULT_ROOT}/inputs/retained_ckks_fixture.json" \
+      >"${RESULT_ROOT}/build/fixture-binding.log"
+  else
+    fail "checked retained fixture must be bound; use the explicit provisional binding mode only to produce the reviewed candidate"
+  fi
   python3 "${fixture_tool}" validate-fixture \
     --fixture "${RESULT_ROOT}/inputs/retained_ckks_fixture.json" \
     "${common[@]}" >"${RESULT_ROOT}/build/fixture-validation.log"
@@ -371,6 +429,86 @@ generate_retained_artifacts() {
     --output-json "${RESULT_ROOT}/outputs/retained_ckks_exact_source.json" \
     --output-bin "${RESULT_ROOT}/outputs/retained_ckks_exact_source.bin" \
     >"${RESULT_ROOT}/build/exact-source-generation.log"
+}
+
+build_manifest_driven_phantom_test() {
+  local test_build="${WORK_ROOT}/phantom-retained-test-sm80"
+  local gtest_source="${ACE_BUILD}/external/src/unittest"
+  local gtest_archive="${ACE_BUILD}/external/src/unittest-build/lib/libgtest.a"
+  local gtest_module="${REPO_ROOT}/fhe-cmplr/rtlib/cmake/modules/unittest.cmake"
+  local expected_gtest_commit observed_gtest_commit gtest_tree
+  expected_gtest_commit="$(
+    sed -n 's/^[[:space:]]*set(UNITTEST_GIT_TAG "\([0-9a-f]\{40\}\)").*/\1/p' \
+      "${gtest_module}"
+  )"
+  [[ "${expected_gtest_commit}" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "ACE googletest dependency pin is invalid"
+  [[ -d "${gtest_source}/.git" && -s "${gtest_archive}" ]] ||
+    fail "ACE pinned googletest source/archive is absent"
+  observed_gtest_commit="$(git -C "${gtest_source}" rev-parse HEAD)"
+  [[ "${observed_gtest_commit}" == "${expected_gtest_commit}" ]] ||
+    fail "ACE googletest source differs from its audited pin"
+  [[ -z "$(git -C "${gtest_source}" status --porcelain --untracked-files=no)" ]] ||
+    fail "ACE googletest source has tracked modifications"
+  gtest_tree="$(git -C "${gtest_source}" rev-parse 'HEAD^{tree}')"
+  python3 - "${RESULT_ROOT}/build/gtest-source-attestation.json" \
+    "${gtest_source}" "${gtest_archive}" "${gtest_module}" \
+    "${expected_gtest_commit}" "${gtest_tree}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+output, source, archive, module = map(Path, sys.argv[1:5])
+commit, tree = sys.argv[5:7]
+inventory = subprocess.run(
+    ["git", "-C", str(source), "ls-tree", "-r", "--full-tree", "HEAD"],
+    check=True,
+    capture_output=True,
+).stdout
+digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+value = {
+    "schema_version": "ace.phantom.retained_ckks.gtest-source/1.0.0",
+    "status": "pass",
+    "source_method": "ace-pinned-external-project-source-reuse",
+    "commit": commit,
+    "tree": tree,
+    "tracked_inventory_sha256": hashlib.sha256(inventory).hexdigest(),
+    "ace_gtest_archive_sha256": digest(archive),
+    "ace_dependency_module_sha256": digest(module),
+    "fetchcontent_source_override": True,
+    "fetchcontent_fully_disconnected": True,
+}
+output.write_text(
+    json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+  PHANTOM_NATIVE_TEST_BINARY="${RESULT_ROOT}/build/retained_ckks_native_primitives_sm80"
+  local -a configure=(
+    -S "${PHANTOM_SOURCE}" -B "${test_build}" -G Ninja
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_CUDA_ARCHITECTURES=80
+    -DCMAKE_CUDA_STANDARD=17 -DCMAKE_CUDA_STANDARD_REQUIRED=ON
+    -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON
+    -DPHANTOM_BUILD_EXAMPLES=OFF
+    -DPHANTOM_BUILD_TESTS=ON
+    "-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=${gtest_source}"
+    -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+    -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
+  )
+  record_command cmake "${configure[@]}"
+  cmake "${configure[@]}" \
+    >"${RESULT_ROOT}/build/phantom-retained-test-configure.log" 2>&1
+  record_command cmake --build "${test_build}" --target \
+    ckks_retained_primitives --parallel "${BUILD_JOBS}"
+  cmake --build "${test_build}" --target ckks_retained_primitives \
+    --parallel "${BUILD_JOBS}" \
+    >"${RESULT_ROOT}/build/phantom-retained-test-build.log" 2>&1
+  cp -- "${test_build}/bin/ckks_retained_primitives" \
+    "${PHANTOM_NATIVE_TEST_BINARY}"
+  [[ -x "${PHANTOM_NATIVE_TEST_BINARY}" ]] ||
+    fail "manifest-driven Phantom retained test binary is absent"
 }
 
 locate_archives() {
@@ -457,6 +595,49 @@ build_phantom_without_running() {
     -pthread -fopenmp -ldl -lrt -lm -o "${PHANTOM_BINARY}"
 }
 
+build_keyless_rejection_binaries() {
+  local keyless_source_object="${RESULT_ROOT}/build/retained_ckks_keyless.o"
+  local -a nvcc_common=(-std=c++17 -arch=sm_80 -rdc=true)
+  local -a includes=(
+    "-I${REPO_ROOT}/fhe-cmplr/rtlib/include"
+    "-I${PHANTOM_SOURCE}/include"
+    "-I${RESULT_ROOT}/outputs"
+  )
+  run_recorded "${NVCC}" "${nvcc_common[@]}" -dc "${includes[@]}" \
+    "${RESULT_ROOT}/outputs/retained_ckks_keyless.cu" \
+    -o "${keyless_source_object}"
+
+  local profile manifest_id harness_object device_link binary
+  for profile in conjugation rotation; do
+    manifest_id="keyless-${profile}"
+    harness_object="${RESULT_ROOT}/build/retained_ckks_${profile}_keyless.harness.o"
+    device_link="${RESULT_ROOT}/build/retained_ckks_${profile}_keyless.dlink.o"
+    binary="${RESULT_ROOT}/build/retained_ckks_${profile}_keyless_sm80"
+    run_recorded "${NVCC}" "${nvcc_common[@]}" -dc "${includes[@]}" \
+      -DACE_REJECTION_ONLY=1 \
+      "-DACE_REJECTION_MANIFEST_ID=\"${manifest_id}\"" \
+      "-DACE_COMMIT_ID=\"${ACE_COMMIT}\"" \
+      "-DPHANTOM_COMMIT_ID=\"${PHANTOM_COMMIT}\"" \
+      "${SCRIPT_DIR}/harness/retained_ckks_phantom_conformance.cu" \
+      -o "${harness_object}"
+    run_recorded "${NVCC}" "${nvcc_common[@]}" -dlink \
+      "${keyless_source_object}" "${harness_object}" \
+      "${ADAPTER_ARCHIVE}" "${PROVIDER_ARCHIVE}" "${COMMON_ARCHIVE}" \
+      "-L${CUDA_ROOT}/lib64" -lcudadevrt -o "${device_link}"
+    run_recorded c++ -std=c++17 "${keyless_source_object}" \
+      "${harness_object}" "${device_link}" -Wl,--start-group \
+      "${ADAPTER_ARCHIVE}" "${PROVIDER_ARCHIVE}" "${COMMON_ARCHIVE}" \
+      -lntl -lgmpxx -lgmp -Wl,--end-group "-L${CUDA_ROOT}/lib64" \
+      "-Wl,-rpath,${CUDA_ROOT}/lib64" -lcudadevrt -lcudart \
+      -pthread -fopenmp -ldl -lrt -lm -o "${binary}"
+    if [[ "${profile}" == conjugation ]]; then
+      KEYLESS_CONJUGATION_BINARY="${binary}"
+    else
+      KEYLESS_ROTATION_BINARY="${binary}"
+    fi
+  done
+}
+
 inspect_build() {
   local inspection="${RESULT_ROOT}/build/inspection"
   local name archive
@@ -469,6 +650,170 @@ inspect_build() {
     ar t "${archive}" >"${inspection}/${name}-archive-members.txt"
     nm -A -C --defined-only "${archive}" >"${inspection}/${name}-archive-symbols.txt"
   done
+  python3 - "${inspection}/production-archive-audit.json" \
+    "${inspection}/adapter-archive-members.txt" \
+    "${inspection}/provider-archive-members.txt" \
+    "${inspection}/common-archive-members.txt" \
+    "${inspection}/adapter-archive-symbols.txt" \
+    "${inspection}/provider-archive-symbols.txt" \
+    "${inspection}/common-archive-symbols.txt" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+report = Path(sys.argv[1])
+member_paths = [Path(value) for value in sys.argv[2:5]]
+symbol_paths = [Path(value) for value in sys.argv[5:8]]
+member_pattern = re.compile(
+    r"(?:bootstrap(?:per|_3|_precom(?:pute)?)?|phantom_bootstrap|"
+    r"coeff(?:icient)?[_-]?to[_-]?slot|slot[_-]?to[_-]?coeff|"
+    r"eval[_-]?mod|fhert_(?:ant|poly)|"
+    r"(?:^|[/_.-])(?:ant|poly|poly2c|ckks2poly|stage)(?:[/_.-]|$)|"
+    r"native.*precom|precom.*native|"
+    r"(?:bootstrap|eval[_-]?mod|coeff.*slot|slot.*coeff).*stage|"
+    r"stage.*(?:bootstrap|eval[_-]?mod|coeff.*slot|slot.*coeff))",
+    re.IGNORECASE,
+)
+symbol_pattern = re.compile(
+    r"Bootstrapper|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|"
+    r"FHErt_(?:ant|poly)|fhe::(?:ant|poly)|CoeffToSlot|SlotToCoeff|"
+    r"EvalMod|Native.*[Pp]recom|[Pp]recom.*Native|"
+    r"(?:Bootstrap|EvalMod|CoeffToSlot|SlotToCoeff).*[Ss]tage|"
+    r"[Ss]tage.*(?:Bootstrap|EvalMod|CoeffToSlot|SlotToCoeff)",
+    re.IGNORECASE,
+)
+inventories = []
+for kind, paths, pattern in (
+    ("member", member_paths, member_pattern),
+    ("defined_symbol", symbol_paths, symbol_pattern),
+):
+    for path in paths:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if not lines or any(not line for line in lines):
+            raise SystemExit(f"production archive {kind} inventory is malformed: {path}")
+        matches = [line for line in lines if pattern.search(line)]
+        inventories.append(
+            {
+                "kind": kind,
+                "path": path.name,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "entry_count": len(lines),
+                "forbidden_entries": matches,
+            }
+        )
+forbidden_count = sum(len(item["forbidden_entries"]) for item in inventories)
+value = {
+    "schema_version": "ace.phantom.retained_ckks.production-archive-audit/1.0.0",
+    "status": "pass" if forbidden_count == 0 else "fail",
+    "forbidden_entry_count": forbidden_count,
+    "inventories": inventories,
+}
+report.write_text(
+    json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+if forbidden_count:
+    raise SystemExit("retained production archives contain forbidden members or symbols")
+PY
+
+  python3 - \
+    "${RESULT_ROOT}/outputs/retained_ckks_phantom.cu" \
+    "${RESULT_ROOT}/inputs/retained_ckks_fixture.json" \
+    "${RESULT_ROOT}/outputs/retained_ckks_generation.json" \
+    "${inspection}/generated-source-audit.json" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+source_path, fixture_path, generation_path, report_path = map(Path, sys.argv[1:])
+source = source_path.read_text(encoding="utf-8")
+fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+generation = json.loads(generation_path.read_text(encoding="utf-8"))
+required_calls = [
+    "Conjugate_ciph", "Rotate_batch_ciph", "Raise_mod", "Mul_mono_ciph"
+]
+call_pattern = re.compile(
+    r"\b(Conjugate_ciph|Rotate_batch_ciph|Raise_mod|Mul_mono_ciph)\s*\("
+)
+call_sequence = call_pattern.findall(source)
+first_distinct = []
+for call in call_sequence:
+    if call not in first_distinct:
+        first_distinct.append(call)
+call_counts = {call: call_sequence.count(call) for call in required_calls}
+argument_patterns = {
+    "Conjugate_ciph": r"Conjugate_ciph\s*\(\s*&[^,]+,\s*&[^)]+\)",
+    "Rotate_batch_ciph": (
+        r"Rotate_batch_ciph\s*\(\s*[^,]+,\s*&[^,]+,\s*"
+        r"_rot_batch_[0-9]+,\s*[0-9]+\s*\)"
+    ),
+    "Raise_mod": r"Raise_mod\s*\(\s*&[^,]+,\s*&[^,]+,\s*[^)]+\)",
+    "Mul_mono_ciph": r"Mul_mono_ciph\s*\(\s*&[^,]+,\s*&[^,]+,\s*[^)]+\)",
+}
+argument_order = {
+    call: call_counts[call] > 0
+    and len(re.findall(pattern, source, re.MULTILINE)) == call_counts[call]
+    for call, pattern in argument_patterns.items()
+}
+batch_pattern = re.compile(
+    r"static\s+const\s+int32_t\s+(_rot_batch_[0-9]+)\s*\[\]\s*=\s*"
+    r"\{([^}]*)\}\s*;\s*Rotate_batch_ciph\s*\(\s*[^,]+,\s*&[^,]+,\s*"
+    r"\1\s*,\s*([0-9]+)\s*\)",
+    re.MULTILINE,
+)
+observed_batches = []
+for _name, body, count in batch_pattern.findall(source):
+    steps = [int(item.strip()) for item in body.split(",") if item.strip()]
+    if len(steps) != int(count):
+        raise SystemExit("retained generated rotation initializer count differs")
+    observed_batches.append(steps)
+expected_batches = [
+    fixture["rotate_batch_steps"],
+    *fixture["production_rotation_batches"],
+    fixture["rotate_batch_steps"],
+]
+forbidden_pattern = re.compile(
+    r"Bootstrapper|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|"
+    r"FHErt_(?:ant|poly)|fhe::(?:ant|poly)|CoeffToSlot|SlotToCoeff|"
+    r"EvalMod|Coeff_to_slot|Slot_to_coeff|Eval_mod|"
+    r"Native.*[Pp]recom|[Pp]recom.*Native|"
+    r"(?:Bootstrap|EvalMod|CoeffToSlot|SlotToCoeff).*[Ss]tage|"
+    r"[Ss]tage.*(?:Bootstrap|EvalMod|CoeffToSlot|SlotToCoeff)",
+    re.IGNORECASE,
+)
+forbidden = sorted(set(match.group(0) for match in forbidden_pattern.finditer(source)))
+status = (
+    generation.get("retained_runtime_calls") == required_calls
+    and first_distinct == required_calls
+    and all(count > 0 for count in call_counts.values())
+    and all(argument_order.values())
+    and observed_batches == expected_batches
+    and source.find("Rotate_ciph(") < 0
+    and not forbidden
+)
+value = {
+    "schema_version": "ace.phantom.retained_ckks.generated-source-audit/1.0.0",
+    "status": "pass" if status else "fail",
+    "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+    "required_calls": required_calls,
+    "first_distinct_calls": first_distinct,
+    "call_counts": call_counts,
+    "argument_order": argument_order,
+    "rotation_array_emission": "ckks-owned-static-int32",
+    "expected_rotation_batches": expected_batches,
+    "observed_rotation_batches": observed_batches,
+    "forbidden_matches": forbidden,
+}
+report_path.write_text(
+    json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+if not status:
+    raise SystemExit("retained generated Phantom source audit failed")
+PY
+
   nm -A -C --undefined-only "${PHANTOM_BINARY}" \
     >"${inspection}/phantom-undefined-symbols.txt"
   nm -A -C --defined-only "${PHANTOM_BINARY}" \
@@ -481,6 +826,35 @@ inspect_build() {
     >"${inspection}/phantom-cuda-resources.txt"
   file "${PHANTOM_BINARY}" >"${inspection}/phantom-file.txt"
   readelf -h -S -Ws -d "${PHANTOM_BINARY}" >"${inspection}/phantom-readelf.txt"
+  nm -A -C --undefined-only "${PHANTOM_NATIVE_TEST_BINARY}" \
+    >"${inspection}/native-primitives-undefined-symbols.txt"
+  nm -A -C --defined-only "${PHANTOM_NATIVE_TEST_BINARY}" \
+    >"${inspection}/native-primitives-defined-symbols.txt"
+  "${CUOBJDUMP}" --list-elf "${PHANTOM_NATIVE_TEST_BINARY}" \
+    >"${inspection}/native-primitives-cuda-elf.txt"
+  rg -F 'sm_80' "${inspection}/native-primitives-cuda-elf.txt" >/dev/null
+  if rg -i 'Bootstrapper|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|FHErt_(ant|poly)|fhe::(ant|poly)|CoeffToSlot|SlotToCoeff|EvalMod|Native.*precom|precom.*Native|Bootstrap.*stage|stage.*Bootstrap' \
+      "${inspection}/native-primitives-defined-symbols.txt" \
+      >"${inspection}/native-primitives-forbidden-symbols.txt"; then
+    fail "manifest-driven Phantom primitive test contains excluded symbols"
+  fi
+  local keyless_name keyless_binary
+  for keyless_entry in \
+    "conjugation:${KEYLESS_CONJUGATION_BINARY}" \
+    "rotation:${KEYLESS_ROTATION_BINARY}"; do
+    keyless_name="${keyless_entry%%:*}"
+    keyless_binary="${keyless_entry#*:}"
+    nm -A -C --undefined-only "${keyless_binary}" \
+      >"${inspection}/${keyless_name}-keyless-undefined-symbols.txt"
+    "${CUOBJDUMP}" --list-elf "${keyless_binary}" \
+      >"${inspection}/${keyless_name}-keyless-cuda-elf.txt"
+    rg -F 'sm_80' "${inspection}/${keyless_name}-keyless-cuda-elf.txt" >/dev/null
+    if rg 'Conjugate_ciph|Rotate_batch_ciph|Raise_mod|Mul_mono_ciph|retained_ckks_' \
+        "${inspection}/${keyless_name}-keyless-undefined-symbols.txt" \
+        >"${inspection}/${keyless_name}-keyless-forbidden-undefined.txt"; then
+      fail "the ${keyless_name} keyless binary has unresolved retained symbols"
+    fi
+  done
   rg -F 'sm_80' "${inspection}/phantom-cuda-elf.txt" >/dev/null
   rg -F 'retained_ckks_composite' "${inspection}/phantom-defined-symbols.txt" >/dev/null
   if rg 'Conjugate_ciph|Rotate_batch_ciph|Raise_mod|Mul_mono_ciph|retained_ckks_' \
@@ -488,7 +862,7 @@ inspect_build() {
       >"${inspection}/forbidden-retained-undefined-symbols.txt"; then
     fail "the retained Phantom binary has unresolved retained symbols"
   fi
-  if rg 'FHErt_(ant|poly)|fhe::(ant|poly)|Eval_bootstrap|Phantom_bootstrap|Bootstrapper' \
+  if rg -i 'FHErt_(ant|poly)|fhe::(ant|poly)|Eval_bootstrap|Phantom_bootstrap|Bootstrapper' \
       "${inspection}/phantom-defined-symbols.txt" \
       >"${inspection}/forbidden-phantom-binary-symbols.txt"; then
     fail "the retained Phantom binary contains excluded provider code"
@@ -501,7 +875,7 @@ write_attestations() {
     "${ADAPTER_ARCHIVE}" "${PROVIDER_ARCHIVE}" "${COMMON_ARCHIVE}" \
     "${ANT_ARCHIVE}" "${ANT_ENCODE_ARCHIVE}" "${ANT_BINARY}" \
     "${PHANTOM_BINARY}" "${CUDA_IMAGE}" "${CUDA_IMAGE_CONFIG}" \
-    "${ACE_RUNPOD_BOOTSTRAP_SHA256}" <<'PY'
+    "${ACE_RUNPOD_BOOTSTRAP_SHA256}" "${FIXTURE_LIFECYCLE}" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -509,7 +883,7 @@ import sys
 
 (root, repo, phantom, ace_commit, phantom_commit, source_mode,
  adapter, provider, common, ant, ant_encode, ant_binary, phantom_binary,
- image, image_config, bootstrap_sha) = sys.argv[1:]
+ image, image_config, bootstrap_sha, fixture_lifecycle) = sys.argv[1:]
 root = Path(root)
 
 def digest(path):
@@ -595,10 +969,41 @@ required = {
     "outputs/retained_ckks_analytic_values.bin",
     "outputs/retained_ckks_exact_source.json",
     "outputs/retained_ckks_exact_source.bin",
+    "outputs/retained_ckks_keyless.cu",
+    "outputs/retained_ckks_keyless_context.json",
+    "outputs/retained_ckks_keyless_resources.json",
+    "outputs/retained_ckks_keyless_post.air",
     "outputs/retained_ckks_cpu_reference.json",
     "outputs/retained_ckks_cpu_values.bin",
     "build/retained_ckks_ant_oracle",
     "build/retained_ckks_phantom_sm80",
+    "build/retained_ckks_conjugation_keyless_sm80",
+    "build/retained_ckks_rotation_keyless_sm80",
+    "build/retained_ckks_native_primitives_sm80",
+    "build/gtest-source-attestation.json",
+    "build/inspection/production-archive-audit.json",
+    "build/inspection/generated-source-audit.json",
+    "build/inspection/adapter-archive-members.txt",
+    "build/inspection/provider-archive-members.txt",
+    "build/inspection/common-archive-members.txt",
+    "build/inspection/adapter-archive-symbols.txt",
+    "build/inspection/provider-archive-symbols.txt",
+    "build/inspection/common-archive-symbols.txt",
+    "build/inspection/phantom-undefined-symbols.txt",
+    "build/inspection/phantom-defined-symbols.txt",
+    "build/inspection/phantom-cuda-elf.txt",
+    "build/inspection/forbidden-retained-undefined-symbols.txt",
+    "build/inspection/forbidden-phantom-binary-symbols.txt",
+    "build/inspection/conjugation-keyless-undefined-symbols.txt",
+    "build/inspection/conjugation-keyless-cuda-elf.txt",
+    "build/inspection/conjugation-keyless-forbidden-undefined.txt",
+    "build/inspection/rotation-keyless-undefined-symbols.txt",
+    "build/inspection/rotation-keyless-cuda-elf.txt",
+    "build/inspection/rotation-keyless-forbidden-undefined.txt",
+    "build/inspection/native-primitives-undefined-symbols.txt",
+    "build/inspection/native-primitives-defined-symbols.txt",
+    "build/inspection/native-primitives-cuda-elf.txt",
+    "build/inspection/native-primitives-forbidden-symbols.txt",
     "build_attestation.json",
 }
 missing = sorted(required - files.keys())
@@ -607,6 +1012,7 @@ if missing:
 artifact = {
     "schema_version": "ace.phantom.retained_ckks.artifact-manifest/1.0.0",
     "status": "bound",
+    "fixture_lifecycle": fixture_lifecycle,
     "ace_commit": ace_commit,
     "phantom_commit": phantom_commit,
     "ace_source_manifest_sha256": digest(
@@ -635,7 +1041,7 @@ PY
 
   (
     cd "${RESULT_ROOT}"
-    find . -type f ! -name manifest.json ! -name SHA256SUMS -print0 |
+    find . -type f ! -path ./manifest.json ! -path ./SHA256SUMS -print0 |
       LC_ALL=C sort -z | xargs -0 -r sha256sum >SHA256SUMS
     sha256sum -c SHA256SUMS >/dev/null
   )
@@ -644,20 +1050,25 @@ PY
   source_manifest_name="source/ace_source_manifest.json"
   source_manifest_sha="$(sha256_of "${RESULT_ROOT}/${source_manifest_name}")"
   python3 - "${RESULT_ROOT}" "${ACE_COMMIT}" "${PHANTOM_COMMIT}" \
-    "${SOURCE_MODE}" "${source_manifest_name}" "${source_manifest_sha}" <<'PY'
+    "${SOURCE_MODE}" "${source_manifest_name}" "${source_manifest_sha}" \
+    "${FIXTURE_LIFECYCLE}" <<'PY'
 import hashlib
 import json
 from pathlib import Path
 import sys
 
 root = Path(sys.argv[1])
-ace_commit, phantom_commit, source_mode, source_manifest, source_sha = sys.argv[2:]
+(
+    ace_commit, phantom_commit, source_mode, source_manifest, source_sha,
+    fixture_lifecycle,
+) = sys.argv[2:]
 digest = lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
 value = {
     "schema_version": "ace.phantom.retained_ckks.host-qualification/1.0.0",
     "status": "pass",
     "gate": "retained_ckks",
     "source_mode": source_mode,
+    "fixture_lifecycle": fixture_lifecycle,
     "ace_commit": ace_commit,
     "phantom_commit": phantom_commit,
     "ace_worktree_dirty": False,
@@ -701,9 +1112,11 @@ configure_and_build
 run_host_tests
 generate_context_authority
 generate_retained_artifacts
+build_manifest_driven_phantom_test
 locate_archives
 build_and_run_ant_oracle
 build_phantom_without_running
+build_keyless_rejection_binaries
 inspect_build
 write_attestations
 

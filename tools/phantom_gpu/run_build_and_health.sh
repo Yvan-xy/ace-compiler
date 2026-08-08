@@ -37,6 +37,8 @@ INPUT="$(realpath -- "${INPUT}")"
 WORK="$(realpath -m -- "${WORK}")"
 RESULT_ARCHIVE="$(realpath -m -- "${RESULT_ARCHIVE}")"
 RESULT_DIR="${WORK}/results"
+RETAINED_HOST_ROOT="${WORK}/retained-host-qualification"
+RETAINED_HOST_WORK="${WORK}/retained-host-build"
 mkdir -p "${RESULT_DIR}"
 chmod 0755 "${RESULT_DIR}"
 TIMINGS="${RESULT_DIR}/phase-timings.tsv"
@@ -783,6 +785,470 @@ run_ordinary_gpu_qualification() {
   rm "${raw_results}"
 }
 
+capture_retained_host_failure() {
+  local retained_root="$1"
+  local qualification_exit="$2"
+  local destination="${RESULT_DIR}/retained-host-failure"
+  mkdir -p "${destination}"
+  if [[ -d "${retained_root}" ]]; then
+    local file_list="${WORK}/retained-host-failure-files.list"
+    find "${retained_root}" -type f \
+      \( -name '*.json' -o -name '*.log' -o -name '*.txt' \) \
+      -size -16M -print0 | LC_ALL=C sort -z >"${file_list}"
+    while IFS= read -r -d '' source_file; do
+      local relative destination_file
+      relative="${source_file#${retained_root}/}"
+      destination_file="${destination}/${relative}"
+      mkdir -p "$(dirname -- "${destination_file}")"
+      cp -- "${source_file}" "${destination_file}"
+    done <"${file_list}"
+    rm "${file_list}"
+  fi
+  (
+    cd "${RESULT_DIR}"
+    find retained-host-failure -type f -print0 | LC_ALL=C sort -z |
+      xargs -0 -r sha256sum >retained-host-failure-files.sha256
+  )
+  jq -n --arg status captured \
+    --arg evidence_path retained-host-failure \
+    --arg sha256_manifest retained-host-failure-files.sha256 \
+    --argjson qualification_exit_code "${qualification_exit}" \
+    '{schema_version:"ace.phantom.retained_ckks.failed-host-evidence/1.0.0",
+      status:$status, qualification_exit_code:$qualification_exit_code,
+      evidence_path:$evidence_path, sha256_manifest:$sha256_manifest}' \
+    >"${RESULT_DIR}/retained-host-failure-evidence.json"
+}
+
+run_retained_host_qualification() {
+  local retained_log="${RESULT_DIR}/retained-host-qualification.log"
+  local -a retained_status
+  local retained_exit
+  set +e
+  ACE_RETAINED_CKKS_RESULT_ROOT="${RETAINED_HOST_ROOT}" \
+  ACE_RETAINED_CKKS_WORK_ROOT="${RETAINED_HOST_WORK}" \
+  ACE_RETAINED_CKKS_PROVISIONAL_BINDING=0 \
+    bash \
+      "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/run_retained_ckks_correctness.sh" \
+      --host-qualify 2>&1 | tee "${retained_log}"
+  retained_status=("${PIPESTATUS[@]}")
+  set -e
+  retained_exit="${retained_status[0]}"
+  if [[ ${retained_exit} -ne 0 ]]; then
+    capture_retained_host_failure "${RETAINED_HOST_ROOT}" "${retained_exit}" || true
+    return "${retained_exit}"
+  fi
+  if [[ "${retained_status[1]}" -ne 0 ]]; then
+    echo "retained host log capture failed with exit ${retained_status[1]}" >&2
+    return "${retained_status[1]}"
+  fi
+  jq -e '
+    .schema_version == "ace.phantom.retained_ckks.host-qualification/1.0.0"
+    and .status == "pass"
+    and .source_mode == "snapshot"
+    and .fixture_lifecycle == "checked-bound"
+    and .host_ant_oracle_was_run == true
+    and .gpu_executables_were_run == false
+  ' "${RETAINED_HOST_ROOT}/manifest.json" >/dev/null
+  mkdir -p "${RESULT_DIR}/retained-host"
+  cp -- "${RETAINED_HOST_ROOT}/manifest.json" \
+    "${RESULT_DIR}/retained-host/manifest.json"
+  cp -- "${RETAINED_HOST_ROOT}/build_attestation.json" \
+    "${RESULT_DIR}/retained-host/build-attestation.json"
+  cp -- "${RETAINED_HOST_ROOT}/artifact_manifest.json" \
+    "${RESULT_DIR}/retained-host/artifact-manifest.json"
+  cp -- "${RETAINED_HOST_ROOT}/tests/pytest-retained-host.txt" \
+    "${RESULT_DIR}/retained-host/pytest.txt"
+  cp -- "${RETAINED_HOST_ROOT}/tests/ctest-retained-host.txt" \
+    "${RESULT_DIR}/retained-host/ctest.txt"
+}
+
+verify_frozen_retained_reference() {
+  jq -e '
+    .contents ==
+      "audited-source-snapshots-and-frozen-provider-neutral-references-without-build-output"
+    and .frozen_retained_reference.status == "pass"
+    and .frozen_retained_reference.contents ==
+      "provider-neutral-references-and-attestations-no-build-output"
+  ' "${INPUT}/payload.json" >/dev/null
+  cmp "${RETAINED_HOST_ROOT}/source/ace_source_manifest.json" \
+    "${INPUT}/ace-source.manifest.json"
+  cmp "${RETAINED_HOST_ROOT}/source/phantom_source_manifest.json" \
+    "${INPUT}/phantom-source.manifest.json"
+  python3 \
+    "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/retained_runpod_evidence.py" \
+    verify-replay \
+    --frozen "${INPUT}" \
+    --regenerated-root "${RETAINED_HOST_ROOT}" \
+    --ace-commit "$(jq -er .commit "${INPUT}/ace-source.manifest.json")" \
+    --phantom-commit \
+      "$(jq -er .commit "${INPUT}/phantom-source.manifest.json")" \
+    >"${RESULT_DIR}/retained-frozen-reference.json"
+  jq -e '
+    .status == "pass"
+    and .provider_neutral_ant_reference_matches == true
+    and .exact_artifact_count > 0
+  ' "${RESULT_DIR}/retained-frozen-reference.json" >/dev/null
+}
+
+run_retained_gpu_qualification() {
+  local expected_gpu="${ACE_RUNPOD_EXPECTED_GPU_NAME:-}"
+  case "${expected_gpu}" in
+    "NVIDIA A100 80GB PCIe"|"NVIDIA A100-SXM4-80GB") ;;
+    *)
+      echo "an exact supported A100 GPU identity is required" >&2
+      return 1
+      ;;
+  esac
+  command -v compute-sanitizer >/dev/null
+  local fixture="${RETAINED_HOST_ROOT}/inputs/retained_ckks_fixture.json"
+  local context="${RETAINED_HOST_ROOT}/inputs/compiler_context_manifest.json"
+  local emitted_context="${RETAINED_HOST_ROOT}/outputs/compiler_context_manifest.json"
+  local analytic_json="${RETAINED_HOST_ROOT}/outputs/retained_ckks_analytic_reference.json"
+  local analytic_bin="${RETAINED_HOST_ROOT}/outputs/retained_ckks_analytic_values.bin"
+  local exact_source_json="${RETAINED_HOST_ROOT}/outputs/retained_ckks_exact_source.json"
+  local exact_source_bin="${RETAINED_HOST_ROOT}/outputs/retained_ckks_exact_source.bin"
+  local ant_json="${INPUT}/retained-ant-reference.json"
+  local ant_bin="${INPUT}/retained-ant-values.bin"
+  local frozen_build="${INPUT}/retained-host-build-attestation.json"
+  local runner="${RETAINED_HOST_ROOT}/build/retained_ckks_phantom_sm80"
+  local native_test="${RETAINED_HOST_ROOT}/build/retained_ckks_native_primitives_sm80"
+  local conjugation_keyless="${RETAINED_HOST_ROOT}/build/retained_ckks_conjugation_keyless_sm80"
+  local rotation_keyless="${RETAINED_HOST_ROOT}/build/retained_ckks_rotation_keyless_sm80"
+  local gpu_json="${RESULT_DIR}/retained_ckks_gpu_results.json"
+  local gpu_bin="${RESULT_DIR}/retained_ckks_gpu_values.bin"
+  local exact_observed_json="${RESULT_DIR}/retained_ckks_exact_observed.json"
+  local exact_observed_bin="${RESULT_DIR}/retained_ckks_exact_observed.bin"
+  local exact_evidence="${RESULT_DIR}/retained_ckks_exact_rns.json"
+  local comparison="${RESULT_DIR}/retained_ckks_compare.json"
+  local aliases="${RESULT_DIR}/retained_ckks_adapter_aliases.json"
+  local required
+  for required in "${fixture}" "${context}" "${analytic_json}" \
+    "${analytic_bin}" "${exact_source_json}" "${exact_source_bin}" \
+    "${ant_json}" "${ant_bin}" "${frozen_build}" "${emitted_context}" \
+    "${runner}" "${native_test}" \
+    "${conjugation_keyless}" \
+    "${rotation_keyless}"; do
+    [[ -s "${required}" ]]
+  done
+
+  local native_test_stdout="${RESULT_DIR}/retained-native-primitives.stdout.txt"
+  local native_test_stderr="${RESULT_DIR}/retained-native-primitives.stderr.txt"
+  timeout 900 "${native_test}" --context-manifest "${emitted_context}" \
+    >"${native_test_stdout}" 2>"${native_test_stderr}"
+  python3 - "${RESULT_DIR}/retained_ckks_native_primitives.json" \
+    "${native_test}" "${emitted_context}" "${native_test_stdout}" \
+    "${native_test_stderr}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+output, binary, context, stdout, stderr = map(Path, sys.argv[1:])
+lines = stdout.read_text(encoding="utf-8").splitlines()
+matches = [
+    re.fullmatch(r"\[  PASSED  \]\s+([1-9][0-9]*) tests?\.", line)
+    for line in lines
+]
+counts = [int(match.group(1)) for match in matches if match is not None]
+if len(counts) != 1:
+    raise SystemExit("manifest-driven Phantom test lacks one pass summary")
+digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+value = {
+    "schema_version": "ace.phantom.retained_ckks.native-primitives/1.0.0",
+    "status": "pass",
+    "test_count": counts[0],
+    "binary_sha256": digest(binary),
+    "emitted_context_manifest_sha256": digest(context),
+    "stdout_sha256": digest(stdout),
+    "stderr_sha256": digest(stderr),
+}
+output.write_text(
+    json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+  jq -e \
+    --arg binary_sha256 "$(sha256sum "${native_test}" | awk '{print $1}')" \
+    --arg context_sha256 "$(sha256sum "${emitted_context}" | awk '{print $1}')" \
+    --arg stdout_sha256 "$(sha256sum "${native_test_stdout}" | awk '{print $1}')" \
+    --arg stderr_sha256 "$(sha256sum "${native_test_stderr}" | awk '{print $1}')" '
+    (keys | sort) ==
+      (["binary_sha256", "emitted_context_manifest_sha256", "schema_version",
+        "status", "stderr_sha256", "stdout_sha256", "test_count"] | sort)
+    and .schema_version ==
+      "ace.phantom.retained_ckks.native-primitives/1.0.0"
+    and .status == "pass" and .test_count > 0
+    and .binary_sha256 == $binary_sha256
+    and .emitted_context_manifest_sha256 == $context_sha256
+    and .stdout_sha256 == $stdout_sha256
+    and .stderr_sha256 == $stderr_sha256
+  ' "${RESULT_DIR}/retained_ckks_native_primitives.json" >/dev/null
+
+  timeout 900 "${runner}" aliases "${fixture}" "${context}" \
+    "${analytic_json}" "${analytic_bin}" "${expected_gpu}" "${aliases}" \
+    >"${RESULT_DIR}/retained-adapter-aliases.stdout.txt" \
+    2>"${RESULT_DIR}/retained-adapter-aliases.stderr.txt"
+  jq -e --slurpfile fixture "${fixture}" --slurpfile context "${context}" \
+    --arg fixture_sha256 "$(sha256sum "${fixture}" | awk '{print $1}')" \
+    --arg context_sha256 "$(sha256sum "${context}" | awk '{print $1}')" '
+    def normalized_power($symbol; $degree):
+      if $symbol == "0" then 0
+      elif $symbol == "N/2" then ($degree / 2)
+      elif $symbol == "N" then $degree
+      elif $symbol == "3N/2" then ($degree + ($degree / 2))
+      elif $symbol == "2N-1" then (2 * $degree - 1)
+      elif $symbol == "2N+1" then 1
+      else error("unsupported fixture monomial symbol")
+      end;
+    def power_label($symbol):
+      if $symbol == "0" then "0"
+      elif $symbol == "N/2" then "N_over_2"
+      elif $symbol == "N" then "N"
+      elif $symbol == "3N/2" then "3N_over_2"
+      elif $symbol == "2N-1" then "2N_minus_1"
+      elif $symbol == "2N+1" then "2N_plus_1"
+      else error("unsupported fixture monomial symbol")
+      end;
+    (keys | sort) ==
+      (["cases", "context_manifest_sha256", "fixture_sha256",
+        "qualification_bindings", "schema_version", "status"] | sort)
+    and .schema_version ==
+      "ace.phantom.retained_ckks.adapter-aliases/1.0.0"
+    and .status == "pass"
+    and .fixture_sha256 == $fixture_sha256
+    and .context_manifest_sha256 == $context_sha256
+    and .qualification_bindings == $fixture[0].qualification_bindings
+    and (.cases | length) == (1 + ($fixture[0].monomial_powers | length))
+    and (.cases[0].case_id == "conjugate.in_place"
+         and .cases[0].operation == "conjugate"
+         and .cases[0].symbol == null
+         and .cases[0].normalized_power == null)
+    and ([.cases[1:][] | .symbol] == $fixture[0].monomial_powers)
+    and ([.cases[1:][] | .case_id] ==
+         [$fixture[0].monomial_powers[] |
+          "mul_mono." + power_label(.) + ".in_place"])
+    and ([.cases[1:][] | .operation] | all(. == "mul_mono"))
+    and ([.cases[1:][] | .normalized_power] ==
+         [$fixture[0].monomial_powers[] |
+          normalized_power(.; $context[0].polynomial_degree)])
+    and ([.cases[] | keys | sort] | all(
+      . == (["alias_returned", "case_id", "decoded_values_match_out_of_place",
+             "identity_matches_source", "in_place_decoded_sha256",
+             "in_place_metadata", "in_place_residues_sha256",
+             "input_decoded_sha256", "input_metadata",
+             "input_residues_sha256", "metadata_matches_out_of_place",
+             "normalized_power", "operation", "out_of_place_decoded_sha256",
+             "out_of_place_metadata", "out_of_place_residues_sha256",
+             "residues_match_out_of_place", "source_preserved", "status",
+             "symbol"] | sort)
+    ))
+    and ([.cases[] |
+      (.status == "pass" and .alias_returned == true and .source_preserved == true
+       and .metadata_matches_out_of_place == true
+       and .decoded_values_match_out_of_place == true
+       and .residues_match_out_of_place == true
+       and .out_of_place_metadata == .in_place_metadata
+       and .out_of_place_decoded_sha256 == .in_place_decoded_sha256
+       and .out_of_place_residues_sha256 == .in_place_residues_sha256)] | all)
+    and ([.cases[1:][] | select(.symbol == "0") |
+          (.identity_matches_source == true
+           and .input_metadata == .in_place_metadata
+           and .input_decoded_sha256 == .in_place_decoded_sha256
+           and .input_residues_sha256 == .in_place_residues_sha256)] == [true])
+    and ([.cases[] | select(.symbol != "0") |
+          .identity_matches_source] | all(. == null))
+  ' "${aliases}" >/dev/null
+
+  timeout 900 "${runner}" conformance "${fixture}" "${context}" \
+    "${analytic_json}" "${analytic_bin}" "${exact_source_json}" \
+    "${exact_source_bin}" "${expected_gpu}" "${gpu_json}" "${gpu_bin}" \
+    "${exact_observed_json}" "${exact_observed_bin}" \
+    >"${RESULT_DIR}/retained-conformance.stdout.txt" \
+    2>"${RESULT_DIR}/retained-conformance.stderr.txt"
+
+  python3 \
+    "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/retained_runpod_evidence.py" \
+    write-run-attestations \
+    --frozen "${INPUT}" \
+    --retained-root "${RETAINED_HOST_ROOT}" \
+    --result-dir "${RESULT_DIR}" \
+    --expected-gpu "${expected_gpu}" \
+    >"${RESULT_DIR}/retained-run-evidence.json"
+
+  python3 \
+    "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/compare_retained_ckks_results.py" \
+    --fixture "${fixture}" \
+    --context-manifest "${context}" \
+    --generation-fixture \
+      "${RETAINED_HOST_ROOT}/inputs/retained_ckks_fixture_template.json" \
+    --generation-attestation \
+      "${RETAINED_HOST_ROOT}/outputs/retained_ckks_generation.json" \
+    --emitted-context-manifest \
+      "${RETAINED_HOST_ROOT}/outputs/compiler_context_manifest.json" \
+    --resource-manifest \
+      "${RETAINED_HOST_ROOT}/outputs/compiler_resource_manifest.json" \
+    --ant-post-ckks-air \
+      "${RETAINED_HOST_ROOT}/outputs/retained_ckks_ant_post.air" \
+    --post-ckks-air \
+      "${RETAINED_HOST_ROOT}/outputs/retained_ckks_phantom_post.air" \
+    --production-post-ckks-air \
+      "${RETAINED_HOST_ROOT}/outputs/retained_ckks_production_post.air" \
+    --ace-source-manifest \
+      "${RETAINED_HOST_ROOT}/source/ace_source_manifest.json" \
+    --phantom-source-manifest \
+      "${RETAINED_HOST_ROOT}/source/phantom_source_manifest.json" \
+    --generated-ant-source \
+      "${RETAINED_HOST_ROOT}/outputs/retained_ckks_ant.cxx" \
+    --generated-phantom-source \
+      "${RETAINED_HOST_ROOT}/outputs/retained_ckks_phantom.cu" \
+    --phantom-executable "${runner}" \
+    --frozen-build-attestation "${frozen_build}" \
+    --remote-build-attestation \
+      "${RETAINED_HOST_ROOT}/build_attestation.json" \
+    --run-attestation "${RESULT_DIR}/retained_ckks_run_attestation.json" \
+    --provider-attestation \
+      "${RESULT_DIR}/retained_ckks_provider_attestation.json" \
+    --analytic-json "${analytic_json}" --analytic-bin "${analytic_bin}" \
+    --ant-json "${ant_json}" --ant-bin "${ant_bin}" \
+    --gpu-json "${gpu_json}" --gpu-bin "${gpu_bin}" \
+    --exact-source-json "${exact_source_json}" \
+    --exact-source-bin "${exact_source_bin}" \
+    --exact-observed-json "${exact_observed_json}" \
+    --exact-observed-bin "${exact_observed_bin}" \
+    --exact-output-json "${exact_evidence}" \
+    --output-json "${comparison}"
+  jq -e '
+    .status == "pass"
+    and .gpu_vs_exact.status == "pass"
+    and .gpu_vs_exact.mismatch_count == 0
+    and (.gpu_vs_analytic | length) > 0
+    and (.gpu_vs_ant | length) > 0
+    and ([.metamorphic_checks[]] | all)
+  ' "${comparison}" >/dev/null
+  jq -e '.status == "pass" and .mismatch_count == 0' \
+    "${exact_evidence}" >/dev/null
+
+  local rejection_table="${WORK}/retained-runtime-rejections.tsv"
+  jq -er '.runtime_rejections[] | [.id, .diagnostic, .manifest] | @tsv' \
+    "${fixture}" >"${rejection_table}"
+  local rejection_jsonl="${WORK}/retained-runtime-rejections.jsonl"
+  : >"${rejection_jsonl}"
+  local case_id diagnostic manifest selected_runner stdout_file stderr_file
+  local rejection_exit
+  while IFS=$'\t' read -r case_id diagnostic manifest; do
+    case "${manifest}" in
+      production) selected_runner="${runner}" ;;
+      keyless-conjugation) selected_runner="${conjugation_keyless}" ;;
+      keyless-rotation) selected_runner="${rotation_keyless}" ;;
+      *)
+        echo "unsupported retained rejection manifest ${manifest}" >&2
+        return 1
+        ;;
+    esac
+    stdout_file="${RESULT_DIR}/retained-reject-${case_id}.stdout.txt"
+    stderr_file="${RESULT_DIR}/retained-reject-${case_id}.stderr.txt"
+    ulimit -c 0
+    set +e
+    timeout 180 "${selected_runner}" reject "${fixture}" "${context}" \
+      "${analytic_json}" "${analytic_bin}" "${expected_gpu}" "${case_id}" \
+      >"${stdout_file}" 2>"${stderr_file}"
+    rejection_exit=$?
+    set -e
+    if [[ ${rejection_exit} -eq 0 || ${rejection_exit} -eq 124 ]]; then
+      echo "retained runtime rejection ${case_id} returned ${rejection_exit}" >&2
+      return 1
+    fi
+    rg -Fq "ACE_RETAINED_EXPECT_DIAGNOSTIC[${diagnostic}]" \
+      "${stderr_file}"
+    rg -Fq "ACE_PHANTOM_ORDINARY_ERROR[${diagnostic}]" "${stderr_file}"
+    jq -cn --arg case_id "${case_id}" --arg diagnostic "${diagnostic}" \
+      --arg manifest "${manifest}" --argjson exit_code "${rejection_exit}" \
+      '{case_id:$case_id, diagnostic:$diagnostic, manifest:$manifest,
+        exit_code:$exit_code, status:"pass"}' >>"${rejection_jsonl}"
+  done <"${rejection_table}"
+  jq -s \
+    '{schema_version:"ace.phantom.retained_ckks.rejections/1.0.0",
+      status:"pass", cases:.}' "${rejection_jsonl}" \
+    >"${RESULT_DIR}/retained_ckks_rejections.json"
+  jq -e --slurpfile fixture "${fixture}" '
+    (keys | sort) == (["cases", "schema_version", "status"] | sort)
+    and .status == "pass"
+    and ([.cases[] | {id:.case_id, diagnostic, manifest}]
+         == [$fixture[0].runtime_rejections[] | {id, diagnostic, manifest}])
+    and ([.cases[] | keys | sort] | all(
+      . == (["case_id", "diagnostic", "exit_code", "manifest", "status"] | sort)
+    ))
+    and ([.cases[] |
+      (.status == "pass" and (.exit_code | type) == "number"
+       and .exit_code != 0 and .exit_code != 124)] | all)
+  ' "${RESULT_DIR}/retained_ckks_rejections.json" >/dev/null
+  rm "${rejection_table}" "${rejection_jsonl}"
+
+  local ownership="${RESULT_DIR}/retained_ckks_ownership.json"
+  local sanitizer_log="${RESULT_DIR}/retained_ckks_sanitizer.log.txt"
+  local sanitizer_stdout="${RESULT_DIR}/retained_ckks_sanitizer.stdout.txt"
+  local sanitizer_stderr="${RESULT_DIR}/retained_ckks_sanitizer.stderr.txt"
+  local sanitizer_version="${RESULT_DIR}/retained_ckks_sanitizer.version.txt"
+  compute-sanitizer --version >"${sanitizer_version}" 2>&1
+  set +e
+  timeout 900 compute-sanitizer --tool memcheck --error-exitcode=99 \
+    --log-file "${sanitizer_log}" "${runner}" ownership "${fixture}" \
+    "${context}" "${analytic_json}" "${analytic_bin}" "${expected_gpu}" \
+    "${ownership}" >"${sanitizer_stdout}" 2>"${sanitizer_stderr}"
+  local sanitizer_exit=$?
+  set -e
+  if [[ ${sanitizer_exit} -ne 0 ]]; then
+    echo "retained Compute Sanitizer exited ${sanitizer_exit}" >&2
+    return "${sanitizer_exit}"
+  fi
+  [[ "$(rg -c '^========= ERROR SUMMARY: 0 errors$' "${sanitizer_log}" || true)" == 1 ]]
+  [[ "$(rg -c '^========= ERROR SUMMARY:' "${sanitizer_log}" || true)" == 1 ]]
+  jq -e --slurpfile fixture "${fixture}" '
+    (keys | sort) ==
+      (["batch_outputs_are_independent", "free_order", "iterations",
+        "ordered_steps", "schema_version", "status"] | sort)
+    and .schema_version == "ace.phantom.retained_ckks.ownership/1.0.0"
+    and .status == "pass"
+    and .iterations == $fixture[0].ownership.iterations
+    and .ordered_steps == $fixture[0].rotate_batch_steps
+    and .batch_outputs_are_independent ==
+      $fixture[0].ownership.batch_outputs_are_independent
+    and .free_order == $fixture[0].ownership.free_order
+  ' "${ownership}" >/dev/null
+  local ownership_iterations
+  ownership_iterations="$(jq -er '.iterations' "${ownership}")"
+  jq -n --arg status pass --arg tool memcheck \
+    --argjson ownership_iterations "${ownership_iterations}" \
+    --arg log_sha256 "$(sha256sum "${sanitizer_log}" | awk '{print $1}')" \
+    --arg version_sha256 \
+      "$(sha256sum "${sanitizer_version}" | awk '{print $1}')" \
+    '{schema_version:"ace.phantom.retained_ckks.sanitizer/1.0.0",
+      status:$status, tool:$tool, error_summary:0,
+      ownership_iterations:$ownership_iterations,
+      log_sha256:$log_sha256, version_sha256:$version_sha256}' \
+    >"${RESULT_DIR}/retained_ckks_sanitizer.json"
+
+  cp -- "${context}" "${RESULT_DIR}/retained_compiler_context_manifest.json"
+  cp -- "${RETAINED_HOST_ROOT}/outputs/compiler_resource_manifest.json" \
+    "${RESULT_DIR}/retained_compiler_resource_manifest.json"
+  cp -- "${fixture}" "${RESULT_DIR}/retained_ckks_v1.json"
+  cp -- "${ant_json}" "${RESULT_DIR}/retained_ckks_cpu_reference.json"
+  cp -- "${ant_bin}" "${RESULT_DIR}/retained_ckks_cpu_values.bin"
+  cp -- "${RETAINED_HOST_ROOT}/outputs/retained_ckks_generation.json" \
+    "${RESULT_DIR}/retained_ckks_generation.json"
+  cp -- "${RETAINED_HOST_ROOT}/source/ace_source_manifest.json" \
+    "${RESULT_DIR}/retained_ace_source_manifest.json"
+  cp -- "${RETAINED_HOST_ROOT}/source/phantom_source_manifest.json" \
+    "${RESULT_DIR}/retained_phantom_source_manifest.json"
+  cp -- \
+    "${RETAINED_HOST_ROOT}/build/inspection/production-archive-audit.json" \
+    "${RESULT_DIR}/retained_production_archive_audit.json"
+  cp -- "${RETAINED_HOST_ROOT}/build/inspection/generated-source-audit.json" \
+    "${RESULT_DIR}/retained_generated_source_audit.json"
+  cp -- "${RETAINED_HOST_ROOT}/build/gtest-source-attestation.json" \
+    "${RESULT_DIR}/retained_gtest_source_attestation.json"
+}
+
 run_native_health() {
   local expected_gpu query gpu_count gpu_name current run_root health_binary
   local context_manifest context_sha health_raw health_exit
@@ -843,6 +1309,11 @@ verify_success_evidence() {
         "${RESULT_DIR}/ordinary-frozen-reference.json" >/dev/null
       jq -e '.status == "skipped"' \
         "${RESULT_DIR}/native-health.json" >/dev/null
+      jq -e '
+        .status == "pass"
+        and .provider_neutral_ant_reference_matches == true
+        and .exact_artifact_count > 0
+      ' "${RESULT_DIR}/retained-frozen-reference.json" >/dev/null
       ;;
     runpod)
       jq -e '.status == "pass" and .device_count == 1' \
@@ -859,6 +1330,100 @@ verify_success_evidence() {
       ' "${RESULT_DIR}/ordinary_ckks_ownership.json" >/dev/null
       jq -e '.status == "pass" and .exit_code == 0' \
         "${RESULT_DIR}/ordinary_ckks_sanitizer.json" >/dev/null
+      jq -e '
+        .status == "pass"
+        and .provider_neutral_ant_reference_matches == true
+        and .ant_replay.comparison ==
+          "semantic-summary-only-no-decoded-byte-comparison"
+        and .exact_artifact_count > 0
+      ' "${RESULT_DIR}/retained-frozen-reference.json" >/dev/null
+      jq -e '
+        .status == "pass"
+        and .gpu_vs_exact.status == "pass"
+        and .gpu_vs_exact.mismatch_count == 0
+      ' "${RESULT_DIR}/retained_ckks_compare.json" >/dev/null
+      jq -e '.status == "pass" and .mismatch_count == 0' \
+        "${RESULT_DIR}/retained_ckks_exact_rns.json" >/dev/null
+      jq -e '
+        .schema_version ==
+          "ace.phantom.retained_ckks.adapter-aliases/1.0.0"
+        and .status == "pass" and (.cases | length) > 1
+        and ([.cases[].status] | all(. == "pass"))
+        and ([.cases[].alias_returned] | all)
+        and ([.cases[].metadata_matches_out_of_place] | all)
+        and ([.cases[].decoded_values_match_out_of_place] | all)
+        and ([.cases[].residues_match_out_of_place] | all)
+      ' "${RESULT_DIR}/retained_ckks_adapter_aliases.json" >/dev/null
+      jq -e --slurpfile fixture "${RESULT_DIR}/retained_ckks_v1.json" '
+        (keys | sort) == (["cases", "schema_version", "status"] | sort)
+        and .status == "pass"
+        and ([.cases[] | {id:.case_id, diagnostic, manifest}]
+             == [$fixture[0].runtime_rejections[] | {id, diagnostic, manifest}])
+        and ([.cases[] | keys | sort] | all(
+          . == (["case_id", "diagnostic", "exit_code", "manifest", "status"] | sort)
+        ))
+        and ([.cases[] |
+          (.status == "pass" and (.exit_code | type) == "number"
+           and .exit_code != 0 and .exit_code != 124)] | all)
+      ' "${RESULT_DIR}/retained_ckks_rejections.json" >/dev/null
+      jq -e --slurpfile fixture "${RESULT_DIR}/retained_ckks_v1.json" '
+        (keys | sort) ==
+          (["batch_outputs_are_independent", "free_order", "iterations",
+            "ordered_steps", "schema_version", "status"] | sort)
+        and .status == "pass"
+        and .iterations == $fixture[0].ownership.iterations
+        and .ordered_steps == $fixture[0].rotate_batch_steps
+        and .batch_outputs_are_independent ==
+          $fixture[0].ownership.batch_outputs_are_independent
+        and .free_order == $fixture[0].ownership.free_order
+      ' "${RESULT_DIR}/retained_ckks_ownership.json" >/dev/null
+      jq -e '.status == "pass" and .error_summary == 0' \
+        "${RESULT_DIR}/retained_ckks_sanitizer.json" >/dev/null
+      jq -e --slurpfile artifact \
+        "${RESULT_DIR}/retained-host/artifact-manifest.json" \
+        --arg context_sha256 \
+          "$(sha256sum "${RESULT_DIR}/retained_compiler_context_manifest.json" | awk '{print $1}')" \
+        --arg stdout_sha256 \
+          "$(sha256sum "${RESULT_DIR}/retained-native-primitives.stdout.txt" | awk '{print $1}')" \
+        --arg stderr_sha256 \
+          "$(sha256sum "${RESULT_DIR}/retained-native-primitives.stderr.txt" | awk '{print $1}')" '
+        (keys | sort) ==
+          (["binary_sha256", "emitted_context_manifest_sha256",
+            "schema_version", "status", "stderr_sha256", "stdout_sha256",
+            "test_count"] | sort)
+        and .schema_version ==
+          "ace.phantom.retained_ckks.native-primitives/1.0.0"
+        and .status == "pass" and .test_count > 0
+        and .binary_sha256 ==
+          $artifact[0].files["build/retained_ckks_native_primitives_sm80"]
+        and .emitted_context_manifest_sha256 == $context_sha256
+        and .stdout_sha256 == $stdout_sha256
+        and .stderr_sha256 == $stderr_sha256
+      ' "${RESULT_DIR}/retained_ckks_native_primitives.json" >/dev/null
+      jq -e '
+        .schema_version ==
+          "ace.phantom.retained_ckks.production-archive-audit/1.0.0"
+        and .status == "pass" and .forbidden_entry_count == 0
+        and (.inventories | length) == 6
+        and ([.inventories[].forbidden_entries] | all(. == []))
+      ' "${RESULT_DIR}/retained_production_archive_audit.json" >/dev/null
+      jq -e '
+        .schema_version ==
+          "ace.phantom.retained_ckks.generated-source-audit/1.0.0"
+        and .status == "pass"
+        and .required_calls ==
+          ["Conjugate_ciph", "Rotate_batch_ciph", "Raise_mod", "Mul_mono_ciph"]
+        and .first_distinct_calls == .required_calls
+        and .rotation_array_emission == "ckks-owned-static-int32"
+        and .forbidden_matches == []
+      ' "${RESULT_DIR}/retained_generated_source_audit.json" >/dev/null
+      jq -e '
+        .schema_version == "ace.phantom.retained_ckks.gtest-source/1.0.0"
+        and .status == "pass"
+        and .source_method == "ace-pinned-external-project-source-reuse"
+        and .fetchcontent_source_override == true
+        and .fetchcontent_fully_disconnected == true
+      ' "${RESULT_DIR}/retained_gtest_source_attestation.json" >/dev/null
       ;;
   esac
   jq -n --arg mode "${MODE}" \
@@ -880,9 +1445,16 @@ if [[ "${MODE}" != "freeze-host" ]]; then
   if [[ "${MODE}" == "runpod" ]]; then
     phase native_a100_health run_native_health
     phase ordinary_gpu_qualification run_ordinary_gpu_qualification
+    # The retained build and all retained execution deliberately begin only
+    # after the complete ordinary GPU prerequisite has passed.
+    phase retained_host_qualification run_retained_host_qualification
+    phase frozen_retained_reference verify_frozen_retained_reference
+    phase retained_gpu_qualification run_retained_gpu_qualification
   else
     printf '{"status":"skipped","reason":"local host has no GPU"}\n' \
       >"${RESULT_DIR}/native-health.json"
+    phase retained_host_qualification run_retained_host_qualification
+    phase frozen_retained_reference verify_frozen_retained_reference
   fi
 fi
 phase result_completeness verify_success_evidence

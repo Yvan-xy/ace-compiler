@@ -125,7 +125,7 @@ REMOTE_ARGS=(
   bash /root/input/run_build_and_health.sh
   --mode runpod
   --input-dir /root/input
-  --work-dir /root/runpod-work
+  --work-dir /retained-qualification/work
   --result-archive /root/runpod-result.tar.gz
 )
 shell_join REMOTE_COMMAND "${REMOTE_ARGS[@]}"

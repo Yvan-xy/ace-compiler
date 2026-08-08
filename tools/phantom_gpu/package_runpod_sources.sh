@@ -6,13 +6,14 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 PHANTOM_REPO="${ACE_PHANTOM_REPO:-/home/dyf/code/phantom-ant}"
 
 usage() {
-  echo "usage: $0 --ace-commit COMMIT --phantom-commit COMMIT --ordinary-run-root DIR OUTPUT_DIRECTORY" >&2
+  echo "usage: $0 --ace-commit COMMIT --phantom-commit COMMIT --ordinary-run-root DIR --retained-run-root DIR OUTPUT_DIRECTORY" >&2
   exit 2
 }
 
 ACE_COMMIT=""
 PHANTOM_COMMIT=""
 ORDINARY_RUN_ROOT=""
+RETAINED_RUN_ROOT=""
 OUTPUT_ARGUMENT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -31,6 +32,11 @@ while [[ $# -gt 0 ]]; do
       ORDINARY_RUN_ROOT="$2"
       shift 2
       ;;
+    --retained-run-root)
+      [[ $# -ge 2 ]] || usage
+      RETAINED_RUN_ROOT="$2"
+      shift 2
+      ;;
     --)
       shift
       [[ $# -eq 1 && -z "${OUTPUT_ARGUMENT}" ]] || usage
@@ -46,7 +52,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "${ACE_COMMIT}" && -n "${PHANTOM_COMMIT}" &&
-   -n "${ORDINARY_RUN_ROOT}" && -n "${OUTPUT_ARGUMENT}" ]] || usage
+   -n "${ORDINARY_RUN_ROOT}" && -n "${RETAINED_RUN_ROOT}" &&
+   -n "${OUTPUT_ARGUMENT}" ]] || usage
 if [[ ! "${ACE_COMMIT}" =~ ^[0-9a-f]{40}$ ||
       ! "${PHANTOM_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "source commits must be full lowercase 40-character object IDs" >&2
@@ -56,6 +63,7 @@ git -C "${REPO_ROOT}" cat-file -e "${ACE_COMMIT}^{commit}"
 git -C "${PHANTOM_REPO}" cat-file -e "${PHANTOM_COMMIT}^{commit}"
 
 ORDINARY_RUN_ROOT="$(realpath -- "${ORDINARY_RUN_ROOT}")"
+RETAINED_RUN_ROOT="$(realpath -- "${RETAINED_RUN_ROOT}")"
 FROZEN_RUN_MANIFEST="${ORDINARY_RUN_ROOT}/manifest.json"
 FROZEN_ACE_SOURCE_MANIFEST="${ORDINARY_RUN_ROOT}/ace_source_manifest.json"
 FROZEN_PHANTOM_SOURCE_MANIFEST="${ORDINARY_RUN_ROOT}/phantom_source_manifest.json"
@@ -600,6 +608,30 @@ for archive_field in (
         raise SystemExit(f"frozen CKKS2C qualification lacks {archive_field}")
 PY
 
+while IFS= read -r retained_evidence_dependency; do
+  expected_dependency_sha256="$(
+    git -C "${REPO_ROOT}" show \
+      "${ACE_COMMIT}:${retained_evidence_dependency}" |
+      sha256sum | awk '{print $1}'
+  )"
+  actual_dependency_sha256="$(
+    sha256sum "${REPO_ROOT}/${retained_evidence_dependency}" | awk '{print $1}'
+  )"
+  if [[ "${actual_dependency_sha256}" != "${expected_dependency_sha256}" ]]; then
+    echo "retained evidence dependency differs from the selected ACE commit: ${retained_evidence_dependency}" >&2
+    exit 1
+  fi
+done <<'FILES'
+tools/phantom_gpu/package_runpod_sources.sh
+tools/phantom_gpu/retained_runpod_evidence.py
+tools/phantom_gpu/compare_retained_ckks_results.py
+tools/phantom_gpu/generate_retained_ckks_fixtures.py
+FILES
+python3 "${SCRIPT_DIR}/retained_runpod_evidence.py" validate-frozen \
+  --root "${RETAINED_RUN_ROOT}" \
+  --ace-commit "${ACE_COMMIT}" \
+  --phantom-commit "${PHANTOM_COMMIT}"
+
 DEPENDENCY_LOCK="$(
   git -C "${REPO_ROOT}" show \
     "${ACE_COMMIT}:tools/phantom_gpu/configs/dependencies.env"
@@ -659,6 +691,10 @@ python3 "${ARCHIVE_TOOL_DIRECTORY}/source_archive.py" create \
 cmp "${FROZEN_ACE_SOURCE_MANIFEST}" "${OUTPUT}/ace-source.manifest.json"
 cmp "${FROZEN_PHANTOM_SOURCE_MANIFEST}" \
   "${OUTPUT}/phantom-source.manifest.json"
+cmp "${RETAINED_RUN_ROOT}/source/ace_source_manifest.json" \
+  "${OUTPUT}/ace-source.manifest.json"
+cmp "${RETAINED_RUN_ROOT}/source/phantom_source_manifest.json" \
+  "${OUTPUT}/phantom-source.manifest.json"
 
 while IFS= read -r relative; do
   git -C "${REPO_ROOT}" show "${ACE_COMMIT}:${relative}" >"${OUTPUT}/${relative##*/}"
@@ -693,6 +729,11 @@ cp "${FROZEN_FIXTURE}" "${OUTPUT}/ordinary-fixture.json"
 cp "${FROZEN_CPU_REFERENCE}" "${OUTPUT}/ordinary-cpu-reference.json"
 cp "${FROZEN_CPU_VALUES}" "${OUTPUT}/ordinary-cpu-values.bin"
 cp "${FROZEN_ANT_VERIFICATION}" "${OUTPUT}/ordinary-ant-verification.json"
+python3 "${SCRIPT_DIR}/retained_runpod_evidence.py" export-frozen \
+  --root "${RETAINED_RUN_ROOT}" \
+  --output "${OUTPUT}" \
+  --ace-commit "${ACE_COMMIT}" \
+  --phantom-commit "${PHANTOM_COMMIT}"
 
 (
   cd "${OUTPUT}"
@@ -710,6 +751,10 @@ import sys
 output = Path(sys.argv[1])
 payload = {
     "schema_version": "1.0.0",
+    "contents": (
+        "audited-source-snapshots-and-frozen-provider-neutral-references-"
+        "without-build-output"
+    ),
     "ace_commit": sys.argv[2],
     "phantom_commit": sys.argv[3],
     "source_snapshots": {
@@ -768,6 +813,9 @@ payload = {
             (output / "ordinary-ant-verification.json").read_bytes()
         ).hexdigest(),
     },
+    "frozen_retained_reference": json.loads(
+        (output / "retained-frozen-export.json").read_text(encoding="utf-8")
+    ),
     "files": sorted(path.name for path in output.iterdir() if path.is_file()),
 }
 (output / "payload.json").write_text(

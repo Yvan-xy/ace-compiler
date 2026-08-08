@@ -27,7 +27,7 @@ RUN_SCHEMA = "ace.phantom.retained_ckks.run-attestation/2.0.0"
 PROVIDER_SCHEMA = "ace.phantom.retained_ckks.provider-attestation/2.0.0"
 
 
-# Only provider-neutral records needed to reproduce and compare the run are
+# Only frozen oracle/reference records and their identity receipts are
 # exported.  In particular, no executable, object, archive, generated CUDA
 # source, generated C++ source, or build log crosses this boundary.
 FROZEN_FILES: dict[str, tuple[str, str]] = {
@@ -310,6 +310,22 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
         root / FROZEN_FILES["emitted_context_manifest"][0]
     ):
         raise EvidenceError("retained emitted context differs from its input")
+    try:
+        (
+            validated_generation,
+            normalized_compiler_command_sha256,
+            _compiler_options,
+        ) = retained_comparator._load_invocation(generation_path)
+        retained_comparator.verify_invocation_context(
+            validated_generation,
+            context_path,
+            root / FROZEN_FILES["phantom_post_ckks_air"][0],
+            root / FROZEN_FILES["generation_fixture"][0],
+        )
+    except (retained_comparator.ComparisonError, RetainedFixtureError) as error:
+        raise EvidenceError(
+            f"retained compiler invocation validation failed: {error}"
+        ) from error
 
     build = load_json(build_path)
     expected_build = {
@@ -354,6 +370,12 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
         != sha256_path(context_path)
         or artifact.get("compiler_resource_manifest_sha256")
         != sha256_path(resource_path)
+        or artifact.get("normalized_compiler_command_sha256")
+        != normalized_compiler_command_sha256
+        or artifact.get("post_ckks_air_sha256")
+        != sha256_path(root / FROZEN_FILES["phantom_post_ckks_air"][0])
+        or artifact.get("production_post_ckks_air_sha256")
+        != sha256_path(root / FROZEN_FILES["production_post_ckks_air"][0])
         or artifact.get("fixture_sha256") != sha256_path(fixture_path)
         or artifact.get("build_attestation_sha256") != sha256_path(build_path)
     ):
@@ -361,6 +383,15 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
     artifact_files = artifact.get("files")
     if not isinstance(artifact_files, dict):
         raise EvidenceError("retained artifact manifest has no file map")
+    expected_artifact_files = {
+        name: digest
+        for name, digest in listed.items()
+        if name != "artifact_manifest.json"
+    }
+    if artifact_files != expected_artifact_files:
+        raise EvidenceError(
+            "retained artifact manifest is not an exhaustive pre-manifest file map"
+        )
     for source_name, _payload_name in FROZEN_FILES.values():
         if source_name in {"manifest.json", "artifact_manifest.json"}:
             continue
@@ -368,8 +399,245 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
             raise EvidenceError(
                 f"retained artifact manifest does not bind {source_name}"
             )
-
     fixture = load_json(fixture_path)
+    try:
+        retained_comparator.verify_bindings(
+            fixture,
+            context_path,
+            generation_path,
+            root / FROZEN_FILES["phantom_post_ckks_air"][0],
+            root / FROZEN_FILES["production_post_ckks_air"][0],
+        )
+    except (retained_comparator.ComparisonError, RetainedFixtureError) as error:
+        raise EvidenceError(
+            f"retained fixture/compiler binding validation failed: {error}"
+        ) from error
+    audit_paths = {
+        "production_archive": root
+        / "build/inspection/production-archive-audit.json",
+        "generated_source": root
+        / "build/inspection/generated-source-audit.json",
+    }
+    for label, path in audit_paths.items():
+        relative = path.relative_to(root).as_posix()
+        if (
+            not path.is_file()
+            or relative not in listed
+            or artifact_files.get(relative) != sha256_path(path)
+        ):
+            raise EvidenceError(f"retained {label} audit is not artifact-bound")
+    archive_audit = load_json(audit_paths["production_archive"])
+    archive_inventories = archive_audit.get("inventories")
+    if (
+        set(archive_audit)
+        != {
+            "schema_version",
+            "status",
+            "forbidden_entry_count",
+            "inventories",
+        }
+        or archive_audit.get("schema_version")
+        != "ace.phantom.retained_ckks.production-archive-audit/1.0.0"
+        or archive_audit.get("status") != "pass"
+        or archive_audit.get("forbidden_entry_count") != 0
+        or not isinstance(archive_inventories, list)
+        or len(archive_inventories) != 6
+        or any(
+            not isinstance(item, dict) or item.get("forbidden_entries") != []
+            for item in archive_inventories
+        )
+    ):
+        raise EvidenceError("retained production archive audit did not pass")
+    expected_archive_inventories = [
+        ("member", f"{name}-archive-members.txt")
+        for name in ("adapter", "provider", "common")
+    ] + [
+        ("defined_symbol", f"{name}-archive-symbols.txt")
+        for name in ("adapter", "provider", "common")
+    ]
+    for item, (expected_kind, expected_name) in zip(
+        archive_inventories, expected_archive_inventories, strict=True
+    ):
+        inventory_path = root / "build/inspection" / expected_name
+        inventory_relative = inventory_path.relative_to(root).as_posix()
+        if (
+            not inventory_path.is_file()
+            or artifact_files.get(inventory_relative)
+            != sha256_path(inventory_path)
+        ):
+            raise EvidenceError(
+                f"retained production archive inventory is not bound: {expected_name}"
+            )
+        lines = inventory_path.read_text(encoding="utf-8").splitlines()
+        if (
+            set(item)
+            != {
+                "kind",
+                "path",
+                "sha256",
+                "entry_count",
+                "forbidden_entries",
+            }
+            or item.get("kind") != expected_kind
+            or item.get("path") != expected_name
+            or item.get("sha256") != sha256_path(inventory_path)
+            or item.get("entry_count") != len(lines)
+            or not lines
+            or any(not line for line in lines)
+        ):
+            raise EvidenceError(
+                f"retained production archive inventory differs: {expected_name}"
+            )
+    generated_audit = load_json(audit_paths["generated_source"])
+    required_calls = [
+        "Conjugate_ciph",
+        "Rotate_batch_ciph",
+        "Raise_mod",
+        "Mul_mono_ciph",
+    ]
+    expected_batches = [
+        fixture["rotate_batch_steps"],
+        *fixture["production_rotation_batches"],
+        fixture["rotate_batch_steps"],
+    ]
+    call_counts = generated_audit.get("call_counts")
+    argument_order = generated_audit.get("argument_order")
+    if (
+        set(generated_audit)
+        != {
+            "schema_version",
+            "status",
+            "source_sha256",
+            "required_calls",
+            "first_distinct_calls",
+            "call_counts",
+            "argument_order",
+            "rotation_array_emission",
+            "expected_rotation_batches",
+            "observed_rotation_batches",
+            "forbidden_matches",
+        }
+        or generated_audit.get("schema_version")
+        != "ace.phantom.retained_ckks.generated-source-audit/1.0.0"
+        or generated_audit.get("status") != "pass"
+        or generated_audit.get("source_sha256")
+        != sha256_path(root / "outputs/retained_ckks_phantom.cu")
+        or generated_audit.get("required_calls") != required_calls
+        or generated_audit.get("first_distinct_calls")
+        != required_calls
+        or not isinstance(call_counts, dict)
+        or set(call_counts) != set(required_calls)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in call_counts.values()
+        )
+        or not isinstance(argument_order, dict)
+        or argument_order != {call: True for call in required_calls}
+        or generated_audit.get("expected_rotation_batches") != expected_batches
+        or generated_audit.get("observed_rotation_batches") != expected_batches
+        or generated_audit.get("forbidden_matches") != []
+        or generated_audit.get("rotation_array_emission")
+        != "ckks-owned-static-int32"
+    ):
+        raise EvidenceError("retained generated source audit did not pass")
+
+    required_bound_paths = {
+        "outputs/retained_ckks_keyless.cu",
+        "outputs/retained_ckks_keyless_context.json",
+        "outputs/retained_ckks_keyless_resources.json",
+        "outputs/retained_ckks_keyless_post.air",
+        "build/retained_ckks_conjugation_keyless_sm80",
+        "build/retained_ckks_rotation_keyless_sm80",
+        "build/retained_ckks_native_primitives_sm80",
+        "build/gtest-source-attestation.json",
+        "build/inspection/conjugation-keyless-undefined-symbols.txt",
+        "build/inspection/conjugation-keyless-cuda-elf.txt",
+        "build/inspection/conjugation-keyless-forbidden-undefined.txt",
+        "build/inspection/rotation-keyless-undefined-symbols.txt",
+        "build/inspection/rotation-keyless-cuda-elf.txt",
+        "build/inspection/rotation-keyless-forbidden-undefined.txt",
+        "build/inspection/native-primitives-undefined-symbols.txt",
+        "build/inspection/native-primitives-defined-symbols.txt",
+        "build/inspection/native-primitives-cuda-elf.txt",
+        "build/inspection/native-primitives-forbidden-symbols.txt",
+        "build/inspection/phantom-undefined-symbols.txt",
+        "build/inspection/phantom-defined-symbols.txt",
+        "build/inspection/phantom-cuda-elf.txt",
+        "build/inspection/forbidden-retained-undefined-symbols.txt",
+        "build/inspection/forbidden-phantom-binary-symbols.txt",
+    }
+    missing_bound = sorted(required_bound_paths - artifact_files.keys())
+    if missing_bound:
+        raise EvidenceError(
+            "retained qualification artifacts are not bound: "
+            + ", ".join(missing_bound)
+        )
+    for path in (
+        "build/inspection/forbidden-retained-undefined-symbols.txt",
+        "build/inspection/forbidden-phantom-binary-symbols.txt",
+        "build/inspection/conjugation-keyless-forbidden-undefined.txt",
+        "build/inspection/rotation-keyless-forbidden-undefined.txt",
+        "build/inspection/native-primitives-forbidden-symbols.txt",
+    ):
+        if (root / path).read_bytes():
+            raise EvidenceError(f"retained forbidden-symbol report is nonempty: {path}")
+    for path in (
+        "build/inspection/phantom-cuda-elf.txt",
+        "build/inspection/conjugation-keyless-cuda-elf.txt",
+        "build/inspection/rotation-keyless-cuda-elf.txt",
+        "build/inspection/native-primitives-cuda-elf.txt",
+    ):
+        if "sm_80" not in (root / path).read_text(encoding="utf-8"):
+            raise EvidenceError(f"retained CUDA inspection lacks sm_80: {path}")
+    keyless = load_json(root / "outputs/retained_ckks_keyless_resources.json")
+    expected_keyless = {
+        "schema_version": 2,
+        "context_schema_version": 1,
+        "relinearization_key": False,
+        "rotation_steps": [],
+        "conjugation_key": False,
+        "rotate_batch": False,
+        "rotation_batches": [],
+        "raise_mod": False,
+        "monomial_powers": [],
+    }
+    if keyless != expected_keyless:
+        raise EvidenceError("retained compiler-emitted keyless resources differ")
+    gtest_attestation = load_json(root / "build/gtest-source-attestation.json")
+    if (
+        set(gtest_attestation)
+        != {
+            "schema_version",
+            "status",
+            "source_method",
+            "commit",
+            "tree",
+            "tracked_inventory_sha256",
+            "ace_gtest_archive_sha256",
+            "ace_dependency_module_sha256",
+            "fetchcontent_source_override",
+            "fetchcontent_fully_disconnected",
+        }
+        or gtest_attestation.get("schema_version")
+        != "ace.phantom.retained_ckks.gtest-source/1.0.0"
+        or gtest_attestation.get("status") != "pass"
+        or gtest_attestation.get("source_method")
+        != "ace-pinned-external-project-source-reuse"
+        or gtest_attestation.get("fetchcontent_source_override") is not True
+        or gtest_attestation.get("fetchcontent_fully_disconnected") is not True
+    ):
+        raise EvidenceError("retained googletest source attestation differs")
+    for field, length in (
+        ("commit", 40),
+        ("tree", 40),
+        ("tracked_inventory_sha256", 64),
+        ("ace_gtest_archive_sha256", 64),
+        ("ace_dependency_module_sha256", 64),
+    ):
+        require_digest(
+            gtest_attestation.get(field), length, f"retained googletest {field}"
+        )
+
     if fixture.get("qualification_bindings", {}).get("status") != "bound":
         raise EvidenceError("retained checked fixture binding is not bound")
     if fixture_path.read_bytes() != (

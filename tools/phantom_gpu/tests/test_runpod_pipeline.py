@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import importlib.util
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -449,6 +449,7 @@ def test_nonzero_sanitizer_exit_precedes_evidence_acceptance() -> None:
 def test_source_packaging_requires_local_ordinary_evidence() -> None:
     source = (TOOLS / "package_runpod_sources.sh").read_text(encoding="utf-8")
     assert "--ordinary-run-root" in source
+    assert "--retained-run-root" in source
     assert "--poly-degree)" not in source
     assert "--mul-level)" not in source
     assert "compiler-invocation.json" in source
@@ -489,14 +490,15 @@ def test_local_reproduction_uses_a_distinct_container_work_root() -> None:
         encoding="utf-8"
     )
 
-    assert '"${PAYLOAD}:/ordinary-replay/input:ro"' in local
-    assert '"${OUTPUT}:/ordinary-replay/output:rw"' in local
-    assert "--input-dir /ordinary-replay/input" in local
-    assert "--work-dir /ordinary-replay/output/work" in local
+    assert '"${PAYLOAD}:/retained-qualification/input:ro"' in local
+    assert '"${OUTPUT}:/retained-qualification/output:rw"' in local
+    assert "--input-dir /retained-qualification/input" in local
+    assert "--work-dir /retained-qualification/output/work" in local
     assert (
-        "--result-archive /ordinary-replay/output/local-result.tar.gz" in local
+        "--result-archive /retained-qualification/output/local-result.tar.gz"
+        in local
     )
-    assert "/ordinary-replay/" not in host_freeze
+    assert "/retained-qualification/" not in host_freeze
     assert "--work-dir /workspace/output/work" in host_freeze
 
 
@@ -684,6 +686,28 @@ def test_runpod_success_completeness_requires_every_terminal_record(
     function = source[start:end]
     results = tmp_path / "results"
     results.mkdir()
+    retained_context = results / "retained_compiler_context_manifest.json"
+    retained_context.write_text('{"schema_version":1}\n', encoding="utf-8")
+    native_stdout = results / "retained-native-primitives.stdout.txt"
+    native_stderr = results / "retained-native-primitives.stderr.txt"
+    native_stdout.write_text("[  PASSED  ] 9 tests.\n", encoding="utf-8")
+    native_stderr.write_text("", encoding="utf-8")
+    native_binary_sha256 = "a" * 64
+    artifact_directory = results / "retained-host"
+    artifact_directory.mkdir()
+    (artifact_directory / "artifact-manifest.json").write_text(
+        json.dumps(
+            {
+                "files": {
+                    "build/retained_ckks_native_primitives_sm80": (
+                        native_binary_sha256
+                    )
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     records = {
         "qualification-current.json": {
@@ -709,6 +733,135 @@ def test_runpod_success_completeness_requires_every_terminal_record(
         "ordinary_ckks_sanitizer.json": {
             "status": "pass",
             "exit_code": 0,
+        },
+        "retained-frozen-reference.json": {
+            "status": "pass",
+            "provider_neutral_ant_reference_matches": True,
+            "exact_artifact_count": 12,
+            "ant_replay": {
+                "comparison": (
+                    "semantic-summary-only-no-decoded-byte-comparison"
+                )
+            },
+        },
+        "retained_ckks_native_primitives.json": {
+            "schema_version": (
+                "ace.phantom.retained_ckks.native-primitives/1.0.0"
+            ),
+            "status": "pass",
+            "test_count": 9,
+            "binary_sha256": native_binary_sha256,
+            "emitted_context_manifest_sha256": hashlib.sha256(
+                retained_context.read_bytes()
+            ).hexdigest(),
+            "stdout_sha256": hashlib.sha256(native_stdout.read_bytes()).hexdigest(),
+            "stderr_sha256": hashlib.sha256(native_stderr.read_bytes()).hexdigest(),
+        },
+        "retained_ckks_compare.json": {
+            "status": "pass",
+            "gpu_vs_exact": {"status": "pass", "mismatch_count": 0},
+        },
+        "retained_ckks_exact_rns.json": {
+            "status": "pass",
+            "mismatch_count": 0,
+        },
+        "retained_ckks_adapter_aliases.json": {
+            "schema_version": (
+                "ace.phantom.retained_ckks.adapter-aliases/1.0.0"
+            ),
+            "status": "pass",
+            "cases": [
+                {
+                    "status": "pass",
+                    "alias_returned": True,
+                    "metadata_matches_out_of_place": True,
+                    "decoded_values_match_out_of_place": True,
+                    "residues_match_out_of_place": True,
+                },
+                {
+                    "status": "pass",
+                    "alias_returned": True,
+                    "metadata_matches_out_of_place": True,
+                    "decoded_values_match_out_of_place": True,
+                    "residues_match_out_of_place": True,
+                },
+            ],
+        },
+        "retained_ckks_rejections.json": {
+            "status": "pass",
+            "cases": [
+                {
+                    "case_id": "expected-rejection",
+                    "diagnostic": "EXPECTED",
+                    "manifest": "production",
+                    "exit_code": 134,
+                    "status": "pass",
+                }
+            ],
+        },
+        "retained_ckks_ownership.json": {
+            "schema_version": "ace.phantom.retained_ckks.ownership/1.0.0",
+            "status": "pass",
+            "iterations": 100,
+            "ordered_steps": [5, 0, -7, 5],
+            "batch_outputs_are_independent": True,
+            "free_order": [3, 1, 0, 2],
+        },
+        "retained_ckks_sanitizer.json": {
+            "status": "pass",
+            "error_summary": 0,
+        },
+        "retained_production_archive_audit.json": {
+            "schema_version": (
+                "ace.phantom.retained_ckks.production-archive-audit/1.0.0"
+            ),
+            "status": "pass",
+            "forbidden_entry_count": 0,
+            "inventories": [
+                {"forbidden_entries": []} for _ in range(6)
+            ],
+        },
+        "retained_generated_source_audit.json": {
+            "schema_version": (
+                "ace.phantom.retained_ckks.generated-source-audit/1.0.0"
+            ),
+            "status": "pass",
+            "required_calls": [
+                "Conjugate_ciph",
+                "Rotate_batch_ciph",
+                "Raise_mod",
+                "Mul_mono_ciph",
+            ],
+            "first_distinct_calls": [
+                "Conjugate_ciph",
+                "Rotate_batch_ciph",
+                "Raise_mod",
+                "Mul_mono_ciph",
+            ],
+            "rotation_array_emission": "ckks-owned-static-int32",
+            "forbidden_matches": [],
+        },
+        "retained_gtest_source_attestation.json": {
+            "schema_version": "ace.phantom.retained_ckks.gtest-source/1.0.0",
+            "status": "pass",
+            "source_method": "ace-pinned-external-project-source-reuse",
+            "fetchcontent_source_override": True,
+            "fetchcontent_fully_disconnected": True,
+        },
+        "retained_ckks_v1.json": {
+            "runtime_rejections": [
+                {
+                    "id": "expected-rejection",
+                    "diagnostic": "EXPECTED",
+                    "manifest": "production",
+                }
+            ],
+            "rotate_batch_steps": [5, 0, -7, 5],
+            "ownership": {
+                "iterations": 100,
+                "batch_outputs_are_independent": True,
+                "free_order": [3, 1, 0, 2],
+            },
         },
     }
     for name, record in records.items():

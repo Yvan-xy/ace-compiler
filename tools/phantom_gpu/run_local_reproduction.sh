@@ -6,13 +6,14 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 source "${SCRIPT_DIR}/transport_helpers.sh"
 
 usage() {
-  echo "usage: $0 --ace-commit COMMIT --phantom-commit COMMIT --ordinary-run-root DIR OUTPUT_DIRECTORY" >&2
+  echo "usage: $0 --ace-commit COMMIT --phantom-commit COMMIT --ordinary-run-root DIR --retained-run-root DIR OUTPUT_DIRECTORY" >&2
   exit 2
 }
 
 ACE_COMMIT=""
 PHANTOM_COMMIT=""
 ORDINARY_RUN_ROOT=""
+RETAINED_RUN_ROOT=""
 OUTPUT_ARGUMENT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -31,6 +32,11 @@ while [[ $# -gt 0 ]]; do
       ORDINARY_RUN_ROOT="$2"
       shift 2
       ;;
+    --retained-run-root)
+      [[ $# -ge 2 ]] || usage
+      RETAINED_RUN_ROOT="$2"
+      shift 2
+      ;;
     --)
       shift
       [[ $# -eq 1 && -z "${OUTPUT_ARGUMENT}" ]] || usage
@@ -46,7 +52,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "${ACE_COMMIT}" && -n "${PHANTOM_COMMIT}" &&
-   -n "${ORDINARY_RUN_ROOT}" && -n "${OUTPUT_ARGUMENT}" ]] || usage
+   -n "${ORDINARY_RUN_ROOT}" && -n "${RETAINED_RUN_ROOT}" &&
+   -n "${OUTPUT_ARGUMENT}" ]] || usage
 if [[ ! "${ACE_COMMIT}" =~ ^[0-9a-f]{40}$ ||
       ! "${PHANTOM_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "source commits must be full lowercase 40-character object IDs" >&2
@@ -85,7 +92,7 @@ mkdir -p "${OUTPUT}"
 chmod 0755 "${OUTPUT}"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-CONTAINER_NAME="ace-phantom-runpod-local-${RUN_ID}"
+CONTAINER_NAME="ace-phantom-retained-local-${RUN_ID}"
 PAYLOAD="${OUTPUT}/payload"
 DOCKER_EVIDENCE="${OUTPUT}/docker"
 mkdir -p "${DOCKER_EVIDENCE}"
@@ -104,7 +111,7 @@ cleanup() {
       echo "task-created container disappeared before exact cleanup: ${CONTAINER_ID}" >&2
       cleanup_exit=1
     elif [[ "$(docker inspect -f '{{index .Config.Labels "ace.phantom.task"}}' "${CONTAINER_ID}")" != \
-          "ordinary-local-reproduction" ]]; then
+          "retained-ckks-local-reproduction" ]]; then
       echo "cleanup refused an unlabeled container" >&2
       cleanup_exit=1
     else
@@ -136,6 +143,7 @@ bash "${SCRIPT_DIR}/package_runpod_sources.sh" \
   --ace-commit "${ACE_COMMIT}" \
   --phantom-commit "${PHANTOM_COMMIT}" \
   --ordinary-run-root "${ORDINARY_RUN_ROOT}" \
+  --retained-run-root "${RETAINED_RUN_ROOT}" \
   "${PAYLOAD}"
 docker pull --platform linux/amd64 "${BASE_IMAGE}" | tee "${DOCKER_EVIDENCE}/pull.txt"
 ACTUAL_BASE_ID="$(docker image inspect -f '{{.Id}}' "${BASE_IMAGE}")"
@@ -144,19 +152,19 @@ if [[ "${ACTUAL_BASE_ID}" != "${BASE_CONFIG}" ]]; then
   exit 1
 fi
 CONTAINER_ID="$(docker create --name "${CONTAINER_NAME}" \
-  --label ace.phantom.task=ordinary-local-reproduction \
+  --label ace.phantom.task=retained-ckks-local-reproduction \
   --platform linux/amd64 \
   --env ACE_RUNPOD_BASE_IMAGE="${BASE_IMAGE}" \
   --env ACE_RUNPOD_BASE_CONFIG_DIGEST="${BASE_CONFIG}" \
   --env ACE_PHANTOM_BUILD_JOBS="${ACE_PHANTOM_BUILD_JOBS:-$(nproc)}" \
-  --volume "${PAYLOAD}:/ordinary-replay/input:ro" \
-  --volume "${OUTPUT}:/ordinary-replay/output:rw" \
+  --volume "${PAYLOAD}:/retained-qualification/input:ro" \
+  --volume "${OUTPUT}:/retained-qualification/output:rw" \
   "${BASE_IMAGE}" \
-  bash /ordinary-replay/input/run_build_and_health.sh \
+  bash /retained-qualification/input/run_build_and_health.sh \
     --mode local \
-    --input-dir /ordinary-replay/input \
-    --work-dir /ordinary-replay/output/work \
-    --result-archive /ordinary-replay/output/local-result.tar.gz)"
+    --input-dir /retained-qualification/input \
+    --work-dir /retained-qualification/output/work \
+    --result-archive /retained-qualification/output/local-result.tar.gz)"
 docker inspect --type container "${CONTAINER_ID}" \
   >"${DOCKER_EVIDENCE}/disposable-container-created.json"
 set +e
