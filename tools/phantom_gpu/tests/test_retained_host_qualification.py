@@ -12,6 +12,9 @@ import pytest
 
 TOOLS = Path(__file__).resolve().parents[1]
 SCRIPT = TOOLS / "run_retained_ckks_correctness.sh"
+PHANTOM_MODULE = (
+    TOOLS.parents[1] / "fhe-cmplr/rtlib/cmake/modules/phantom.cmake"
+)
 
 
 def _load_air_tools():
@@ -110,3 +113,13 @@ def test_host_gate_attests_context_build_and_complete_result_tree() -> None:
     ):
         assert token in source
     assert "milestone" not in source.lower()
+
+
+def test_ordinary_phantom_external_install_is_an_explicit_noop() -> None:
+    source = PHANTOM_MODULE.read_text(encoding="utf-8")
+    assert (
+        "BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> "
+        "--target phantom_ordinary"
+    ) in source
+    assert "INSTALL_COMMAND ${CMAKE_COMMAND} -E true" in source
+    assert 'INSTALL_COMMAND ""' not in source

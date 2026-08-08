@@ -68,7 +68,11 @@ function(build_external_phantom)
                  -DPHANTOM_BUILD_EXAMPLES=OFF
                  -DPHANTOM_BUILD_TESTS=OFF
       BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target phantom_ordinary
-      INSTALL_COMMAND ""
+      # This argument list is expanded into ExternalProject_Add.  An empty
+      # string is dropped during list expansion and silently restores the
+      # default `cmake --build . --target install`, which pulls the native-BTS
+      # and CNN partitions into an ordinary/retained qualification build.
+      INSTALL_COMMAND ${CMAKE_COMMAND} -E true
       BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/external/src/phantom_external-build/lib/libphantom_ordinary.a)
   if(PHANTOM_SOURCE_SNAPSHOT)
     ExternalProject_Add(
