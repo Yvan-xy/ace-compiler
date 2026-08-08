@@ -10101,6 +10101,14 @@ py::dict run_ckks_driver(std::shared_ptr<GlobScope> glob) {
     // Run SIHE2CKKS_LOWER (only if there are SIHE operations to transform)
     try {
         fhe::ckks::CKKS_CONFIG cfg;
+        if (glob->fhe_config_set) {
+            cfg._poly_deg = glob->fhe_poly_degree;
+            cfg._max_cipher_lvl = glob->fhe_mul_level;
+            cfg._input_cipher_lvl = glob->fhe_input_level;
+            cfg._q0_bit_num = glob->fhe_first_prime_bits;
+            cfg._scale_factor_bit_num = glob->fhe_scaling_factor_bits;
+            cfg._hamming_weight = glob->fhe_hamming_weight;
+        }
         
         // Check if input already has CKKS operations (on original glob)
         // Recursively check all nested blocks (loops, conditionals)
@@ -10217,7 +10225,7 @@ py::dict run_ckks_driver(std::shared_ptr<GlobScope> glob) {
                     if (!has_loops) {
                         try {
                             air::driver::DRIVER_CTX driver_ctx;
-                            fhe::ckks::CKKS_CONFIG ckks_cfg;
+                            fhe::ckks::CKKS_CONFIG ckks_cfg = cfg;
                             fhe::ckks::SCALE_MANAGER scale_mngr(&driver_ctx, &ckks_cfg, ckks_func, lower_ctx.get());
                             scale_mngr.Run();
                             
@@ -10255,7 +10263,7 @@ py::dict run_ckks_driver(std::shared_ptr<GlobScope> glob) {
                      fit != ckks_glob->End_func_scope(); ++fit) {
                     FUNC_SCOPE* fs = &(*fit);
                     air::driver::DRIVER_CTX driver_ctx;
-                    fhe::ckks::CKKS_CONFIG ckks_cfg;
+                    fhe::ckks::CKKS_CONFIG ckks_cfg = cfg;
                     // Use PARS scale management so rescales are inserted after muls
                     // (ACE_SM only rescales when Rescale_node is true, which is false for CKKS-only IR).
                     ckks_cfg._pars_rsc = true;

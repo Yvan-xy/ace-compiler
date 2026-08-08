@@ -59,6 +59,24 @@ void SetValidContextParameters(fhe::core::CTX_PARAM& parameters) {
   parameters.Set_security_level(0);
 }
 
+NODE_PTR FindOpcode(NODE_PTR node, OPCODE opcode) {
+  if (node == Null_ptr) return Null_ptr;
+  if (node->Opcode() == opcode) return node;
+  if (node->Is_block()) {
+    for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+         stmt          = stmt->Next()) {
+      NODE_PTR found = FindOpcode(stmt->Node(), opcode);
+      if (found != Null_ptr) return found;
+    }
+    return Null_ptr;
+  }
+  for (uint32_t child = 0; child < node->Num_child(); ++child) {
+    NODE_PTR found = FindOpcode(node->Child(child), opcode);
+    if (found != Null_ptr) return found;
+  }
+  return Null_ptr;
+}
+
 TEST(CKKS2COrdinaryContract, NormalizesScalarRotationKeys) {
   EXPECT_EQ(fhe::core::Normalize_scalar_rotation_index(-1, 8192), -1);
   EXPECT_EQ(fhe::core::Normalize_scalar_rotation_index(8192, 8192), 0);
@@ -350,6 +368,145 @@ TEST_F(CKKSFullQPipelineTest, RaiseBeyondConfiguredFullQIsUserError) {
       stderr_text.find(
           "raise_mod target_q_count exceeds configured full data-Q count"),
       std::string::npos);
+}
+
+TEST(CKKS2COrdinaryContract, DriverEstablishesRetainedLevelMetadata) {
+  META_INFO::Remove_all();
+  ASSERT_TRUE(air::core::Register_core());
+  ASSERT_TRUE(fhe::sihe::Register_sihe_domain());
+  ASSERT_TRUE(fhe::ckks::Register_ckks_domain());
+
+  fhe::core::LOWER_CTX lower_ctx;
+  GLOB_SCOPE*          input = new GLOB_SCOPE(0, true);
+  const SPOS           spos  = input->Unknown_simple_spos();
+  fhe::sihe::SIHE_GEN(input, &lower_ctx).Register_sihe_types();
+  fhe::ckks::CKKS_GEN(input, &lower_ctx).Register_ckks_types();
+  TYPE_PTR cipher = lower_ctx.Get_cipher_type(input);
+
+  fhe::core::CTX_PARAM& parameters = lower_ctx.Get_ctx_param();
+  parameters.Set_poly_degree(32, false);
+  parameters.Set_mul_level(1, false);
+  parameters.Set_first_prime_bit_num(60);
+  parameters.Set_scaling_factor_bit_num(56);
+  parameters.Set_q_part_num(1);
+  parameters.Set_input_level(1);
+  parameters.Set_hamming_weight(8);
+  parameters.Set_security_level(0);
+
+  FUNC_PTR    function = input->New_func("retained_level_pipeline", spos);
+  FUNC_SCOPE* scope    = &input->New_func_scope(function);
+  SIGNATURE_TYPE_PTR signature = input->New_sig_type();
+  input->New_param("input", cipher, signature, spos);
+  input->New_ret_param(cipher->Id(), signature->Id());
+  signature->Set_complete();
+  input->New_entry_point(signature, function, "retained_level_pipeline", spos)
+      ->Set_program_entry();
+
+  CONTAINER*     container = &scope->Container();
+  ADDR_DATUM_PTR formal = scope->New_formal(cipher->Id(), "input", spos);
+  STMT_PTR       entry  = container->New_func_entry(spos, 1);
+  entry->Node()->Set_child(0, container->New_idname(formal, spos));
+
+  TYPE_PTR u32 = input->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  TYPE_PTR i64 = input->Prim_type(PRIMITIVE_TYPE::INT_S64);
+  TYPE_PTR i32 = input->Prim_type(PRIMITIVE_TYPE::INT_S32);
+
+  NODE_PTR raise =
+      container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, cipher, spos);
+  raise->Set_child(0, container->New_ld(formal, spos));
+  raise->Set_child(1, container->New_intconst(u32, 4, spos));
+  ADDR_DATUM_PTR raised = scope->New_var(cipher, "raised", spos);
+  container->Stmt_list().Append(container->New_st(raise, raised, spos));
+
+  NODE_PTR mono =
+      container->New_cust_node(fhe::ckks::OPC_MUL_MONO, cipher, spos);
+  mono->Set_child(0, container->New_ld(raised, spos));
+  mono->Set_child(1, container->New_intconst(i64, 16, spos));
+  ADDR_DATUM_PTR multiplied = scope->New_var(cipher, "multiplied", spos);
+  container->Stmt_list().Append(
+      container->New_st(mono, multiplied, spos));
+
+  NODE_PTR conjugate =
+      container->New_cust_node(fhe::ckks::OPC_CONJUGATE, cipher, spos);
+  conjugate->Set_child(0, container->New_ld(multiplied, spos));
+  ADDR_DATUM_PTR conjugated = scope->New_var(cipher, "conjugated", spos);
+  container->Stmt_list().Append(
+      container->New_st(conjugate, conjugated, spos));
+
+  TYPE_PTR batch_type = input->New_arr_type(
+      input->New_str("retained_level_batch"), cipher, {4}, spos);
+  NODE_PTR batch = container->New_cust_node(
+      fhe::ckks::OPC_ROTATE_BATCH, batch_type, spos);
+  batch->Set_child(0, container->New_ld(conjugated, spos));
+  const int32_t steps[] = {5, 0, -7, 5};
+  batch->Set_attr(nn::core::ATTR::RNUM, steps, 4);
+  ADDR_DATUM_PTR rotations = scope->New_var(batch_type, "rotations", spos);
+  container->Stmt_list().Append(
+      container->New_st(batch, rotations, spos));
+
+  NODE_PTR address = container->New_array(
+      container->New_lda(rotations, POINTER_KIND::FLAT64, spos), 1, spos);
+  container->Set_array_idx(address, 0,
+                           container->New_intconst(i32, 0, spos));
+  NODE_PTR first = container->New_ild(address, spos);
+  ADDR_DATUM_PTR output = scope->New_var(cipher, "output", spos);
+  container->Stmt_list().Append(container->New_st(first, output, spos));
+  container->Stmt_list().Append(
+      container->New_retv(container->New_ld(output, spos), spos));
+
+  fhe::ckks::CKKS_CONFIG config;
+  config._poly_deg         = 32;
+  config._max_cipher_lvl   = 4;
+  config._input_cipher_lvl = 1;
+  config._q0_bit_num       = 60;
+  config._scale_factor_bit_num = 56;
+  config._hamming_weight       = 8;
+  air::driver::DRIVER_CTX driver_context;
+  R_CODE                  status = R_CODE::INTERNAL;
+  GLOB_SCOPE* result = fhe::ckks::Ckks_driver(
+      input, &lower_ctx, &driver_context, &config, &status);
+  ASSERT_EQ(status, R_CODE::NORMAL);
+  ASSERT_NE(result, nullptr);
+
+  NODE_PTR root = (*result->Begin_func_scope()).Container().Entry_node();
+  raise         = FindOpcode(root, fhe::ckks::OPC_RAISE_MOD);
+  mono          = FindOpcode(root, fhe::ckks::OPC_MUL_MONO);
+  conjugate     = FindOpcode(root, fhe::ckks::OPC_CONJUGATE);
+  batch         = FindOpcode(root, fhe::ckks::OPC_ROTATE_BATCH);
+  ASSERT_NE(raise, Null_ptr);
+  ASSERT_NE(mono, Null_ptr);
+  ASSERT_NE(conjugate, Null_ptr);
+  ASSERT_NE(batch, Null_ptr);
+
+  auto expect_metadata = [](NODE_PTR node, uint32_t level, uint32_t scale,
+                            uint32_t rescale) {
+    const uint32_t* observed_level =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
+    const uint32_t* observed_scale =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::SCALE);
+    const uint32_t* observed_rescale =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::RESCALE_LEVEL);
+    ASSERT_NE(observed_level, nullptr);
+    ASSERT_NE(observed_scale, nullptr);
+    ASSERT_NE(observed_rescale, nullptr);
+    EXPECT_EQ(*observed_level, level);
+    EXPECT_EQ(*observed_scale, scale);
+    EXPECT_EQ(*observed_rescale, rescale);
+  };
+
+  expect_metadata(raise->Child(0), 1, 1, 4);
+  expect_metadata(raise, 4, 1, 1);
+  for (NODE_PTR preserved : {mono, conjugate, batch}) {
+    expect_metadata(preserved->Child(0), 4, 1, 1);
+    expect_metadata(preserved, 4, 1, 1);
+  }
+  EXPECT_EQ(lower_ctx.Get_ctx_param().Get_mul_level(), 4u);
+
+  std::string diagnostic;
+  EXPECT_TRUE(CKKS2C_VERIFIER::Verify(
+      result, lower_ctx.Get_ctx_param(), PROVIDER::PHANTOM, &diagnostic))
+      << diagnostic;
+  delete result;
 }
 
 TEST(CKKS2COrdinaryContract, RejectsProviderUnsupportedPolynomialDegree) {
@@ -1126,8 +1283,8 @@ TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
 
   NODE_PTR conjugate =
       _container->New_cust_node(fhe::ckks::OPC_CONJUGATE, _cipher, _spos);
-  conjugate->Set_child(0, Cipher_load(2, 1, 0));
-  Set_metadata(conjugate, 2, 1, 0);
+  conjugate->Set_child(0, Cipher_load(2, 1, 3));
+  Set_metadata(conjugate, 2, 1, 3);
   ADDR_DATUM_PTR conjugated =
       _func_scope->New_var(_cipher, "conjugated", _spos);
   _container->Stmt_list().Append(
@@ -1136,10 +1293,10 @@ TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
   TYPE_PTR batch_type = Cipher_array({4});
   NODE_PTR batch = _container->New_cust_node(
       fhe::ckks::OPC_ROTATE_BATCH, batch_type, _spos);
-  batch->Set_child(0, Cipher_load(2, 1, 0));
+  batch->Set_child(0, Cipher_load(2, 1, 3));
   const int32_t batch_steps[] = {0, -1, -1, 17};
   batch->Set_attr(nn::core::ATTR::RNUM, batch_steps, 4);
-  Set_metadata(batch, 2, 1, 0);
+  Set_metadata(batch, 2, 1, 3);
   ADDR_DATUM_PTR rotated =
       _func_scope->New_var(batch_type, "rotated", _spos);
   _container->Stmt_list().Append(_container->New_st(batch, rotated, _spos));
@@ -1154,9 +1311,9 @@ TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
 
   NODE_PTR mono =
       _container->New_cust_node(fhe::ckks::OPC_MUL_MONO, _cipher, _spos);
-  mono->Set_child(0, Cipher_load(2, 1, 0));
+  mono->Set_child(0, Cipher_load(2, 1, 3));
   mono->Set_child(1, _container->New_intconst(i64, -1, _spos));
-  Set_metadata(mono, 2, 1, 0);
+  Set_metadata(mono, 2, 1, 3);
   ADDR_DATUM_PTR monomial =
       _func_scope->New_var(_cipher, "monomial", _spos);
   _container->Stmt_list().Append(_container->New_st(mono, monomial, _spos));

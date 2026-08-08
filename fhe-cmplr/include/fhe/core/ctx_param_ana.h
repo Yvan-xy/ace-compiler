@@ -198,6 +198,32 @@ public:
     node->Set_attr(core::FHE_ATTR_KIND::LEVEL, &mul_level, 1);
   }
 
+  //! Return the active data-Q count represented by matching, preserved
+  //! RESCALE_LEVEL metadata.  The scale manager runs before context-parameter
+  //! analysis and owns this forward level coordinate; using it here keeps a
+  //! retained operation's LEVEL independent of whether its result is carried
+  //! through a scalar or ciphertext-array SSA value.
+  uint32_t Preserved_active_q_count(NODE_PTR result, NODE_PTR input) const {
+    if (result == air::base::Null_ptr || input == air::base::Null_ptr) {
+      return INVALID_LVL;
+    }
+    const uint32_t* result_rescale =
+        result->Attr<uint32_t>(core::FHE_ATTR_KIND::RESCALE_LEVEL);
+    const uint32_t* input_rescale =
+        input->Attr<uint32_t>(core::FHE_ATTR_KIND::RESCALE_LEVEL);
+    if (result_rescale == nullptr || input_rescale == nullptr ||
+        *result_rescale != *input_rescale) {
+      return INVALID_LVL;
+    }
+
+    const uint32_t full_q_count = Lower_ctx()->Get_ctx_param().Get_mul_level();
+    if (full_q_count == 0 || *result_rescale == 0 ||
+        *result_rescale > full_q_count) {
+      return INVALID_LVL;
+    }
+    return full_q_count - *result_rescale + 1;
+  }
+
   uint32_t Input_level() {
     if (Func_scope()->Owning_func()->Entry_point()->Is_program_entry()) {
       uint32_t input_lev_config = _config->Input_cipher_lvl();
@@ -991,6 +1017,11 @@ RETV CKKS_ANA_IMPL::Handle_rotate_batch(VISITOR* visitor, NODE_PTR rot_node) {
   }
   CTX_PARAM_ANA_CTX& ana_ctx   = visitor->Context();
   uint32_t           mul_level = ana_ctx.Top_mul_level();
+  const uint32_t preserved_q =
+      ana_ctx.Preserved_active_q_count(rot_node, rot_node->Child(0));
+  if (preserved_q != CTX_PARAM_ANA_CTX::INVALID_LVL) {
+    mul_level = preserved_q;
+  }
   ana_ctx.Set_node_mul_level(rot_node, mul_level);
 
   ana_ctx.Push_mul_level(mul_level);
@@ -1027,6 +1058,11 @@ RETV CKKS_ANA_IMPL::Handle_mul_mono(VISITOR* visitor, NODE_PTR mul_mono_node) {
   }
   CTX_PARAM_ANA_CTX& ana_ctx   = visitor->Context();
   uint32_t           mul_level = ana_ctx.Top_mul_level();
+  const uint32_t preserved_q = ana_ctx.Preserved_active_q_count(
+      mul_mono_node, mul_mono_node->Child(0));
+  if (preserved_q != CTX_PARAM_ANA_CTX::INVALID_LVL) {
+    mul_level = preserved_q;
+  }
   ana_ctx.Set_node_mul_level(mul_mono_node, mul_level);
 
   ana_ctx.Trace(ckks::TRACE_DETAIL::TD_CKKS_LEVEL_MGT,
@@ -1063,6 +1099,11 @@ RETV CKKS_ANA_IMPL::Handle_conjugate(VISITOR* visitor, NODE_PTR conjugate_node) 
   }
   CTX_PARAM_ANA_CTX& ana_ctx   = visitor->Context();
   uint32_t           mul_level = ana_ctx.Top_mul_level();
+  const uint32_t preserved_q = ana_ctx.Preserved_active_q_count(
+      conjugate_node, conjugate_node->Child(0));
+  if (preserved_q != CTX_PARAM_ANA_CTX::INVALID_LVL) {
+    mul_level = preserved_q;
+  }
   ana_ctx.Set_node_mul_level(conjugate_node, mul_level);
 
   ana_ctx.Trace(ckks::TRACE_DETAIL::TD_CKKS_LEVEL_MGT,
