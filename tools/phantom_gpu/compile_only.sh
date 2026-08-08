@@ -1669,7 +1669,17 @@ build_ordinary_conformance() {
     --hamming-weight "${COMPILER_HAMMING_WEIGHT}" \
     --resource-mode keyless
   cmp "${context_manifest}" "${keyless_context}"
-  jq -e '.relinearization_key == false and .rotation_steps == []' \
+  jq -e '
+    .schema_version == 2 and
+    .context_schema_version == 1 and
+    .relinearization_key == false and
+    .rotation_steps == [] and
+    .conjugation_key == false and
+    .rotate_batch == false and
+    .rotation_batches == [] and
+    .raise_mod == false and
+    .monomial_powers == []
+  ' \
     "${keyless_resources}" >/dev/null
   python3 "${SCRIPT_DIR}/check_primitive_codegen.py" \
     "${keyless_source}" \

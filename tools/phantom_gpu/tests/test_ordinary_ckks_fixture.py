@@ -22,7 +22,7 @@ CONTEXT_MANIFEST_TEXT = (
     '{"data_q_bit_sizes":[60,56,56,56],"first_modulus_bits":60,'
     '"hamming_weight":192,"input_level":1,"logical_slot_capacity":8192,'
     '"packing":"full","polynomial_degree":16384,"q_part_count":2,'
-    '"resource_schema_version":1,"scaling_modulus_bits":56,'
+    '"resource_schema_version":2,"scaling_modulus_bits":56,'
     '"schema_version":1,"security_level":0,'
     '"special_p_bit_sizes":[60,60]}'
 )

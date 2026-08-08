@@ -35,7 +35,8 @@ extern "C" const PHANTOM_CONTEXT_MANIFEST* Get_phantom_context_manifest() {
   return &context;
 }
 extern "C" const PHANTOM_RESOURCE_MANIFEST* Get_phantom_resource_manifest() {
-  static const PHANTOM_RESOURCE_MANIFEST resources = {1, 1, 0, 0, nullptr};
+  static const PHANTOM_RESOURCE_MANIFEST resources = {
+      2, 1, 0, 0, nullptr, 0, nullptr, nullptr, 0, nullptr};
   return &resources;
 }
 """
@@ -54,7 +55,7 @@ CONTEXT = {
     "security_level": 0,
     "first_modulus_bits": 60,
     "scaling_modulus_bits": 56,
-    "resource_schema_version": 1,
+    "resource_schema_version": 2,
 }
 
 

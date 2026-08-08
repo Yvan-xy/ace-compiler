@@ -276,7 +276,7 @@ degree = context["polynomial_degree"]
 data_q = context["data_q_bit_sizes"]
 if (
     context["schema_version"] != 1
-    or context["resource_schema_version"] != 1
+    or context["resource_schema_version"] != 2
     or context["packing"] != "full"
     or isinstance(degree, bool)
     or not isinstance(degree, int)

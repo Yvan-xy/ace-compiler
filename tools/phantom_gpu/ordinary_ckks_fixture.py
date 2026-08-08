@@ -385,7 +385,7 @@ def validate_context_manifest(value: Any) -> dict[str, int]:
         },
         "compiler context manifest",
     )
-    if manifest["schema_version"] != 1 or manifest["resource_schema_version"] != 1:
+    if manifest["schema_version"] != 1 or manifest["resource_schema_version"] != 2:
         fail("compiler context manifest schema is unsupported")
     if manifest["packing"] != "full":
         fail("compiler context manifest packing is unsupported")
