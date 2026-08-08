@@ -61,6 +61,14 @@ bool Fail_node(NODE_PTR node, const std::string& message,
   return Fail(os.str(), diagnostic);
 }
 
+NODE_PTR Child_or_null(NODE_PTR node, uint32_t index) {
+  if (node == air::base::Null_ptr || index >= node->Num_child() ||
+      node->Child_id(index) == air::base::Null_id) {
+    return air::base::Null_ptr;
+  }
+  return node->Child(index);
+}
+
 bool Has_record_name(TYPE_PTR type, const char* expected) {
   if (type == air::base::Null_ptr || !type->Is_record() ||
       type->Name() == air::base::Null_ptr) {
@@ -427,7 +435,8 @@ bool Verify_phantom_conjugate(NODE_PTR node, std::string* diagnostic) {
                      "Phantom CKKS2C conjugate requires exactly one operand",
                      diagnostic);
   }
-  return Verify_retained_cipher_result(node, node->Child(0), diagnostic);
+  return Verify_retained_cipher_result(node, Child_or_null(node, 0),
+                                       diagnostic);
 }
 
 bool Verify_phantom_rotate_batch(NODE_PTR node, std::string* diagnostic) {
@@ -436,8 +445,9 @@ bool Verify_phantom_rotate_batch(NODE_PTR node, std::string* diagnostic) {
         node, "Phantom CKKS2C rotate_batch requires exactly one operand",
         diagnostic);
   }
-  if (node->Child(0) == air::base::Null_ptr ||
-      Operand_kind(node->Child(0)->Rtype()) != OPERAND_KIND::CIPHER) {
+  NODE_PTR input = Child_or_null(node, 0);
+  if (input == air::base::Null_ptr ||
+      Operand_kind(input->Rtype()) != OPERAND_KIND::CIPHER) {
     return Fail_node(node,
                      "Phantom CKKS2C rotate_batch requires a CIPHERTEXT "
                      "operand",
@@ -458,14 +468,14 @@ bool Verify_phantom_rotate_batch(NODE_PTR node, std::string* diagnostic) {
       Operand_kind(result_type->Cast_to_arr()->Elem_type()) !=
           OPERAND_KIND::CIPHER ||
       result_type->Cast_to_arr()->Elem_type_id() !=
-          node->Child(0)->Rtype_id()) {
+          input->Rtype_id()) {
     return Fail_node(
         node,
         "Phantom CKKS2C rotate_batch requires a one-dimensional "
         "CIPHERTEXT array whose exact length matches RNUM",
         diagnostic);
   }
-  return Verify_preserved_metadata(node, node->Child(0), diagnostic);
+  return Verify_preserved_metadata(node, input, diagnostic);
 }
 
 bool Verify_phantom_raise_mod(NODE_PTR node,
@@ -478,15 +488,15 @@ bool Verify_phantom_raise_mod(NODE_PTR node,
         "Phantom CKKS2C raise_mod forbids runtime target-level helpers",
         diagnostic);
   }
-  if (node->Num_child() != 2 ||
-      node->Child(1) == air::base::Null_ptr ||
-      node->Child(1)->Opcode() != air::core::OPC_INTCONST) {
+  NODE_PTR target_node = Child_or_null(node, 1);
+  if (node->Num_child() != 2 || target_node == air::base::Null_ptr ||
+      target_node->Opcode() != air::core::OPC_INTCONST) {
     return Fail_node(
         node,
         "Phantom CKKS2C raise_mod requires a constant target_q_count",
         diagnostic);
   }
-  const int64_t target = node->Child(1)->Intconst();
+  const int64_t target = target_node->Intconst();
   const int64_t full_q = static_cast<int64_t>(context._data_q_bit_sizes.size());
   if (target < 1 || target > full_q) {
     std::ostringstream os;
@@ -500,7 +510,7 @@ bool Verify_phantom_raise_mod(NODE_PTR node,
        << full_q << ", got " << target;
     return Fail_node(node, os.str(), diagnostic);
   }
-  NODE_PTR input = node->Child(0);
+  NODE_PTR input = Child_or_null(node, 0);
   if (input == air::base::Null_ptr ||
       Operand_kind(input->Rtype()) != OPERAND_KIND::CIPHER ||
       Operand_kind(node->Rtype()) != OPERAND_KIND::CIPHER ||
@@ -534,9 +544,9 @@ bool Verify_phantom_raise_mod(NODE_PTR node,
 bool Verify_phantom_mul_mono(NODE_PTR node,
                              const PHANTOM_CONTEXT_DESCRIPTOR& context,
                              std::string* diagnostic) {
-  if (node->Num_child() != 2 ||
-      node->Child(1) == air::base::Null_ptr ||
-      node->Child(1)->Opcode() != air::core::OPC_INTCONST) {
+  NODE_PTR power_node = Child_or_null(node, 1);
+  if (node->Num_child() != 2 || power_node == air::base::Null_ptr ||
+      power_node->Opcode() != air::core::OPC_INTCONST) {
     return Fail_node(node,
                      "Phantom CKKS2C mul_mono requires a constant monomial "
                      "power",
@@ -554,7 +564,7 @@ bool Verify_phantom_mul_mono(NODE_PTR node,
                      "degree",
                      diagnostic);
   }
-  const int64_t power = node->Child(1)->Intconst();
+  const int64_t power = power_node->Intconst();
   const int64_t period = static_cast<int64_t>(context._poly_degree) * 2;
   if (power < 0 || power >= period) {
     std::ostringstream os;
@@ -562,7 +572,8 @@ bool Verify_phantom_mul_mono(NODE_PTR node,
        << period << "), got " << power;
     return Fail_node(node, os.str(), diagnostic);
   }
-  return Verify_retained_cipher_result(node, node->Child(0), diagnostic);
+  return Verify_retained_cipher_result(node, Child_or_null(node, 0),
+                                       diagnostic);
 }
 
 bool Verify_phantom_rotate(NODE_PTR node, std::string* diagnostic) {
@@ -688,15 +699,26 @@ bool Verify_ckks_node(NODE_PTR node,
     case CKKS_OPERATOR::RELIN:
     case CKKS_OPERATOR::SCALE:
     case CKKS_OPERATOR::LEVEL:
-    case CKKS_OPERATOR::CONJUGATE:
     case CKKS_OPERATOR::FREE:
+      return true;
+
+    case CKKS_OPERATOR::CONJUGATE:
+      if (node->Num_child() != 1 ||
+          Child_or_null(node, 0) == air::base::Null_ptr) {
+        return Fail("CKKS2C conjugate requires exactly one operand",
+                    diagnostic);
+      }
       return true;
 
     case CKKS_OPERATOR::ROTATE_BATCH: {
       uint32_t count = 0;
       const int* rotations =
           node->Attr<int>(nn::core::ATTR::RNUM, &count);
-      if (rotations == nullptr || count == 0 || !node->Rtype()->Is_array() ||
+      if (node->Num_child() != 1 ||
+          Child_or_null(node, 0) == air::base::Null_ptr ||
+          rotations == nullptr || count == 0 ||
+          node->Rtype() == air::base::Null_ptr ||
+          !node->Rtype()->Is_array() ||
           node->Rtype()->Cast_to_arr()->Elem_count() != count) {
         return Fail(
             "CKKS2C rotate_batch requires a non-empty ordered RNUM attribute "
@@ -706,22 +728,32 @@ bool Verify_ckks_node(NODE_PTR node,
       return true;
     }
 
-    case CKKS_OPERATOR::RAISE_MOD:
+    case CKKS_OPERATOR::RAISE_MOD: {
+      NODE_PTR target_node = Child_or_null(node, 1);
       if (node->Num_child() != 2 ||
-          node->Child(1)->Opcode() != air::core::OPC_INTCONST) {
+          Child_or_null(node, 0) == air::base::Null_ptr ||
+          target_node == air::base::Null_ptr ||
+          target_node->Opcode() != air::core::OPC_INTCONST) {
         return Fail(
-            "CKKS2C raise_mod requires a constant target_q_count operand",
+            "CKKS2C raise_mod requires an input and a constant "
+            "target_q_count operand",
             diagnostic);
       }
       return true;
+    }
 
-    case CKKS_OPERATOR::MUL_MONO:
+    case CKKS_OPERATOR::MUL_MONO: {
+      NODE_PTR power_node = Child_or_null(node, 1);
       if (node->Num_child() != 2 ||
-          node->Child(1)->Opcode() != air::core::OPC_INTCONST) {
-        return Fail("CKKS2C mul_mono requires a constant monomial power",
+          Child_or_null(node, 0) == air::base::Null_ptr ||
+          power_node == air::base::Null_ptr ||
+          power_node->Opcode() != air::core::OPC_INTCONST) {
+        return Fail("CKKS2C mul_mono requires an input and a constant "
+                    "monomial power",
                     diagnostic);
       }
       return true;
+    }
 
     case CKKS_OPERATOR::BOOTSTRAP:
     case CKKS_OPERATOR::BOOTSTRAP_COEFFS_TO_SLOTS:

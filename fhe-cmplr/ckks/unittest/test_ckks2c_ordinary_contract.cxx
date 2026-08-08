@@ -1016,7 +1016,8 @@ TEST_F(CKKS2COrdinaryAirVerifier, RejectsRetainedMetadataMismatchWithNode) {
   EXPECT_NE(diagnostic.find("opcode="), std::string::npos);
   EXPECT_NE(diagnostic.find("conjugate"), std::string::npos);
   EXPECT_NE(diagnostic.find("AIR="), std::string::npos);
-  EXPECT_NE(diagnostic.find("SCALE"), std::string::npos);
+  EXPECT_NE(diagnostic.find("must preserve scale metadata"),
+            std::string::npos);
 }
 
 TEST_F(CKKS2COrdinaryAirVerifier, RejectsMissingRetainedResultMetadata) {
@@ -1025,7 +1026,7 @@ TEST_F(CKKS2COrdinaryAirVerifier, RejectsMissingRetainedResultMetadata) {
   conjugate->Set_child(0, Cipher_load(2, 3, 1));
   std::string diagnostic;
   EXPECT_FALSE(Verify(conjugate, &diagnostic));
-  EXPECT_NE(diagnostic.find("must preserve LEVEL metadata"),
+  EXPECT_NE(diagnostic.find("must preserve level metadata"),
             std::string::npos);
 }
 
@@ -1065,6 +1066,18 @@ TEST_F(CKKS2COrdinaryAirVerifier, DiagnosesRaiseMissingOperand) {
   EXPECT_NE(diagnostic.find("opcode="), std::string::npos);
 }
 
+TEST_F(CKKS2COrdinaryAirVerifier, DiagnosesRaiseMissingTargetOperand) {
+  NODE_PTR raise =
+      _container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, _cipher, _spos);
+  raise->Set_child(0, Cipher_load(1, 1, 4));
+  Set_metadata(raise, 4, 1, 1);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(raise, &diagnostic));
+  EXPECT_NE(diagnostic.find("requires a constant target_q_count"),
+            std::string::npos);
+  EXPECT_NE(diagnostic.find("opcode="), std::string::npos);
+}
+
 TEST_F(CKKS2COrdinaryAirVerifier, DiagnosesMulMonoMissingOperand) {
   TYPE_PTR i64 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
   NODE_PTR mono =
@@ -1074,6 +1087,18 @@ TEST_F(CKKS2COrdinaryAirVerifier, DiagnosesMulMonoMissingOperand) {
   std::string diagnostic;
   EXPECT_FALSE(Verify(mono, &diagnostic));
   EXPECT_NE(diagnostic.find("matching CIPHERTEXT input/result types"),
+            std::string::npos);
+  EXPECT_NE(diagnostic.find("opcode="), std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, DiagnosesMulMonoMissingPowerOperand) {
+  NODE_PTR mono =
+      _container->New_cust_node(fhe::ckks::OPC_MUL_MONO, _cipher, _spos);
+  mono->Set_child(0, Cipher_load());
+  Set_metadata(mono);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(mono, &diagnostic));
+  EXPECT_NE(diagnostic.find("requires a constant monomial power"),
             std::string::npos);
   EXPECT_NE(diagnostic.find("opcode="), std::string::npos);
 }
