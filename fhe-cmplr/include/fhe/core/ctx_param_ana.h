@@ -179,7 +179,10 @@ public:
   void Record_rotate_batch(NODE_ID node_id,
                            const std::vector<int32_t>& steps) {
     if (_rotate_batch_nodes.insert(node_id.Value()).second) {
-      _rotate_batches.push_back(steps);
+      // Context-parameter analysis visits statements in reverse data-flow
+      // order.  Prepending restores the forward statement order used by
+      // CKKS2C, so the authenticated manifest and emitted calls agree.
+      _rotate_batches.insert(_rotate_batches.begin(), steps);
     }
     _rotate_batch_required = true;
   }

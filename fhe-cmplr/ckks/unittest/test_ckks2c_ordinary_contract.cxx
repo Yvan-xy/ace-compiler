@@ -1078,6 +1078,42 @@ TEST_F(CKKS2COrdinaryAirVerifier, AcceptsOrderedRotateBatchWithDuplicatesAndZero
   EXPECT_TRUE(Verify(batch, &diagnostic)) << diagnostic;
 }
 
+TEST_F(CKKS2COrdinaryAirVerifier,
+       RecordsRotateBatchesInForwardStatementOrder) {
+  auto append_batch = [this](const char* name,
+                             const std::vector<int32_t>& steps) {
+    TYPE_PTR batch_type = Cipher_array(
+        {static_cast<int64_t>(steps.size())});
+    NODE_PTR batch = _container->New_cust_node(
+        fhe::ckks::OPC_ROTATE_BATCH, batch_type, _spos);
+    batch->Set_child(0, Cipher_load(2, 1, 3));
+    batch->Set_attr(nn::core::ATTR::RNUM, steps.data(),
+                    static_cast<uint32_t>(steps.size()));
+    Set_metadata(batch, 2, 1, 3);
+    ADDR_DATUM_PTR result = _func_scope->New_var(batch_type, name, _spos);
+    _container->Stmt_list().Append(
+        _container->New_st(batch, result, _spos));
+  };
+
+  const std::vector<int32_t> first{5, 0, -7, 5};
+  const std::vector<int32_t> second{256, 512};
+  append_batch("first_batch", first);
+  append_batch("second_batch", second);
+  _container->Stmt_list().Append(
+      _container->New_retv(Cipher_load(2, 1, 3), _spos));
+
+  fhe::ckks::CKKS_CONFIG config;
+  config._poly_deg         = 32;
+  config._max_cipher_lvl   = 4;
+  config._input_cipher_lvl = 4;
+  air::driver::DRIVER_CTX driver_context;
+  fhe::core::CTX_PARAM_ANA analysis(_func_scope, &_lower_ctx,
+                                    &driver_context, &config);
+  ASSERT_EQ(analysis.Run(), R_CODE::NORMAL);
+  EXPECT_EQ(_lower_ctx.Get_ctx_param().Get_rotate_batches(),
+            (std::vector<std::vector<int32_t>>{first, second}));
+}
+
 TEST_F(CKKS2COrdinaryAirVerifier, RejectsRotateBatchMissingRnum) {
   NODE_PTR batch = _container->New_cust_node(
       fhe::ckks::OPC_ROTATE_BATCH, Cipher_array({1}), _spos);
