@@ -88,9 +88,10 @@ fi
   cd "${INPUT}"
   sha256sum -c SHA256SUMS
 )
-python3 - "${INPUT}/payload.json" \
-  "${INPUT}/ace-source.manifest.json" \
-  "${INPUT}/phantom-source.manifest.json" <<'PY'
+verify_payload_identity() {
+  python3 - "${INPUT}/payload.json" \
+    "${INPUT}/ace-source.manifest.json" \
+    "${INPUT}/phantom-source.manifest.json" <<'PY'
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -146,6 +147,7 @@ for kind, path in (("ace", ace_path), ("phantom", phantom_path)):
 if payload.get("source_snapshots") != bindings:
     raise SystemExit("retained payload does not bind its source manifests")
 PY
+}
 
 ACE_APT_LOCK="${INPUT}/apt-packages.lock" \
 ACE_PYTHON_LOCK="${INPUT}/python-requirements-hashed.lock" \
@@ -153,6 +155,11 @@ ACE_BASE_FILES_LOCK="${INPUT}/base-files.sha256" \
 ACE_DEPENDENCIES_LOCK="${INPUT}/dependencies.env" \
   bash "${INPUT}/bootstrap_environment.sh" "${WORK}/environment"
 export PATH="/opt/ace-runpod-venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+command -v python3 >/dev/null || {
+  echo "retained host-freeze bootstrap did not install Python" >&2
+  exit 1
+}
+verify_payload_identity
 
 ACE_ARCHIVE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "${INPUT}/ace-source.manifest.json")"
 PHANTOM_ARCHIVE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "${INPUT}/phantom-source.manifest.json")"

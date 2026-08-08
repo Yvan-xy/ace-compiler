@@ -245,3 +245,13 @@ def test_snapshot_entry_invokes_only_the_retained_host_gate() -> None:
     assert "compute-sanitizer" not in snapshot
     assert "cuda-memcheck" not in snapshot
     assert "gpu_executables_were_run" in snapshot
+
+
+def test_snapshot_bootstraps_python_before_deep_payload_validation() -> None:
+    snapshot = source(SNAPSHOT)
+    checksum = snapshot.index("sha256sum -c SHA256SUMS")
+    bootstrap = snapshot.index('bash "${INPUT}/bootstrap_environment.sh"')
+    python_check = snapshot.index("command -v python3")
+    identity_call = snapshot.index("\nverify_payload_identity\n")
+
+    assert checksum < bootstrap < python_check < identity_call
