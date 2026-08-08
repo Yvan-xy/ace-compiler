@@ -13,6 +13,9 @@ from ace_edsl.edsl import AceEDSL, CkksCiphertext, ckks_kernel
 
 
 EDGE_ROTATION_BATCH = [5, 0, -7, 5]
+GENERATED_FUNCTIONS = (
+    "retained_ckks_conformance",
+)
 
 
 class ContextManifestError(ValueError):
@@ -58,7 +61,7 @@ def load_context_dimensions(path: Path) -> tuple[int, int, int]:
     return degree, slots, len(data_q)
 
 
-def load_production_rotation_batches(path: Path) -> tuple[tuple[int, ...], ...]:
+def _load_retained_fixture(path: Path) -> dict[str, Any]:
     try:
         fixture = json.loads(
             path.read_text(encoding="utf-8"),
@@ -75,6 +78,11 @@ def load_production_rotation_batches(path: Path) -> tuple[tuple[int, ...], ...]:
         != "ace.phantom.retained_ckks.fixture/1.0.0"
     ):
         raise ContextManifestError("retained fixture schema is unsupported")
+    return fixture
+
+
+def load_production_rotation_batches(path: Path) -> tuple[tuple[int, ...], ...]:
+    fixture = _load_retained_fixture(path)
     batches = fixture.get("production_rotation_batches")
     if not isinstance(batches, list) or not batches:
         raise ContextManifestError("retained fixture has no production rotation batches")
@@ -92,17 +100,32 @@ def load_production_rotation_batches(path: Path) -> tuple[tuple[int, ...], ...]:
     return tuple(result)
 
 
+def load_normalized_monomial_powers(path: Path, degree: int) -> tuple[int, ...]:
+    fixture = _load_retained_fixture(path)
+    symbolic = fixture.get("monomial_powers")
+    expected = ("0", "N/2", "N", "3N/2", "2N-1", "2N+1")
+    if symbolic != list(expected):
+        raise ContextManifestError("retained monomial power matrix changed")
+    raw = (0, degree // 2, degree, 3 * degree // 2, 2 * degree - 1, 2 * degree + 1)
+    normalized = tuple(power % (2 * degree) for power in raw)
+    if len(set(normalized)) != len(normalized):
+        raise ContextManifestError("normalized monomial power matrix has duplicates")
+    return normalized
+
+
 @dataclass(frozen=True)
 class RetainedCkksMicrographs:
     polynomial_degree: int
     logical_slots: int
     full_data_q_count: int
     production_rotation_batches: tuple[tuple[int, ...], ...]
+    normalized_monomial_powers: tuple[int, ...]
     conjugate: Callable[..., Any]
     rotate_batch: Callable[..., Any]
     raise_mod: Callable[..., Any]
     mul_mono: Callable[..., Any]
     composite: Callable[..., Any]
+    conformance: Callable[..., Any]
 
 
 def _emit_rotation_batches(ct: Any, batches: tuple[tuple[int, ...], ...]) -> list[Any]:
@@ -128,45 +151,89 @@ def create_retained_ckks_micrographs(
 
     degree, slots, full_data_q_count = load_context_dimensions(context_manifest)
     production_rotation_batches = load_production_rotation_batches(retained_fixture)
+    normalized_monomial_powers = load_normalized_monomial_powers(
+        retained_fixture, degree
+    )
 
     @ckks_kernel
-    def conjugate_graph(ct: CkksCiphertext) -> CkksCiphertext:
+    def retained_ckks_conjugate(ct: CkksCiphertext) -> CkksCiphertext:
         return ct.conjugate()
 
     @ckks_kernel
-    def rotate_batch_graph(ct: CkksCiphertext) -> CkksCiphertext:
+    def retained_ckks_rotate_batches(ct: CkksCiphertext) -> CkksCiphertext:
         outputs = _emit_rotation_batches(
             ct, (tuple(EDGE_ROTATION_BATCH),) + production_rotation_batches
         )
         return _combine_first_batch_outputs(outputs)
 
     @ckks_kernel
-    def raise_mod_graph(ct: CkksCiphertext) -> CkksCiphertext:
+    def retained_ckks_raise_mod(ct: CkksCiphertext) -> CkksCiphertext:
         return ct.raise_mod(full_data_q_count)
 
     @ckks_kernel
-    def mul_mono_graph(ct: CkksCiphertext) -> CkksCiphertext:
-        return ct.mul_mono(2 * degree + 1)
+    def retained_ckks_mul_monomials(ct: CkksCiphertext) -> CkksCiphertext:
+        outputs = [ct.mul_mono(power) for power in normalized_monomial_powers]
+        accumulator = outputs[0]
+        for output in outputs[1:]:
+            accumulator = accumulator + output
+        return accumulator
 
     @ckks_kernel
-    def composite_graph(ct: CkksCiphertext) -> CkksCiphertext:
+    def retained_ckks_composite(ct: CkksCiphertext) -> CkksCiphertext:
         raised = ct.raise_mod(full_data_q_count)
         multiplied = raised.mul_mono(degree // 2)
         conjugated = multiplied.conjugate()
         outputs = conjugated.rotate_batch(EDGE_ROTATION_BATCH)
         return (outputs[0] + outputs[1]) + (outputs[2] + outputs[3])
 
+    @ckks_kernel
+    def retained_ckks_conformance(ct: CkksCiphertext) -> CkksCiphertext:
+        """Executable matrix from one bottom-Q input to one ciphertext."""
+
+        raised = ct.raise_mod(full_data_q_count)
+        monomials = [
+            raised.mul_mono(power) for power in normalized_monomial_powers
+        ]
+        multiplied = monomials[normalized_monomial_powers.index(degree // 2)]
+        conjugated = multiplied.conjugate()
+        batches = _emit_rotation_batches(
+            conjugated,
+            (tuple(EDGE_ROTATION_BATCH),) + production_rotation_batches,
+        )
+        accumulator = _combine_first_batch_outputs(batches)
+        for monomial in monomials:
+            accumulator = accumulator + monomial
+        return accumulator
+
     return RetainedCkksMicrographs(
         polynomial_degree=degree,
         logical_slots=slots,
         full_data_q_count=full_data_q_count,
         production_rotation_batches=production_rotation_batches,
-        conjugate=conjugate_graph,
-        rotate_batch=rotate_batch_graph,
-        raise_mod=raise_mod_graph,
-        mul_mono=mul_mono_graph,
-        composite=composite_graph,
+        normalized_monomial_powers=normalized_monomial_powers,
+        conjugate=retained_ckks_conjugate,
+        rotate_batch=retained_ckks_rotate_batches,
+        raise_mod=retained_ckks_raise_mod,
+        mul_mono=retained_ckks_mul_monomials,
+        composite=retained_ckks_composite,
+        conformance=retained_ckks_conformance,
     )
+
+
+def declare_retained_ckks_conformance_module(
+    context_manifest: Path,
+    retained_fixture: Path,
+) -> RetainedCkksMicrographs:
+    """Declare every retained conformance entry point in one AIR module."""
+
+    AceEDSL._get_dsl.cache_clear()
+    graphs = create_retained_ckks_micrographs(context_manifest, retained_fixture)
+    graphs.conformance(
+        CkksCiphertext(
+            shape=(graphs.polynomial_degree,), name="retained_conformance_input"
+        )
+    )
+    return graphs
 
 
 def emit_air(
@@ -175,10 +242,13 @@ def emit_air(
     graph_name: str,
     output: Path,
 ) -> None:
-    AceEDSL._get_dsl.cache_clear()
-    graphs = create_retained_ckks_micrographs(context_manifest, retained_fixture)
-    graph = getattr(graphs, graph_name)
-    graph(CkksCiphertext(shape=(graphs.polynomial_degree,), name="input_ct"))
+    if graph_name == "conformance":
+        declare_retained_ckks_conformance_module(context_manifest, retained_fixture)
+    else:
+        AceEDSL._get_dsl.cache_clear()
+        graphs = create_retained_ckks_micrographs(context_manifest, retained_fixture)
+        graph = getattr(graphs, graph_name)
+        graph(CkksCiphertext(shape=(graphs.polynomial_degree,), name="input_ct"))
     module = AceEDSL._get_dsl().current_air_module
     if module is None:
         raise RuntimeError("micrograph did not emit AIR")
@@ -193,7 +263,14 @@ def main() -> int:
     parser.add_argument(
         "--graph",
         required=True,
-        choices=("conjugate", "rotate_batch", "raise_mod", "mul_mono", "composite"),
+        choices=(
+            "conjugate",
+            "rotate_batch",
+            "raise_mod",
+            "mul_mono",
+            "composite",
+            "conformance",
+        ),
     )
     parser.add_argument("--output-air", required=True, type=Path)
     arguments = parser.parse_args()

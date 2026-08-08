@@ -9,9 +9,6 @@ import subprocess
 import sys
 import textwrap
 
-import pytest
-
-
 REPOSITORY = Path(__file__).resolve().parents[2]
 EXAMPLES = REPOSITORY / "ace_edsl" / "examples"
 FIXTURE = REPOSITORY / "tools" / "phantom_gpu" / "fixtures" / "retained_ckks_v1.json"
@@ -164,13 +161,6 @@ def test_rotation_batches_survive_driver_and_source_emission(tmp_path: Path) -> 
                 compiled = pipeline.run(
                     start_domain="fhe::ckks", dump_stages=True, verbose=False
                 )
-                if (
-                    not compiled.success
-                    and "context_manifest_file" in compiled.error
-                    and "incompatible function arguments" in compiled.error
-                ):
-                    print("RETAINED_BINDINGS_REQUIRE_REBUILD")
-                    raise SystemExit(0)
                 assert compiled.success, compiled.error
                 post_air = compiled.air_dumps["ckks_driver"].lower()
                 assert post_air.count("ckks.rotate_batch") == len(batches)
@@ -192,8 +182,6 @@ def test_rotation_batches_survive_driver_and_source_emission(tmp_path: Path) -> 
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    if "RETAINED_BINDINGS_REQUIRE_REBUILD" in result.stdout:
-        pytest.skip("local Python bindings predate the retained manifest ABI")
     assert "RETAINED_ROTATION_SOURCE_OK" in result.stdout
 
 
@@ -293,11 +281,101 @@ def test_phantom_pipeline_rejects_runtime_raise_helper(tmp_path: Path) -> None:
         capture_output=True,
         check=False,
     )
-    if (
-        result.returncode != 0
-        and "forbids runtime target-level helpers" in result.stderr
-        and "ValueError" in result.stderr
-    ):
-        pytest.skip("local Python bindings predate provider-bound rejection")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "RETAINED_DYNAMIC_RAISE_REJECTED" in result.stdout
+
+
+def test_one_conformance_module_declares_the_complete_retained_matrix(
+    tmp_path: Path,
+) -> None:
+    air = _emit(tmp_path, "conformance")
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    assert air.count("ckks.conjugate") == 1
+    assert air.count("ckks.rotate_batch") == (
+        1 + len(fixture["production_rotation_batches"])
+    )
+    assert air.count("ckks.raise_mod") == 1
+    assert air.count("ckks.mul_mono") == len(fixture["monomial_powers"])
+    assert "retained_ckks_conformance" in air
+    _assert_no_forbidden_boundary_ops(air)
+
+
+def test_same_conformance_module_generates_both_terminal_sources(
+    tmp_path: Path,
+) -> None:
+    context = tmp_path / "context.json"
+    _context(context)
+    outputs = {
+        "ant_source": tmp_path / "retained_ant.c",
+        "phantom_source": tmp_path / "retained_phantom.cu",
+        "ant_air": tmp_path / "retained_ant.air",
+        "phantom_air": tmp_path / "retained_phantom.air",
+        "emitted_context": tmp_path / "emitted_context.json",
+        "emitted_resources": tmp_path / "emitted_resources.json",
+        "record": tmp_path / "generation.json",
+        "interface": tmp_path / "retained_generated.h",
+    }
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(REPOSITORY), str(EXAMPLES), environment.get("PYTHONPATH", ""))
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPOSITORY / "tools/phantom_gpu/generate_retained_ckks_sources.py"),
+            "--context-manifest", str(context),
+            "--fixture", str(FIXTURE),
+            "--ant-source", str(outputs["ant_source"]),
+            "--phantom-source", str(outputs["phantom_source"]),
+            "--ant-post-ckks-air", str(outputs["ant_air"]),
+            "--phantom-post-ckks-air", str(outputs["phantom_air"]),
+            "--phantom-context-manifest", str(outputs["emitted_context"]),
+            "--phantom-resource-manifest", str(outputs["emitted_resources"]),
+            "--generation-record", str(outputs["record"]),
+            "--interface-header", str(outputs["interface"]),
+        ],
+        cwd=REPOSITORY,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs["ant_air"].read_bytes() == outputs["phantom_air"].read_bytes()
+    functions = ("retained_ckks_conformance",)
+    for source_path in (outputs["ant_source"], outputs["phantom_source"]):
+        source = source_path.read_text(encoding="utf-8")
+        for function in functions:
+            assert f"CIPHERTEXT {function}(CIPHERTEXT p0" in source
+    interface = outputs["interface"].read_text(encoding="utf-8")
+    assert (
+        "CIPHERTEXT retained_ckks_conformance(CIPHERTEXT input);" in interface
+    )
+    phantom = outputs["phantom_source"].read_text(encoding="utf-8")
+    for call in ("Conjugate_ciph", "Rotate_batch_ciph", "Raise_mod", "Mul_mono_ciph"):
+        assert f"{call}(" in phantom
+    for forbidden in (
+        "Eval_bootstrap_ciph(",
+        "Bootstrap(",
+        "Coeff_to_slot(",
+        "Slot_to_coeff(",
+        "Eval_mod(",
+        "Hw_mod",
+        "Poly_",
+    ):
+        assert forbidden not in phantom
+    resources = json.loads(outputs["emitted_resources"].read_text(encoding="utf-8"))
+    assert resources["rotation_batches"] == [
+        [5, 0, -7, 5],
+        *fixture["production_rotation_batches"],
+    ]
+    assert resources["monomial_powers"] == [
+        0,
+        1,
+        8192,
+        16384,
+        24576,
+        32767,
+    ]
+    assert 0 not in resources["rotation_steps"]
+    assert len(resources["rotation_steps"]) == len(set(resources["rotation_steps"]))
