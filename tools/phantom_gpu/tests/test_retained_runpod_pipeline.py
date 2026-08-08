@@ -308,14 +308,27 @@ def test_executable_symbol_audits_do_not_match_the_binary_path() -> None:
             "\nwrite_attestations() {"
         )
     ]
-    assert 'nm -A -C --undefined-only "${PHANTOM_BINARY}"' not in inspection
-    assert 'nm -A -C --defined-only "${PHANTOM_BINARY}"' not in inspection
-    assert 'nm -A -C --undefined-only "${keyless_binary}"' not in inspection
-    assert 'nm -C --undefined-only "${keyless_binary}"' in inspection
+    assert "nm -A -C" not in inspection
+    for command in (
+        'nm -C --undefined-only "${PHANTOM_BINARY}"',
+        'nm -C --defined-only "${PHANTOM_BINARY}"',
+        'nm -C --undefined-only "${ANT_BINARY}"',
+        'nm -C --undefined-only "${PHANTOM_NATIVE_TEST_BINARY}"',
+        'nm -C --defined-only "${PHANTOM_NATIVE_TEST_BINARY}"',
+        'nm -C --undefined-only "${keyless_binary}"',
+    ):
+        assert command in inspection
     assert (
         "Conjugate_ciph|Rotate_batch_ciph|Raise_mod|Mul_mono_ciph|"
         "retained_ckks_"
     ) in inspection
+    archive_loop = host[
+        host.index("inspect_build() {") : host.index(
+            'nm -C --undefined-only "${PHANTOM_BINARY}"'
+        )
+    ]
+    # Archive inputs still need member provenance in their symbol receipts.
+    assert 'nm -A -C --defined-only "${archive}"' in archive_loop
 
 
 def test_a100_gate_executes_fixture_owned_adapter_aliases() -> None:
