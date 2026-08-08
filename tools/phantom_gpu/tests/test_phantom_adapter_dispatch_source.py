@@ -46,3 +46,25 @@ def test_monomial_alias_uses_provider_in_place_entry_point() -> None:
     assert "if (result == source)" in body
     assert "multiply_by_monomial_inplace(*_context, *result, power)" in body
     assert "multiply_by_monomial(*_context, *source, power, *result)" in body
+
+
+def test_retained_outputs_are_live_before_metadata_validation() -> None:
+    source = ADAPTER.read_text(encoding="utf-8")
+    for function, provider, result_check in (
+        ("Conjugate", "CONJUGATE_PROVIDER", "CONJUGATE_RESULT"),
+        ("MultiplyMonomial", "MUL_MONO_PROVIDER", "MUL_MONO_RESULT"),
+    ):
+        body = _function_body(source, function)
+        provider_call = body.index(f'ProviderCall("{provider}"')
+        live_transition = body.index("MarkCipher(result, ObjectState::kLive)")
+        metadata_validation = body.index(f'ActiveQ(result, "{result_check}")')
+        assert provider_call < live_transition < metadata_validation
+
+
+def test_cipher_validation_rejects_foreign_parameter_identity() -> None:
+    body = _function_body(
+        ADAPTER.read_text(encoding="utf-8"), "ValidateCipher"
+    )
+    assert (
+        "cipher->parms_id() != context_data.parms().parms_id()" in body
+    )

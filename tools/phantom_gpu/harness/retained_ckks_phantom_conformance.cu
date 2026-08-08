@@ -1443,7 +1443,8 @@ void RunAliases(int argc, char **argv) {
   Require(fixture.at("fixture_id") == "retained_ckks_v1", "FIXTURE_ID",
           "alias fixture identifier is unsupported");
   Require(analytic.at("fixture_sha256") == fixture_sha256 &&
-              analytic.at("context_manifest_sha256") ==
+              analytic.at("qualification_bindings")
+                      .at("compiler_context_manifest_sha256") ==
                   authenticated_context._sha256 &&
               analytic.at("qualification_bindings") ==
                   fixture.at("qualification_bindings"),

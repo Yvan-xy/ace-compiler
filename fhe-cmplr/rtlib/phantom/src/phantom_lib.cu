@@ -478,6 +478,7 @@ public:
       if (result != source) *result = *source;
       complex_conjugate_inplace(*_context, *result, *_galois_key);
     });
+    MarkCipher(result, ObjectState::kLive);
     const size_t result_q = ActiveQ(result, "CONJUGATE_RESULT");
     if (result_q != source_q || result->chain_index() != source_chain ||
         result->size() != source_size || result->scale() != source_scale ||
@@ -492,7 +493,6 @@ public:
            source_chain, source_size, source_scale, source_scale_degree,
            source_ntt);
     }
-    MarkCipher(result, ObjectState::kLive);
   }
 
   void RotateBatch(Ciphertext* outputs, Ciphertext* source,
@@ -649,6 +649,7 @@ public:
         multiply_by_monomial(*_context, *source, power, *result);
       }
     });
+    MarkCipher(result, ObjectState::kLive);
     const size_t result_q = ActiveQ(result, "MUL_MONO_RESULT");
     if (result_q != source_q || result->chain_index() != source_chain ||
         result->size() != source_size ||
@@ -664,7 +665,6 @@ public:
            source_chain, source_size, source_scale, source_scale_degree,
            source_ntt);
     }
-    MarkCipher(result, ObjectState::kLive);
   }
 
   void CopyCipher(Ciphertext* result, Ciphertext* source) {
@@ -1350,6 +1350,7 @@ private:
     const auto& context_data =
         _context->get_context_data(cipher->chain_index());
     if (context_data.parms().coeff_modulus().size() != q_count ||
+        cipher->parms_id() != context_data.parms().parms_id() ||
         cipher->coeff_modulus_size() != q_count ||
         cipher->poly_modulus_degree() != _manifest->_poly_degree ||
         cipher->data() == nullptr || !std::isfinite(cipher->scale()) ||

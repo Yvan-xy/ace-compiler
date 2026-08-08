@@ -144,6 +144,12 @@ def test_decoded_composite_invokes_the_generated_interface() -> None:
 def test_adapter_alias_gate_is_fixture_owned_and_exact() -> None:
     source = _source()
     body = _function_body(source, "RunAliases")
+    assert re.search(
+        r'analytic\.at\("qualification_bindings"\)\s*'
+        r'\.at\("compiler_context_manifest_sha256"\)',
+        body,
+    )
+    assert 'analytic.at("context_manifest_sha256")' not in body
     assert 'fixture.at("monomial_powers")' in body
     assert "Conjugate_ciph(alias, alias)" in body
     assert "Mul_mono_ciph(alias, alias, power)" in body
