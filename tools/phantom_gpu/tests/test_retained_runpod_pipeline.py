@@ -214,6 +214,15 @@ def test_native_test_reuses_audited_ace_googletest_source() -> None:
     assert "exhaustive pre-manifest file map" in evidence
 
 
+def test_ant_oracle_uses_audited_installed_dependency_headers() -> None:
+    host = (TOOLS / "run_retained_ckks_correctness.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'ant_install_include="${INSTALL_ROOT}/rtlib/include/ant"' in host
+    assert '[[ -r "${ant_install_include}/uthash.h" ]]' in host
+    assert '"-I${ant_install_include}"' in host
+
+
 def test_a100_gate_executes_fixture_owned_adapter_aliases() -> None:
     runner = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
     retained_function = runner[

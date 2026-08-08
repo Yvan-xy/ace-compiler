@@ -533,7 +533,11 @@ build_and_run_ant_oracle() {
   local ant_generated_object="${RESULT_ROOT}/build/retained_ckks_ant.generated.o"
   local ant_harness_object="${RESULT_ROOT}/build/retained_ckks_ant.harness.o"
   ANT_BINARY="${RESULT_ROOT}/build/retained_ckks_ant_oracle"
+  local ant_install_include="${INSTALL_ROOT}/rtlib/include/ant"
+  [[ -r "${ant_install_include}/uthash.h" ]] ||
+    fail "installed ANT dependency header is absent: ${ant_install_include}/uthash.h"
   local -a includes=(
+    "-I${ant_install_include}"
     "-I${REPO_ROOT}/fhe-cmplr/rtlib/include"
     "-I${REPO_ROOT}/fhe-cmplr/rtlib/ant/include"
     "-I${REPO_ROOT}/fhe-cmplr/rtlib/ant/util/include"
