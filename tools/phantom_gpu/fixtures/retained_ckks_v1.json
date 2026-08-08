@@ -1,0 +1,106 @@
+{
+  "schema_version": "ace.phantom.retained_ckks.fixture/1.0.0",
+  "fixture_id": "retained_ckks_v1",
+  "description": "Provider-neutral retained CKKS operation fixture",
+  "qualification_bindings": {
+    "status": "unbound",
+    "required": [
+      "compiler_context_manifest_sha256",
+      "normalized_compiler_command_sha256",
+      "post_ckks_air_sha256"
+    ]
+  },
+  "determinism": {
+    "seed": 20260808,
+    "generator": "splitmix64-float53-complex-v1"
+  },
+  "context_rules": {
+    "polynomial_degree": "compiler_context.polynomial_degree",
+    "logical_slots": "compiler_context.logical_slot_capacity",
+    "full_data_q_count": "len(compiler_context.data_q_bit_sizes)",
+    "input_active_q_count": "compiler_context.input_level",
+    "ordered_data_q_bits": "compiler_context.data_q_bit_sizes",
+    "ordered_special_p_bits": "compiler_context.special_p_bit_sizes"
+  },
+  "inputs": [
+    {"id": "zero", "recipe": "zero"},
+    {"id": "impulse", "recipe": "seeded_impulse"},
+    {"id": "ramp", "recipe": "centered_complex_ramp"},
+    {"id": "alternating", "recipe": "alternating_sign"},
+    {"id": "bounded_nonperiodic", "recipe": "seeded_bounded_nonperiodic"}
+  ],
+  "rotate_batch_steps": [5, 0, -7, 5],
+  "production_rotation_batches": [
+    [256, 512, 768, 1024, 1280, 1536, 1792, 2048],
+    [7944, 7952, 7960, 7968, 7976, 7984, 7992, 8000],
+    [8185, 8186, 8187, 8188],
+    [8161, 8162, 8163, 8164, 8165, 8166, 8167, 8168],
+    [7200, 7232, 7264, 7296, 7328, 7360, 7392, 7424],
+    [1024, 2048, 3072, 4096]
+  ],
+  "production_rotation_source": {
+    "kind": "audited_default_post_ckks_air",
+    "post_ckks_air_sha256": "42328a52814bfaf985b78e8a12ea7561bd4470ced9b2c9d3c9311b533d94f33a"
+  },
+  "monomial_powers": ["0", "N/2", "N", "3N/2", "2N-1", "2N+1"],
+  "decoded_cases": [
+    {"id": "conjugate.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
+    {"id": "conjugate_twice.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
+    {"id": "rotate_batch.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
+    {"id": "raise_mod.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
+    {"id": "mul_mono.0.bounded_nonperiodic", "oracle": ["ant"]},
+    {"id": "mul_mono.N_over_2.bounded_nonperiodic", "oracle": ["ant"]},
+    {"id": "mul_mono.N.bounded_nonperiodic", "oracle": ["ant"]},
+    {"id": "mul_mono.3N_over_2.bounded_nonperiodic", "oracle": ["ant"]},
+    {"id": "mul_mono.2N_minus_1.bounded_nonperiodic", "oracle": ["ant"]},
+    {"id": "mul_mono.2N_plus_1.bounded_nonperiodic", "oracle": ["ant"]},
+    {"id": "mul_mono.inverse_composition.bounded_nonperiodic", "oracle": ["ant"]},
+    {"id": "composite.bounded_nonperiodic", "oracle": ["ant"]}
+  ],
+  "exact_algebraic_cases": [
+    "exact_algebraic.raise_mod",
+    "exact_algebraic.mul_mono.0",
+    "exact_algebraic.mul_mono.N_over_2",
+    "exact_algebraic.mul_mono.N",
+    "exact_algebraic.mul_mono.3N_over_2",
+    "exact_algebraic.mul_mono.2N_minus_1",
+    "exact_algebraic.mul_mono.2N_plus_1",
+    "exact_algebraic.mul_mono.inverse_composition"
+  ],
+  "metadata_contract": {
+    "scale_degree": 1,
+    "ciphertext_size": 2,
+    "logical_slots": "compiler_context.logical_slot_capacity",
+    "ntt": true,
+    "preserve_raw_scale": true,
+    "preserve_source_for_out_of_place": true,
+    "ordinary_result_active_q_count": "compiler_context.input_level",
+    "raised_result_active_q_count": "len(compiler_context.data_q_bit_sizes)"
+  },
+  "ownership": {
+    "iterations": 100,
+    "batch_outputs_are_independent": true,
+    "free_order": [3, 1, 0, 2]
+  },
+  "tolerances": {
+    "primitive_absolute": 0.0001,
+    "primitive_relative": 0.001,
+    "composite_absolute": 0.0005,
+    "composite_relative": 0.002,
+    "hard_maximum_absolute": 0.005,
+    "relative_metric_floor": 1e-12,
+    "exact_mismatches": 0
+  },
+  "decoded_binary_format": {
+    "id": "ace.retained_ckks.complex_float64le/1.0.0",
+    "magic_ascii": "ACERCK01",
+    "endianness": "little",
+    "encoding": "interleaved IEEE-754 binary64 real,imaginary pairs"
+  },
+  "exact_binary_format": {
+    "id": "ace.retained_ckks.rns_uint64le/1.0.0",
+    "magic_ascii": "ACERNS01",
+    "endianness": "little",
+    "encoding": "unsigned 64-bit residues"
+  }
+}
