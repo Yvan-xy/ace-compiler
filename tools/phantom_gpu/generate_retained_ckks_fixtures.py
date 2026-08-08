@@ -509,8 +509,16 @@ def _load_invocation(path: Path) -> tuple[dict[str, Any], str, dict[str, str]]:
         "--generation-record": ".json", "--interface-header": ".h",
     }
     for option, suffix in expected_suffixes.items():
-        artifact = Path(pairs[option])
-        if ".." in artifact.parts or artifact.suffix != suffix:
+        raw_artifact = pairs[option]
+        artifact = Path(raw_artifact)
+        if (
+            artifact.is_absolute()
+            or ".." in artifact.parts
+            or "." in artifact.parts
+            or "\\" in raw_artifact
+            or artifact.as_posix() != raw_artifact
+            or artifact.suffix != suffix
+        ):
             fail(f"compiler invocation {option} has an unsafe artifact path")
     if invocation["canonical_module"] != "ace_edsl/examples/ckks_retained_ops.py":
         fail("retained invocation names an unexpected canonical module")

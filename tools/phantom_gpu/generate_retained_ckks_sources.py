@@ -37,6 +37,20 @@ RETAINED_CALLS = (
 )
 
 
+CANONICAL_ARTIFACT_PATHS = {
+    "context_manifest": "inputs/compiler_context_manifest.json",
+    "fixture": "inputs/retained_ckks_fixture.json",
+    "ant_source": "outputs/retained_ckks_ant.cxx",
+    "phantom_source": "outputs/retained_ckks_phantom.cu",
+    "ant_post_ckks_air": "outputs/retained_ckks_ant_post.air",
+    "phantom_post_ckks_air": "outputs/retained_ckks_phantom_post.air",
+    "phantom_context_manifest": "outputs/compiler_context_manifest.json",
+    "phantom_resource_manifest": "outputs/compiler_resource_manifest.json",
+    "generation_record": "outputs/retained_ckks_generation.json",
+    "interface_header": "outputs/retained_ckks_generated_interface.h",
+}
+
+
 def _load_context(path: Path) -> dict[str, object]:
     value = json.loads(path.read_text(encoding="utf-8"))
     required = (
@@ -191,16 +205,19 @@ CIPHERTEXT retained_ckks_composite(CIPHERTEXT input);
     arguments.interface_header.write_text(interface, encoding="utf-8")
     canonical_argv = [
         "tools/phantom_gpu/generate_retained_ckks_sources.py",
-        "--context-manifest", str(arguments.context_manifest),
-        "--fixture", str(arguments.fixture),
-        "--ant-source", str(arguments.ant_source),
-        "--phantom-source", str(arguments.phantom_source),
-        "--ant-post-ckks-air", str(arguments.ant_post_ckks_air),
-        "--phantom-post-ckks-air", str(arguments.phantom_post_ckks_air),
-        "--phantom-context-manifest", str(arguments.phantom_context_manifest),
-        "--phantom-resource-manifest", str(arguments.phantom_resource_manifest),
-        "--generation-record", str(arguments.generation_record),
-        "--interface-header", str(arguments.interface_header),
+        "--context-manifest", CANONICAL_ARTIFACT_PATHS["context_manifest"],
+        "--fixture", CANONICAL_ARTIFACT_PATHS["fixture"],
+        "--ant-source", CANONICAL_ARTIFACT_PATHS["ant_source"],
+        "--phantom-source", CANONICAL_ARTIFACT_PATHS["phantom_source"],
+        "--ant-post-ckks-air", CANONICAL_ARTIFACT_PATHS["ant_post_ckks_air"],
+        "--phantom-post-ckks-air",
+        CANONICAL_ARTIFACT_PATHS["phantom_post_ckks_air"],
+        "--phantom-context-manifest",
+        CANONICAL_ARTIFACT_PATHS["phantom_context_manifest"],
+        "--phantom-resource-manifest",
+        CANONICAL_ARTIFACT_PATHS["phantom_resource_manifest"],
+        "--generation-record", CANONICAL_ARTIFACT_PATHS["generation_record"],
+        "--interface-header", CANONICAL_ARTIFACT_PATHS["interface_header"],
     ]
     def digest(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()

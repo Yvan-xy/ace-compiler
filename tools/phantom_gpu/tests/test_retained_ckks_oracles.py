@@ -49,16 +49,16 @@ def _context() -> dict:
 def _invocation(context_path: Path, fixture_path: Path, air_path: Path) -> dict:
     argv = [
         "tools/phantom_gpu/generate_retained_ckks_sources.py",
-        "--context-manifest", str(context_path),
-        "--fixture", str(fixture_path),
-        "--ant-source", "retained.cxx",
-        "--phantom-source", "retained.cu",
-        "--ant-post-ckks-air", str(air_path),
-        "--phantom-post-ckks-air", str(air_path),
-        "--phantom-context-manifest", "emitted-context.json",
-        "--phantom-resource-manifest", "resources.json",
-        "--generation-record", "generation.json",
-        "--interface-header", "retained.h",
+        "--context-manifest", "inputs/compiler_context_manifest.json",
+        "--fixture", "inputs/retained_ckks_fixture.json",
+        "--ant-source", "outputs/retained_ckks_ant.cxx",
+        "--phantom-source", "outputs/retained_ckks_phantom.cu",
+        "--ant-post-ckks-air", "outputs/retained_ckks_ant_post.air",
+        "--phantom-post-ckks-air", "outputs/retained_ckks_phantom_post.air",
+        "--phantom-context-manifest", "outputs/compiler_context_manifest.json",
+        "--phantom-resource-manifest", "outputs/compiler_resource_manifest.json",
+        "--generation-record", "outputs/retained_ckks_generation.json",
+        "--interface-header", "outputs/retained_ckks_generated_interface.h",
     ]
     context_sha = hashlib.sha256(context_path.read_bytes()).hexdigest()
     fixture_sha = hashlib.sha256(fixture_path.read_bytes()).hexdigest()
@@ -152,6 +152,35 @@ def test_binding_rejects_self_reported_hash_and_context_disagreement(tmp_path: P
         fixture_tool.RetainedFixtureError, match="input_context_manifest_sha256"
     ):
         fixture_tool.bind_fixture(template, context, invocation, air)
+
+
+def test_generation_receipt_is_root_independent_and_rejects_absolute_paths(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "freeze-root"
+    second_root = tmp_path / "replay-root"
+    first_root.mkdir()
+    second_root.mkdir()
+    first = _qualification_files(first_root)
+    second = _qualification_files(second_root)
+    first_record = _invocation(first[1], first[0], first[3])
+    second_record = _invocation(second[1], second[0], second[3])
+    assert first_record["argv"] == second_record["argv"]
+    assert (
+        first_record["normalized_argv_sha256"]
+        == second_record["normalized_argv_sha256"]
+    )
+
+    invalid = dict(first_record)
+    invalid["argv"] = list(first_record["argv"])
+    invalid["argv"][2] = str(first[1].resolve())
+    invalid["normalized_argv_sha256"] = hashlib.sha256(
+        fixture_tool.canonical_bytes(invalid["argv"])
+    ).hexdigest()
+    invalid_path = tmp_path / "absolute-invocation.json"
+    _write_json(invalid_path, invalid)
+    with pytest.raises(fixture_tool.RetainedFixtureError, match="unsafe artifact path"):
+        fixture_tool._load_invocation(invalid_path)
 
 
 def test_generator_consumes_seed_and_is_binary_deterministic(tmp_path: Path) -> None:
