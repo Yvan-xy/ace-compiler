@@ -15,6 +15,7 @@ SCRIPT = TOOLS / "run_retained_ckks_correctness.sh"
 PHANTOM_MODULE = (
     TOOLS.parents[1] / "fhe-cmplr/rtlib/cmake/modules/phantom.cmake"
 )
+OUTER_RTLIB_MODULE = TOOLS.parents[1] / "fhe-cmplr/cmake/modules/fhe_rtlib.cmake"
 
 
 def _load_air_tools():
@@ -123,3 +124,9 @@ def test_ordinary_phantom_external_install_is_an_explicit_noop() -> None:
     ) in source
     assert "INSTALL_COMMAND ${CMAKE_COMMAND} -E true" in source
     assert 'INSTALL_COMMAND ""' not in source
+
+
+def test_outer_runtime_uses_only_the_ordinary_phantom_archive() -> None:
+    source = OUTER_RTLIB_MODULE.read_text(encoding="utf-8")
+    assert source.count("libphantom_ordinary.a") == 2
+    assert "libphantom.a" not in source

@@ -76,7 +76,7 @@ function(build_rtlib)
                       <BINARY_DIR>/seal/libFHErt_seal.a
                       <BINARY_DIR>/openfhe/libFHErt_openfhe.a
                       <BINARY_DIR>/phantom/libFHErt_phantom.a
-                      <BINARY_DIR>/external/src/phantom_external-build/lib/libphantom.a
+                      <BINARY_DIR>/external/src/phantom_external-build/lib/libphantom_ordinary.a
   )
   ExternalProject_Get_Property(fhe_rtlib SOURCE_DIR BINARY_DIR)
 
@@ -117,7 +117,7 @@ function(build_rtlib)
     find_library(GMPXX_LIBRARY NAMES gmpxx REQUIRED)
     find_library(GMP_LIBRARY NAMES gmp REQUIRED)
     set(PHANTOM_ARCHIVE
-      "${BINARY_DIR}/external/src/phantom_external-build/lib/libphantom.a")
+      "${BINARY_DIR}/external/src/phantom_external-build/lib/libphantom_ordinary.a")
     add_library(FHErt_phantom STATIC IMPORTED GLOBAL)
     set_target_properties(FHErt_phantom PROPERTIES
       IMPORTED_LOCATION "${BINARY_DIR}/phantom/libFHErt_phantom.a"
