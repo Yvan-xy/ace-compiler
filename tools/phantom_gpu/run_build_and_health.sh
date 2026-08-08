@@ -1172,6 +1172,8 @@ PY
     >"${RESULT_DIR}/retained_ckks_rejections.json"
   jq -e --slurpfile fixture "${fixture}" '
     (keys | sort) == (["cases", "schema_version", "status"] | sort)
+    and .schema_version ==
+      "ace.phantom.retained_ckks.rejections/1.0.0"
     and .status == "pass"
     and ([.cases[] | {id:.case_id, diagnostic, manifest}]
          == [$fixture[0].runtime_rejections[] | {id, diagnostic, manifest}])
@@ -1294,57 +1296,72 @@ run_native_health() {
 }
 
 verify_success_evidence() {
-  jq -e '
+  require_terminal_record() {
+    local record_name="$1"
+    shift
+    local record_path="${RESULT_DIR}/${record_name}"
+    if [[ ! -s "${record_path}" ]]; then
+      printf 'result completeness: missing or empty terminal record: %s\n' \
+        "${record_name}" >&2
+      return 1
+    fi
+    if ! jq -e "$@" "${record_path}" >/dev/null; then
+      printf 'result completeness: terminal record violates its contract: %s\n' \
+        "${record_name}" >&2
+      return 1
+    fi
+  }
+
+  require_terminal_record qualification-current.json '
     .gate == "ordinary" and .status == "pass" and .exit_code == 0
-  ' "${RESULT_DIR}/qualification-current.json" >/dev/null
+  '
   case "${MODE}" in
     freeze-host)
-      jq -e '
+      require_terminal_record host-freeze-candidate.json '
         .schema_version == "ace.phantom.host-freeze-candidate/1.0.0"
         and .status == "candidate"
-      ' "${RESULT_DIR}/host-freeze-candidate.json" >/dev/null
+      '
       ;;
     local)
-      jq -e '.status == "pass"' \
-        "${RESULT_DIR}/ordinary-frozen-reference.json" >/dev/null
-      jq -e '.status == "skipped"' \
-        "${RESULT_DIR}/native-health.json" >/dev/null
-      jq -e '
+      require_terminal_record ordinary-frozen-reference.json \
+        '.status == "pass"'
+      require_terminal_record native-health.json '.status == "skipped"'
+      require_terminal_record retained-frozen-reference.json '
         .status == "pass"
         and .provider_neutral_ant_reference_matches == true
         and .exact_artifact_count > 0
-      ' "${RESULT_DIR}/retained-frozen-reference.json" >/dev/null
+      '
       ;;
     runpod)
-      jq -e '.status == "pass" and .device_count == 1' \
-        "${RESULT_DIR}/native-health.json" >/dev/null
-      jq -e '
+      require_terminal_record native-health.json \
+        '.status == "pass" and .device_count == 1'
+      require_terminal_record ordinary_ckks_compare.json '
         .status == "pass" and .case_count > 0
         and .passing_case_count == .case_count
-      ' "${RESULT_DIR}/ordinary_ckks_compare.json" >/dev/null
-      jq -e '.status == "pass" and (.cases | length) > 0' \
-        "${RESULT_DIR}/ordinary_ckks_diagnostics.json" >/dev/null
-      jq -e '
+      '
+      require_terminal_record ordinary_ckks_diagnostics.json \
+        '.status == "pass" and (.cases | length) > 0'
+      require_terminal_record ordinary_ckks_ownership.json '
         .schema_version == "ace.phantom.ordinary_ckks.ownership/1.0.0"
         and .status == "pass" and .total_iterations > 0
-      ' "${RESULT_DIR}/ordinary_ckks_ownership.json" >/dev/null
-      jq -e '.status == "pass" and .exit_code == 0' \
-        "${RESULT_DIR}/ordinary_ckks_sanitizer.json" >/dev/null
-      jq -e '
+      '
+      require_terminal_record ordinary_ckks_sanitizer.json \
+        '.status == "pass" and .exit_code == 0'
+      require_terminal_record retained-frozen-reference.json '
         .status == "pass"
         and .provider_neutral_ant_reference_matches == true
         and .ant_replay.comparison ==
           "semantic-summary-only-no-decoded-byte-comparison"
         and .exact_artifact_count > 0
-      ' "${RESULT_DIR}/retained-frozen-reference.json" >/dev/null
-      jq -e '
+      '
+      require_terminal_record retained_ckks_compare.json '
         .status == "pass"
         and .gpu_vs_exact.status == "pass"
         and .gpu_vs_exact.mismatch_count == 0
-      ' "${RESULT_DIR}/retained_ckks_compare.json" >/dev/null
-      jq -e '.status == "pass" and .mismatch_count == 0' \
-        "${RESULT_DIR}/retained_ckks_exact_rns.json" >/dev/null
-      jq -e '
+      '
+      require_terminal_record retained_ckks_exact_rns.json \
+        '.status == "pass" and .mismatch_count == 0'
+      require_terminal_record retained_ckks_adapter_aliases.json '
         .schema_version ==
           "ace.phantom.retained_ckks.adapter-aliases/1.0.0"
         and .status == "pass" and (.cases | length) > 1
@@ -1353,9 +1370,12 @@ verify_success_evidence() {
         and ([.cases[].metadata_matches_out_of_place] | all)
         and ([.cases[].decoded_values_match_out_of_place] | all)
         and ([.cases[].residues_match_out_of_place] | all)
-      ' "${RESULT_DIR}/retained_ckks_adapter_aliases.json" >/dev/null
-      jq -e --slurpfile fixture "${RESULT_DIR}/retained_ckks_v1.json" '
+      '
+      require_terminal_record retained_ckks_rejections.json \
+        --slurpfile fixture "${RESULT_DIR}/retained_ckks_v1.json" '
         (keys | sort) == (["cases", "schema_version", "status"] | sort)
+        and .schema_version ==
+          "ace.phantom.retained_ckks.rejections/1.0.0"
         and .status == "pass"
         and ([.cases[] | {id:.case_id, diagnostic, manifest}]
              == [$fixture[0].runtime_rejections[] | {id, diagnostic, manifest}])
@@ -1365,21 +1385,25 @@ verify_success_evidence() {
         and ([.cases[] |
           (.status == "pass" and (.exit_code | type) == "number"
            and .exit_code != 0 and .exit_code != 124)] | all)
-      ' "${RESULT_DIR}/retained_ckks_rejections.json" >/dev/null
-      jq -e --slurpfile fixture "${RESULT_DIR}/retained_ckks_v1.json" '
+      '
+      require_terminal_record retained_ckks_ownership.json \
+        --slurpfile fixture "${RESULT_DIR}/retained_ckks_v1.json" '
         (keys | sort) ==
           (["batch_outputs_are_independent", "free_order", "iterations",
             "ordered_steps", "schema_version", "status"] | sort)
+        and .schema_version ==
+          "ace.phantom.retained_ckks.ownership/1.0.0"
         and .status == "pass"
         and .iterations == $fixture[0].ownership.iterations
         and .ordered_steps == $fixture[0].rotate_batch_steps
         and .batch_outputs_are_independent ==
           $fixture[0].ownership.batch_outputs_are_independent
         and .free_order == $fixture[0].ownership.free_order
-      ' "${RESULT_DIR}/retained_ckks_ownership.json" >/dev/null
-      jq -e '.status == "pass" and .error_summary == 0' \
-        "${RESULT_DIR}/retained_ckks_sanitizer.json" >/dev/null
-      jq -e --slurpfile artifact \
+      '
+      require_terminal_record retained_ckks_sanitizer.json \
+        '.status == "pass" and .error_summary == 0'
+      require_terminal_record retained_ckks_native_primitives.json \
+        --slurpfile artifact \
         "${RESULT_DIR}/retained-host/artifact-manifest.json" \
         --arg context_sha256 \
           "$(sha256sum "${RESULT_DIR}/retained_compiler_context_manifest.json" | awk '{print $1}')" \
@@ -1399,15 +1423,15 @@ verify_success_evidence() {
         and .emitted_context_manifest_sha256 == $context_sha256
         and .stdout_sha256 == $stdout_sha256
         and .stderr_sha256 == $stderr_sha256
-      ' "${RESULT_DIR}/retained_ckks_native_primitives.json" >/dev/null
-      jq -e '
+      '
+      require_terminal_record retained_production_archive_audit.json '
         .schema_version ==
           "ace.phantom.retained_ckks.production-archive-audit/1.0.0"
         and .status == "pass" and .forbidden_entry_count == 0
         and (.inventories | length) == 6
         and ([.inventories[].forbidden_entries] | all(. == []))
-      ' "${RESULT_DIR}/retained_production_archive_audit.json" >/dev/null
-      jq -e '
+      '
+      require_terminal_record retained_generated_source_audit.json '
         .schema_version ==
           "ace.phantom.retained_ckks.generated-source-audit/1.0.0"
         and .status == "pass"
@@ -1416,14 +1440,14 @@ verify_success_evidence() {
         and .first_distinct_calls == .required_calls
         and .rotation_array_emission == "ckks-owned-static-int32"
         and .forbidden_matches == []
-      ' "${RESULT_DIR}/retained_generated_source_audit.json" >/dev/null
-      jq -e '
+      '
+      require_terminal_record retained_gtest_source_attestation.json '
         .schema_version == "ace.phantom.retained_ckks.gtest-source/1.0.0"
         and .status == "pass"
         and .source_method == "ace-pinned-external-project-source-reuse"
         and .fetchcontent_source_override == true
         and .fetchcontent_fully_disconnected == true
-      ' "${RESULT_DIR}/retained_gtest_source_attestation.json" >/dev/null
+      '
       ;;
   esac
   jq -n --arg mode "${MODE}" \

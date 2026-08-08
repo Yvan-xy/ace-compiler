@@ -888,6 +888,7 @@ def test_runpod_success_completeness_requires_every_terminal_record(
             ],
         },
         "retained_ckks_rejections.json": {
+            "schema_version": "ace.phantom.retained_ckks.rejections/1.0.0",
             "status": "pass",
             "cases": [
                 {
@@ -996,6 +997,34 @@ def test_runpod_success_completeness_requires_every_terminal_record(
         text=True,
     )
     assert failed.returncode != 0
+    assert failed.stderr == (
+        "result completeness: missing or empty terminal record: "
+        "ordinary_ckks_sanitizer.json\n"
+    )
+    assert not (results / "result-completeness.json").exists()
+
+    records["retained_ckks_rejections.json"]["schema_version"] = (
+        "ace.phantom.retained_ckks.rejections/0.0.0"
+    )
+    (results / "retained_ckks_rejections.json").write_text(
+        json.dumps(records["retained_ckks_rejections.json"]) + "\n",
+        encoding="utf-8",
+    )
+    (results / "ordinary_ckks_sanitizer.json").write_text(
+        json.dumps(records["ordinary_ckks_sanitizer.json"]) + "\n",
+        encoding="utf-8",
+    )
+    rejected_schema = subprocess.run(
+        ["bash", "-c", script, "completeness-test", str(results)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected_schema.returncode != 0
+    assert rejected_schema.stderr == (
+        "result completeness: terminal record violates its contract: "
+        "retained_ckks_rejections.json\n"
+    )
     assert not (results / "result-completeness.json").exists()
 
 
