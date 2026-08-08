@@ -94,6 +94,16 @@ def test_host_gate_builds_both_generated_paths_but_runs_only_ant() -> None:
     assert "cuda-memcheck" not in source
 
 
+def test_host_gate_creates_the_explicit_state_root_before_locking() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    create = source.index('mkdir -p "${STATE_ROOT}"')
+    permissions = source.index('chmod 0755 "${STATE_ROOT}"')
+    lock = source.index(
+        'exec 9>"${STATE_ROOT}/retained_ckks_host_qualification.lock"'
+    )
+    assert create < permissions < lock
+
+
 def test_host_gate_attests_context_build_and_complete_result_tree() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
     for token in (

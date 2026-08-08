@@ -212,9 +212,11 @@ require_clean_sources() {
 prepare_roots() {
   [[ ! -e "${RESULT_ROOT}" ]] || fail "result root already exists: ${RESULT_ROOT}"
   [[ ! -e "${WORK_ROOT}" ]] || fail "work root already exists: ${WORK_ROOT}"
-  mkdir -p "${RESULT_ROOT}"/{inputs,outputs,build/inspection,tests,source} \
+  # Snapshot wrappers may place state, results, and build work in sibling roots.
+  mkdir -p "${STATE_ROOT}" \
+    "${RESULT_ROOT}"/{inputs,outputs,build/inspection,tests,source} \
     "${WORK_ROOT}"
-  chmod 0755 "${RESULT_ROOT}" "${WORK_ROOT}"
+  chmod 0755 "${STATE_ROOT}" "${RESULT_ROOT}" "${WORK_ROOT}"
   : >"${RESULT_ROOT}/build/link-commands.txt"
   cp -- "${ACE_SOURCE_MANIFEST}" "${RESULT_ROOT}/source/ace_source_manifest.json"
   cp -- "${PHANTOM_SOURCE_MANIFEST}" \
