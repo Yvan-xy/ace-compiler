@@ -1375,22 +1375,44 @@ TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
   fhe::ckks::CKKS2C_DRIVER::Verify_source_or_throw(source,
                                                    PROVIDER::PHANTOM);
 
+  auto generated_cipher_symbol = [&source](const std::string& stem,
+                                            bool is_array) {
+    const std::regex declaration(
+        "(^|\\n)  CIPHERTEXT (" + stem +
+        "_[0-9]+)" + (is_array ? "\\[[0-9]+\\]" : "") +
+        ";(\\n|$)");
+    std::smatch match;
+    const bool  found = std::regex_search(source, match, declaration);
+    EXPECT_TRUE(found) << "missing generated declaration for " << stem;
+    return found ? match[2].str() : std::string();
+  };
+  const std::string input_symbol = generated_cipher_symbol("input", false);
+  const std::string conjugated_symbol =
+      generated_cipher_symbol("conjugated", false);
+  const std::string rotated_symbol =
+      generated_cipher_symbol("rotated", true);
+  const std::string raised_symbol = generated_cipher_symbol("raised", false);
+  const std::string monomial_symbol =
+      generated_cipher_symbol("monomial", false);
+
   const std::size_t input_registration =
-      source.find("Register_ciph_lifetime(&input)");
+      source.find("Register_ciph_lifetime(&" + input_symbol + ")");
   const std::size_t first_retained_call = source.find("Conjugate_ciph(");
   ASSERT_NE(input_registration, std::string::npos);
   ASSERT_NE(first_retained_call, std::string::npos);
   EXPECT_LT(input_registration, first_retained_call);
-  EXPECT_NE(source.find("Register_ciph_lifetime(&conjugated)"),
+  EXPECT_NE(source.find("Register_ciph_lifetime(&" + conjugated_symbol + ")"),
             std::string::npos);
-  EXPECT_NE(source.find("Register_ciph_lifetime(&raised)"),
+  EXPECT_NE(source.find("Register_ciph_lifetime(&" + raised_symbol + ")"),
             std::string::npos);
-  EXPECT_NE(source.find("Register_ciph_lifetime(&monomial)"),
+  EXPECT_NE(source.find("Register_ciph_lifetime(&" + monomial_symbol + ")"),
             std::string::npos);
-  EXPECT_NE(source.find("Register_ciph_array_lifetime(rotated, "
-                        "sizeof(rotated) / sizeof(rotated[0]))"),
+  EXPECT_NE(source.find("Register_ciph_array_lifetime(" + rotated_symbol +
+                        ", sizeof(" + rotated_symbol + ") / sizeof(" +
+                        rotated_symbol + "[0]))"),
             std::string::npos);
-  EXPECT_NE(source.find("Conjugate_ciph(&conjugated, &input)"),
+  EXPECT_NE(source.find("Conjugate_ciph(&" + conjugated_symbol + ", &" +
+                        input_symbol + ")"),
             std::string::npos);
   EXPECT_NE(source.find(
                 "static const int32_t _rot_batch_"),
@@ -1399,11 +1421,13 @@ TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
             std::string::npos);
   EXPECT_TRUE(std::regex_search(
       source,
-      std::regex(
-          R"(Rotate_batch_ciph\(rotated, &input, _rot_batch_[0-9]+, 4\))")));
-  EXPECT_NE(source.find("Raise_mod(&raised, &input, 4)"),
+      std::regex("Rotate_batch_ciph\\(" + rotated_symbol + ", &" +
+                 input_symbol + ", _rot_batch_[0-9]+, 4\\)")));
+  EXPECT_NE(source.find("Raise_mod(&" + raised_symbol + ", &" + input_symbol +
+                        ", 4)"),
             std::string::npos);
-  EXPECT_NE(source.find("Mul_mono_ciph(&monomial, &input, 63)"),
+  EXPECT_NE(source.find("Mul_mono_ciph(&" + monomial_symbol + ", &" +
+                        input_symbol + ", 63)"),
             std::string::npos);
   EXPECT_NE(source.find("phantom_rotation_batch_offsets[] = {0, 4}"),
             std::string::npos);
