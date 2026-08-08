@@ -27,3 +27,8 @@ def test_component_wise_centered_raise_is_not_a_decoded_identity() -> None:
     assert component_wise_lift == 16
     assert decoded_value_lift == 18
     assert component_wise_lift != decoded_value_lift
+
+    # Strictly retaining the original q0 residue is a ring projection and
+    # therefore recovers the source ciphertext phase.
+    projected_phase = (c0 + c1) % source_modulus
+    assert _center(projected_phase, source_modulus) == decoded_at_source

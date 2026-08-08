@@ -97,6 +97,11 @@ def test_ant_oracle_invokes_the_generated_composite() -> None:
     )
     assert "CIPHERTEXT retained_ckks_composite(CIPHERTEXT input);" in source
     assert "CIPHERTEXT result = retained_ckks_composite(*source);" in source
+    assert "DecodeStrictQ0" in source
+    assert "Modswitch_ciph(projected)" in source
+    assert "ANT decoded projection changed the retained q0 tower" in source
+    assert "ANT decoded projection mutated the full-Q result" in source
+    assert source.count("full_q_count, slots, nullptr, true") == 2
 
 
 def test_phantom_harness_invokes_the_generated_composite_interface() -> None:

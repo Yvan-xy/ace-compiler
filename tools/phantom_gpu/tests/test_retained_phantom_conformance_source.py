@@ -107,7 +107,7 @@ def test_case_matrix_order_and_strict_artifact_schemas_are_literal() -> None:
         "2N_plus_1",
     ):
         assert label in source
-    assert "ace.phantom.retained_ckks.provider-result/2.0.0" in source
+    assert "ace.phantom.retained_ckks.provider-result/3.0.0" in source
     assert "ace.phantom.retained_ckks.exact-observed/2.0.0" in source
     compact = re.sub(r"\s+", "", source)
     assert "'A','C','E','R','C','K','0','1'" in compact
@@ -151,6 +151,20 @@ def test_source_preservation_hashes_exact_device_residues() -> None:
     assert "CipherResiduesSha256(cipher)" in snapshot
     assert '"source_values_sha256_before", before._residues_sha256' in source
     assert '"source_values_sha256_after", after._residues_sha256' in source
+
+
+def test_raised_decodes_use_a_verified_temporary_q0_projection() -> None:
+    source = _source()
+    projection = _function_body(source, "DecodeStrictQ0")
+    assert "Copy_ciph(&projected, result)" in projection
+    assert "while (Active_q_count(&projected) > 1)" in projection
+    assert "Mod_switch(&projected, &projected)" in projection
+    assert "Q0Tower(&projected) == full_q0" in projection
+    assert "CipherResiduesSha256(result) == full_residues" in projection
+    assert "result->data() == full_buffer" in projection
+    assert '"strict_q0_prefix_drop"' in source
+    body = _function_body(source, "RunDecoded")
+    assert body.count("nullptr, true") == 2
 
 
 def test_rejections_publish_stable_identifiers_and_tokens() -> None:

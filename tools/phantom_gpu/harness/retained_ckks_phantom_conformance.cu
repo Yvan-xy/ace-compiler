@@ -61,7 +61,7 @@ constexpr std::array<std::uint8_t, 8> kExactMagic = {'A', 'C', 'E', 'R',
 constexpr std::array<std::uint8_t, 8> kExactSourceMagic = {
     'A', 'C', 'E', 'S', 'R', 'C', '0', '1'};
 constexpr char kProviderSchema[] =
-    "ace.phantom.retained_ckks.provider-result/2.0.0";
+    "ace.phantom.retained_ckks.provider-result/3.0.0";
 constexpr char kExactObservedSchema[] =
     "ace.phantom.retained_ckks.exact-observed/2.0.0";
 
@@ -581,6 +581,58 @@ void RequirePreserved(const RuntimeSnapshot &before, CIPHER source,
           diagnostic, "out-of-place operation mutated its source");
 }
 
+std::vector<std::uint64_t> Q0Tower(CIPHER cipher) {
+  Require(cipher != nullptr && cipher->data() != nullptr, "DECODE_PROJECTION",
+          "ciphertext has no device residue buffer");
+  const std::size_t components = cipher->size();
+  const std::size_t towers = cipher->coeff_modulus_size();
+  const std::size_t degree = cipher->poly_modulus_degree();
+  Require(components != 0 && towers != 0 && degree != 0,
+          "DECODE_PROJECTION", "ciphertext residue dimensions are empty");
+  std::vector<std::uint64_t> result(components * degree);
+  for (std::size_t component = 0; component < components; ++component) {
+    RequireCuda(
+        cudaMemcpy(result.data() + component * degree,
+                   cipher->data() + component * towers * degree,
+                   degree * sizeof(std::uint64_t), cudaMemcpyDeviceToHost),
+        "decoded projection q0 cudaMemcpy");
+  }
+  return result;
+}
+
+std::vector<Complex> DecodeStrictQ0(CIPHER result) {
+  const Json full_metadata = Metadata(result);
+  const std::string full_residues = CipherResiduesSha256(result);
+  const phantom::parms_id_type full_parms_id = result->parms_id();
+  const std::uint64_t *const full_buffer = result->data();
+  const std::vector<std::uint64_t> full_q0 = Q0Tower(result);
+
+  CIPHERTEXT projected;
+  Copy_ciph(&projected, result);
+  while (Active_q_count(&projected) > 1)
+    Mod_switch(&projected, &projected);
+  Require(Active_q_count(&projected) == 1 &&
+              Get_ciph_size(&projected) == Get_ciph_size(result) &&
+              Get_ciph_slots(&projected) == Get_ciph_slots(result) &&
+              Sc_degree(&projected) == Sc_degree(result) &&
+              Raw_scale(&projected) == Raw_scale(result) &&
+              Is_ciph_ntt(&projected) == Is_ciph_ntt(result),
+          "DECODE_PROJECTION",
+          "strict q0 projection changed non-chain metadata");
+  Require(Q0Tower(&projected) == full_q0, "DECODE_PROJECTION",
+          "strict q0 projection changed the retained tower");
+  std::vector<Complex> values = Decode(&projected);
+  Free_ciph(&projected);
+
+  Require(Metadata(result) == full_metadata &&
+              CipherResiduesSha256(result) == full_residues &&
+              result->parms_id() == full_parms_id &&
+              result->data() == full_buffer,
+          "DECODE_PROJECTION",
+          "strict q0 projection mutated the full-Q result");
+  return values;
+}
+
 class RuntimeArena final {
 public:
   CIPHER NewCipher() {
@@ -702,12 +754,19 @@ Json AppendDecodedRecord(std::vector<std::uint8_t> &binary,
                          const std::string &case_id,
                          const std::string &operation, CIPHER result,
                          const RuntimeSnapshot &before, CIPHER source,
-                         const Json &ownership_token = nullptr) {
-  const auto values = Decode(result);
+                         const Json &ownership_token = nullptr,
+                         bool project_to_q0 = false) {
+  const auto values = project_to_q0 ? DecodeStrictQ0(result) : Decode(result);
   const Json descriptor =
       AppendBlob(binary, PackComplex(values), values.size());
-  return MakeDecodedRecord(case_id, operation, result, before, source,
-                           descriptor, ownership_token);
+  Json record = MakeDecodedRecord(case_id, operation, result, before, source,
+                                  descriptor, ownership_token);
+  record["decoded_projection"] =
+      project_to_q0
+          ? Json{{"kind", "strict_q0_prefix_drop"},
+                 {"active_q_count", 1}}
+          : Json(nullptr);
+  return record;
 }
 
 std::string OwnershipToken(CIPHER output, std::size_t serial) {
@@ -864,7 +923,8 @@ Json RunDecoded(const Json &fixture, const std::vector<Complex> &source_values,
               static_cast<std::uint32_t>(context._data_q_count));
     records.push_back(AppendDecodedRecord(binary,
                                           "raise_mod.bounded_nonperiodic",
-                                          "raise_mod", result, before, source));
+                                          "raise_mod", result, before, source,
+                                          nullptr, true));
   }
 
   for (const auto &raw_symbol : fixture.at("monomial_powers")) {
@@ -894,7 +954,8 @@ Json RunDecoded(const Json &fixture, const std::vector<Complex> &source_values,
     CIPHERTEXT result = retained_ckks_composite(*source);
     records.push_back(AppendDecodedRecord(binary,
                                           "composite.bounded_nonperiodic",
-                                          "composite", &result, before, source));
+                                          "composite", &result, before, source,
+                                          nullptr, true));
     Zero_ciph(&result);
   }
   arena.FreeAll();

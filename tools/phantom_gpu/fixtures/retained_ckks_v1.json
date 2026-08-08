@@ -52,7 +52,7 @@
     {"id": "conjugate.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
     {"id": "conjugate_twice.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
     {"id": "rotate_batch.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
-    {"id": "raise_mod.bounded_nonperiodic", "oracle": ["ant"]},
+    {"id": "raise_mod.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
     {"id": "mul_mono.0.bounded_nonperiodic", "oracle": ["ant"]},
     {"id": "mul_mono.N_over_2.bounded_nonperiodic", "oracle": ["ant"]},
     {"id": "mul_mono.N.bounded_nonperiodic", "oracle": ["ant"]},

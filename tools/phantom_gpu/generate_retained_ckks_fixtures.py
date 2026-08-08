@@ -284,7 +284,7 @@ def validate_template(fixture: dict[str, Any], *, require_bound: bool) -> None:
         {"id": "conjugate.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
         {"id": "conjugate_twice.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
         {"id": "rotate_batch.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
-        {"id": "raise_mod.bounded_nonperiodic", "oracle": ["ant"]},
+        {"id": "raise_mod.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
         {"id": "mul_mono.0.bounded_nonperiodic", "oracle": ["ant"]},
         {"id": "mul_mono.N_over_2.bounded_nonperiodic", "oracle": ["ant"]},
         {"id": "mul_mono.N.bounded_nonperiodic", "oracle": ["ant"]},
@@ -883,10 +883,17 @@ def analytic_case_values(
                     step,
                 )
             )
-    # Centering each RNS ciphertext component is not additive across a change
-    # of modulus.  Consequently it cannot supply an isolated clear decoded
-    # identity oracle for raise_mod.  Exact centered RNS evidence and the
-    # independently encoded/encrypted ANT result are the two authorities.
+    # A component-wise centered raise is not directly decryptable at full Q.
+    # The provider harnesses decode a strict temporary projection back to the
+    # retained q0 tower, where reduction recovers the original ciphertext.
+    records.append(
+        (
+            "raise_mod.bounded_nonperiodic",
+            "raise_mod",
+            source,
+            None,
+        )
+    )
     return records
 
 

@@ -45,7 +45,7 @@ using Json = nlohmann::json;
 constexpr std::array<std::uint8_t, 8> kDecodedMagic = {'A', 'C', 'E', 'R',
                                                        'C', 'K', '0', '1'};
 constexpr char kProviderSchema[] =
-    "ace.phantom.retained_ckks.provider-result/2.0.0";
+    "ace.phantom.retained_ckks.provider-result/3.0.0";
 constexpr char kBinaryFormat[] = "ace.retained_ckks.complex_float64le/1.0.0";
 constexpr std::uint32_t kResourceSchemaVersion = 2;
 
@@ -480,14 +480,63 @@ void RequirePreserved(const Snapshot &before, CIPHER source,
           "out-of-place ANT operation mutated its source");
 }
 
+void RequireStrictQ0Tower(CIPHER full, CIPHER projected,
+                          std::size_t full_q_count) {
+  Require(Get_ciph_prime_cnt(full) == full_q_count &&
+              Get_ciph_prime_cnt(projected) == 1 &&
+              Get_ciph_degree(projected) == Get_ciph_degree(full) &&
+              Get_ciph_slots(projected) == Get_ciph_slots(full) &&
+              Get_ciph_sf_degree(projected) == Get_ciph_sf_degree(full) &&
+              Get_ciph_sfactor(projected) == Get_ciph_sfactor(full) &&
+              Is_ntt(Get_c0(projected)) == Is_ntt(Get_c0(full)) &&
+              Is_ntt(Get_c1(projected)) == Is_ntt(Get_c1(full)),
+          "ANT decoded projection changed non-chain metadata");
+  const std::size_t bytes =
+      static_cast<std::size_t>(Get_ciph_degree(full)) * sizeof(int64_t);
+  for (const auto &components :
+       {std::pair<POLYNOMIAL *, POLYNOMIAL *>{Get_c0(full),
+                                              Get_c0(projected)},
+        std::pair<POLYNOMIAL *, POLYNOMIAL *>{Get_c1(full),
+                                              Get_c1(projected)}}) {
+    Require(std::memcmp(Get_poly_coeffs(components.first),
+                        Get_poly_coeffs(components.second), bytes) == 0,
+            "ANT decoded projection changed the retained q0 tower");
+  }
+}
+
+std::vector<Complex> DecodeStrictQ0(CIPHER result, std::size_t full_q_count,
+                                    std::size_t slots) {
+  const Snapshot before = TakeSnapshot(result, full_q_count);
+  CIPHER projected = Alloc_ciphertext();
+  Copy_ciph(projected, result);
+  while (Get_ciph_prime_cnt(projected) > 1)
+    Modswitch_ciph(projected);
+  RequireStrictQ0Tower(result, projected, full_q_count);
+  std::vector<Complex> values = Decode(projected, slots);
+  Free_ciphertext(projected);
+  const Snapshot after = TakeSnapshot(result, full_q_count);
+  Require(before._metadata == after._metadata &&
+              before._residue_hash == after._residue_hash,
+          "ANT decoded projection mutated the full-Q result");
+  return values;
+}
+
 Json AppendRecord(std::vector<std::uint8_t> &binary, const std::string &case_id,
                   const std::string &operation, CIPHER result,
                   const Snapshot &before, CIPHER source,
                   std::size_t full_q_count, std::size_t slots,
-                  const Json &ownership_token = nullptr) {
+                  const Json &ownership_token = nullptr,
+                  bool project_to_q0 = false) {
   const Snapshot after = TakeSnapshot(source, full_q_count);
   RequirePreserved(before, source, full_q_count);
-  const std::vector<Complex> values = Decode(result, slots);
+  const std::vector<Complex> values =
+      project_to_q0 ? DecodeStrictQ0(result, full_q_count, slots)
+                    : Decode(result, slots);
+  const Json decoded_projection =
+      project_to_q0
+          ? Json{{"kind", "strict_q0_prefix_drop"},
+                 {"active_q_count", 1}}
+          : Json(nullptr);
   return {{"case_id", case_id},
           {"operation", operation},
           {"metadata", Metadata(result, full_q_count)},
@@ -496,6 +545,7 @@ Json AppendRecord(std::vector<std::uint8_t> &binary, const std::string &case_id,
           {"source_values_sha256_before", before._residue_hash},
           {"source_values_sha256_after", after._residue_hash},
           {"ownership_token", ownership_token},
+          {"decoded_projection", decoded_projection},
           {"values", AppendBlob(binary, PackComplex(values), values.size())}};
 }
 
@@ -613,7 +663,7 @@ Json RunDecoded(const Json &fixture, const Json &context,
     Raise_mod(result, source, static_cast<std::uint32_t>(full_q_count));
     records.push_back(AppendRecord(binary, "raise_mod.bounded_nonperiodic",
                                    "raise_mod", result, before, source,
-                                   full_q_count, slots));
+                                   full_q_count, slots, nullptr, true));
     Free_ciphertext(result);
     Free_ciphertext(source);
   }
@@ -650,7 +700,7 @@ Json RunDecoded(const Json &fixture, const Json &context,
     CIPHERTEXT result = retained_ckks_composite(*source);
     records.push_back(AppendRecord(binary, "composite.bounded_nonperiodic",
                                    "composite", &result, before, source,
-                                   full_q_count, slots));
+                                   full_q_count, slots, nullptr, true));
     Zero_ciph(&result);
     Free_ciphertext(source);
   }
