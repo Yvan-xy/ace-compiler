@@ -822,11 +822,11 @@ if not status:
     raise SystemExit("retained generated Phantom source audit failed")
 PY
 
-  nm -A -C --undefined-only "${PHANTOM_BINARY}" \
+  nm -C --undefined-only "${PHANTOM_BINARY}" \
     >"${inspection}/phantom-undefined-symbols.txt"
-  nm -A -C --defined-only "${PHANTOM_BINARY}" \
+  nm -C --defined-only "${PHANTOM_BINARY}" \
     >"${inspection}/phantom-defined-symbols.txt"
-  nm -A -C --undefined-only "${ANT_BINARY}" \
+  nm -C --undefined-only "${ANT_BINARY}" \
     >"${inspection}/ant-undefined-symbols.txt"
   "${CUOBJDUMP}" --list-elf "${PHANTOM_BINARY}" \
     >"${inspection}/phantom-cuda-elf.txt"
@@ -834,9 +834,9 @@ PY
     >"${inspection}/phantom-cuda-resources.txt"
   file "${PHANTOM_BINARY}" >"${inspection}/phantom-file.txt"
   readelf -h -S -Ws -d "${PHANTOM_BINARY}" >"${inspection}/phantom-readelf.txt"
-  nm -A -C --undefined-only "${PHANTOM_NATIVE_TEST_BINARY}" \
+  nm -C --undefined-only "${PHANTOM_NATIVE_TEST_BINARY}" \
     >"${inspection}/native-primitives-undefined-symbols.txt"
-  nm -A -C --defined-only "${PHANTOM_NATIVE_TEST_BINARY}" \
+  nm -C --defined-only "${PHANTOM_NATIVE_TEST_BINARY}" \
     >"${inspection}/native-primitives-defined-symbols.txt"
   "${CUOBJDUMP}" --list-elf "${PHANTOM_NATIVE_TEST_BINARY}" \
     >"${inspection}/native-primitives-cuda-elf.txt"
@@ -852,7 +852,7 @@ PY
     "rotation:${KEYLESS_ROTATION_BINARY}"; do
     keyless_name="${keyless_entry%%:*}"
     keyless_binary="${keyless_entry#*:}"
-    nm -A -C --undefined-only "${keyless_binary}" \
+    nm -C --undefined-only "${keyless_binary}" \
       >"${inspection}/${keyless_name}-keyless-undefined-symbols.txt"
     "${CUOBJDUMP}" --list-elf "${keyless_binary}" \
       >"${inspection}/${keyless_name}-keyless-cuda-elf.txt"

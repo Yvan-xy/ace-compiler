@@ -299,6 +299,25 @@ def test_ant_rotation_runtime_normalizes_steps_to_compiler_key_ids() -> None:
     )
 
 
+def test_executable_symbol_audits_do_not_match_the_binary_path() -> None:
+    host = (TOOLS / "run_retained_ckks_correctness.sh").read_text(
+        encoding="utf-8"
+    )
+    inspection = host[
+        host.index('nm -C --undefined-only "${PHANTOM_BINARY}"') : host.index(
+            "\nwrite_attestations() {"
+        )
+    ]
+    assert 'nm -A -C --undefined-only "${PHANTOM_BINARY}"' not in inspection
+    assert 'nm -A -C --defined-only "${PHANTOM_BINARY}"' not in inspection
+    assert 'nm -A -C --undefined-only "${keyless_binary}"' not in inspection
+    assert 'nm -C --undefined-only "${keyless_binary}"' in inspection
+    assert (
+        "Conjugate_ciph|Rotate_batch_ciph|Raise_mod|Mul_mono_ciph|"
+        "retained_ckks_"
+    ) in inspection
+
+
 def test_a100_gate_executes_fixture_owned_adapter_aliases() -> None:
     runner = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
     retained_function = runner[
