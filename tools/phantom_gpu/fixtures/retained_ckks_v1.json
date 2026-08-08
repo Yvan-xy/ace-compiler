@@ -40,14 +40,14 @@
   ],
   "production_rotation_source": {
     "kind": "audited_default_post_ckks_air",
-    "post_ckks_air_sha256": "42328a52814bfaf985b78e8a12ea7561bd4470ced9b2c9d3c9311b533d94f33a"
+    "post_ckks_air_sha256": null
   },
   "monomial_powers": ["0", "N/2", "N", "3N/2", "2N-1", "2N+1"],
   "decoded_cases": [
     {"id": "conjugate.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
     {"id": "conjugate_twice.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
     {"id": "rotate_batch.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
-    {"id": "raise_mod.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
+    {"id": "raise_mod.bounded_nonperiodic", "oracle": ["ant"]},
     {"id": "mul_mono.0.bounded_nonperiodic", "oracle": ["ant"]},
     {"id": "mul_mono.N_over_2.bounded_nonperiodic", "oracle": ["ant"]},
     {"id": "mul_mono.N.bounded_nonperiodic", "oracle": ["ant"]},
@@ -82,6 +82,17 @@
     "batch_outputs_are_independent": true,
     "free_order": [3, 1, 0, 2]
   },
+  "runtime_rejections": [
+    {"id": "conjugate_missing_key", "diagnostic": "CONJUGATE_KEY_MISSING", "manifest": "keyless-conjugation"},
+    {"id": "rotate_batch_missing_nonzero_key", "diagnostic": "RESOURCE_ROTATE_BATCH", "manifest": "keyless-rotation"},
+    {"id": "rotate_batch_source_overlap", "diagnostic": "ROTATE_BATCH_ALIAS", "manifest": "production"},
+    {"id": "raise_alias", "diagnostic": "RAISE_MOD_ALIAS", "manifest": "production"},
+    {"id": "raise_size", "diagnostic": "RAISE_MOD_SIZE", "manifest": "production"},
+    {"id": "raise_chain", "diagnostic": "RAISE_MOD_SOURCE_LEVEL", "manifest": "production"},
+    {"id": "raise_target", "diagnostic": "RAISE_MOD_TARGET", "manifest": "production"},
+    {"id": "raise_malformed_metadata", "diagnostic": "RAISE_MOD_SOURCE", "manifest": "production"},
+    {"id": "mul_mono_undeclared", "diagnostic": "MUL_MONO_RESOURCE", "manifest": "production"}
+  ],
   "tolerances": {
     "primitive_absolute": 0.0001,
     "primitive_relative": 0.001,

@@ -200,6 +200,57 @@ def test_strict_json_and_metric_reject_invalid_data(tmp_path: Path) -> None:
     assert result["maximum_absolute_error"] == 0
 
 
+def test_provider_operation_and_metadata_projection_are_case_driven() -> None:
+    assert comparator.expected_provider_operation(
+        "conjugate_twice.bounded_nonperiodic"
+    ) == "conjugate_twice"
+    assert comparator.expected_provider_operation(
+        "rotate_batch.production_2.output_1.step_0"
+    ) == "rotate_batch"
+    assert comparator.expected_provider_operation(
+        "mul_mono.2N_plus_1.bounded_nonperiodic"
+    ) == "mul_mono"
+    metadata = {
+        "ace_level": 1,
+        "active_q_count": 1,
+        "scale_degree": 1,
+        "logical_slots": 4,
+        "ciphertext_size": 2,
+        "ntt": True,
+        "chain_index": 17,
+        "raw_scale": 32.0,
+    }
+    projected = comparator.provider_independent_metadata(metadata)
+    assert projected == {
+        "ace_level": 1,
+        "active_q_count": 1,
+        "scale_degree": 1,
+        "logical_slots": 4,
+        "ciphertext_size": 2,
+        "ntt": True,
+    }
+    assert "chain_index" not in projected
+    assert "raw_scale" not in projected
+
+    resolved = fixture_tool.validate_context_manifest(_context())
+    provider_local = dict(metadata, chain_index=9)
+    assert comparator.validate_metadata(
+        provider_local,
+        resolved,
+        raised=False,
+        first_data_chain_index=7,
+        context="provider-local",
+    )["chain_index"] == 9
+    with pytest.raises(comparator.ComparisonError, match="chain_index"):
+        comparator.validate_metadata(
+            dict(provider_local, chain_index=8),
+            resolved,
+            raised=False,
+            first_data_chain_index=7,
+            context="provider-local",
+        )
+
+
 def test_runtime_exact_oracle_recomputes_from_observed_sources(tmp_path: Path) -> None:
     context = _context()
     resolved = fixture_tool.validate_context_manifest(context)
@@ -229,12 +280,16 @@ def test_runtime_exact_oracle_recomputes_from_observed_sources(tmp_path: Path) -
         "ciphertext_size": 2,
         "ntt": False,
         "chain_index": 2,
+        "scale_degree": 1,
+        "raw_scale": 32.0,
     }
     full_metadata = {
         "active_q_count": len(moduli),
         "ciphertext_size": 2,
         "ntt": False,
         "chain_index": 0,
+        "scale_degree": 1,
+        "raw_scale": 32.0,
     }
     records.append(
         {
@@ -336,11 +391,61 @@ def test_runtime_exact_oracle_recomputes_from_observed_sources(tmp_path: Path) -
     observed_path = tmp_path / "observed.json"
     _write_json(observed_path, observed)
     evidence = comparator.compare_exact(
-        observed_path, binary_path, fixture_sha, context_sha, resolved
+        observed_path, binary_path, fixture_sha, context_sha, resolved, 0
     )
     assert evidence["mismatch_count"] == 0
     assert evidence["comparison_count"] > 0
     assert all(not record["mismatches"] for record in evidence["records"])
+
+    mutations = (
+        (
+            "operation",
+            lambda value: value["records"][1].__setitem__("operation", "raise_mod"),
+            "operation",
+        ),
+        (
+            "normalized_power",
+            lambda value: value["records"][2].__setitem__(
+                "normalized_power", degree // 2 + 1
+            ),
+            "normalized_power",
+        ),
+        (
+            "layout_product",
+            lambda value: value["records"][1]["layout"].__setitem__(
+                "source_modulus_count", len(moduli) - 1
+            ),
+            "blob count disagrees with layout",
+        ),
+        (
+            "chain_coordinate",
+            lambda value: value["records"][1]["result_metadata"].__setitem__(
+                "chain_index", 1
+            ),
+            "chain coordinates",
+        ),
+        (
+            "raw_scale",
+            lambda value: value["records"][1]["result_metadata"].__setitem__(
+                "raw_scale", 64.0
+            ),
+            "changed raw scale",
+        ),
+    )
+    for name, mutate, diagnostic in mutations:
+        invalid = json.loads(json.dumps(observed))
+        mutate(invalid)
+        invalid_path = tmp_path / f"invalid_{name}.json"
+        _write_json(invalid_path, invalid)
+        with pytest.raises(comparator.ComparisonError, match=diagnostic):
+            comparator.compare_exact(
+                invalid_path,
+                binary_path,
+                fixture_sha,
+                context_sha,
+                resolved,
+                0,
+            )
 
 
 def test_fixture_contains_no_independent_context_numbers() -> None:
@@ -350,3 +455,24 @@ def test_fixture_contains_no_independent_context_numbers() -> None:
     serialized = json.dumps(rules, sort_keys=True)
     for forbidden in ("16384", "8192", "56", "60", "192"):
         assert forbidden not in serialized
+
+
+def test_fixture_owns_frozen_runtime_rejection_contract() -> None:
+    fixture = fixture_tool.load_json(TOOLS / "fixtures" / "retained_ckks_v1.json")
+    fixture_tool.validate_template(fixture, require_bound=False)
+    ids = [item["id"] for item in fixture["runtime_rejections"]]
+    assert ids == [
+        "conjugate_missing_key",
+        "rotate_batch_missing_nonzero_key",
+        "rotate_batch_source_overlap",
+        "raise_alias",
+        "raise_size",
+        "raise_chain",
+        "raise_target",
+        "raise_malformed_metadata",
+        "mul_mono_undeclared",
+    ]
+    invalid = json.loads(json.dumps(fixture))
+    invalid["runtime_rejections"][4]["diagnostic"] = "UNSTABLE_TOKEN"
+    with pytest.raises(fixture_tool.RetainedFixtureError, match="runtime rejection"):
+        fixture_tool.validate_template(invalid, require_bound=False)

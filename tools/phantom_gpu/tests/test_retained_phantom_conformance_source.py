@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 
@@ -12,6 +13,7 @@ HARNESS = (
     / "harness"
     / "retained_ckks_phantom_conformance.cu"
 )
+FIXTURE = REPO_ROOT / "tools" / "phantom_gpu" / "fixtures" / "retained_ckks_v1.json"
 
 
 def _source() -> str:
@@ -66,6 +68,12 @@ def test_exact_path_imports_and_observes_both_representations() -> None:
     assert "EXACT_NTT_RAISE" in body
     assert "mutated its NTT source" in body
     assert "NTT and coefficient-form exact residues disagree" in body
+    raise_branch_start = body.index("if (index == 0)")
+    raise_branch_end = body.index("continue;", raise_branch_start)
+    raise_branch = body[raise_branch_start:raise_branch_end]
+    assert raise_branch.count("raise_modulus(") == 2
+    assert "copy_ciphertext_to_ntt_form(" in raise_branch
+    assert "raise_modulus(" not in body[raise_branch_end + len("continue;") :]
     for wrapper in (
         "Conjugate_ciph",
         "Rotate_batch_ciph",
@@ -95,8 +103,8 @@ def test_case_matrix_order_and_strict_artifact_schemas_are_literal() -> None:
         "2N_plus_1",
     ):
         assert label in source
-    assert "ace.phantom.retained_ckks.provider-result/1.0.0" in source
-    assert "ace.phantom.retained_ckks.exact-observed/1.0.0" in source
+    assert "ace.phantom.retained_ckks.provider-result/2.0.0" in source
+    assert "ace.phantom.retained_ckks.exact-observed/2.0.0" in source
     compact = re.sub(r"\s+", "", source)
     assert "'A','C','E','R','C','K','0','1'" in compact
     assert "'A','C','E','R','N','S','0','1'" in compact
@@ -144,18 +152,31 @@ def test_rejections_publish_stable_identifiers_and_tokens() -> None:
         "raise_malformed_metadata": "RAISE_MOD_SOURCE",
         "mul_mono_undeclared": "MUL_MONO_RESOURCE",
     }
-    for rejection_id, diagnostic in expected.items():
-        assert f'{{"{rejection_id}", "{diagnostic}"}}' in source
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    observed = {
+        item["id"]: (item["diagnostic"], item["manifest"])
+        for item in fixture["runtime_rejections"]
+    }
+    assert {key: value[0] for key, value in observed.items()} == expected
+    assert observed["conjugate_missing_key"][1] == "keyless-conjugation"
+    assert observed["rotate_batch_missing_nonzero_key"][1] == "keyless-rotation"
+    assert all(
+        manifest == "production"
+        for rejection_id, (_diagnostic, manifest) in observed.items()
+        if "missing" not in rejection_id
+    )
+    assert 'fixture.at("runtime_rejections")' in source
     assert "ACE_RETAINED_EXPECT_DIAGNOSTIC[" in source
     assert "ACE_REJECTION_MANIFEST_ID" in source
-    assert '"keyless-conjugation"' in source
-    assert '"keyless-rotation"' in source
-    assert "separately audited keyless" in source
+    assert "expected_manifest == ACE_REJECTION_MANIFEST_ID" in source
     assert "PHANTOM_RESOURCE_CONJUGATION_KEY" in source
     assert "missing_nonzero_key" in source
     assert "REJECTION_INITIALIZATION" in source
     assert "REJECTION_RETURNED" in source
     assert "raise_invalid_form" not in source
+    assert 'Require(source->is_ntt_form(), "REJECTION_SETUP"' in source
+    assert "source->set_ntt_form(false)" not in source
+    assert "source->set_parms_id(phantom::parms_id_zero)" in source
 
 
 def test_context_and_resources_have_one_generated_authority() -> None:
@@ -176,6 +197,15 @@ def test_context_and_resources_have_one_generated_authority() -> None:
         assert field in exact_context
     assert "CoeffModulus::Create" in exact_context
     assert "ordered_data_q_moduli" in source
+    authenticated = _function_body(source, "AuthenticateContext")
+    assert "ParseJson(bytes, path)" in authenticated
+    assert 'require_ordered_bits("data_q_bit_sizes"' in authenticated
+    assert 'require_ordered_bits("special_p_bit_sizes"' in authenticated
+    assert "Sha256(bytes)" in authenticated
+    assert "CONTEXT_FILE_MISMATCH" in authenticated
+    assert "JSON_DUPLICATE_KEY" in source
+    assert source.count("AuthenticateContext(argv[3])") == 3
+    assert source.count('{"first_data_chain_index", first_data_chain_index}') == 2
     for profile_literal in ("16384", "8192", "192"):
         assert re.search(rf"\b{profile_literal}\b", source) is None
 

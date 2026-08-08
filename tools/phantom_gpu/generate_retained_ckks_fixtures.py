@@ -202,6 +202,7 @@ def validate_template(fixture: dict[str, Any], *, require_bound: bool) -> None:
         "exact_algebraic_cases",
         "metadata_contract",
         "ownership",
+        "runtime_rejections",
         "tolerances",
         "decoded_binary_format",
         "exact_binary_format",
@@ -236,6 +237,14 @@ def validate_template(fixture: dict[str, Any], *, require_bound: bool) -> None:
     )
     if production_source["kind"] != "audited_default_post_ckks_air":
         fail("production rotation source kind changed")
+    binding_status = fixture["qualification_bindings"].get("status")
+    if binding_status == "unbound" and production_source["post_ckks_air_sha256"] is not None:
+        fail(
+            "an unbound fixture must not predeclare its production post-CKKS "
+            "AIR hash"
+        )
+    if binding_status == "bound" and production_source["post_ckks_air_sha256"] is None:
+        fail("a bound fixture must bind its production post-CKKS AIR hash")
     if production_source["post_ckks_air_sha256"] is not None:
         _sha256(
             production_source["post_ckks_air_sha256"],
@@ -265,7 +274,7 @@ def validate_template(fixture: dict[str, Any], *, require_bound: bool) -> None:
         {"id": "conjugate.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
         {"id": "conjugate_twice.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
         {"id": "rotate_batch.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
-        {"id": "raise_mod.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
+        {"id": "raise_mod.bounded_nonperiodic", "oracle": ["ant"]},
         {"id": "mul_mono.0.bounded_nonperiodic", "oracle": ["ant"]},
         {"id": "mul_mono.N_over_2.bounded_nonperiodic", "oracle": ["ant"]},
         {"id": "mul_mono.N.bounded_nonperiodic", "oracle": ["ant"]},
@@ -342,6 +351,55 @@ def validate_template(fixture: dict[str, Any], *, require_bound: bool) -> None:
         "free_order": [3, 1, 0, 2],
     }:
         fail("ownership contract changed")
+    expected_runtime_rejections = [
+        {
+            "id": "conjugate_missing_key",
+            "diagnostic": "CONJUGATE_KEY_MISSING",
+            "manifest": "keyless-conjugation",
+        },
+        {
+            "id": "rotate_batch_missing_nonzero_key",
+            "diagnostic": "RESOURCE_ROTATE_BATCH",
+            "manifest": "keyless-rotation",
+        },
+        {
+            "id": "rotate_batch_source_overlap",
+            "diagnostic": "ROTATE_BATCH_ALIAS",
+            "manifest": "production",
+        },
+        {
+            "id": "raise_alias",
+            "diagnostic": "RAISE_MOD_ALIAS",
+            "manifest": "production",
+        },
+        {
+            "id": "raise_size",
+            "diagnostic": "RAISE_MOD_SIZE",
+            "manifest": "production",
+        },
+        {
+            "id": "raise_chain",
+            "diagnostic": "RAISE_MOD_SOURCE_LEVEL",
+            "manifest": "production",
+        },
+        {
+            "id": "raise_target",
+            "diagnostic": "RAISE_MOD_TARGET",
+            "manifest": "production",
+        },
+        {
+            "id": "raise_malformed_metadata",
+            "diagnostic": "RAISE_MOD_SOURCE",
+            "manifest": "production",
+        },
+        {
+            "id": "mul_mono_undeclared",
+            "diagnostic": "MUL_MONO_RESOURCE",
+            "manifest": "production",
+        },
+    ]
+    if fixture["runtime_rejections"] != expected_runtime_rejections:
+        fail("runtime rejection identifiers, diagnostics, or linkage changed")
     _expect_keys(
         fixture["tolerances"],
         {
@@ -516,15 +574,7 @@ def bind_fixture(
     bound = copy.deepcopy(fixture)
     production_air_path = production_air_path or post_air_path
     production_batches = extract_production_rotation_batches(production_air_path)
-    frozen_production_sha256 = fixture["production_rotation_source"][
-        "post_ckks_air_sha256"
-    ]
     observed_production_sha256 = sha256_path(production_air_path)
-    if (
-        frozen_production_sha256 is not None
-        and frozen_production_sha256 != observed_production_sha256
-    ):
-        fail("audited production post-CKKS AIR hash changed")
     if fixture["production_rotation_batches"] and (
         fixture["production_rotation_batches"] != production_batches
     ):
@@ -740,9 +790,10 @@ def analytic_case_values(
                     step,
                 )
             )
-    records.append(
-        ("raise_mod.bounded_nonperiodic", "raise_mod", list(source), None)
-    )
+    # Centering each RNS ciphertext component is not additive across a change
+    # of modulus.  Consequently it cannot supply an isolated clear decoded
+    # identity oracle for raise_mod.  Exact centered RNS evidence and the
+    # independently encoded/encrypted ANT result are the two authorities.
     return records
 
 

@@ -32,10 +32,10 @@ from generate_retained_ckks_fixtures import (  # noqa: E402
 )
 
 
-PROVIDER_SCHEMA = "ace.phantom.retained_ckks.provider-result/1.0.0"
-EXACT_OBSERVED_SCHEMA = "ace.phantom.retained_ckks.exact-observed/1.0.0"
+PROVIDER_SCHEMA = "ace.phantom.retained_ckks.provider-result/2.0.0"
+EXACT_OBSERVED_SCHEMA = "ace.phantom.retained_ckks.exact-observed/2.0.0"
 COMPARISON_SCHEMA = "ace.phantom.retained_ckks.comparison/1.0.0"
-EXACT_EVIDENCE_SCHEMA = "ace.phantom.retained_ckks.exact-evidence/1.0.0"
+EXACT_EVIDENCE_SCHEMA = "ace.phantom.retained_ckks.exact-evidence/2.0.0"
 
 
 class ComparisonError(ValueError):
@@ -65,6 +65,44 @@ def finite_number(value: Any, context: str) -> float:
     if not math.isfinite(result):
         fail(f"{context} must be finite")
     return result
+
+
+def integer(value: Any, context: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        fail(f"{context} must be an integer at least {minimum}")
+    return value
+
+
+def expected_provider_operation(case_id: str) -> str:
+    if case_id == "conjugate.bounded_nonperiodic":
+        return "conjugate"
+    if case_id == "conjugate_twice.bounded_nonperiodic":
+        return "conjugate_twice"
+    if case_id.startswith("rotate_batch."):
+        return "rotate_batch"
+    if case_id == "raise_mod.bounded_nonperiodic":
+        return "raise_mod"
+    if case_id == "mul_mono.inverse_composition.bounded_nonperiodic":
+        return "mul_mono_inverse_composition"
+    if case_id.startswith("mul_mono."):
+        return "mul_mono"
+    if case_id == "composite.bounded_nonperiodic":
+        return "composite"
+    fail(f"provider case {case_id!r} has no contracted operation")
+
+
+def provider_independent_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        field: metadata[field]
+        for field in (
+            "ace_level",
+            "active_q_count",
+            "scale_degree",
+            "logical_slots",
+            "ciphertext_size",
+            "ntt",
+        )
+    }
 
 
 def hex_digest(value: Any, length: int, context: str) -> str:
@@ -181,13 +219,20 @@ def validate_metadata(
         context,
     )
     expected = expected_metadata(resolved, raised=raised)
+    for field in (
+        "ace_level",
+        "active_q_count",
+        "scale_degree",
+        "logical_slots",
+        "ciphertext_size",
+    ):
+        integer(metadata[field], f"{context}.{field}")
+    if not isinstance(metadata["ntt"], bool):
+        fail(f"{context}.ntt must be a boolean")
     for field, expected_value in expected.items():
         if metadata[field] != expected_value:
             fail(f"{context}.{field} is {metadata[field]!r}, expected {expected_value!r}")
-    if isinstance(metadata["chain_index"], bool) or not isinstance(
-        metadata["chain_index"], int
-    ):
-        fail(f"{context}.chain_index must be an integer")
+    integer(metadata["chain_index"], f"{context}.chain_index")
     expected_chain_index = (
         first_data_chain_index
         + resolved["full_data_q_count"]
@@ -276,7 +321,7 @@ def load_provider(
     bindings: dict[str, Any],
     expected_order: Sequence[str],
     resolved: dict[str, Any],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
     value = expect_keys(
         load_json(path),
         {
@@ -339,8 +384,16 @@ def load_provider(
             f"{provider_name} record {index}",
         )
         case_id = record["case_id"]
+        if not isinstance(case_id, str) or not case_id:
+            fail(f"{provider_name} record {index}.case_id must be a string")
         observed_order.append(case_id)
-        raised = record["operation"] in ("raise_mod", "composite")
+        expected_operation = expected_provider_operation(case_id)
+        if record["operation"] != expected_operation:
+            fail(
+                f"{provider_name}.{case_id}.operation is "
+                f"{record['operation']!r}, expected {expected_operation!r}"
+            )
+        raised = expected_operation in ("raise_mod", "composite")
         metadata = validate_metadata(record["metadata"], resolved, raised=raised, first_data_chain_index=first_data_chain_index, context=f"{provider_name}.{case_id}.metadata")
         source_before = validate_metadata(record["source_metadata_before"], resolved, raised=False, first_data_chain_index=first_data_chain_index, context=f"{provider_name}.{case_id}.source_before")
         source_after = validate_metadata(record["source_metadata_after"], resolved, raised=False, first_data_chain_index=first_data_chain_index, context=f"{provider_name}.{case_id}.source_after")
@@ -356,7 +409,7 @@ def load_provider(
             f"{provider_name}.{case_id}.source_values_sha256_before",
         )
         token = record["ownership_token"]
-        if record["operation"] == "rotate_batch":
+        if expected_operation == "rotate_batch":
             if not isinstance(token, str) or not token or token in ownership_tokens:
                 fail(f"{provider_name}.{case_id} lacks independent batch ownership")
             ownership_tokens.add(token)
@@ -372,7 +425,7 @@ def load_provider(
     if observed_order != list(expected_order):
         fail(f"{provider_name} case order differs from the frozen order")
     validate_canonical_offsets(descriptors, len(data), provider_name)
-    return records
+    return records, first_data_chain_index
 
 
 def metric(
@@ -415,6 +468,7 @@ def compare_exact(
     fixture_sha256: str,
     context_sha256: str,
     resolved: dict[str, Any],
+    expected_first_data_chain_index: int,
 ) -> dict[str, Any]:
     observed = expect_keys(
         load_json(observed_json),
@@ -436,12 +490,13 @@ def compare_exact(
         fail("exact observed binding mismatch")
     moduli = observed["ordered_data_q_moduli"]
     first_data_chain_index = observed["first_data_chain_index"]
-    if (
-        isinstance(first_data_chain_index, bool)
-        or not isinstance(first_data_chain_index, int)
-        or first_data_chain_index < 0
-    ):
-        fail("exact first_data_chain_index must be nonnegative")
+    integer(first_data_chain_index, "exact first_data_chain_index")
+    if first_data_chain_index != expected_first_data_chain_index:
+        fail(
+            "exact first_data_chain_index differs from the Phantom provider "
+            f"result: observed {first_data_chain_index}, "
+            f"expected {expected_first_data_chain_index}"
+        )
     if not isinstance(moduli, list) or len(moduli) != resolved["full_data_q_count"]:
         fail("exact runtime modulus count differs from the context manifest")
     for index, modulus in enumerate(moduli):
@@ -459,12 +514,26 @@ def compare_exact(
         "ace.retained_ckks.rns_uint64le/1.0.0",
     )
     observed_records = observed["records"]
-    expected_case_ids = ["exact_runtime.raise_mod"] + [
-        f"exact_runtime.mul_mono.{label}"
-        for label in (
-            "0", "N_over_2", "N", "3N_over_2", "2N_minus_1", "2N_plus_1"
-        )
-    ] + ["exact_runtime.mul_mono.inverse_composition"]
+    degree = resolved["polynomial_degree"]
+    contracts = [
+        ("exact_runtime.raise_mod", "raise_mod", None),
+        ("exact_runtime.mul_mono.0", "mul_mono", 0),
+        ("exact_runtime.mul_mono.N_over_2", "mul_mono", degree // 2),
+        ("exact_runtime.mul_mono.N", "mul_mono", degree),
+        ("exact_runtime.mul_mono.3N_over_2", "mul_mono", 3 * degree // 2),
+        ("exact_runtime.mul_mono.2N_minus_1", "mul_mono", 2 * degree - 1),
+        ("exact_runtime.mul_mono.2N_plus_1", "mul_mono", 1),
+        (
+            "exact_runtime.mul_mono.inverse_composition",
+            "mul_mono_inverse_composition",
+            0,
+        ),
+    ]
+    expected_case_ids = [case_id for case_id, _operation, _power in contracts]
+    contract_by_id = {
+        case_id: (operation, normalized_power)
+        for case_id, operation, normalized_power in contracts
+    }
     if [record.get("case_id") for record in observed_records] != expected_case_ids:
         fail("exact runtime case order mismatch")
     evidence_records: list[dict[str, Any]] = []
@@ -488,6 +557,24 @@ def compare_exact(
             },
             f"exact observed record {record_index}",
         )
+        case_id = actual_record["case_id"]
+        expected_operation, expected_power = contract_by_id[case_id]
+        if actual_record["operation"] != expected_operation:
+            fail(
+                f"{case_id}.operation is {actual_record['operation']!r}, "
+                f"expected {expected_operation!r}"
+            )
+        if actual_record["normalized_power"] != expected_power or (
+            expected_power is not None
+            and (
+                isinstance(actual_record["normalized_power"], bool)
+                or not isinstance(actual_record["normalized_power"], int)
+            )
+        ):
+            fail(
+                f"{case_id}.normalized_power is "
+                f"{actual_record['normalized_power']!r}, expected {expected_power!r}"
+            )
         source_values = read_u64(observed_data, actual_record["source"], f"exact observed source {record_index}")
         source_after_values = read_u64(
             observed_data,
@@ -496,7 +583,14 @@ def compare_exact(
         )
         if source_after_values != source_values:
             fail(f"exact operation mutated its source for {actual_record['case_id']}")
-        metadata_keys = {"active_q_count", "ciphertext_size", "ntt", "chain_index"}
+        metadata_keys = {
+            "active_q_count",
+            "ciphertext_size",
+            "ntt",
+            "chain_index",
+            "scale_degree",
+            "raw_scale",
+        }
         source_metadata = expect_keys(
             actual_record["source_metadata"], metadata_keys, f"exact source metadata {record_index}"
         )
@@ -508,13 +602,36 @@ def compare_exact(
         )
         if source_metadata_after != source_metadata:
             fail(f"exact operation mutated source metadata for {actual_record['case_id']}")
-        for name, metadata in (
-            ("source", source_metadata), ("result", result_metadata)
-        ):
+        for name, metadata in (("source", source_metadata), ("result", result_metadata)):
+            integer(
+                metadata["active_q_count"],
+                f"exact {name} metadata.active_q_count",
+                1,
+            )
+            integer(
+                metadata["ciphertext_size"],
+                f"exact {name} metadata.ciphertext_size",
+                1,
+            )
+            integer(
+                metadata["chain_index"],
+                f"exact {name} metadata.chain_index",
+            )
+            integer(
+                metadata["scale_degree"],
+                f"exact {name} metadata.scale_degree",
+                1,
+            )
             if metadata["ciphertext_size"] != 2 or metadata["ntt"] is not False:
                 fail(f"exact {name} metadata requires size-2 coefficient form")
-            if isinstance(metadata["chain_index"], bool) or not isinstance(metadata["chain_index"], int):
-                fail(f"exact {name} chain index must be an integer")
+            if metadata["scale_degree"] != 1:
+                fail(f"exact {name} metadata scale degree must be 1")
+            if finite_number(metadata["raw_scale"], f"exact {name} metadata.raw_scale") <= 0:
+                fail(f"exact {name} metadata raw scale must be positive")
+        if result_metadata["raw_scale"] != source_metadata["raw_scale"]:
+            fail(f"exact operation changed raw scale for {case_id}")
+        if result_metadata["scale_degree"] != source_metadata["scale_degree"]:
+            fail(f"exact operation changed scale degree for {case_id}")
         actual_values = read_u64(observed_data, actual_record["actual"], f"exact observed result {record_index}")
         descriptors.extend(
             (
@@ -535,12 +652,35 @@ def compare_exact(
             f"exact observed layout {record_index}",
         )
         component_count = layout["component_count"]
+        source_modulus_count = layout["source_modulus_count"]
+        result_modulus_count = layout["result_modulus_count"]
         coefficient_count = layout["coefficient_count"]
+        for name, value in (
+            ("component_count", component_count),
+            ("source_modulus_count", source_modulus_count),
+            ("result_modulus_count", result_modulus_count),
+            ("coefficient_count", coefficient_count),
+        ):
+            integer(value, f"exact observed layout.{name}", 1)
         if component_count != 2 or coefficient_count != resolved["polynomial_degree"]:
             fail(f"exact observed shape mismatch for {actual_record['case_id']}")
         if layout["ordering"] != "component,modulus,coefficient":
             fail("exact observed layout ordering is unsupported")
-        if actual_record["operation"] == "raise_mod":
+        expected_source_values = component_count * source_modulus_count * coefficient_count
+        expected_result_values = component_count * result_modulus_count * coefficient_count
+        if (
+            len(source_values) != expected_source_values
+            or len(source_after_values) != expected_source_values
+            or actual_record["source"]["count"] != expected_source_values
+            or actual_record["source_after"]["count"] != expected_source_values
+        ):
+            fail(f"exact source blob count disagrees with layout for {case_id}")
+        if (
+            len(actual_values) != expected_result_values
+            or actual_record["actual"]["count"] != expected_result_values
+        ):
+            fail(f"exact result blob count disagrees with layout for {case_id}")
+        if expected_operation == "raise_mod":
             if source_metadata["active_q_count"] != 1 or result_metadata["active_q_count"] != len(moduli):
                 fail("exact raise metadata has the wrong active-Q counts")
             if (
@@ -549,8 +689,10 @@ def compare_exact(
                 or result_metadata["chain_index"] != first_data_chain_index
             ):
                 fail("exact raise metadata has the wrong chain coordinates")
-            if layout["source_modulus_count"] != 1 or layout["result_modulus_count"] != len(moduli):
+            if source_modulus_count != 1 or result_modulus_count != len(moduli):
                 fail("exact raise layout has the wrong modulus counts")
+            if any(value >= moduli[0] for value in source_values):
+                fail("exact raise source contains a noncanonical q0 residue")
             expected_values = []
             for component in range(component_count):
                 begin = component * coefficient_count
@@ -564,31 +706,26 @@ def compare_exact(
                 or result_metadata["chain_index"] != first_data_chain_index
             ):
                 fail("exact monomial metadata has the wrong chain coordinates")
-            if layout["source_modulus_count"] != len(moduli) or layout["result_modulus_count"] != len(moduli):
+            if source_modulus_count != len(moduli) or result_modulus_count != len(moduli):
                 fail("exact monomial layout has the wrong modulus counts")
             expected_values = []
             source_offset = 0
-            normalized_power = actual_record["normalized_power"]
-            if (
-                isinstance(normalized_power, bool)
-                or not isinstance(normalized_power, int)
-                or normalized_power < 0
-                or normalized_power >= 2 * coefficient_count
-            ):
-                fail("exact monomial power is not normalized into [0, 2N)")
+            normalized_power = expected_power
             for _component in range(component_count):
                 for modulus in moduli:
                     coefficients = source_values[source_offset : source_offset + coefficient_count]
                     source_offset += coefficient_count
-                    if actual_record["operation"] == "mul_mono":
+                    if any(value >= modulus for value in coefficients):
+                        fail(f"exact monomial source contains a noncanonical residue for {case_id}")
+                    if expected_operation == "mul_mono":
                         expected_values.extend(
-                            negacyclic_monomial(coefficients, actual_record["normalized_power"], modulus)
+                            negacyclic_monomial(coefficients, normalized_power, modulus)
                         )
-                    elif actual_record["operation"] == "mul_mono_inverse_composition":
+                    elif expected_operation == "mul_mono_inverse_composition":
                         first = negacyclic_monomial(coefficients, 2 * coefficient_count - 1, modulus)
                         expected_values.extend(negacyclic_monomial(first, 1, modulus))
                     else:
-                        fail(f"unknown exact operation {actual_record['operation']}")
+                        fail(f"unknown exact operation {expected_operation}")
         if len(actual_values) != len(expected_values):
             fail(f"exact comparison length differs for {actual_record['case_id']}")
         modulus_count = layout["result_modulus_count"]
@@ -633,6 +770,7 @@ def compare_exact(
         "context_manifest_sha256": context_sha256,
         "observed_sha256": sha256_path(observed_json),
         "ordered_data_q_moduli": moduli,
+        "first_data_chain_index": first_data_chain_index,
         "conversion_convention": observed["conversion_convention"],
         "comparison_count": total,
         "mismatch_count": len(all_mismatches),
@@ -666,8 +804,8 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
         if record["id"] not in analytic_ids
         and record["id"] != "rotate_batch.bounded_nonperiodic"
     ]
-    ant = load_provider(arguments.ant_json, arguments.ant_bin, "ant", fixture_sha256, context_sha256, fixture["qualification_bindings"], expected_order, resolved)
-    gpu = load_provider(arguments.gpu_json, arguments.gpu_bin, "phantom", fixture_sha256, context_sha256, fixture["qualification_bindings"], expected_order, resolved)
+    ant, _ant_first_data_chain_index = load_provider(arguments.ant_json, arguments.ant_bin, "ant", fixture_sha256, context_sha256, fixture["qualification_bindings"], expected_order, resolved)
+    gpu, gpu_first_data_chain_index = load_provider(arguments.gpu_json, arguments.gpu_bin, "phantom", fixture_sha256, context_sha256, fixture["qualification_bindings"], expected_order, resolved)
     ant_by_id = {record["case_id"]: record for record in ant}
     gpu_by_id = {record["case_id"]: record for record in gpu}
     analytic_by_id = {record["case_id"]: record for record in analytic_records}
@@ -676,8 +814,10 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
     ant_metrics: list[dict[str, Any]] = []
     failed = False
     for case_id in expected_order:
-        if gpu_by_id[case_id]["metadata"] != ant_by_id[case_id]["metadata"]:
-            fail(f"GPU and ANT metadata differ for {case_id}")
+        if provider_independent_metadata(
+            gpu_by_id[case_id]["metadata"]
+        ) != provider_independent_metadata(ant_by_id[case_id]["metadata"]):
+            fail(f"GPU and ANT provider-independent metadata differ for {case_id}")
         is_composite = case_id.startswith("composite.")
         absolute = tolerances["composite_absolute"] if is_composite else tolerances["primitive_absolute"]
         relative = tolerances["composite_relative"] if is_composite else tolerances["primitive_relative"]
@@ -712,6 +852,7 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
         fixture_sha256,
         context_sha256,
         resolved,
+        gpu_first_data_chain_index,
     )
     if exact["mismatch_count"] != tolerances["exact_mismatches"]:
         failed = True

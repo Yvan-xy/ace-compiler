@@ -58,9 +58,9 @@ constexpr std::array<std::uint8_t, 8> kDecodedMagic = {'A', 'C', 'E', 'R',
 constexpr std::array<std::uint8_t, 8> kExactMagic = {'A', 'C', 'E', 'R',
                                                      'N', 'S', '0', '1'};
 constexpr char kProviderSchema[] =
-    "ace.phantom.retained_ckks.provider-result/1.0.0";
+    "ace.phantom.retained_ckks.provider-result/2.0.0";
 constexpr char kExactObservedSchema[] =
-    "ace.phantom.retained_ckks.exact-observed/1.0.0";
+    "ace.phantom.retained_ckks.exact-observed/2.0.0";
 
 [[noreturn]] void Fail(const std::string &diagnostic,
                        const std::string &detail) {
@@ -187,14 +187,43 @@ std::vector<std::uint8_t> ReadBytes(const std::string &path) {
   return bytes;
 }
 
+Json ParseJson(const std::vector<std::uint8_t> &bytes,
+               const std::string &path) {
+  std::vector<std::set<std::string>> object_keys;
+  std::string duplicate_key;
+  Json::parser_callback_t callback =
+      [&](int, Json::parse_event_t event, Json &parsed) {
+        if (event == Json::parse_event_t::object_start) {
+          object_keys.emplace_back();
+        } else if (event == Json::parse_event_t::key) {
+          Require(!object_keys.empty(), "JSON_PARSE",
+                  "JSON key appeared outside an object in " + path);
+          const std::string key = parsed.get<std::string>();
+          if (!object_keys.back().insert(key).second && duplicate_key.empty()) {
+            duplicate_key = key;
+          }
+        } else if (event == Json::parse_event_t::object_end) {
+          Require(!object_keys.empty(), "JSON_PARSE",
+                  "JSON object nesting is invalid in " + path);
+          object_keys.pop_back();
+        }
+        return true;
+      };
+  try {
+    Json value = Json::parse(bytes.begin(), bytes.end(), callback, true, false);
+    Require(!value.is_discarded(), "JSON_PARSE", "cannot parse " + path);
+    Require(duplicate_key.empty(), "JSON_DUPLICATE_KEY",
+            "duplicate key '" + duplicate_key + "' in " + path);
+    Require(object_keys.empty(), "JSON_PARSE",
+            "unterminated JSON object in " + path);
+    return value;
+  } catch (const Json::exception &error) {
+    Fail("JSON_PARSE", "cannot parse " + path + ": " + error.what());
+  }
+}
+
 Json LoadJson(const std::string &path) {
-  std::ifstream input(path);
-  if (!input)
-    Fail("JSON_OPEN", "cannot open " + path);
-  Json value;
-  input >> value;
-  Require(static_cast<bool>(input), "JSON_PARSE", "cannot parse " + path);
-  return value;
+  return ParseJson(ReadBytes(path), path);
 }
 
 void WriteBytes(const std::string &path,
@@ -360,6 +389,113 @@ const PHANTOM_CONTEXT_MANIFEST &ContextManifest() {
               manifest->_special_p_bit_sizes != nullptr,
           "CONTEXT_MANIFEST", "compiler-derived modulus arrays are empty");
   return *manifest;
+}
+
+std::uint64_t JsonUnsigned(const Json &value, const std::string &field) {
+  if (value.is_number_unsigned())
+    return value.get<std::uint64_t>();
+  if (value.is_number_integer()) {
+    const auto signed_value = value.get<std::int64_t>();
+    Require(signed_value >= 0, "CONTEXT_FILE_FIELD",
+            field + " must be nonnegative");
+    return static_cast<std::uint64_t>(signed_value);
+  }
+  Fail("CONTEXT_FILE_FIELD", field + " must be an unsigned integer");
+}
+
+void RequireContextKeys(const Json &value) {
+  static const std::set<std::string> expected = {
+      "data_q_bit_sizes",       "first_modulus_bits",
+      "hamming_weight",         "input_level",
+      "logical_slot_capacity",  "packing",
+      "polynomial_degree",      "q_part_count",
+      "resource_schema_version", "scaling_modulus_bits",
+      "schema_version",         "security_level",
+      "special_p_bit_sizes"};
+  Require(value.is_object(), "CONTEXT_FILE_SCHEMA",
+          "context manifest JSON must be an object");
+  std::set<std::string> observed;
+  for (auto iterator = value.begin(); iterator != value.end(); ++iterator)
+    observed.insert(iterator.key());
+  Require(observed == expected, "CONTEXT_FILE_SCHEMA",
+          "context manifest JSON fields differ from the compiler schema");
+}
+
+struct AuthenticatedContext {
+  std::string _sha256;
+};
+
+AuthenticatedContext AuthenticateContext(const std::string &path) {
+  const auto bytes = ReadBytes(path);
+  const Json value = ParseJson(bytes, path);
+  RequireContextKeys(value);
+  const auto &linked = ContextManifest();
+  auto require_equal = [&](const char *field, std::uint64_t expected) {
+    const std::uint64_t observed = JsonUnsigned(value.at(field), field);
+    Require(observed == expected, "CONTEXT_FILE_MISMATCH",
+            std::string(field) + " observed " + std::to_string(observed) +
+                ", expected " + std::to_string(expected));
+  };
+  require_equal("schema_version", linked._schema_version);
+  Require(value.at("packing").is_string() &&
+              value.at("packing").get<std::string>() == "full" &&
+              linked._packing == PHANTOM_PACKING_FULL,
+          "CONTEXT_FILE_MISMATCH",
+          "packing must equal the linked full-packing manifest");
+  require_equal("polynomial_degree", linked._poly_degree);
+  require_equal("logical_slot_capacity", linked._logical_slots);
+  require_equal("input_level", linked._input_level);
+  require_equal("q_part_count", linked._q_part_count);
+  require_equal("hamming_weight", linked._hamming_weight);
+  require_equal("security_level", linked._security_level);
+  require_equal("first_modulus_bits", linked._first_modulus_bits);
+  require_equal("scaling_modulus_bits", linked._scaling_modulus_bits);
+  require_equal("resource_schema_version", linked._resource_schema_version);
+
+  auto require_ordered_bits = [&](const char *field, const std::uint32_t *bits,
+                                  std::size_t count) {
+    const Json &array = value.at(field);
+    Require(array.is_array(), "CONTEXT_FILE_FIELD",
+            std::string(field) + " must be an array");
+    Require(array.size() == count, "CONTEXT_FILE_MISMATCH",
+            std::string(field) + " count observed " +
+                std::to_string(array.size()) + ", expected " +
+                std::to_string(count));
+    for (std::size_t index = 0; index < count; ++index) {
+      const std::uint64_t observed =
+          JsonUnsigned(array.at(index), std::string(field) + "[" +
+                                            std::to_string(index) + "]");
+      Require(observed == bits[index], "CONTEXT_FILE_MISMATCH",
+              std::string(field) + "[" + std::to_string(index) +
+                  "] observed " + std::to_string(observed) + ", expected " +
+                  std::to_string(bits[index]));
+    }
+  };
+  require_ordered_bits("data_q_bit_sizes", linked._data_q_bit_sizes,
+                       linked._data_q_count);
+  require_ordered_bits("special_p_bit_sizes", linked._special_p_bit_sizes,
+                       linked._special_p_count);
+  return {Sha256(bytes)};
+}
+
+void RequireContextBinding(const Json &fixture,
+                           const AuthenticatedContext &context) {
+  const Json &bindings = fixture.at("qualification_bindings");
+  Require(bindings.at("compiler_context_manifest_sha256").is_string(),
+          "CONTEXT_BINDING",
+          "fixture context-manifest binding must be a SHA-256 string");
+  const std::string expected =
+      bindings.at("compiler_context_manifest_sha256").get<std::string>();
+  Require(expected.size() == 64U &&
+              std::all_of(expected.begin(), expected.end(), [](char value) {
+                return (value >= '0' && value <= '9') ||
+                       (value >= 'a' && value <= 'f');
+              }),
+          "CONTEXT_BINDING",
+          "fixture context-manifest binding must be lowercase SHA-256");
+  Require(expected == context._sha256, "CONTEXT_BINDING",
+          "context manifest observed SHA-256 " + context._sha256 +
+              ", expected " + expected);
 }
 
 const PHANTOM_RESOURCE_MANIFEST &ResourceManifest() {
@@ -841,7 +977,9 @@ Json ExactMetadata(const PhantomCiphertext &cipher) {
   return {{"active_q_count", cipher.coeff_modulus_size()},
           {"ciphertext_size", cipher.size()},
           {"ntt", cipher.is_ntt_form()},
-          {"chain_index", cipher.chain_index()}};
+          {"chain_index", cipher.chain_index()},
+          {"scale_degree", cipher.GetNoiseScaleDeg()},
+          {"raw_scale", cipher.scale()}};
 }
 
 Json ExactLayout(std::size_t source_q_count, std::size_t result_q_count) {
@@ -877,10 +1015,12 @@ Json AppendExactRecord(std::vector<std::uint8_t> &output,
 Json RunExact(const Json &exact_reference,
               const std::vector<std::uint8_t> &exact_input,
               std::vector<std::uint8_t> &output,
-              std::vector<std::uint64_t> &ordered_moduli) {
+              std::vector<std::uint64_t> &ordered_moduli,
+              std::size_t &first_data_chain_index) {
   ValidateBinary(exact_input, exact_reference.at("binary"), kExactMagic,
                  "EXACT_REFERENCE");
   auto context = MakeExactContext();
+  first_data_chain_index = context->get_first_index();
   ordered_moduli = ExactModuli(*context);
   Require(exact_reference.at("ordered_data_q_moduli") == ordered_moduli,
           "EXACT_MODULI",
@@ -917,6 +1057,30 @@ Json RunExact(const Json &exact_reference,
       const auto source_after =
           export_ciphertext_coefficients(*context, source);
       const auto actual = export_ciphertext_coefficients(*context, result);
+
+      PhantomCiphertext ntt_source =
+          copy_ciphertext_to_ntt_form(*context, source);
+      const Json ntt_source_metadata = ExactMetadata(ntt_source);
+      const auto ntt_source_before =
+          export_ciphertext_coefficients(*context, ntt_source);
+      const auto *ntt_source_storage = ntt_source.data();
+      PhantomCiphertext ntt_result;
+      raise_modulus(*context, ntt_source, ordered_moduli.size(), ntt_result);
+      const auto ntt_source_after =
+          export_ciphertext_coefficients(*context, ntt_source);
+      const auto ntt_actual =
+          export_ciphertext_coefficients(*context, ntt_result);
+      Require(ntt_source.is_ntt_form() && ntt_result.is_ntt_form(),
+              "EXACT_NTT_RAISE",
+              runtime_id + " did not preserve valid NTT form");
+      Require(ExactMetadata(ntt_source) == ntt_source_metadata &&
+                  ntt_source.data() == ntt_source_storage &&
+                  ntt_source_before == ntt_source_after,
+              "EXACT_NTT_RAISE", runtime_id + " mutated its NTT source");
+      Require(ntt_source_before == source_before && ntt_actual == actual,
+              "EXACT_NTT_RAISE",
+              runtime_id +
+                  " NTT and coefficient-form exact residues disagree");
       records.push_back(AppendExactRecord(
           output, runtime_id, "raise_mod", nullptr, before,
           ExactMetadata(source), ExactMetadata(result), source_before,
@@ -953,28 +1117,6 @@ Json RunExact(const Json &exact_reference,
     }
     const auto source_after = export_ciphertext_coefficients(*context, source);
     const auto actual = export_ciphertext_coefficients(*context, result);
-
-    PhantomCiphertext ntt_source =
-        copy_ciphertext_to_ntt_form(*context, source);
-    const Json ntt_source_metadata = ExactMetadata(ntt_source);
-    const auto ntt_source_before =
-        export_ciphertext_coefficients(*context, ntt_source);
-    const auto *ntt_source_storage = ntt_source.data();
-    PhantomCiphertext ntt_result;
-    raise_modulus(*context, ntt_source, ordered_moduli.size(), ntt_result);
-    const auto ntt_source_after =
-        export_ciphertext_coefficients(*context, ntt_source);
-    const auto ntt_actual =
-        export_ciphertext_coefficients(*context, ntt_result);
-    Require(ntt_source.is_ntt_form() && ntt_result.is_ntt_form(),
-            "EXACT_NTT_RAISE", runtime_id + " did not preserve valid NTT form");
-    Require(ExactMetadata(ntt_source) == ntt_source_metadata &&
-                ntt_source.data() == ntt_source_storage &&
-                ntt_source_before == ntt_source_after,
-            "EXACT_NTT_RAISE", runtime_id + " mutated its NTT source");
-    Require(ntt_source_before == source_before && ntt_actual == actual,
-            "EXACT_NTT_RAISE",
-            runtime_id + " NTT and coefficient-form exact residues disagree");
     records.push_back(AppendExactRecord(
         output, runtime_id, operation, normalized_power, before,
         ExactMetadata(source), ExactMetadata(result), source_before,
@@ -1023,17 +1165,20 @@ void RequireDecodedOrder(const Json &fixture, const Json &analytic,
 }
 
 void RunConformance(int argc, char **argv) {
-  Require(argc == 12, "ARGUMENTS",
-          "conformance requires fixture, analytic json/bin, exact json/bin, "
-          "GPU, decoded json/bin, and exact json/bin outputs");
+  Require(argc == 13, "ARGUMENTS",
+          "conformance requires fixture, context manifest, analytic json/bin, "
+          "exact json/bin, GPU, decoded json/bin, and exact json/bin outputs");
   const Json fixture = LoadJson(argv[2]);
-  const Json analytic = LoadJson(argv[3]);
-  const auto analytic_binary = ReadBytes(argv[4]);
+  const AuthenticatedContext authenticated_context =
+      AuthenticateContext(argv[3]);
+  RequireContextBinding(fixture, authenticated_context);
+  const Json analytic = LoadJson(argv[4]);
+  const auto analytic_binary = ReadBytes(argv[5]);
   Require(fixture.at("fixture_id") == "retained_ckks_v1", "FIXTURE_ID",
           "conformance fixture identifier is unsupported");
-  const Json exact_reference = LoadJson(argv[5]);
-  const auto exact_input = ReadBytes(argv[6]);
-  CheckGpu(argv[7]);
+  const Json exact_reference = LoadJson(argv[6]);
+  const auto exact_input = ReadBytes(argv[7]);
+  CheckGpu(argv[8]);
   const std::string fixture_sha256 = Sha256(ReadBytes(argv[2]));
   Require(analytic.at("qualification_bindings") ==
                   fixture.at("qualification_bindings") &&
@@ -1045,9 +1190,10 @@ void RunConformance(int argc, char **argv) {
               exact_reference.at("fixture_sha256") == fixture_sha256,
           "FIXTURE_BINDING", "generated references use another fixture");
   Require(exact_reference.at("context_manifest_sha256") ==
-              fixture.at("qualification_bindings")
-                  .at("compiler_context_manifest_sha256"),
-          "CONTEXT_BINDING", "exact reference context binding mismatch");
+              authenticated_context._sha256,
+          "CONTEXT_BINDING",
+          "exact reference context SHA-256 differs from the authenticated "
+          "manifest");
 
   const auto source_values = LoadSource(analytic, analytic_binary);
   Prepare_context();
@@ -1058,22 +1204,22 @@ void RunConformance(int argc, char **argv) {
   std::vector<std::uint8_t> exact_binary(kExactMagic.begin(),
                                          kExactMagic.end());
   std::vector<std::uint64_t> ordered_moduli;
-  Json exact_records =
-      RunExact(exact_reference, exact_input, exact_binary, ordered_moduli);
+  std::size_t first_data_chain_index = 0;
+  Json exact_records = RunExact(exact_reference, exact_input, exact_binary,
+                                ordered_moduli, first_data_chain_index);
   Finalize_context();
 
-  WriteBytes(argv[9], decoded_binary);
-  WriteBytes(argv[11], exact_binary);
-  const std::string context_sha256 = fixture.at("qualification_bindings")
-                                         .at("compiler_context_manifest_sha256")
-                                         .get<std::string>();
+  WriteBytes(argv[10], decoded_binary);
+  WriteBytes(argv[12], exact_binary);
+  const std::string &context_sha256 = authenticated_context._sha256;
   WriteJson(
-      argv[8],
+      argv[9],
       {{"schema_version", kProviderSchema},
        {"provider", "phantom"},
        {"fixture_sha256", fixture_sha256},
        {"context_manifest_sha256", context_sha256},
        {"qualification_bindings", fixture.at("qualification_bindings")},
+       {"first_data_chain_index", first_data_chain_index},
        {"identifiers",
         {{"ace_commit", ACE_COMMIT_ID},
          {"phantom_commit", PHANTOM_COMMIT_ID},
@@ -1082,11 +1228,12 @@ void RunConformance(int argc, char **argv) {
                                    decoded_binary)},
        {"records", std::move(decoded_records)}});
   WriteJson(
-      argv[10],
+      argv[11],
       {{"schema_version", kExactObservedSchema},
        {"fixture_sha256", fixture_sha256},
        {"context_manifest_sha256", context_sha256},
        {"ordered_data_q_moduli", ordered_moduli},
+       {"first_data_chain_index", first_data_chain_index},
        {"conversion_convention", exact_reference.at("conversion_convention")},
        {"binary", BinaryDescriptor(fixture.at("exact_binary_format").at("id"),
                                    exact_binary)},
@@ -1094,12 +1241,16 @@ void RunConformance(int argc, char **argv) {
 }
 
 void RunOwnership(int argc, char **argv) {
-  Require(argc == 7, "ARGUMENTS",
-          "ownership requires fixture, analytic json/bin, GPU, and output");
+  Require(argc == 8, "ARGUMENTS",
+          "ownership requires fixture, context manifest, analytic json/bin, "
+          "GPU, and output");
   const Json fixture = LoadJson(argv[2]);
-  const Json analytic = LoadJson(argv[3]);
-  const auto analytic_binary = ReadBytes(argv[4]);
-  CheckGpu(argv[5]);
+  const AuthenticatedContext authenticated_context =
+      AuthenticateContext(argv[3]);
+  RequireContextBinding(fixture, authenticated_context);
+  const Json analytic = LoadJson(argv[4]);
+  const auto analytic_binary = ReadBytes(argv[5]);
+  CheckGpu(argv[6]);
   const auto source_values = LoadSource(analytic, analytic_binary);
   const std::size_t iterations =
       fixture.at("ownership").at("iterations").get<std::size_t>();
@@ -1137,7 +1288,7 @@ void RunOwnership(int argc, char **argv) {
   arena.FreeAll();
   Finalize_context();
   RequireCuda(cudaDeviceSynchronize(), "ownership cudaDeviceSynchronize");
-  WriteJson(argv[6],
+  WriteJson(argv[7],
             {{"schema_version", "ace.phantom.retained_ckks.ownership/1.0.0"},
              {"status", "pass"},
              {"iterations", iterations},
@@ -1146,44 +1297,51 @@ void RunOwnership(int argc, char **argv) {
 }
 
 void RunRejection(int argc, char **argv) {
-  Require(argc == 7, "ARGUMENTS",
-          "reject requires fixture, analytic json/bin, GPU, and rejection ID");
+  Require(argc == 8, "ARGUMENTS",
+          "reject requires fixture, context manifest, analytic json/bin, GPU, "
+          "and rejection ID");
   const Json fixture = LoadJson(argv[2]);
-  const Json analytic = LoadJson(argv[3]);
-  const auto analytic_binary = ReadBytes(argv[4]);
+  const AuthenticatedContext authenticated_context =
+      AuthenticateContext(argv[3]);
+  RequireContextBinding(fixture, authenticated_context);
+  const Json analytic = LoadJson(argv[4]);
+  const auto analytic_binary = ReadBytes(argv[5]);
   Require(fixture.at("fixture_id") == "retained_ckks_v1", "FIXTURE_ID",
           "rejection fixture identifier is unsupported");
-  CheckGpu(argv[5]);
-  const std::string id = argv[6];
+  CheckGpu(argv[6]);
+  const std::string id = argv[7];
   const auto source_values = LoadSource(analytic, analytic_binary);
-  const std::vector<std::pair<std::string, std::string>> expected_diagnostics =
-      {{"conjugate_missing_key", "CONJUGATE_KEY_MISSING"},
-       {"rotate_batch_missing_nonzero_key", "RESOURCE_ROTATE_BATCH"},
-       {"rotate_batch_source_overlap", "ROTATE_BATCH_ALIAS"},
-       {"raise_alias", "RAISE_MOD_ALIAS"},
-       {"raise_size", "RAISE_MOD_SIZE"},
-       {"raise_chain", "RAISE_MOD_SOURCE_LEVEL"},
-       {"raise_target", "RAISE_MOD_TARGET"},
-       {"raise_malformed_metadata", "RAISE_MOD_SOURCE"},
-       {"mul_mono_undeclared", "MUL_MONO_RESOURCE"}};
-  const auto diagnostic =
-      std::find_if(expected_diagnostics.begin(), expected_diagnostics.end(),
-                   [&](const auto &entry) { return entry.first == id; });
-  Require(diagnostic != expected_diagnostics.end(), "REJECTION_ID",
-          "unknown rejection ID " + id);
+  const Json *rejection = nullptr;
+  std::set<std::string> rejection_ids;
+  for (const auto &candidate : fixture.at("runtime_rejections")) {
+    Require(candidate.is_object() && candidate.size() == 3U &&
+                candidate.contains("id") && candidate.contains("diagnostic") &&
+                candidate.contains("manifest") && candidate.at("id").is_string() &&
+                candidate.at("diagnostic").is_string() &&
+                candidate.at("manifest").is_string(),
+            "REJECTION_FIXTURE",
+            "runtime rejection entries require id, diagnostic, and manifest "
+            "strings");
+    const std::string candidate_id = candidate.at("id").get<std::string>();
+    Require(rejection_ids.insert(candidate_id).second, "REJECTION_FIXTURE",
+            "duplicate runtime rejection ID " + candidate_id);
+    if (candidate_id == id)
+      rejection = &candidate;
+  }
+  Require(rejection != nullptr, "REJECTION_ID", "unknown rejection ID " + id);
+  const std::string diagnostic =
+      rejection->at("diagnostic").get<std::string>();
+  const std::string expected_manifest =
+      rejection->at("manifest").get<std::string>();
+  Require(expected_manifest == ACE_REJECTION_MANIFEST_ID,
+          "REJECTION_LINKAGE",
+          id + " requires manifest " + expected_manifest + ", linked " +
+              ACE_REJECTION_MANIFEST_ID);
   if (id == "conjugate_missing_key") {
-    Require(std::string(ACE_REJECTION_MANIFEST_ID) == "keyless-conjugation",
-            "REJECTION_LINKAGE",
-            "conjugate_missing_key requires the separately audited keyless "
-            "resource-manifest translation unit");
     Require((ResourceManifest()._flags & PHANTOM_RESOURCE_CONJUGATION_KEY) == 0,
             "REJECTION_LINKAGE",
             "keyless rejection binary unexpectedly declares conjugation");
   } else if (id == "rotate_batch_missing_nonzero_key") {
-    Require(std::string(ACE_REJECTION_MANIFEST_ID) == "keyless-rotation",
-            "REJECTION_LINKAGE",
-            "rotate_batch_missing_nonzero_key requires the separately "
-            "audited keyless resource-manifest translation unit");
     const auto &resources = ResourceManifest();
     Require(resources._rotation_batch_count != 0 &&
                 resources._rotation_batch_offsets != nullptr &&
@@ -1215,7 +1373,7 @@ void RunRejection(int argc, char **argv) {
             "keyless rotation manifest has no unauthorised nonzero batch "
             "step");
   }
-  std::cerr << "ACE_RETAINED_EXPECT_DIAGNOSTIC[" << diagnostic->second
+  std::cerr << "ACE_RETAINED_EXPECT_DIAGNOSTIC[" << diagnostic
             << "] rejection=" << id << " manifest=" << ACE_REJECTION_MANIFEST_ID
             << '\n';
   Prepare_context();
@@ -1247,7 +1405,8 @@ void RunRejection(int argc, char **argv) {
             "raise_target needs more than one data-Q tower");
     Raise_mod(result, source, context._data_q_count - 1);
   } else if (id == "raise_malformed_metadata") {
-    source->set_ntt_form(false);
+    Require(source->is_ntt_form(), "REJECTION_SETUP",
+            "malformed-state rejection requires a valid NTT source first");
     source->set_parms_id(phantom::parms_id_zero);
     Raise_mod(result, source, context._data_q_count);
   } else if (id == "mul_mono_undeclared") {
