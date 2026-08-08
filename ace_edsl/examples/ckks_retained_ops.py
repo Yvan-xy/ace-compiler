@@ -79,7 +79,7 @@ def _load_retained_fixture(path: Path) -> dict[str, Any]:
     if (
         not isinstance(fixture, dict)
         or fixture.get("schema_version")
-        != "ace.phantom.retained_ckks.fixture/1.0.0"
+        != "ace.phantom.retained_ckks.fixture/2.0.0"
     ):
         raise ContextManifestError("retained fixture schema is unsupported")
     return fixture

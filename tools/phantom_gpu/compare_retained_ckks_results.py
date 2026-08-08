@@ -19,8 +19,11 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
 from generate_retained_ckks_fixtures import (  # noqa: E402
     ANALYTIC_SCHEMA,
     DECODED_MAGIC,
+    EXACT_SCHEMA,
     EXACT_MAGIC,
+    EXACT_SOURCE_MAGIC,
     RetainedFixtureError,
+    SplitMix64,
     centered_lift,
     expected_metadata,
     load_json,
@@ -36,6 +39,9 @@ PROVIDER_SCHEMA = "ace.phantom.retained_ckks.provider-result/2.0.0"
 EXACT_OBSERVED_SCHEMA = "ace.phantom.retained_ckks.exact-observed/2.0.0"
 COMPARISON_SCHEMA = "ace.phantom.retained_ckks.comparison/1.0.0"
 EXACT_EVIDENCE_SCHEMA = "ace.phantom.retained_ckks.exact-evidence/2.0.0"
+PROVIDER_ATTESTATION_SCHEMA = (
+    "ace.phantom.retained_ckks.provider-attestation/1.0.0"
+)
 
 
 class ComparisonError(ValueError):
@@ -181,6 +187,123 @@ def read_u64(data: bytes, descriptor: Any, context: str) -> list[int]:
     return [item[0] for item in struct.iter_unpack("<Q", blob)]
 
 
+def read_i64(data: bytes, descriptor: Any, context: str) -> list[int]:
+    blob = read_blob(data, descriptor, unit_size=8, context=context)
+    return [item[0] for item in struct.iter_unpack("<q", blob)]
+
+
+def expected_analytic_contracts(fixture: dict[str, Any]) -> list[dict[str, Any]]:
+    contracts: list[dict[str, Any]] = [
+        {
+            "case_id": "conjugate.bounded_nonperiodic",
+            "operation": "conjugate",
+            "batch_step": None,
+        },
+        {
+            "case_id": "conjugate_twice.bounded_nonperiodic",
+            "operation": "conjugate_twice",
+            "batch_step": None,
+        },
+    ]
+    batches = [("bounded_nonperiodic", fixture["rotate_batch_steps"])] + [
+        (f"production_{index}", batch)
+        for index, batch in enumerate(fixture["production_rotation_batches"])
+    ]
+    for prefix, batch in batches:
+        for position, step in enumerate(batch):
+            contracts.append(
+                {
+                    "case_id": (
+                        f"rotate_batch.{prefix}.output_{position}.step_{step}"
+                    ),
+                    "operation": "rotate_batch",
+                    "batch_step": step,
+                }
+            )
+    case_ids = [contract["case_id"] for contract in contracts]
+    if len(case_ids) != len(set(case_ids)):
+        fail("fixture expands to duplicate analytic case identifiers")
+    return contracts
+
+
+def expected_deterministic_inputs(
+    fixture: dict[str, Any], slots: int
+) -> tuple[dict[str, list[complex]], int]:
+    generator = SplitMix64(fixture["determinism"]["seed"])
+    result: dict[str, list[complex]] = {}
+    for descriptor in fixture["inputs"]:
+        input_id = descriptor["id"]
+        recipe = descriptor["recipe"]
+        if recipe == "zero":
+            values = [0j] * slots
+        elif recipe == "seeded_impulse":
+            values = [0j] * slots
+            values[0] = complex(
+                0.75 * generator.signed_float53(),
+                0.75 * generator.signed_float53(),
+            )
+        elif recipe == "centered_complex_ramp":
+            denominator = max(1, slots - 1)
+            values = [
+                complex(
+                    (2.0 * index - denominator) / denominator * 0.5,
+                    ((index * 3) % max(2, slots) - slots / 2) / max(1, slots),
+                )
+                for index in range(slots)
+            ]
+        elif recipe == "alternating_sign":
+            values = [
+                complex(
+                    (0.375 + (index % 7) / 32.0)
+                    * (-1 if index & 1 else 1),
+                    (0.25 + (index % 5) / 40.0)
+                    * (-1 if index & 2 else 1),
+                )
+                for index in range(slots)
+            ]
+        elif recipe == "seeded_bounded_nonperiodic":
+            values = [
+                complex(
+                    0.875 * generator.signed_float53(),
+                    0.875 * generator.signed_float53(),
+                )
+                for _ in range(slots)
+            ]
+        else:
+            fail(f"unsupported deterministic input recipe {recipe!r}")
+        result[input_id] = values
+    return result, generator.draw_count
+
+
+def expected_provider_order(fixture: dict[str, Any]) -> list[str]:
+    order = [contract["case_id"] for contract in expected_analytic_contracts(fixture)]
+    present = set(order)
+    decoded_seen: set[str] = set()
+    for index, descriptor in enumerate(fixture["decoded_cases"]):
+        descriptor = expect_keys(
+            descriptor, {"id", "oracle"}, f"fixture decoded case {index}"
+        )
+        case_id = descriptor["id"]
+        if case_id in decoded_seen:
+            fail(f"fixture contains duplicate decoded case {case_id}")
+        decoded_seen.add(case_id)
+        if case_id == "rotate_batch.bounded_nonperiodic" or case_id in present:
+            continue
+        present.add(case_id)
+        order.append(case_id)
+    return order
+
+
+def validate_exact_case_order(
+    observed: Sequence[str], expected: Sequence[str], context: str
+) -> None:
+    if list(observed) != list(expected):
+        fail(
+            f"{context} case order differs from the fixture expansion: "
+            f"observed_count={len(observed)}, expected_count={len(expected)}"
+        )
+
+
 def validate_canonical_offsets(
     descriptors: Sequence[dict[str, Any]], data_size: int, context: str
 ) -> None:
@@ -252,7 +375,7 @@ def load_analytic(
     path: Path,
     binary_path: Path,
     fixture_sha256: str,
-    bindings: dict[str, Any],
+    fixture: dict[str, Any],
     slots: int,
 ) -> tuple[dict[str, list[complex]], list[dict[str, Any]]]:
     value = expect_keys(
@@ -272,8 +395,20 @@ def load_analytic(
     )
     if value["schema_version"] != ANALYTIC_SCHEMA or value["fixture_sha256"] != fixture_sha256:
         fail("analytic reference schema or fixture binding mismatch")
-    if value["qualification_bindings"] != bindings:
+    if value["qualification_bindings"] != fixture["qualification_bindings"]:
         fail("analytic reference qualification bindings mismatch")
+    if value["deterministic_generator"] != fixture["determinism"]["generator"]:
+        fail("analytic deterministic generator differs from the fixture")
+    if value["deterministic_seed"] != fixture["determinism"]["seed"]:
+        fail("analytic deterministic seed differs from the fixture")
+    expected_inputs, expected_draw_count = expected_deterministic_inputs(
+        fixture, slots
+    )
+    if value["generator_draw_count"] != expected_draw_count:
+        fail(
+            "analytic generator draw count is "
+            f"{value['generator_draw_count']!r}, expected {expected_draw_count}"
+        )
     data = load_binary(
         binary_path,
         value["binary"],
@@ -282,6 +417,13 @@ def load_analytic(
     )
     inputs: dict[str, list[complex]] = {}
     descriptors: list[dict[str, Any]] = []
+    expected_input_ids = [descriptor["id"] for descriptor in fixture["inputs"]]
+    if not isinstance(value["inputs"], list) or any(
+        not isinstance(item, dict) for item in value["inputs"]
+    ):
+        fail("analytic inputs must be an array of objects")
+    if [item.get("input_id") for item in value["inputs"]] != expected_input_ids:
+        fail("analytic input order differs from the fixture recipe order")
     for index, item in enumerate(value["inputs"]):
         item = expect_keys(item, {"input_id", "values"}, f"analytic input {index}")
         if item["input_id"] in inputs:
@@ -292,8 +434,23 @@ def load_analytic(
         descriptors.append(item["values"])
         if len(inputs[item["input_id"]]) != slots:
             fail(f"analytic input {item['input_id']} has the wrong slot count")
+        if inputs[item["input_id"]] != expected_inputs[item["input_id"]]:
+            fail(
+                f"analytic input {item['input_id']} does not reproduce the "
+                "fixture seed and generator"
+            )
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
+    expected_contracts = expected_analytic_contracts(fixture)
+    if not isinstance(value["records"], list) or any(
+        not isinstance(item, dict) for item in value["records"]
+    ):
+        fail("analytic records must be an array of objects")
+    validate_exact_case_order(
+        [item.get("case_id") for item in value["records"]],
+        [contract["case_id"] for contract in expected_contracts],
+        "analytic",
+    )
     for index, item in enumerate(value["records"]):
         expected_keys = {"case_id", "operation", "metadata", "source_input_id", "values"}
         if item.get("operation") == "rotate_batch":
@@ -302,11 +459,31 @@ def load_analytic(
         if item["case_id"] in seen:
             fail(f"duplicate analytic case {item['case_id']}")
         seen.add(item["case_id"])
+        contract = expected_contracts[index]
+        if item["operation"] != contract["operation"]:
+            fail(f"analytic operation differs for {item['case_id']}")
+        if item.get("batch_step") != contract["batch_step"]:
+            fail(f"analytic batch step differs for {item['case_id']}")
+        if item["source_input_id"] != "bounded_nonperiodic":
+            fail(f"analytic source input differs for {item['case_id']}")
         item = dict(item)
         item["decoded_values"] = read_complex(data, item["values"], item["case_id"])
         descriptors.append(item["values"])
         if len(item["decoded_values"]) != slots:
             fail(f"analytic case {item['case_id']} has the wrong slot count")
+        source_values = expected_inputs["bounded_nonperiodic"]
+        if item["operation"] == "conjugate":
+            expected_values = [value.conjugate() for value in source_values]
+        elif item["operation"] == "conjugate_twice":
+            expected_values = list(source_values)
+        else:
+            step = item["batch_step"]
+            expected_values = [
+                source_values[(position + step) % slots]
+                for position in range(slots)
+            ]
+        if item["decoded_values"] != expected_values:
+            fail(f"analytic values differ from the fixture oracle for {item['case_id']}")
         records.append(item)
     validate_canonical_offsets(descriptors, len(data), "analytic")
     return inputs, records
@@ -321,6 +498,7 @@ def load_provider(
     bindings: dict[str, Any],
     expected_order: Sequence[str],
     resolved: dict[str, Any],
+    attested_identifiers: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], int]:
     value = expect_keys(
         load_json(path),
@@ -350,6 +528,8 @@ def load_provider(
             40 if field != "executable_sha256" else 64,
             f"{provider_name} identifiers.{field}",
         )
+    if identifiers != attested_identifiers:
+        fail(f"{provider_name} identifiers differ from the provider attestation")
     first_data_chain_index = value["first_data_chain_index"]
     if (
         isinstance(first_data_chain_index, bool)
@@ -422,10 +602,113 @@ def load_provider(
         if len(materialized["decoded_values"]) != resolved["logical_slots"]:
             fail(f"{provider_name}.{case_id} has the wrong slot count")
         records.append(materialized)
-    if observed_order != list(expected_order):
-        fail(f"{provider_name} case order differs from the frozen order")
+    validate_exact_case_order(observed_order, expected_order, provider_name)
     validate_canonical_offsets(descriptors, len(data), provider_name)
     return records, first_data_chain_index
+
+
+def load_provider_attestation(
+    path: Path,
+    *,
+    fixture_sha256: str,
+    context_sha256: str,
+    compiler_invocation: Path,
+    ant_json: Path,
+    ant_binary: Path,
+    gpu_json: Path,
+    gpu_binary: Path,
+    exact_observed_json: Path,
+    exact_observed_binary: Path,
+) -> dict[str, dict[str, Any]]:
+    value = expect_keys(
+        load_json(path),
+        {
+            "schema_version",
+            "fixture_sha256",
+            "context_manifest_sha256",
+            "compiler_invocation_sha256",
+            "build_attestation_sha256",
+            "run_attestation_sha256",
+            "providers",
+            "exact_observed",
+        },
+        "provider attestation",
+    )
+    if value["schema_version"] != PROVIDER_ATTESTATION_SCHEMA:
+        fail("provider attestation schema mismatch")
+    expected_bindings = {
+        "fixture_sha256": fixture_sha256,
+        "context_manifest_sha256": context_sha256,
+        "compiler_invocation_sha256": sha256_path(compiler_invocation),
+    }
+    for field, expected in expected_bindings.items():
+        if value[field] != expected:
+            fail(f"provider attestation {field} mismatch")
+    hex_digest(
+        value["build_attestation_sha256"], 64, "build_attestation_sha256"
+    )
+    hex_digest(value["run_attestation_sha256"], 64, "run_attestation_sha256")
+    expected_artifacts = {
+        "ant": (sha256_path(ant_json), sha256_path(ant_binary)),
+        "phantom": (sha256_path(gpu_json), sha256_path(gpu_binary)),
+    }
+    providers = value["providers"]
+    if not isinstance(providers, list) or [
+        item.get("provider") if isinstance(item, dict) else None
+        for item in providers
+    ] != ["ant", "phantom"]:
+        fail("provider attestation must contain ordered ANT and Phantom records")
+    identifiers_by_provider: dict[str, dict[str, Any]] = {}
+    for index, raw_provider in enumerate(providers):
+        provider = expect_keys(
+            raw_provider,
+            {
+                "provider",
+                "identifiers",
+                "result_json_sha256",
+                "result_binary_sha256",
+            },
+            f"provider attestation record {index}",
+        )
+        provider_name = provider["provider"]
+        identifiers = expect_keys(
+            provider["identifiers"],
+            {"ace_commit", "phantom_commit", "executable_sha256"},
+            f"provider attestation {provider_name} identifiers",
+        )
+        for field, digest in identifiers.items():
+            hex_digest(
+                digest,
+                64 if field == "executable_sha256" else 40,
+                f"provider attestation {provider_name}.{field}",
+            )
+        expected_json, expected_binary = expected_artifacts[provider_name]
+        if (
+            provider["result_json_sha256"] != expected_json
+            or provider["result_binary_sha256"] != expected_binary
+        ):
+            fail(f"provider attestation {provider_name} artifact hash mismatch")
+        identifiers_by_provider[provider_name] = identifiers
+    exact = expect_keys(
+        value["exact_observed"],
+        {
+            "provider",
+            "executable_sha256",
+            "result_json_sha256",
+            "result_binary_sha256",
+        },
+        "provider attestation exact observed",
+    )
+    if exact["provider"] != "phantom":
+        fail("exact observed attestation must name the Phantom provider")
+    if (
+        exact["executable_sha256"]
+        != identifiers_by_provider["phantom"]["executable_sha256"]
+        or exact["result_json_sha256"] != sha256_path(exact_observed_json)
+        or exact["result_binary_sha256"] != sha256_path(exact_observed_binary)
+    ):
+        fail("exact observed artifact differs from the provider attestation")
+    return identifiers_by_provider
 
 
 def metric(
@@ -462,20 +745,193 @@ def metric(
     }
 
 
+def reduce_signed_coefficients(
+    components: Sequence[Sequence[int]], moduli: Sequence[int]
+) -> list[int]:
+    return [
+        coefficient % modulus
+        for component in components
+        for modulus in moduli
+        for coefficient in component
+    ]
+
+
+def load_exact_source(
+    json_path: Path,
+    binary_path: Path,
+    fixture: dict[str, Any],
+    fixture_sha256: str,
+    context_sha256: str,
+    resolved: dict[str, Any],
+) -> tuple[list[list[int]], dict[str, Any]]:
+    source = expect_keys(
+        load_json(json_path),
+        {
+            "schema_version",
+            "fixture_sha256",
+            "qualification_bindings",
+            "context_manifest_sha256",
+            "determinism",
+            "conversion_convention",
+            "layout",
+            "source_id",
+            "signed_coefficients",
+            "binary",
+            "records",
+        },
+        "exact signed source",
+    )
+    if source["schema_version"] != EXACT_SCHEMA:
+        fail("exact signed source schema mismatch")
+    if (
+        source["fixture_sha256"] != fixture_sha256
+        or source["context_manifest_sha256"] != context_sha256
+        or source["qualification_bindings"] != fixture["qualification_bindings"]
+    ):
+        fail("exact signed source artifact binding mismatch")
+    recipe = fixture["exact_source_recipe"]
+    determinism = expect_keys(
+        source["determinism"],
+        {
+            "generator",
+            "seed",
+            "component_seed_xors",
+            "coefficient_absolute_bound",
+            "generator_draw_count",
+        },
+        "exact signed source determinism",
+    )
+    expected_determinism = {
+        "generator": recipe["generator"],
+        "seed": fixture["determinism"]["seed"],
+        "component_seed_xors": recipe["component_seed_xors"],
+        "coefficient_absolute_bound": recipe["coefficient_absolute_bound"],
+        "generator_draw_count": (
+            len(recipe["component_seed_xors"]) * resolved["polynomial_degree"]
+        ),
+    }
+    if determinism != expected_determinism:
+        fail("exact signed source determinism differs from the fixture recipe")
+    layout = expect_keys(
+        source["layout"],
+        {"component_count", "coefficient_count", "ordering"},
+        "exact signed source layout",
+    )
+    component_count = len(recipe["component_seed_xors"])
+    degree = resolved["polynomial_degree"]
+    if layout != {
+        "component_count": component_count,
+        "coefficient_count": degree,
+        "ordering": "component,coefficient",
+    }:
+        fail("exact signed source layout differs from the fixture context")
+    if source["source_id"] != "signed_coefficients.default":
+        fail("exact signed source identifier changed")
+    data = load_binary(
+        binary_path,
+        source["binary"],
+        EXACT_SOURCE_MAGIC,
+        "ace.retained_ckks.signed_int64le/1.0.0",
+    )
+    flat_coefficients = read_i64(
+        data, source["signed_coefficients"], "exact signed coefficients"
+    )
+    validate_canonical_offsets(
+        [source["signed_coefficients"]], len(data), "exact signed source"
+    )
+    if len(flat_coefficients) != component_count * degree:
+        fail("exact signed coefficient count differs from its layout")
+    components = [
+        flat_coefficients[index * degree : (index + 1) * degree]
+        for index in range(component_count)
+    ]
+    bound = recipe["coefficient_absolute_bound"]
+    if any(abs(value) > bound for value in flat_coefficients):
+        fail("exact signed coefficient exceeds the fixture bound")
+    expected_coefficients: list[int] = []
+    width = 2 * bound + 1
+    for seed_xor in recipe["component_seed_xors"]:
+        generator = SplitMix64(fixture["determinism"]["seed"] ^ seed_xor)
+        expected_coefficients.extend(
+            int(generator.next_u64() % width) - bound for _ in range(degree)
+        )
+    if flat_coefficients != expected_coefficients:
+        fail("exact signed coefficients do not reproduce the fixture recipe")
+
+    label_by_symbol = {
+        "0": "0",
+        "N/2": "N_over_2",
+        "N": "N",
+        "3N/2": "3N_over_2",
+        "2N-1": "2N_minus_1",
+        "2N+1": "2N_plus_1",
+    }
+    expected_records: list[dict[str, Any]] = [
+        {
+            "case_id": "exact_algebraic.raise_mod",
+            "operation": "raise_mod",
+            "normalized_power": None,
+            "source_id": source["source_id"],
+        }
+    ]
+    for symbol in fixture["monomial_powers"]:
+        expected_records.append(
+            {
+                "case_id": f"exact_algebraic.mul_mono.{label_by_symbol[symbol]}",
+                "operation": "mul_mono",
+                "normalized_power": (
+                    {
+                        "0": 0,
+                        "N/2": degree // 2,
+                        "N": degree,
+                        "3N/2": 3 * degree // 2,
+                        "2N-1": 2 * degree - 1,
+                        "2N+1": 1,
+                    }[symbol]
+                ),
+                "source_id": source["source_id"],
+            }
+        )
+    expected_records.append(
+        {
+            "case_id": "exact_algebraic.mul_mono.inverse_composition",
+            "operation": "mul_mono_inverse_composition",
+            "normalized_power": 0,
+            "source_id": source["source_id"],
+        }
+    )
+    if source["records"] != expected_records:
+        fail("exact signed source case order or contract differs from the fixture")
+    return components, source
+
+
 def compare_exact(
+    exact_source_json: Path,
+    exact_source_binary: Path,
     observed_json: Path,
     observed_binary: Path,
+    fixture: dict[str, Any],
     fixture_sha256: str,
     context_sha256: str,
     resolved: dict[str, Any],
     expected_first_data_chain_index: int,
 ) -> dict[str, Any]:
+    signed_components, exact_source = load_exact_source(
+        exact_source_json,
+        exact_source_binary,
+        fixture,
+        fixture_sha256,
+        context_sha256,
+        resolved,
+    )
     observed = expect_keys(
         load_json(observed_json),
         {
             "schema_version",
             "fixture_sha256",
             "context_manifest_sha256",
+            "exact_source_json_sha256",
+            "exact_source_binary_sha256",
             "ordered_data_q_moduli",
             "first_data_chain_index",
             "conversion_convention",
@@ -488,6 +944,14 @@ def compare_exact(
         fail("exact observed schema mismatch")
     if observed["fixture_sha256"] != fixture_sha256 or observed["context_manifest_sha256"] != context_sha256:
         fail("exact observed binding mismatch")
+    if (
+        observed["exact_source_json_sha256"] != sha256_path(exact_source_json)
+        or observed["exact_source_binary_sha256"]
+        != sha256_path(exact_source_binary)
+    ):
+        fail("exact observed result references another signed source")
+    if observed["conversion_convention"] != exact_source["conversion_convention"]:
+        fail("exact observed conversion convention differs from its signed source")
     moduli = observed["ordered_data_q_moduli"]
     first_data_chain_index = observed["first_data_chain_index"]
     integer(first_data_chain_index, "exact first_data_chain_index")
@@ -534,8 +998,15 @@ def compare_exact(
         case_id: (operation, normalized_power)
         for case_id, operation, normalized_power in contracts
     }
-    if [record.get("case_id") for record in observed_records] != expected_case_ids:
-        fail("exact runtime case order mismatch")
+    if not isinstance(observed_records, list) or any(
+        not isinstance(record, dict) for record in observed_records
+    ):
+        fail("exact observed records must be an array of objects")
+    validate_exact_case_order(
+        [record.get("case_id") for record in observed_records],
+        expected_case_ids,
+        "exact runtime",
+    )
     evidence_records: list[dict[str, Any]] = []
     descriptors: list[dict[str, Any]] = []
     total = 0
@@ -691,6 +1162,14 @@ def compare_exact(
                 fail("exact raise metadata has the wrong chain coordinates")
             if source_modulus_count != 1 or result_modulus_count != len(moduli):
                 fail("exact raise layout has the wrong modulus counts")
+            expected_source = reduce_signed_coefficients(
+                signed_components, [moduli[0]]
+            )
+            if source_values != expected_source:
+                fail(
+                    "exact raise source is not the exact q0 reduction of the "
+                    "provider-neutral signed coefficients"
+                )
             if any(value >= moduli[0] for value in source_values):
                 fail("exact raise source contains a noncanonical q0 residue")
             expected_values = []
@@ -708,6 +1187,14 @@ def compare_exact(
                 fail("exact monomial metadata has the wrong chain coordinates")
             if source_modulus_count != len(moduli) or result_modulus_count != len(moduli):
                 fail("exact monomial layout has the wrong modulus counts")
+            expected_source = reduce_signed_coefficients(
+                signed_components, moduli
+            )
+            if source_values != expected_source:
+                fail(
+                    "exact monomial source is not the exact runtime-prime "
+                    "reduction of the provider-neutral signed coefficients"
+                )
             expected_values = []
             source_offset = 0
             normalized_power = expected_power
@@ -768,6 +1255,8 @@ def compare_exact(
         "status": "pass" if not all_mismatches else "fail",
         "fixture_sha256": fixture_sha256,
         "context_manifest_sha256": context_sha256,
+        "exact_source_json_sha256": sha256_path(exact_source_json),
+        "exact_source_binary_sha256": sha256_path(exact_source_binary),
         "observed_sha256": sha256_path(observed_json),
         "ordered_data_q_moduli": moduli,
         "first_data_chain_index": first_data_chain_index,
@@ -794,18 +1283,47 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
         arguments.analytic_json,
         arguments.analytic_bin,
         fixture_sha256,
-        fixture["qualification_bindings"],
+        fixture,
         resolved["logical_slots"],
     )
     analytic_ids = [record["case_id"] for record in analytic_records]
-    expected_order = analytic_ids + [
-        record["id"]
-        for record in fixture["decoded_cases"]
-        if record["id"] not in analytic_ids
-        and record["id"] != "rotate_batch.bounded_nonperiodic"
-    ]
-    ant, _ant_first_data_chain_index = load_provider(arguments.ant_json, arguments.ant_bin, "ant", fixture_sha256, context_sha256, fixture["qualification_bindings"], expected_order, resolved)
-    gpu, gpu_first_data_chain_index = load_provider(arguments.gpu_json, arguments.gpu_bin, "phantom", fixture_sha256, context_sha256, fixture["qualification_bindings"], expected_order, resolved)
+    expected_order = expected_provider_order(fixture)
+    if analytic_ids != expected_order[: len(analytic_ids)]:
+        fail("analytic cases are not the exact provider-order prefix")
+    attested_identifiers = load_provider_attestation(
+        arguments.provider_attestation,
+        fixture_sha256=fixture_sha256,
+        context_sha256=context_sha256,
+        compiler_invocation=arguments.compiler_invocation,
+        ant_json=arguments.ant_json,
+        ant_binary=arguments.ant_bin,
+        gpu_json=arguments.gpu_json,
+        gpu_binary=arguments.gpu_bin,
+        exact_observed_json=arguments.exact_observed_json,
+        exact_observed_binary=arguments.exact_observed_bin,
+    )
+    ant, _ant_first_data_chain_index = load_provider(
+        arguments.ant_json,
+        arguments.ant_bin,
+        "ant",
+        fixture_sha256,
+        context_sha256,
+        fixture["qualification_bindings"],
+        expected_order,
+        resolved,
+        attested_identifiers["ant"],
+    )
+    gpu, gpu_first_data_chain_index = load_provider(
+        arguments.gpu_json,
+        arguments.gpu_bin,
+        "phantom",
+        fixture_sha256,
+        context_sha256,
+        fixture["qualification_bindings"],
+        expected_order,
+        resolved,
+        attested_identifiers["phantom"],
+    )
     ant_by_id = {record["case_id"]: record for record in ant}
     gpu_by_id = {record["case_id"]: record for record in gpu}
     analytic_by_id = {record["case_id"]: record for record in analytic_records}
@@ -847,8 +1365,11 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
     failed |= not all(metamorphic.values())
 
     exact = compare_exact(
+        arguments.exact_source_json,
+        arguments.exact_source_bin,
         arguments.exact_observed_json,
         arguments.exact_observed_bin,
+        fixture,
         fixture_sha256,
         context_sha256,
         resolved,
@@ -905,6 +1426,15 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
             "analytic_json_sha256": sha256_path(arguments.analytic_json),
             "ant_json_sha256": sha256_path(arguments.ant_json),
             "gpu_json_sha256": sha256_path(arguments.gpu_json),
+            "provider_attestation_sha256": sha256_path(
+                arguments.provider_attestation
+            ),
+            "exact_source_json_sha256": sha256_path(
+                arguments.exact_source_json
+            ),
+            "exact_source_binary_sha256": sha256_path(
+                arguments.exact_source_bin
+            ),
             "exact_evidence_sha256": sha256_path(arguments.exact_output_json),
         },
     }
@@ -917,7 +1447,9 @@ def parse_arguments() -> argparse.Namespace:
     for name in (
         "fixture", "context-manifest", "compiler-invocation", "post-ckks-air",
         "production-post-ckks-air",
+        "provider-attestation",
         "analytic-json", "analytic-bin", "ant-json", "ant-bin", "gpu-json", "gpu-bin",
+        "exact-source-json", "exact-source-bin",
         "exact-observed-json", "exact-observed-bin",
         "exact-output-json", "output-json",
     ):

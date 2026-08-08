@@ -1,5 +1,5 @@
 {
-  "schema_version": "ace.phantom.retained_ckks.fixture/1.0.0",
+  "schema_version": "ace.phantom.retained_ckks.fixture/2.0.0",
   "fixture_id": "retained_ckks_v1",
   "description": "Provider-neutral retained CKKS operation fixture",
   "qualification_bindings": {
@@ -43,6 +43,11 @@
     "post_ckks_air_sha256": null
   },
   "monomial_powers": ["0", "N/2", "N", "3N/2", "2N-1", "2N+1"],
+  "exact_source_recipe": {
+    "generator": "splitmix64-bounded-signed-int-v1",
+    "component_seed_xors": [4412464, 4412465],
+    "coefficient_absolute_bound": 1048576
+  },
   "decoded_cases": [
     {"id": "conjugate.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
     {"id": "conjugate_twice.bounded_nonperiodic", "oracle": ["analytic", "ant"]},
@@ -108,7 +113,13 @@
     "endianness": "little",
     "encoding": "interleaved IEEE-754 binary64 real,imaginary pairs"
   },
-  "exact_binary_format": {
+  "exact_source_binary_format": {
+    "id": "ace.retained_ckks.signed_int64le/1.0.0",
+    "magic_ascii": "ACESRC01",
+    "endianness": "little",
+    "encoding": "signed two's-complement 64-bit coefficients"
+  },
+  "exact_observed_binary_format": {
     "id": "ace.retained_ckks.rns_uint64le/1.0.0",
     "magic_ascii": "ACERNS01",
     "endianness": "little",

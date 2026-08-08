@@ -71,6 +71,7 @@ def _compile(
     context_path: Path,
     fixture_path: Path,
     *,
+    compiler_parameters: dict[str, int],
     provider: str,
     codegen_ir: str,
     context_output: Path | None = None,
@@ -82,13 +83,13 @@ def _compile(
     if module is None:
         raise SystemExit("retained conformance declaration emitted no AIR")
     pipeline = AcePipeline(module).configure_fhe(
-        poly_degree=int(context["polynomial_degree"]),
-        mul_level=len(context["data_q_bit_sizes"]),
-        input_level=int(context["input_level"]),
-        security_level=int(context["security_level"]),
-        scaling_factor_bits=int(context["scaling_modulus_bits"]),
-        first_prime_bits=int(context["first_modulus_bits"]),
-        hamming_weight=int(context["hamming_weight"]),
+        poly_degree=compiler_parameters["polynomial_degree"],
+        mul_level=compiler_parameters["mul_level"],
+        input_level=compiler_parameters["input_level"],
+        security_level=compiler_parameters["security_level"],
+        scaling_factor_bits=compiler_parameters["scaling_modulus_bits"],
+        first_prime_bits=compiler_parameters["first_modulus_bits"],
+        hamming_weight=compiler_parameters["hamming_weight"],
         data_file="",
         provider=provider,
         codegen_ir=codegen_ir,
@@ -157,15 +158,40 @@ def generate(arguments: argparse.Namespace) -> None:
             "tools/phantom_gpu/retained_air_tools.py",
         ),
     )
+    compiler_parameters = {
+        "polynomial_degree": arguments.polynomial_degree,
+        "mul_level": arguments.mul_level,
+        "input_level": arguments.input_level,
+        "security_level": arguments.security_level,
+        "scaling_modulus_bits": arguments.scaling_modulus_bits,
+        "first_modulus_bits": arguments.first_modulus_bits,
+        "hamming_weight": arguments.hamming_weight,
+    }
+    input_context = _load_context(arguments.context_manifest)
+    expected_parameters = {
+        "polynomial_degree": int(input_context["polynomial_degree"]),
+        "mul_level": len(input_context["data_q_bit_sizes"]),
+        "input_level": int(input_context["input_level"]),
+        "security_level": int(input_context["security_level"]),
+        "scaling_modulus_bits": int(input_context["scaling_modulus_bits"]),
+        "first_modulus_bits": int(input_context["first_modulus_bits"]),
+        "hamming_weight": int(input_context["hamming_weight"]),
+    }
+    if compiler_parameters != expected_parameters:
+        raise SystemExit(
+            "retained compiler CLI parameters disagree with the input context manifest"
+        )
     ant_air, ant_source = _compile(
         arguments.context_manifest,
         arguments.fixture,
+        compiler_parameters=compiler_parameters,
         provider="ant",
         codegen_ir="poly",
     )
     phantom_air, phantom_source = _compile(
         arguments.context_manifest,
         arguments.fixture,
+        compiler_parameters=compiler_parameters,
         provider="phantom",
         codegen_ir="ckks",
         context_output=arguments.phantom_context_manifest,
@@ -218,6 +244,13 @@ CIPHERTEXT retained_ckks_composite(CIPHERTEXT input);
         CANONICAL_ARTIFACT_PATHS["phantom_resource_manifest"],
         "--generation-record", CANONICAL_ARTIFACT_PATHS["generation_record"],
         "--interface-header", CANONICAL_ARTIFACT_PATHS["interface_header"],
+        "--polynomial-degree", str(arguments.polynomial_degree),
+        "--mul-level", str(arguments.mul_level),
+        "--input-level", str(arguments.input_level),
+        "--security-level", str(arguments.security_level),
+        "--scaling-modulus-bits", str(arguments.scaling_modulus_bits),
+        "--first-modulus-bits", str(arguments.first_modulus_bits),
+        "--hamming-weight", str(arguments.hamming_weight),
     ]
     def digest(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -273,6 +306,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--phantom-resource-manifest", required=True, type=Path)
     parser.add_argument("--generation-record", required=True, type=Path)
     parser.add_argument("--interface-header", required=True, type=Path)
+    parser.add_argument("--polynomial-degree", required=True, type=int)
+    parser.add_argument("--mul-level", required=True, type=int)
+    parser.add_argument("--input-level", required=True, type=int)
+    parser.add_argument("--security-level", required=True, type=int)
+    parser.add_argument("--scaling-modulus-bits", required=True, type=int)
+    parser.add_argument("--first-modulus-bits", required=True, type=int)
+    parser.add_argument("--hamming-weight", required=True, type=int)
     return parser.parse_args()
 
 

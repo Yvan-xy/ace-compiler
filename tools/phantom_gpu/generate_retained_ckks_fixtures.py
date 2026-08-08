@@ -15,11 +15,12 @@ import tempfile
 from typing import Any, Iterable, Sequence
 
 
-FIXTURE_SCHEMA = "ace.phantom.retained_ckks.fixture/1.0.0"
+FIXTURE_SCHEMA = "ace.phantom.retained_ckks.fixture/2.0.0"
 ANALYTIC_SCHEMA = "ace.phantom.retained_ckks.analytic/1.0.0"
-EXACT_SCHEMA = "ace.phantom.retained_ckks.exact-rns/1.0.0"
+EXACT_SCHEMA = "ace.phantom.retained_ckks.exact-source/2.0.0"
 INVOCATION_SCHEMA = "ace.retained_ckks.generated-sources/1.0.0"
 DECODED_MAGIC = b"ACERCK01"
+EXACT_SOURCE_MAGIC = b"ACESRC01"
 EXACT_MAGIC = b"ACERNS01"
 MASK64 = (1 << 64) - 1
 RETAINED_RESOURCE_SCHEMA_VERSION = 2
@@ -198,6 +199,7 @@ def validate_template(fixture: dict[str, Any], *, require_bound: bool) -> None:
         "production_rotation_batches",
         "production_rotation_source",
         "monomial_powers",
+        "exact_source_recipe",
         "decoded_cases",
         "exact_algebraic_cases",
         "metadata_contract",
@@ -205,7 +207,8 @@ def validate_template(fixture: dict[str, Any], *, require_bound: bool) -> None:
         "runtime_rejections",
         "tolerances",
         "decoded_binary_format",
-        "exact_binary_format",
+        "exact_source_binary_format",
+        "exact_observed_binary_format",
     }
     _expect_keys(fixture, required, "retained fixture")
     if fixture["schema_version"] != FIXTURE_SCHEMA:
@@ -259,6 +262,13 @@ def validate_template(fixture: dict[str, Any], *, require_bound: bool) -> None:
         "2N+1",
     ]:
         fail("the symbolic monomial power matrix changed")
+    expected_exact_recipe = {
+        "generator": "splitmix64-bounded-signed-int-v1",
+        "component_seed_xors": [0x435430, 0x435431],
+        "coefficient_absolute_bound": 1 << 20,
+    }
+    if fixture["exact_source_recipe"] != expected_exact_recipe:
+        fail("the provider-neutral exact source recipe changed")
     if fixture["exact_algebraic_cases"] != [
         "exact_algebraic.raise_mod",
         "exact_algebraic.mul_mono.0",
@@ -430,9 +440,14 @@ def validate_template(fixture: dict[str, Any], *, require_bound: bool) -> None:
         "decoded_binary_format",
     )
     _expect_keys(
-        fixture["exact_binary_format"],
+        fixture["exact_source_binary_format"],
         {"id", "magic_ascii", "endianness", "encoding"},
-        "exact_binary_format",
+        "exact_source_binary_format",
+    )
+    _expect_keys(
+        fixture["exact_observed_binary_format"],
+        {"id", "magic_ascii", "endianness", "encoding"},
+        "exact_observed_binary_format",
     )
     if fixture["decoded_binary_format"]["magic_ascii"] != DECODED_MAGIC.decode():
         fail("decoded binary magic changed")
@@ -442,14 +457,28 @@ def validate_template(fixture: dict[str, Any], *, require_bound: bool) -> None:
         or fixture["decoded_binary_format"]["endianness"] != "little"
     ):
         fail("decoded binary format changed")
-    if fixture["exact_binary_format"]["magic_ascii"] != EXACT_MAGIC.decode():
-        fail("exact binary magic changed")
     if (
-        fixture["exact_binary_format"]["id"]
-        != "ace.retained_ckks.rns_uint64le/1.0.0"
-        or fixture["exact_binary_format"]["endianness"] != "little"
+        fixture["exact_source_binary_format"]["magic_ascii"]
+        != EXACT_SOURCE_MAGIC.decode()
     ):
-        fail("exact binary format changed")
+        fail("exact source binary magic changed")
+    if (
+        fixture["exact_source_binary_format"]["id"]
+        != "ace.retained_ckks.signed_int64le/1.0.0"
+        or fixture["exact_source_binary_format"]["endianness"] != "little"
+    ):
+        fail("exact source binary format changed")
+    if (
+        fixture["exact_observed_binary_format"]["magic_ascii"]
+        != EXACT_MAGIC.decode()
+    ):
+        fail("exact observed binary magic changed")
+    if (
+        fixture["exact_observed_binary_format"]["id"]
+        != "ace.retained_ckks.rns_uint64le/1.0.0"
+        or fixture["exact_observed_binary_format"]["endianness"] != "little"
+    ):
+        fail("exact observed binary format changed")
 
 
 def _load_invocation(path: Path) -> tuple[dict[str, Any], str, dict[str, str]]:
@@ -495,9 +524,18 @@ def _load_invocation(path: Path) -> tuple[dict[str, Any], str, dict[str, str]]:
         "--phantom-context-manifest", "--phantom-resource-manifest",
         "--generation-record", "--interface-header",
     }
+    compiler_options = {
+        "--polynomial-degree",
+        "--mul-level",
+        "--input-level",
+        "--security-level",
+        "--scaling-modulus-bits",
+        "--first-modulus-bits",
+        "--hamming-weight",
+    }
     if (
         len(pairs) != len(arguments) // 2
-        or set(pairs) != artifact_options
+        or set(pairs) != artifact_options | compiler_options
     ):
         fail("compiler invocation options are incomplete or duplicated")
     expected_suffixes = {
@@ -520,6 +558,9 @@ def _load_invocation(path: Path) -> tuple[dict[str, Any], str, dict[str, str]]:
             or artifact.suffix != suffix
         ):
             fail(f"compiler invocation {option} has an unsafe artifact path")
+    for option in compiler_options:
+        if re.fullmatch(r"(?:0|[1-9][0-9]*)", pairs[option]) is None:
+            fail(f"compiler invocation {option} must be a canonical integer")
     if invocation["canonical_module"] != "ace_edsl/examples/ckks_retained_ops.py":
         fail("retained invocation names an unexpected canonical module")
     if invocation["generated_functions"] != [
@@ -561,6 +602,24 @@ def verify_invocation_context(
     for field, digest in expected.items():
         if invocation[field] != digest:
             fail(f"retained generator invocation disagrees with {field}")
+    arguments = invocation["argv"][1:]
+    pairs = dict(zip(arguments[0::2], arguments[1::2]))
+    context = load_json(context_path)
+    compiler_parameters = {
+        "--polynomial-degree": context["polynomial_degree"],
+        "--mul-level": len(context["data_q_bit_sizes"]),
+        "--input-level": context["input_level"],
+        "--security-level": context["security_level"],
+        "--scaling-modulus-bits": context["scaling_modulus_bits"],
+        "--first-modulus-bits": context["first_modulus_bits"],
+        "--hamming-weight": context["hamming_weight"],
+    }
+    for option, expected_value in compiler_parameters.items():
+        if pairs[option] != str(expected_value):
+            fail(
+                f"retained compiler invocation {option} disagrees with the "
+                "compiler context manifest"
+            )
 
 
 _ROTATE_BATCH_PATTERN = re.compile(
@@ -919,34 +978,32 @@ def negacyclic_monomial(
     return result
 
 
-def _pack_u64(values: Iterable[int]) -> bytes:
-    output = bytearray()
-    for value in values:
-        if value < 0 or value > MASK64:
-            fail("RNS residue does not fit uint64")
-        output.extend(struct.pack("<Q", value))
-    return bytes(output)
-
-
-def _load_moduli(path: Path, resolved: dict[str, Any]) -> list[int]:
-    value = load_json(path)
-    _expect_keys(value, {"ordered_data_q_moduli"}, "modulus attestation")
-    moduli = value["ordered_data_q_moduli"]
-    if not isinstance(moduli, list) or len(moduli) != resolved["full_data_q_count"]:
-        fail("observed data-Q modulus count disagrees with the context manifest")
-    result: list[int] = []
-    for index, modulus in enumerate(moduli):
-        modulus = _integer(modulus, f"ordered_data_q_moduli[{index}]", 3)
-        if modulus.bit_length() != resolved["data_q_bit_sizes"][index]:
-            fail(f"observed data-Q modulus {index} has the wrong bit length")
-        result.append(modulus)
-    return result
-
-
 def _seeded_coefficients(seed: int, count: int, bound: int) -> list[int]:
     generator = SplitMix64(seed)
     width = 2 * bound + 1
     return [int(generator.next_u64() % width) - bound for _ in range(count)]
+
+
+def exact_signed_coefficients(
+    fixture: dict[str, Any], degree: int
+) -> tuple[list[list[int]], int]:
+    recipe = fixture["exact_source_recipe"]
+    seed = fixture["determinism"]["seed"]
+    bound = recipe["coefficient_absolute_bound"]
+    components = [
+        _seeded_coefficients(seed ^ seed_xor, degree, bound)
+        for seed_xor in recipe["component_seed_xors"]
+    ]
+    return components, len(components) * degree
+
+
+def _pack_i64(values: Iterable[int]) -> bytes:
+    output = bytearray()
+    for value in values:
+        if value < -(1 << 63) or value >= 1 << 63:
+            fail("signed coefficient does not fit int64")
+        output.extend(struct.pack("<q", value))
+    return bytes(output)
 
 
 def generate_exact(
@@ -954,16 +1011,10 @@ def generate_exact(
     context_path: Path,
     invocation_path: Path,
     post_air_path: Path,
-    moduli_path: Path,
     output_json: Path,
     output_bin: Path,
     production_air_path: Path | None = None,
 ) -> dict[str, Any]:
-    fail(
-        "host modulus-attestation exact generation is retired; exact raise and "
-        "monomial evidence must be recomputed from provider-observed source "
-        "residues and the Phantom runtime modulus attestation"
-    )
     fixture = load_json(fixture_path)
     resolved = verify_bindings(
         fixture,
@@ -972,169 +1023,51 @@ def generate_exact(
         post_air_path,
         production_air_path,
     )
-    moduli = _load_moduli(moduli_path, resolved)
     degree = resolved["polynomial_degree"]
-    seed = fixture["determinism"]["seed"]
-    coefficient_components = [
-        _seeded_coefficients(seed ^ 0x435430, degree, 1 << 20),
-        _seeded_coefficients(seed ^ 0x435431, degree, 1 << 20),
-    ]
-    binary = bytearray(EXACT_MAGIC)
-    records: list[dict[str, Any]] = []
-
-    q0 = moduli[0]
-    bottom = [[coefficient % q0 for coefficient in component]
-              for component in coefficient_components]
-    lifted = [centered_lift(component, moduli) for component in bottom]
-    source_blob = _pack_u64(value for component in bottom for value in component)
-    expected_blob = _pack_u64(
-        value
-        for component in lifted
-        for modulus_values in component
-        for value in modulus_values
+    coefficient_components, draw_count = exact_signed_coefficients(fixture, degree)
+    binary = bytearray(EXACT_SOURCE_MAGIC)
+    source = _append_blob(
+        binary,
+        _pack_i64(
+            coefficient
+            for component in coefficient_components
+            for coefficient in component
+        ),
+        len(coefficient_components) * degree,
     )
-    records.append(
+    label_by_symbol = {
+        "0": "0",
+        "N/2": "N_over_2",
+        "N": "N",
+        "3N/2": "3N_over_2",
+        "2N-1": "2N_minus_1",
+        "2N+1": "2N_plus_1",
+    }
+    records: list[dict[str, Any]] = [
         {
             "case_id": "exact_algebraic.raise_mod",
             "operation": "raise_mod",
-            "source_kind": "deterministic_harness_import",
             "normalized_power": None,
-            "source_metadata": {
-                "active_q_count": 1,
-                "ciphertext_size": 2,
-                "ntt": False,
-                "chain_position": "bottom_data_q",
-            },
-            "result_metadata": {
-                "active_q_count": len(moduli),
-                "ciphertext_size": 2,
-                "ntt": False,
-                "chain_position": "full_data_q",
-            },
-            "source": _append_blob(binary, source_blob, len(bottom) * degree),
-            "expected": _append_blob(
-                binary, expected_blob, len(bottom) * len(moduli) * degree
-            ),
-            "layout": {
-                "component_count": len(bottom),
-                "source_modulus_count": 1,
-                "result_modulus_count": len(moduli),
-                "coefficient_count": degree,
-                "ordering": "component,modulus,coefficient",
-            },
+            "source_id": "signed_coefficients.default",
         }
-    )
-
-    source_by_modulus = [
-        [[coefficient % modulus for coefficient in component] for modulus in moduli]
-        for component in coefficient_components
     ]
-    source_blob = _pack_u64(
-        value
-        for component in source_by_modulus
-        for modulus_values in component
-        for value in modulus_values
-    )
-    symbols = list(fixture["monomial_powers"])
-    for symbol in symbols:
-        power = resolve_power(symbol, degree)
-        normalized = normalize_power(power, degree)
-        expected = [
-            [
-                negacyclic_monomial(component[index], normalized, modulus)
-                for index, modulus in enumerate(moduli)
-            ]
-            for component in source_by_modulus
-        ]
-        expected_blob = _pack_u64(
-            value
-            for component in expected
-            for modulus_values in component
-            for value in modulus_values
-        )
-        label = {
-            "0": "0",
-            "N/2": "N_over_2",
-            "N": "N",
-            "3N/2": "3N_over_2",
-            "2N-1": "2N_minus_1",
-            "2N+1": "2N_plus_1",
-        }[symbol]
+    for symbol in fixture["monomial_powers"]:
         records.append(
             {
-                "case_id": f"exact_algebraic.mul_mono.{label}",
+                "case_id": f"exact_algebraic.mul_mono.{label_by_symbol[symbol]}",
                 "operation": "mul_mono",
-                "source_kind": "deterministic_harness_import",
-                "normalized_power": normalized,
-                "source_metadata": {
-                    "active_q_count": len(moduli),
-                    "ciphertext_size": 2,
-                    "ntt": False,
-                    "chain_position": "full_data_q",
-                },
-                "result_metadata": {
-                    "active_q_count": len(moduli),
-                    "ciphertext_size": 2,
-                    "ntt": False,
-                    "chain_position": "full_data_q",
-                },
-                "source": _append_blob(
-                    binary,
-                    source_blob,
-                    len(coefficient_components) * len(moduli) * degree,
+                "normalized_power": normalize_power(
+                    resolve_power(symbol, degree), degree
                 ),
-                "expected": _append_blob(
-                    binary,
-                    expected_blob,
-                    len(coefficient_components) * len(moduli) * degree,
-                ),
-                "layout": {
-                    "component_count": len(coefficient_components),
-                    "source_modulus_count": len(moduli),
-                    "result_modulus_count": len(moduli),
-                    "coefficient_count": degree,
-                    "ordering": "component,modulus,coefficient",
-                },
+                "source_id": "signed_coefficients.default",
             }
         )
-
-    inverse_expected_blob = source_blob
     records.append(
         {
             "case_id": "exact_algebraic.mul_mono.inverse_composition",
             "operation": "mul_mono_inverse_composition",
-            "source_kind": "deterministic_harness_import",
             "normalized_power": 0,
-            "source_metadata": {
-                "active_q_count": len(moduli),
-                "ciphertext_size": 2,
-                "ntt": False,
-                "chain_position": "full_data_q",
-            },
-            "result_metadata": {
-                "active_q_count": len(moduli),
-                "ciphertext_size": 2,
-                "ntt": False,
-                "chain_position": "full_data_q",
-            },
-            "source": _append_blob(
-                binary,
-                source_blob,
-                len(coefficient_components) * len(moduli) * degree,
-            ),
-            "expected": _append_blob(
-                binary,
-                inverse_expected_blob,
-                len(coefficient_components) * len(moduli) * degree,
-            ),
-            "layout": {
-                "component_count": len(coefficient_components),
-                "source_modulus_count": len(moduli),
-                "result_modulus_count": len(moduli),
-                "coefficient_count": degree,
-                "ordering": "component,modulus,coefficient",
-                "composition_powers": [2 * degree - 1, 1],
-            },
+            "source_id": "signed_coefficients.default",
         }
     )
     _atomic_write(output_bin, bytes(binary))
@@ -1143,18 +1076,30 @@ def generate_exact(
         "fixture_sha256": sha256_path(fixture_path),
         "qualification_bindings": fixture["qualification_bindings"],
         "context_manifest_sha256": sha256_path(context_path),
-        "modulus_attestation_sha256": sha256_path(moduli_path),
-        "ordered_data_q_moduli": moduli,
+        "determinism": {
+            "generator": fixture["exact_source_recipe"]["generator"],
+            "seed": fixture["determinism"]["seed"],
+            "component_seed_xors": fixture["exact_source_recipe"][
+                "component_seed_xors"
+            ],
+            "coefficient_absolute_bound": fixture["exact_source_recipe"][
+                "coefficient_absolute_bound"
+            ],
+            "generator_draw_count": draw_count,
+        },
         "conversion_convention": (
-            "coefficient residues; q0 residues centered at q0/2; "
-            "X^N=-1 signed negacyclic permutation"
+            "provider-neutral signed coefficients in component,coefficient "
+            "order; providers reduce exactly under runtime-attested data-Q primes"
         ),
-        "source_contract": (
-            "The harness must import these deterministic coefficient residues "
-            "as size-2 test ciphertexts without encoding or encryption."
-        ),
+        "layout": {
+            "component_count": len(coefficient_components),
+            "coefficient_count": degree,
+            "ordering": "component,coefficient",
+        },
+        "source_id": "signed_coefficients.default",
+        "signed_coefficients": source,
         "binary": {
-            "format": fixture["exact_binary_format"]["id"],
+            "format": fixture["exact_source_binary_format"]["id"],
             "size_bytes": len(binary),
             "sha256": sha256_bytes(bytes(binary)),
         },
@@ -1180,7 +1125,6 @@ def parse_arguments() -> argparse.Namespace:
     bind.add_argument("--output-json", required=True, type=Path)
     analytic.add_argument("--output-json", required=True, type=Path)
     analytic.add_argument("--output-bin", required=True, type=Path)
-    exact.add_argument("--moduli-json", required=True, type=Path)
     exact.add_argument("--output-json", required=True, type=Path)
     exact.add_argument("--output-bin", required=True, type=Path)
     return parser.parse_args()
@@ -1228,7 +1172,6 @@ def main() -> int:
                 arguments.context_manifest,
                 arguments.compiler_invocation,
                 arguments.post_ckks_air,
-                arguments.moduli_json,
                 arguments.output_json,
                 arguments.output_bin,
                 arguments.production_post_ckks_air,

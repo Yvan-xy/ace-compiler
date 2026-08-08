@@ -3,6 +3,7 @@
 
 #include "common/rt_api.h"
 #include "rt_phantom/rt_phantom.h"
+#include "retained_ckks_generated_interface.h"
 
 #include "context.cuh"
 #include "evaluate.cuh"
@@ -57,6 +58,8 @@ constexpr std::array<std::uint8_t, 8> kDecodedMagic = {'A', 'C', 'E', 'R',
                                                        'C', 'K', '0', '1'};
 constexpr std::array<std::uint8_t, 8> kExactMagic = {'A', 'C', 'E', 'R',
                                                      'N', 'S', '0', '1'};
+constexpr std::array<std::uint8_t, 8> kExactSourceMagic = {
+    'A', 'C', 'E', 'S', 'R', 'C', '0', '1'};
 constexpr char kProviderSchema[] =
     "ace.phantom.retained_ckks.provider-result/2.0.0";
 constexpr char kExactObservedSchema[] =
@@ -346,17 +349,18 @@ std::vector<Complex> ReadComplexBlob(const std::vector<std::uint8_t> &file,
   return values;
 }
 
-std::vector<std::uint64_t> ReadU64Blob(const std::vector<std::uint8_t> &file,
-                                       const Json &descriptor,
-                                       const std::string &diagnostic) {
+std::vector<std::int64_t> ReadI64Blob(const std::vector<std::uint8_t> &file,
+                                      const Json &descriptor,
+                                      const std::string &diagnostic) {
   ValidateBlob(file, descriptor, diagnostic);
   const std::size_t count = descriptor.at("count").get<std::size_t>();
   Require(descriptor.at("byte_length").get<std::size_t>() == count * 8U,
-          diagnostic, "residue blob length mismatch");
+          diagnostic, "signed coefficient blob length mismatch");
   const std::size_t offset = descriptor.at("offset_bytes").get<std::size_t>();
-  std::vector<std::uint64_t> values(count);
+  std::vector<std::int64_t> values(count);
   for (std::size_t index = 0; index < count; ++index) {
-    values[index] = ReadU64Le(file.data() + offset + index * 8U);
+    const std::uint64_t bits = ReadU64Le(file.data() + offset + index * 8U);
+    std::memcpy(&values[index], &bits, sizeof(bits));
   }
   return values;
 }
@@ -887,30 +891,11 @@ Json RunDecoded(const Json &fixture, const std::vector<Complex> &source_values,
   {
     CIPHER source = Encrypt(arena, source_values, context._input_level);
     const RuntimeSnapshot before = Snapshot(source);
-    CIPHER raised = arena.NewCipher();
-    CIPHER multiplied = arena.NewCipher();
-    CIPHER conjugated = arena.NewCipher();
-    Raise_mod(raised, source,
-              static_cast<std::uint32_t>(context._data_q_count));
-    Mul_mono_ciph(multiplied, raised, context._poly_degree / 2U);
-    Conjugate_ciph(conjugated, multiplied);
-    auto outputs = std::make_unique<CIPHERTEXT[]>(edge_steps.size());
-    Rotate_batch_ciph(outputs.get(), conjugated, edge_steps.data(),
-                      edge_steps.size());
-    RequireIndependentBatch(conjugated, outputs.get(), edge_steps.size(),
-                            "COMPOSITE_OWNERSHIP");
-    CIPHER left = arena.NewCipher();
-    CIPHER right = arena.NewCipher();
-    CIPHER result = arena.NewCipher();
-    Add_ciph(left, &outputs[0], &outputs[1]);
-    Add_ciph(right, &outputs[2], &outputs[3]);
-    Add_ciph(result, left, right);
+    CIPHERTEXT result = retained_ckks_composite(*source);
     records.push_back(AppendDecodedRecord(binary,
                                           "composite.bounded_nonperiodic",
-                                          "composite", result, before, source));
-    FreeBatchInOrder(outputs.get(), edge_steps.size(),
-                     fixture.at("ownership").at("free_order"));
-    retained_batches.push_back(std::move(outputs));
+                                          "composite", &result, before, source));
+    Zero_ciph(&result);
   }
   arena.FreeAll();
   return records;
@@ -942,6 +927,36 @@ std::vector<std::uint64_t> ExactModuli(const PhantomContext &context) {
   result.reserve(moduli.size());
   for (const auto &modulus : moduli)
     result.push_back(modulus.value());
+  return result;
+}
+
+std::uint64_t ReduceSignedCoefficient(std::int64_t value,
+                                      std::uint64_t modulus) {
+  if (value >= 0)
+    return static_cast<std::uint64_t>(value) % modulus;
+  const std::uint64_t magnitude =
+      static_cast<std::uint64_t>(-(value + 1)) + 1U;
+  const std::uint64_t residue = magnitude % modulus;
+  return residue == 0 ? 0 : modulus - residue;
+}
+
+std::vector<std::uint64_t>
+ReduceSignedSource(const std::vector<std::int64_t> &coefficients,
+                   const std::vector<std::uint64_t> &moduli) {
+  const std::size_t degree = ContextManifest()._poly_degree;
+  Require(coefficients.size() == 2U * degree, "EXACT_SOURCE",
+          "signed source must contain two polynomial components");
+  std::vector<std::uint64_t> result;
+  result.reserve(coefficients.size() * moduli.size());
+  for (std::size_t component = 0; component < 2U; ++component) {
+    const std::size_t begin = component * degree;
+    for (std::uint64_t modulus : moduli) {
+      for (std::size_t coefficient = 0; coefficient < degree; ++coefficient) {
+        result.push_back(
+            ReduceSignedCoefficient(coefficients[begin + coefficient], modulus));
+      }
+    }
+  }
   return result;
 }
 
@@ -1017,14 +1032,25 @@ Json RunExact(const Json &exact_reference,
               std::vector<std::uint8_t> &output,
               std::vector<std::uint64_t> &ordered_moduli,
               std::size_t &first_data_chain_index) {
-  ValidateBinary(exact_input, exact_reference.at("binary"), kExactMagic,
+  ValidateBinary(exact_input, exact_reference.at("binary"), kExactSourceMagic,
                  "EXACT_REFERENCE");
+  Require(exact_reference.at("schema_version") ==
+              "ace.phantom.retained_ckks.exact-source/2.0.0",
+          "EXACT_REFERENCE", "signed exact source schema mismatch");
   auto context = MakeExactContext();
   first_data_chain_index = context->get_first_index();
   ordered_moduli = ExactModuli(*context);
-  Require(exact_reference.at("ordered_data_q_moduli") == ordered_moduli,
-          "EXACT_MODULI",
-          "generated exact reference and manifest-derived context disagree");
+  const auto signed_coefficients =
+      ReadI64Blob(exact_input, exact_reference.at("signed_coefficients"),
+                  "EXACT_SIGNED_SOURCE");
+  Require(exact_reference.at("source_id") == "signed_coefficients.default" &&
+              signed_coefficients.size() ==
+                  2U * ContextManifest()._poly_degree,
+          "EXACT_SIGNED_SOURCE", "signed exact source shape changed");
+  const std::vector<std::uint64_t> bottom_source =
+      ReduceSignedSource(signed_coefficients, {ordered_moduli.front()});
+  const std::vector<std::uint64_t> full_source =
+      ReduceSignedSource(signed_coefficients, ordered_moduli);
   const std::array<std::string, 8> expected_ids = {
       "exact_algebraic.raise_mod",
       "exact_algebraic.mul_mono.0",
@@ -1041,8 +1067,9 @@ Json RunExact(const Json &exact_reference,
     const Json &specification = exact_reference.at("records").at(index);
     Require(specification.at("case_id") == expected_ids[index], "EXACT_CASES",
             "exact case order mismatch");
-    const auto source_values = ReadU64Blob(
-        exact_input, specification.at("source"), expected_ids[index]);
+    Require(specification.at("source_id") == exact_reference.at("source_id"),
+            "EXACT_CASES", "exact case references another signed source");
+    const auto &source_values = index == 0 ? bottom_source : full_source;
     const std::string runtime_id =
         "exact_runtime." +
         expected_ids[index].substr(std::string("exact_algebraic.").size());
@@ -1232,11 +1259,14 @@ void RunConformance(int argc, char **argv) {
       {{"schema_version", kExactObservedSchema},
        {"fixture_sha256", fixture_sha256},
        {"context_manifest_sha256", context_sha256},
+       {"exact_source_json_sha256", Sha256(ReadBytes(argv[6]))},
+       {"exact_source_binary_sha256", Sha256(exact_input)},
        {"ordered_data_q_moduli", ordered_moduli},
        {"first_data_chain_index", first_data_chain_index},
        {"conversion_convention", exact_reference.at("conversion_convention")},
-       {"binary", BinaryDescriptor(fixture.at("exact_binary_format").at("id"),
-                                   exact_binary)},
+       {"binary",
+        BinaryDescriptor(
+            fixture.at("exact_observed_binary_format").at("id"), exact_binary)},
        {"records", std::move(exact_records)}});
 }
 

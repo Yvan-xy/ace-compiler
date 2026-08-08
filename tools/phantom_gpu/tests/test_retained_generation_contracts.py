@@ -74,9 +74,34 @@ def test_default_production_recipe_stops_after_ckks_driver() -> None:
         assert forbidden not in source
 
 
+def test_retained_generator_cli_owns_compiler_context_parameters() -> None:
+    source = (TOOLS / "generate_retained_ckks_sources.py").read_text(
+        encoding="utf-8"
+    )
+    for option, parameter in (
+        ("--polynomial-degree", "poly_degree=compiler_parameters"),
+        ("--mul-level", "mul_level=compiler_parameters"),
+        ("--input-level", "input_level=compiler_parameters"),
+        ("--security-level", "security_level=compiler_parameters"),
+        ("--scaling-modulus-bits", "scaling_factor_bits=compiler_parameters"),
+        ("--first-modulus-bits", "first_prime_bits=compiler_parameters"),
+        ("--hamming-weight", "hamming_weight=compiler_parameters"),
+    ):
+        assert f'parser.add_argument("{option}", required=True' in source
+        assert parameter in source
+
+
 def test_ant_oracle_invokes_the_generated_composite() -> None:
     source = (TOOLS / "harness/retained_ckks_ant_oracle.cxx").read_text(
         encoding="utf-8"
     )
     assert "CIPHERTEXT retained_ckks_composite(CIPHERTEXT input);" in source
+    assert "CIPHERTEXT result = retained_ckks_composite(*source);" in source
+
+
+def test_phantom_harness_invokes_the_generated_composite_interface() -> None:
+    source = (
+        TOOLS / "harness/retained_ckks_phantom_conformance.cu"
+    ).read_text(encoding="utf-8")
+    assert '#include "retained_ckks_generated_interface.h"' in source
     assert "CIPHERTEXT result = retained_ckks_composite(*source);" in source

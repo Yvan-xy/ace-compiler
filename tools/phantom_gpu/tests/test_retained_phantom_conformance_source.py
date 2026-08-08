@@ -68,6 +68,10 @@ def test_exact_path_imports_and_observes_both_representations() -> None:
     assert "EXACT_NTT_RAISE" in body
     assert "mutated its NTT source" in body
     assert "NTT and coefficient-form exact residues disagree" in body
+    assert "ReadI64Blob" in body
+    assert "ReduceSignedSource" in body
+    assert 'exact_reference.at("ordered_data_q_moduli")' not in body
+    assert 'specification.at("source")' not in body
     raise_branch_start = body.index("if (index == 0)")
     raise_branch_end = body.index("continue;", raise_branch_start)
     raise_branch = body[raise_branch_start:raise_branch_end]
@@ -109,6 +113,9 @@ def test_case_matrix_order_and_strict_artifact_schemas_are_literal() -> None:
     assert "'A','C','E','R','C','K','0','1'" in compact
     assert "'A','C','E','R','N','S','0','1'" in compact
     assert '"component,modulus,coefficient"' in source
+    assert "ace.phantom.retained_ckks.exact-source/2.0.0" in source
+    assert "exact_source_json_sha256" in source
+    assert "exact_source_binary_sha256" in source
     assert "AppendDoubleLe" in source
     assert "AppendU64Le" in source
 
@@ -123,6 +130,13 @@ def test_batch_contract_and_ownership_stress_are_explicit() -> None:
     assert 'iterations == 100' in source
     assert 'fixture.at("ownership").at("free_order")' in source
     assert "OwnershipToken" in source
+
+
+def test_decoded_composite_invokes_the_generated_interface() -> None:
+    source = _source()
+    body = _function_body(source, "RunDecoded")
+    assert '#include "retained_ckks_generated_interface.h"' in source
+    assert "CIPHERTEXT result = retained_ckks_composite(*source);" in body
 
 
 def test_source_preservation_hashes_exact_device_residues() -> None:

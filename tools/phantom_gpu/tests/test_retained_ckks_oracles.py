@@ -59,6 +59,13 @@ def _invocation(context_path: Path, fixture_path: Path, air_path: Path) -> dict:
         "--phantom-resource-manifest", "outputs/compiler_resource_manifest.json",
         "--generation-record", "outputs/retained_ckks_generation.json",
         "--interface-header", "outputs/retained_ckks_generated_interface.h",
+        "--polynomial-degree", "8",
+        "--mul-level", "3",
+        "--input-level", "1",
+        "--security-level", "0",
+        "--scaling-modulus-bits", "5",
+        "--first-modulus-bits", "5",
+        "--hamming-weight", "4",
     ]
     context_sha = hashlib.sha256(context_path.read_bytes()).hexdigest()
     fixture_sha = hashlib.sha256(fixture_path.read_bytes()).hexdigest()
@@ -183,6 +190,24 @@ def test_generation_receipt_is_root_independent_and_rejects_absolute_paths(
         fixture_tool._load_invocation(invalid_path)
 
 
+def test_binding_rejects_compiler_cli_parameter_manifest_disagreement(
+    tmp_path: Path,
+) -> None:
+    template, context, invocation, air = _qualification_files(tmp_path)
+    record = fixture_tool.load_json(invocation)
+    option_index = record["argv"].index("--polynomial-degree")
+    record["argv"][option_index + 1] = "16"
+    record["normalized_argv_sha256"] = hashlib.sha256(
+        fixture_tool.canonical_bytes(record["argv"])
+    ).hexdigest()
+    _write_json(invocation, record)
+    with pytest.raises(
+        fixture_tool.RetainedFixtureError,
+        match="--polynomial-degree disagrees",
+    ):
+        fixture_tool.bind_fixture(template, context, invocation, air)
+
+
 def test_generator_consumes_seed_and_is_binary_deterministic(tmp_path: Path) -> None:
     template, context, invocation, air = _qualification_files(tmp_path)
     bound = fixture_tool.bind_fixture(template, context, invocation, air)
@@ -200,6 +225,26 @@ def test_generator_consumes_seed_and_is_binary_deterministic(tmp_path: Path) -> 
     assert first["binary"]["sha256"] == second["binary"]["sha256"]
     assert first_bin.read_bytes() == second_bin.read_bytes()
     assert [record["batch_step"] for record in first["records"] if record["operation"] == "rotate_batch"] == [5, 0, -7, 5, 2, -1, 2, 3, 0]
+    expected_order = comparator.expected_provider_order(bound)
+    analytic_order = [record["case_id"] for record in first["records"]]
+    assert analytic_order == expected_order[: len(analytic_order)]
+    production_ids = [
+        case_id for case_id in analytic_order if case_id.startswith("rotate_batch.production_")
+    ]
+    assert production_ids == [
+        "rotate_batch.production_0.output_0.step_2",
+        "rotate_batch.production_0.output_1.step_-1",
+        "rotate_batch.production_0.output_2.step_2",
+        "rotate_batch.production_1.output_0.step_3",
+        "rotate_batch.production_1.output_1.step_0",
+    ]
+    for name, invalid in (
+        ("truncated", expected_order[:-1]),
+        ("reordered", expected_order[1:2] + expected_order[:1] + expected_order[2:]),
+        ("duplicated", expected_order + expected_order[-1:]),
+    ):
+        with pytest.raises(comparator.ComparisonError, match="case order"):
+            comparator.validate_exact_case_order(invalid, expected_order, name)
 
 
 def test_exact_centered_lift_and_negacyclic_normalization() -> None:
@@ -217,21 +262,29 @@ def test_exact_centered_lift_and_negacyclic_normalization() -> None:
     assert inverse == coefficients
 
 
-def test_host_exact_generator_cannot_freeze_provider_moduli(tmp_path: Path) -> None:
+def test_host_exact_generator_emits_only_provider_neutral_signed_sources(
+    tmp_path: Path,
+) -> None:
     template, context, invocation, air = _qualification_files(tmp_path)
     bound = fixture_tool.bind_fixture(template, context, invocation, air)
     bound_path = tmp_path / "bound.json"
     _write_json(bound_path, bound)
-    moduli = tmp_path / "moduli.json"
-    _write_json(moduli, {"ordered_data_q_moduli": [17, 19, 23]})
     output_json, output_bin = tmp_path / "exact.json", tmp_path / "exact.bin"
-    with pytest.raises(
-        fixture_tool.RetainedFixtureError,
-        match="provider-observed source residues",
-    ):
-        fixture_tool.generate_exact(
-            bound_path, context, invocation, air, moduli, output_json, output_bin
-        )
+    exact = fixture_tool.generate_exact(
+        bound_path, context, invocation, air, output_json, output_bin
+    )
+    assert exact["schema_version"] == fixture_tool.EXACT_SCHEMA
+    assert output_bin.read_bytes().startswith(fixture_tool.EXACT_SOURCE_MAGIC)
+    assert exact["binary"]["format"] == "ace.retained_ckks.signed_int64le/1.0.0"
+    assert exact["determinism"]["generator_draw_count"] == 16
+    assert exact["layout"] == {
+        "component_count": 2,
+        "coefficient_count": 8,
+        "ordering": "component,coefficient",
+    }
+    assert "ordered_data_q_moduli" not in exact
+    assert "modulus_attestation_sha256" not in exact
+    assert all("expected" not in record for record in exact["records"])
 
 
 def test_strict_json_and_metric_reject_invalid_data(tmp_path: Path) -> None:
@@ -254,6 +307,101 @@ def test_strict_json_and_metric_reject_invalid_data(tmp_path: Path) -> None:
     assert result["status"] == "pass"
     assert result["comparison_count"] == 1
     assert result["maximum_absolute_error"] == 0
+
+
+def test_provider_attestation_binds_identifiers_and_all_result_artifacts(
+    tmp_path: Path,
+) -> None:
+    artifacts = {}
+    for name in (
+        "compiler-invocation.json",
+        "ant.json",
+        "ant.bin",
+        "phantom.json",
+        "phantom.bin",
+        "exact.json",
+        "exact.bin",
+    ):
+        path = tmp_path / name
+        path.write_bytes(f"artifact:{name}".encode())
+        artifacts[name] = path
+    fixture_sha = "a" * 64
+    context_sha = "b" * 64
+    identifiers = {
+        "ant": {
+            "ace_commit": "1" * 40,
+            "phantom_commit": "2" * 40,
+            "executable_sha256": "3" * 64,
+        },
+        "phantom": {
+            "ace_commit": "1" * 40,
+            "phantom_commit": "2" * 40,
+            "executable_sha256": "4" * 64,
+        },
+    }
+    attestation = {
+        "schema_version": comparator.PROVIDER_ATTESTATION_SCHEMA,
+        "fixture_sha256": fixture_sha,
+        "context_manifest_sha256": context_sha,
+        "compiler_invocation_sha256": fixture_tool.sha256_path(
+            artifacts["compiler-invocation.json"]
+        ),
+        "build_attestation_sha256": "5" * 64,
+        "run_attestation_sha256": "6" * 64,
+        "providers": [
+            {
+                "provider": provider,
+                "identifiers": identifiers[provider],
+                "result_json_sha256": fixture_tool.sha256_path(
+                    artifacts[f"{'ant' if provider == 'ant' else 'phantom'}.json"]
+                ),
+                "result_binary_sha256": fixture_tool.sha256_path(
+                    artifacts[f"{'ant' if provider == 'ant' else 'phantom'}.bin"]
+                ),
+            }
+            for provider in ("ant", "phantom")
+        ],
+        "exact_observed": {
+            "provider": "phantom",
+            "executable_sha256": identifiers["phantom"]["executable_sha256"],
+            "result_json_sha256": fixture_tool.sha256_path(artifacts["exact.json"]),
+            "result_binary_sha256": fixture_tool.sha256_path(artifacts["exact.bin"]),
+        },
+    }
+    attestation_path = tmp_path / "provider-attestation.json"
+    _write_json(attestation_path, attestation)
+
+    observed = comparator.load_provider_attestation(
+        attestation_path,
+        fixture_sha256=fixture_sha,
+        context_sha256=context_sha,
+        compiler_invocation=artifacts["compiler-invocation.json"],
+        ant_json=artifacts["ant.json"],
+        ant_binary=artifacts["ant.bin"],
+        gpu_json=artifacts["phantom.json"],
+        gpu_binary=artifacts["phantom.bin"],
+        exact_observed_json=artifacts["exact.json"],
+        exact_observed_binary=artifacts["exact.bin"],
+    )
+    assert observed == identifiers
+
+    invalid = json.loads(json.dumps(attestation))
+    invalid["providers"][1]["identifiers"]["executable_sha256"] = "7" * 64
+    invalid_path = tmp_path / "invalid-provider-attestation.json"
+    _write_json(invalid_path, invalid)
+    with pytest.raises(comparator.ComparisonError, match="exact observed artifact"):
+        comparator.load_provider_attestation(
+            invalid_path,
+            fixture_sha256=fixture_sha,
+            context_sha256=context_sha,
+            compiler_invocation=artifacts["compiler-invocation.json"],
+            ant_json=artifacts["ant.json"],
+            ant_binary=artifacts["ant.bin"],
+            gpu_json=artifacts["phantom.json"],
+            gpu_binary=artifacts["phantom.bin"],
+            exact_observed_json=artifacts["exact.json"],
+            exact_observed_binary=artifacts["exact.bin"],
+        )
 
 
 def test_provider_operation_and_metadata_projection_are_case_driven() -> None:
@@ -307,9 +455,110 @@ def test_provider_operation_and_metadata_projection_are_case_driven() -> None:
         )
 
 
+def _write_exact_source(
+    tmp_path: Path,
+    fixture: dict,
+    resolved: dict,
+    fixture_sha: str,
+    context_sha: str,
+) -> tuple[Path, Path, list[list[int]]]:
+    degree = resolved["polynomial_degree"]
+    components, draw_count = fixture_tool.exact_signed_coefficients(
+        fixture, degree
+    )
+    binary = bytearray(fixture_tool.EXACT_SOURCE_MAGIC)
+    descriptor = fixture_tool._append_blob(
+        binary,
+        fixture_tool._pack_i64(
+            coefficient for component in components for coefficient in component
+        ),
+        2 * degree,
+    )
+    label_by_symbol = {
+        "0": "0",
+        "N/2": "N_over_2",
+        "N": "N",
+        "3N/2": "3N_over_2",
+        "2N-1": "2N_minus_1",
+        "2N+1": "2N_plus_1",
+    }
+    records = [
+        {
+            "case_id": "exact_algebraic.raise_mod",
+            "operation": "raise_mod",
+            "normalized_power": None,
+            "source_id": "signed_coefficients.default",
+        }
+    ]
+    for symbol in fixture["monomial_powers"]:
+        records.append(
+            {
+                "case_id": f"exact_algebraic.mul_mono.{label_by_symbol[symbol]}",
+                "operation": "mul_mono",
+                "normalized_power": fixture_tool.normalize_power(
+                    fixture_tool.resolve_power(symbol, degree), degree
+                ),
+                "source_id": "signed_coefficients.default",
+            }
+        )
+    records.append(
+        {
+            "case_id": "exact_algebraic.mul_mono.inverse_composition",
+            "operation": "mul_mono_inverse_composition",
+            "normalized_power": 0,
+            "source_id": "signed_coefficients.default",
+        }
+    )
+    binary_path = tmp_path / "exact-source.bin"
+    json_path = tmp_path / "exact-source.json"
+    binary_path.write_bytes(binary)
+    _write_json(
+        json_path,
+        {
+            "schema_version": fixture_tool.EXACT_SCHEMA,
+            "fixture_sha256": fixture_sha,
+            "qualification_bindings": fixture["qualification_bindings"],
+            "context_manifest_sha256": context_sha,
+            "determinism": {
+                "generator": fixture["exact_source_recipe"]["generator"],
+                "seed": fixture["determinism"]["seed"],
+                "component_seed_xors": fixture["exact_source_recipe"][
+                    "component_seed_xors"
+                ],
+                "coefficient_absolute_bound": fixture["exact_source_recipe"][
+                    "coefficient_absolute_bound"
+                ],
+                "generator_draw_count": draw_count,
+            },
+            "conversion_convention": "provider-neutral signed test convention",
+            "layout": {
+                "component_count": 2,
+                "coefficient_count": degree,
+                "ordering": "component,coefficient",
+            },
+            "source_id": "signed_coefficients.default",
+            "signed_coefficients": descriptor,
+            "binary": {
+                "format": "ace.retained_ckks.signed_int64le/1.0.0",
+                "size_bytes": len(binary),
+                "sha256": fixture_tool.sha256_bytes(binary),
+            },
+            "records": records,
+        },
+    )
+    return json_path, binary_path, components
+
+
 def test_runtime_exact_oracle_recomputes_from_observed_sources(tmp_path: Path) -> None:
     context = _context()
     resolved = fixture_tool.validate_context_manifest(context)
+    fixture = fixture_tool.load_json(TOOLS / "fixtures/retained_ckks_v1.json")
+    fixture["qualification_bindings"] = {
+        "status": "bound",
+        "compiler_context_manifest_sha256": "1" * 64,
+        "normalized_compiler_command_sha256": "2" * 64,
+        "post_ckks_air_sha256": "3" * 64,
+    }
     moduli = [17, 19, 23]
     degree = context["polynomial_degree"]
     binary = bytearray(fixture_tool.EXACT_MAGIC)
@@ -320,7 +569,11 @@ def test_runtime_exact_oracle_recomputes_from_observed_sources(tmp_path: Path) -
             binary, struct.pack(f"<{len(values)}Q", *values), len(values)
         )
 
-    coefficient_components = [list(range(degree)), list(range(degree, 2 * degree))]
+    fixture_sha = "a" * 64
+    context_sha = "b" * 64
+    exact_source_json, exact_source_bin, coefficient_components = _write_exact_source(
+        tmp_path, fixture, resolved, fixture_sha, context_sha
+    )
     raise_source = [value % moduli[0] for component in coefficient_components for value in component]
     raise_actual = []
     for component in coefficient_components:
@@ -426,17 +679,17 @@ def test_runtime_exact_oracle_recomputes_from_observed_sources(tmp_path: Path) -
             },
         }
     )
-    fixture_sha = "a" * 64
-    context_sha = "b" * 64
     binary_path = tmp_path / "observed.bin"
     binary_path.write_bytes(binary)
     observed = {
         "schema_version": comparator.EXACT_OBSERVED_SCHEMA,
         "fixture_sha256": fixture_sha,
         "context_manifest_sha256": context_sha,
+        "exact_source_json_sha256": fixture_tool.sha256_path(exact_source_json),
+        "exact_source_binary_sha256": fixture_tool.sha256_path(exact_source_bin),
         "ordered_data_q_moduli": moduli,
         "first_data_chain_index": 0,
-        "conversion_convention": "coefficient residues in component,modulus,coefficient order",
+        "conversion_convention": "provider-neutral signed test convention",
         "binary": {
             "format": "ace.retained_ckks.rns_uint64le/1.0.0",
             "size_bytes": len(binary),
@@ -447,11 +700,49 @@ def test_runtime_exact_oracle_recomputes_from_observed_sources(tmp_path: Path) -
     observed_path = tmp_path / "observed.json"
     _write_json(observed_path, observed)
     evidence = comparator.compare_exact(
-        observed_path, binary_path, fixture_sha, context_sha, resolved, 0
+        exact_source_json,
+        exact_source_bin,
+        observed_path,
+        binary_path,
+        fixture,
+        fixture_sha,
+        context_sha,
+        resolved,
+        0,
     )
     assert evidence["mismatch_count"] == 0
     assert evidence["comparison_count"] > 0
     assert all(not record["mismatches"] for record in evidence["records"])
+
+    invalid_source = json.loads(json.dumps(observed))
+    invalid_binary = bytearray(binary)
+    monomial = invalid_source["records"][1]
+    for field in ("source", "source_after"):
+        descriptor = monomial[field]
+        offset = descriptor["offset_bytes"]
+        original = struct.unpack_from("<Q", invalid_binary, offset)[0]
+        struct.pack_into("<Q", invalid_binary, offset, (original + 1) % moduli[0])
+        blob = bytes(
+            invalid_binary[offset : offset + descriptor["byte_length"]]
+        )
+        descriptor["sha256"] = fixture_tool.sha256_bytes(blob)
+    invalid_source["binary"]["sha256"] = fixture_tool.sha256_bytes(invalid_binary)
+    invalid_source_binary = tmp_path / "invalid-source.bin"
+    invalid_source_json = tmp_path / "invalid-source.json"
+    invalid_source_binary.write_bytes(invalid_binary)
+    _write_json(invalid_source_json, invalid_source)
+    with pytest.raises(comparator.ComparisonError, match="exact runtime-prime reduction"):
+        comparator.compare_exact(
+            exact_source_json,
+            exact_source_bin,
+            invalid_source_json,
+            invalid_source_binary,
+            fixture,
+            fixture_sha,
+            context_sha,
+            resolved,
+            0,
+        )
 
     mutations = (
         (
@@ -495,8 +786,11 @@ def test_runtime_exact_oracle_recomputes_from_observed_sources(tmp_path: Path) -
         _write_json(invalid_path, invalid)
         with pytest.raises(comparator.ComparisonError, match=diagnostic):
             comparator.compare_exact(
+                exact_source_json,
+                exact_source_bin,
                 invalid_path,
                 binary_path,
+                fixture,
                 fixture_sha,
                 context_sha,
                 resolved,

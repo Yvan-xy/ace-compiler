@@ -694,7 +694,7 @@ int main(int argc, char **argv) {
     const std::string fixture_sha256 = Sha256(fixture_bytes);
     const std::string context_sha256 = Sha256(context_bytes);
     Require(fixture.at("schema_version") ==
-                    "ace.phantom.retained_ckks.fixture/1.0.0" &&
+                    "ace.phantom.retained_ckks.fixture/2.0.0" &&
                 fixture.at("qualification_bindings").at("status") == "bound",
             "fixture is not a bound retained CKKS fixture");
     Require(fixture.at("qualification_bindings")
