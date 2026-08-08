@@ -711,6 +711,16 @@ def test_provider_operation_and_metadata_projection_are_case_driven() -> None:
             required=True,
             context="projection",
         )
+    for invalid_active_q_count in (True, 1.0):
+        with pytest.raises(comparator.ComparisonError, match="must be an integer"):
+            comparator.validate_decoded_projection(
+                {
+                    "kind": "strict_q0_prefix_drop",
+                    "active_q_count": invalid_active_q_count,
+                },
+                required=True,
+                context="projection",
+            )
 
     resolved = fixture_tool.validate_context_manifest(_context())
     provider_local = dict(metadata, chain_index=9)

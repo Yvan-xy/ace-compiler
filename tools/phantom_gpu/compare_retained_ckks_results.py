@@ -125,7 +125,7 @@ def validate_decoded_projection(
     marker = expect_keys(value, {"kind", "active_q_count"}, context)
     if marker["kind"] != "strict_q0_prefix_drop":
         fail(f"{context}.kind is unsupported")
-    if marker["active_q_count"] != 1:
+    if integer(marker["active_q_count"], f"{context}.active_q_count", 1) != 1:
         fail(f"{context}.active_q_count must equal 1")
     return marker
 
