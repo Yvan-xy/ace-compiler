@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
 
 
 TOOLS = Path(__file__).resolve().parents[1]
@@ -235,6 +236,23 @@ def test_ant_runtime_header_declares_generated_callbacks_with_c_abi() -> None:
     assert 'extern "C" {' in common_api
     assert "CKKS_PARAMS* Get_context_params();" in common_api
     assert "RT_DATA_INFO* Get_rt_data_info();" in common_api
+
+
+def test_retained_harnesses_share_the_sha256_constant_table() -> None:
+    def constants(relative: str) -> list[str]:
+        source = (TOOLS / relative).read_text(encoding="utf-8")
+        table = source[
+            source.index(
+                "static constexpr std::array<std::uint32_t, 64> constants"
+            ) : source.index("std::array<std::uint32_t, 8> state")
+        ]
+        return re.findall(r"0x[0-9a-f]+U", table)
+
+    ant = constants("harness/retained_ckks_ant_oracle.cxx")
+    phantom = constants("harness/retained_ckks_phantom_conformance.cu")
+    assert len(ant) == 64
+    assert ant == phantom
+    assert "0x4ed8aa4aU" in ant
 
 
 def test_a100_gate_executes_fixture_owned_adapter_aliases() -> None:
