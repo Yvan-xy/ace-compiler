@@ -138,6 +138,7 @@ def test_full_primitive_bootstrap_preserves_retained_ops_through_ckks2c():
     result = _run_isolated(
         r'''
         import os
+        import re
         os.environ["ACE_BOOTSTRAP_STAGE_PRIMITIVE_LOWERING"] = "1"
         from bootstrap_full import (
             G_COEFFICIENTS_UNIFORM_HW_192,
@@ -206,6 +207,12 @@ def test_full_primitive_bootstrap_preserves_retained_ops_through_ckks2c():
         )
         for token in retained_calls:
             assert token in source, token
+        assert re.search(
+            r"(?P<level>_preg_[0-9]+)\s*=\s*Level\([^;]+\);\s*"
+            r"Encode_(?:float|double)(?:_mask)?\([^;]+,\s*"
+            r"(?P=level)\s*\);",
+            source,
+        )
         for token in forbidden_calls:
             assert token not in source, token
         print("CKKS2C_FULL_PRIMITIVE_OK")

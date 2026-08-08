@@ -868,6 +868,121 @@ TEST_F(CKKS2COrdinaryAirVerifier, RejectsDynamicEncodeLevel) {
             "Phantom CKKS2C encode requires constant logical_level");
 }
 
+TEST_F(CKKS2COrdinaryAirVerifier, AcceptsCipherDerivedEncodeLevel) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR cipher = Cipher_load(3);
+  NODE_PTR encode = Encode(
+      Float_constant(), _container->New_intconst(u32, 1, _spos),
+      _container->New_intconst(u32, 1, _spos),
+      fhe::ckks::CKKS_GEN(_container, &_lower_ctx).Gen_get_level(cipher));
+  std::string diagnostic;
+  NODE_PTR expression = _container->New_bin_arith(
+      fhe::ckks::OPC_MUL, _cipher, cipher, encode, _spos);
+  EXPECT_TRUE(Verify(expression, &diagnostic)) << diagnostic;
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, AcceptsCipherDerivedEncodeLevelForAdd) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR cipher = Cipher_load(3);
+  NODE_PTR encode = Encode(
+      Float_constant(), _container->New_intconst(u32, 1, _spos),
+      _container->New_intconst(u32, 1, _spos),
+      fhe::ckks::CKKS_GEN(_container, &_lower_ctx).Gen_get_level(cipher));
+  std::string diagnostic;
+  NODE_PTR expression = _container->New_bin_arith(
+      fhe::ckks::OPC_ADD, _cipher, cipher, encode, _spos);
+  EXPECT_TRUE(Verify(expression, &diagnostic)) << diagnostic;
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier,
+       AcceptsCipherDerivedEncodeLevelWithoutMetadata) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR cipher = _container->New_ld(_cipher_input, _spos);
+  NODE_PTR encode = Encode(
+      Float_constant(), _container->New_intconst(u32, 1, _spos),
+      _container->New_intconst(u32, 1, _spos),
+      fhe::ckks::CKKS_GEN(_container, &_lower_ctx).Gen_get_level(cipher));
+  std::string diagnostic;
+  NODE_PTR expression = _container->New_bin_arith(
+      fhe::ckks::OPC_MUL, _cipher, cipher, encode, _spos);
+  EXPECT_TRUE(Verify(expression, &diagnostic)) << diagnostic;
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier,
+       RejectsUnrepresentableCipherDerivedEncodeScale) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR cipher = Cipher_load(1);
+  NODE_PTR encode = Encode(
+      Float_constant(), _container->New_intconst(u32, 1, _spos),
+      _container->New_intconst(u32, 3, _spos),
+      fhe::ckks::CKKS_GEN(_container, &_lower_ctx).Gen_get_level(cipher));
+  std::string diagnostic;
+  NODE_PTR expression = _container->New_bin_arith(
+      fhe::ckks::OPC_MUL, _cipher, cipher, encode, _spos);
+  EXPECT_FALSE(Verify(expression, &diagnostic));
+  EXPECT_EQ(diagnostic,
+            "Phantom CKKS2C encode scale_degree 3 is not representable at "
+            "logical_level 1");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier,
+       RejectsCipherDerivedEncodeLevelFromDifferentOperand) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR lhs = Cipher_load(3);
+  NODE_PTR other = Cipher_load(3);
+  NODE_PTR encode = Encode(
+      Float_constant(), _container->New_intconst(u32, 1, _spos),
+      _container->New_intconst(u32, 1, _spos),
+      fhe::ckks::CKKS_GEN(_container, &_lower_ctx).Gen_get_level(other));
+  NODE_PTR expression = _container->New_bin_arith(
+      fhe::ckks::OPC_MUL, _cipher, lhs, encode, _spos);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(expression, &diagnostic));
+  EXPECT_EQ(diagnostic,
+            "Phantom CKKS2C cipher-derived encode level requires the encode "
+            "to be the right operand of add, sub, or mul and to query that "
+            "operation's left operand");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsStoredCipherDerivedEncodeLevel) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR source = Cipher_load(3);
+  NODE_PTR encode = Encode(
+      Float_constant(), _container->New_intconst(u32, 1, _spos),
+      _container->New_intconst(u32, 1, _spos),
+      fhe::ckks::CKKS_GEN(_container, &_lower_ctx).Gen_get_level(source));
+  ADDR_DATUM_PTR stored_plain =
+      _func_scope->New_var(_plain, "stored_plain", _spos);
+  _container->Stmt_list().Append(
+      _container->New_st(encode, stored_plain, _spos));
+
+  NODE_PTR expression = _container->New_bin_arith(
+      fhe::ckks::OPC_MUL, _cipher, Cipher_load(3),
+      _container->New_ld(stored_plain, _spos), _spos);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(expression, &diagnostic));
+  EXPECT_EQ(diagnostic,
+            "Phantom CKKS2C cipher-derived encode level requires the encode "
+            "to be the right operand of add, sub, or mul and to query that "
+            "operation's left operand");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsNonCipherDerivedEncodeLevel) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  OPCODE level_opcode(fhe::ckks::CKKS_DOMAIN::ID,
+                      fhe::ckks::CKKS_OPERATOR::LEVEL);
+  NODE_PTR level = _container->New_cust_node(
+      level_opcode, _lower_ctx.Get_level_type(_glob), _spos, 0);
+  level->Set_child(0, Float_constant());
+  NODE_PTR encode = Encode(
+      Float_constant(), _container->New_intconst(u32, 1, _spos),
+      _container->New_intconst(u32, 1, _spos), level);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(Use_plain(encode), &diagnostic));
+  EXPECT_EQ(diagnostic,
+            "Phantom CKKS2C encode requires constant logical_level");
+}
+
 TEST_F(CKKS2COrdinaryAirVerifier, RejectsIntegerEncodeInput) {
   TYPE_PTR i32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
   NODE_PTR encode = Encode(_container->New_intconst(i32, 7, _spos), 1, 1, 1);

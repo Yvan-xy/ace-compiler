@@ -117,6 +117,18 @@ bool Is_cipher_family(OPERAND_KIND kind) {
   return kind == OPERAND_KIND::CIPHER || kind == OPERAND_KIND::CIPHER3;
 }
 
+bool Cipher_derived_encode_level_source(NODE_PTR argument,
+                                        NODE_PTR* source) {
+  if (argument == air::base::Null_ptr || argument->Opcode() != OPC_LEVEL ||
+      argument->Num_child() != 1 ||
+      argument->Child(0) == air::base::Null_ptr ||
+      Operand_kind(argument->Child(0)->Rtype()) != OPERAND_KIND::CIPHER) {
+    return false;
+  }
+  *source = argument->Child(0);
+  return true;
+}
+
 bool Effective_encode_argument(NODE_PTR node, uint32_t child_index,
                                const char* attr_name, int64_t* value) {
   if (attr_name != nullptr) {
@@ -127,11 +139,35 @@ bool Effective_encode_argument(NODE_PTR node, uint32_t child_index,
     }
   }
   if (node->Num_child() <= child_index ||
-      node->Child(child_index) == air::base::Null_ptr ||
-      node->Child(child_index)->Opcode() != air::core::OPC_INTCONST) {
+      node->Child(child_index) == air::base::Null_ptr) {
     return false;
   }
-  *value = node->Child(child_index)->Intconst();
+  NODE_PTR argument = node->Child(child_index);
+  if (argument->Opcode() == air::core::OPC_INTCONST) {
+    *value = argument->Intconst();
+    return true;
+  }
+
+  // Scale management binds an unspecified encode level to the exact cipher
+  // operand with CKKS.level(cipher). Internal/callable functions must retain
+  // that runtime query because their concrete input chain is not part of the
+  // entry-point ABI. Use the compiler's nonzero source metadata only for the
+  // verifier's range and scale-representability checks; IR2C still emits the
+  // runtime level query. Arbitrary dynamic expressions remain rejected.
+  if (attr_name == nullptr ||
+      std::strcmp(attr_name, core::FHE_ATTR_KIND::LEVEL) != 0) {
+    return false;
+  }
+  NODE_PTR source = air::base::Null_ptr;
+  if (!Cipher_derived_encode_level_source(argument, &source)) {
+    return false;
+  }
+  const uint32_t* source_level =
+      source->Attr<uint32_t>(core::FHE_ATTR_KIND::LEVEL);
+  // Some internal SSA loads remain deliberately runtime-level-polymorphic.
+  // In that case use the minimum valid Q count as a conservative verifier
+  // budget. The emitted Level(cipher) and Phantom runtime retain authority.
+  *value = source_level == nullptr || *source_level == 0 ? 1 : *source_level;
   return true;
 }
 
@@ -175,7 +211,34 @@ TYPE_PTR Encode_element_type(TYPE_PTR type) {
   return type;
 }
 
-bool Verify_phantom_encode(NODE_PTR node,
+bool Verify_cipher_derived_encode_parent(NODE_PTR node, NODE_PTR parent,
+                                         std::string* diagnostic) {
+  if (node->Attr<uint32_t>(core::FHE_ATTR_KIND::LEVEL) != nullptr ||
+      node->Num_child() <= 3 || node->Child(3) == air::base::Null_ptr) {
+    return true;
+  }
+  NODE_PTR source = air::base::Null_ptr;
+  if (!Cipher_derived_encode_level_source(node->Child(3), &source)) {
+    return true;
+  }
+  if (parent != air::base::Null_ptr && parent->Domain() == CKKS_DOMAIN::ID) {
+    CKKS_OPERATOR parent_op =
+        static_cast<CKKS_OPERATOR>(parent->Operator());
+    if ((parent_op == CKKS_OPERATOR::ADD || parent_op == CKKS_OPERATOR::SUB ||
+         parent_op == CKKS_OPERATOR::MUL) &&
+        parent->Num_child() == 2 && parent->Child(1) == node &&
+        parent->Child(0) == source) {
+      return true;
+    }
+  }
+  return Fail(
+      "Phantom CKKS2C cipher-derived encode level requires the encode to be "
+      "the right operand of add, sub, or mul and to query that operation's "
+      "left operand",
+      diagnostic);
+}
+
+bool Verify_phantom_encode(NODE_PTR node, NODE_PTR parent,
                            const PHANTOM_CONTEXT_DESCRIPTOR& context,
                            std::string* diagnostic) {
   if (node->Num_child() != 4) {
@@ -232,6 +295,9 @@ bool Verify_phantom_encode(NODE_PTR node,
                                  &logical_level)) {
     return Fail("Phantom CKKS2C encode requires constant logical_level",
                 diagnostic);
+  }
+  if (!Verify_cipher_derived_encode_parent(node, parent, diagnostic)) {
+    return false;
   }
   if (logical_level < 1 ||
       static_cast<uint64_t>(logical_level) >
@@ -641,7 +707,7 @@ bool Verify_phantom_modulus_drop(NODE_PTR node, CKKS_OPERATOR op,
   return true;
 }
 
-bool Verify_ckks_node(NODE_PTR node,
+bool Verify_ckks_node(NODE_PTR node, NODE_PTR parent,
                       const PHANTOM_CONTEXT_DESCRIPTOR& context,
                       core::PROVIDER provider,
                       std::string* diagnostic) {
@@ -663,7 +729,7 @@ bool Verify_ckks_node(NODE_PTR node,
 
     switch (op) {
       case CKKS_OPERATOR::ENCODE:
-        return Verify_phantom_encode(node, context, diagnostic);
+        return Verify_phantom_encode(node, parent, context, diagnostic);
       case CKKS_OPERATOR::ADD:
       case CKKS_OPERATOR::SUB:
       case CKKS_OPERATOR::MUL:
@@ -774,7 +840,7 @@ bool Verify_ckks_node(NODE_PTR node,
   }
 }
 
-bool Verify_node(NODE_PTR node,
+bool Verify_node(NODE_PTR node, NODE_PTR parent,
                  const PHANTOM_CONTEXT_DESCRIPTOR& context,
                  core::PROVIDER provider,
                  std::string* diagnostic) {
@@ -785,20 +851,20 @@ bool Verify_node(NODE_PTR node,
     return Fail("CKKS2C input contains forbidden POLY AIR", diagnostic);
   }
   if (node->Domain() == CKKS_DOMAIN::ID &&
-      !Verify_ckks_node(node, context, provider, diagnostic)) {
+      !Verify_ckks_node(node, parent, context, provider, diagnostic)) {
     return false;
   }
   if (node->Is_block()) {
     for (air::base::STMT_PTR stmt = node->Begin_stmt();
          stmt != node->End_stmt(); stmt = stmt->Next()) {
-      if (!Verify_node(stmt->Node(), context, provider, diagnostic)) {
+      if (!Verify_node(stmt->Node(), node, context, provider, diagnostic)) {
         return false;
       }
     }
     return true;
   }
   for (uint32_t i = 0; i < node->Num_child(); ++i) {
-    if (!Verify_node(node->Child(i), context, provider, diagnostic)) {
+    if (!Verify_node(node->Child(i), node, context, provider, diagnostic)) {
       return false;
     }
   }
@@ -830,7 +896,8 @@ bool CKKS2C_VERIFIER::Verify(air::base::GLOB_SCOPE* glob,
   for (air::base::GLOB_SCOPE::FUNC_SCOPE_ITER it = glob->Begin_func_scope();
        it != glob->End_func_scope(); ++it) {
     NODE_PTR entry = (*it).Container().Entry_node();
-    if (!Verify_node(entry, context, provider, diagnostic)) {
+    if (!Verify_node(entry, air::base::Null_ptr, context, provider,
+                     diagnostic)) {
       return false;
     }
   }
