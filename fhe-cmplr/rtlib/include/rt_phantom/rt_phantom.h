@@ -176,6 +176,34 @@ inline CIPHER Rotate_ciph(CIPHER res, CIPHER op, int step) {
   return res;
 }
 
+inline CIPHER Conjugate_ciph(CIPHER res, CIPHER op) {
+  START_TIMER
+  Phantom_conjugate(res, op);
+  END_TIMER("Conjugate_ciph")
+  return res;
+}
+
+inline void Rotate_batch_ciph(CIPHER outputs, CIPHER op,
+                              const int32_t* steps, size_t count) {
+  START_TIMER
+  Phantom_rotate_batch(outputs, op, steps, count);
+  END_TIMER("Rotate_batch_ciph")
+}
+
+inline CIPHER Raise_mod(CIPHER res, CIPHER op, uint32_t target_q_count) {
+  START_TIMER
+  Phantom_raise_mod(res, op, target_q_count);
+  END_TIMER("Raise_mod")
+  return res;
+}
+
+inline CIPHER Mul_mono_ciph(CIPHER res, CIPHER op, uint32_t power) {
+  START_TIMER
+  Phantom_mul_mono(res, op, power);
+  END_TIMER("Mul_mono_ciph")
+  return res;
+}
+
 inline CIPHER Rescale_ciph(CIPHER res, CIPHER op) {
   START_TIMER
   Phantom_rescale(res, op);

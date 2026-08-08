@@ -58,6 +58,11 @@ void Phantom_mul_ciph(CIPHER res, CIPHER op1, CIPHER op2);
 void Phantom_mul_ciph_const(CIPHER res, CIPHER op1, double op2);
 void Phantom_mul_plain(CIPHER res, CIPHER op1, PLAIN op2);
 void Phantom_rotate(CIPHER res, CIPHER op, int step);
+void Phantom_conjugate(CIPHER res, CIPHER op);
+void Phantom_rotate_batch(CIPHER outputs, CIPHER op, const int32_t* steps,
+                          size_t count);
+void Phantom_raise_mod(CIPHER res, CIPHER op, uint32_t target_q_count);
+void Phantom_mul_mono(CIPHER res, CIPHER op, uint32_t power);
 void Phantom_rescale(CIPHER res, CIPHER op);
 void Phantom_mod_switch(CIPHER res, CIPHER op);
 void Phantom_relin(CIPHER res, CIPHER3 op);

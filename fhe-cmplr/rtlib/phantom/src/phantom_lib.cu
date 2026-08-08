@@ -454,6 +454,210 @@ public:
     MarkCipher(result, ObjectState::kLive);
   }
 
+  void Conjugate(Ciphertext* result, Ciphertext* source) {
+    ValidateCipher(source, "CONJUGATE_SOURCE");
+    RequireWritableCipher(result, "CONJUGATE_DESTINATION");
+    if (source->size() != 2) {
+      Fail("CONJUGATE_SIZE", "observed ciphertext size %zu, expected 2",
+           source->size());
+    }
+    if ((_resource_flags & PHANTOM_RESOURCE_CONJUGATION_KEY) == 0 ||
+        !_galois_key || !_galois_key->is_generated()) {
+      Fail("CONJUGATE_KEY_MISSING",
+           "observed resource flag=%d and generated key=%d, expected both 1",
+           (_resource_flags & PHANTOM_RESOURCE_CONJUGATION_KEY) != 0,
+           _galois_key != nullptr && _galois_key->is_generated());
+    }
+    const size_t source_q = ActiveQ(source, "CONJUGATE_SOURCE");
+    const size_t source_chain = source->chain_index();
+    const size_t source_size = source->size();
+    const size_t source_scale_degree = source->GetNoiseScaleDeg();
+    const double source_scale = source->scale();
+    const bool source_ntt = source->is_ntt_form();
+    ProviderCall("CONJUGATE_PROVIDER", [&] {
+      if (result != source) *result = *source;
+      complex_conjugate_inplace(*_context, *result, *_galois_key);
+    });
+    const size_t result_q = ActiveQ(result, "CONJUGATE_RESULT");
+    if (result_q != source_q || result->chain_index() != source_chain ||
+        result->size() != source_size || result->scale() != source_scale ||
+        result->GetNoiseScaleDeg() != source_scale_degree ||
+        result->is_ntt_form() != source_ntt) {
+      Fail("CONJUGATE_METADATA",
+           "observed q=%zu chain=%zu size=%zu scale=%.17g scale_degree=%zu "
+           "ntt=%d; expected q=%zu chain=%zu size=%zu scale=%.17g "
+           "scale_degree=%zu ntt=%d",
+           result_q, result->chain_index(), result->size(), result->scale(),
+           result->GetNoiseScaleDeg(), result->is_ntt_form(), source_q,
+           source_chain, source_size, source_scale, source_scale_degree,
+           source_ntt);
+    }
+    MarkCipher(result, ObjectState::kLive);
+  }
+
+  void RotateBatch(Ciphertext* outputs, Ciphertext* source,
+                   const int32_t* steps, size_t count) {
+    ValidateCipher(source, "ROTATE_BATCH_SOURCE");
+    if (outputs == nullptr || steps == nullptr || count == 0) {
+      Fail("ROTATE_BATCH_ARGUMENT",
+           "outputs, ordered steps, and count must be non-empty");
+    }
+    for (size_t index = 0; index < count; ++index) {
+      if (&outputs[index] == source) {
+        Fail("ROTATE_BATCH_ALIAS",
+             "source cannot overlap the rotate_batch output array");
+      }
+      RequireWritableCipher(&outputs[index], "ROTATE_BATCH_DESTINATION");
+    }
+    bool declared_batch = false;
+    for (size_t batch = 0; batch < _resources->_rotation_batch_count; ++batch) {
+      const size_t begin = _resources->_rotation_batch_offsets[batch];
+      const size_t end = _resources->_rotation_batch_offsets[batch + 1];
+      if (end - begin != count) continue;
+      declared_batch = std::equal(steps, steps + count,
+                                  _resources->_rotation_batch_steps + begin);
+      if (declared_batch) break;
+    }
+    if (!declared_batch) {
+      Fail("ROTATE_BATCH_RESOURCE",
+           "observed ordered batch count %zu, expected one of %zu "
+           "compiler-declared batches",
+           count, _resources->_rotation_batch_count);
+    }
+    std::vector<int> provider_steps(steps, steps + count);
+    std::vector<Ciphertext> provider_outputs;
+    PhantomGaloisKey empty_key;
+    const PhantomGaloisKey& key = _galois_key ? *_galois_key : empty_key;
+    ProviderCall("ROTATE_BATCH_PROVIDER", [&] {
+      rotate_batch(*_context, *source, provider_steps, key,
+                   provider_outputs);
+    });
+    if (provider_outputs.size() != count) {
+      Fail("ROTATE_BATCH_COUNT", "provider returned %zu outputs, expected %zu",
+           provider_outputs.size(), count);
+    }
+    for (size_t index = 0; index < count; ++index) {
+      outputs[index] = std::move(provider_outputs[index]);
+      MarkCipher(&outputs[index], ObjectState::kLive);
+      ValidateCipher(&outputs[index], "ROTATE_BATCH_RESULT");
+      const size_t output_q = ActiveQ(&outputs[index], "ROTATE_BATCH_RESULT");
+      const size_t source_q = ActiveQ(source, "ROTATE_BATCH_SOURCE");
+      if (output_q != source_q ||
+          outputs[index].size() != source->size() ||
+          outputs[index].scale() != source->scale() ||
+          outputs[index].GetNoiseScaleDeg() != source->GetNoiseScaleDeg() ||
+          outputs[index].chain_index() != source->chain_index() ||
+          outputs[index].is_ntt_form() != source->is_ntt_form()) {
+        Fail("ROTATE_BATCH_METADATA",
+             "output %zu observed q=%zu chain=%zu size=%zu scale=%.17g "
+             "scale_degree=%zu ntt=%d; expected q=%zu chain=%zu size=%zu "
+             "scale=%.17g scale_degree=%zu ntt=%d",
+             index, output_q, outputs[index].chain_index(),
+             outputs[index].size(), outputs[index].scale(),
+             outputs[index].GetNoiseScaleDeg(), outputs[index].is_ntt_form(),
+             source_q, source->chain_index(), source->size(), source->scale(),
+             source->GetNoiseScaleDeg(), source->is_ntt_form());
+      }
+    }
+  }
+
+  void RaiseModulus(Ciphertext* result, Ciphertext* source,
+                    size_t target_q_count) {
+    RequireWritableCipher(result, "RAISE_MOD_DESTINATION");
+    if (result == source) {
+      Fail("RAISE_MOD_ALIAS",
+           "observed identical source/destination, expected distinct objects");
+    }
+    CipherState(source, "RAISE_MOD_SOURCE", false);
+    if (source->size() != 2) {
+      Fail("RAISE_MOD_SIZE", "observed ciphertext size %zu, expected 2",
+           source->size());
+    }
+    ValidateCipher(source, "RAISE_MOD_SOURCE");
+    if ((_resource_flags & PHANTOM_RESOURCE_RAISE_MOD) == 0) {
+      Fail("RAISE_MOD_RESOURCE",
+           "observed raise_mod resource flag 0, expected 1");
+    }
+    const size_t observed_q = ActiveQ(source, "RAISE_MOD_SOURCE");
+    const size_t expected_chain = AceLevelToChainIndex(
+        1, _manifest->_data_q_count, _first_data_chain_index);
+    if (observed_q != 1 || source->chain_index() != expected_chain) {
+      Fail("RAISE_MOD_SOURCE_LEVEL",
+           "observed chain %zu with %zu active Qs, expected bottom chain %zu "
+           "with 1 active Q",
+           source->chain_index(), observed_q, expected_chain);
+    }
+    if (target_q_count != _manifest->_data_q_count) {
+      Fail("RAISE_MOD_TARGET",
+           "observed target_q_count %zu, expected full data-Q count %zu",
+           target_q_count, _manifest->_data_q_count);
+    }
+    ProviderCall("RAISE_MOD_PROVIDER", [&] {
+      raise_modulus(*_context, *source, target_q_count, *result);
+    });
+    MarkCipher(result, ObjectState::kLive);
+    ValidateCipher(result, "RAISE_MOD_RESULT");
+    const size_t result_q = ActiveQ(result, "RAISE_MOD_RESULT");
+    const size_t expected_result_chain = AceLevelToChainIndex(
+        target_q_count, _manifest->_data_q_count, _first_data_chain_index);
+    if (result_q != target_q_count ||
+        result->chain_index() != expected_result_chain ||
+        result->size() != source->size() ||
+        result->scale() != source->scale() ||
+        result->GetNoiseScaleDeg() != source->GetNoiseScaleDeg() ||
+        result->is_ntt_form() != source->is_ntt_form()) {
+      Fail("RAISE_MOD_METADATA",
+           "observed q=%zu chain=%zu size=%zu scale=%.17g scale_degree=%zu "
+           "ntt=%d; expected q=%zu chain=%zu size=%zu scale=%.17g "
+           "scale_degree=%zu ntt=%d",
+           result_q, result->chain_index(), result->size(), result->scale(),
+           result->GetNoiseScaleDeg(), result->is_ntt_form(), target_q_count,
+           expected_result_chain, source->size(), source->scale(),
+           source->GetNoiseScaleDeg(), source->is_ntt_form());
+    }
+  }
+
+  void MultiplyMonomial(Ciphertext* result, Ciphertext* source,
+                        uint32_t power) {
+    ValidateCipher(source, "MUL_MONO_SOURCE");
+    RequireWritableCipher(result, "MUL_MONO_DESTINATION");
+    if ((_resource_flags & PHANTOM_RESOURCE_MONOMIALS) == 0 ||
+        !std::binary_search(_resources->_monomial_powers,
+                            _resources->_monomial_powers +
+                                _resources->_monomial_count,
+                            power)) {
+      Fail("MUL_MONO_RESOURCE",
+           "observed normalized monomial power %u absent, expected one of %zu "
+           "compiler-declared powers",
+           power, _resources->_monomial_count);
+    }
+    const size_t source_q = ActiveQ(source, "MUL_MONO_SOURCE");
+    const size_t source_chain = source->chain_index();
+    const size_t source_size = source->size();
+    const size_t source_scale_degree = source->GetNoiseScaleDeg();
+    const double source_scale = source->scale();
+    const bool source_ntt = source->is_ntt_form();
+    ProviderCall("MUL_MONO_PROVIDER", [&] {
+      multiply_by_monomial(*_context, *source, power, *result);
+    });
+    const size_t result_q = ActiveQ(result, "MUL_MONO_RESULT");
+    if (result_q != source_q || result->chain_index() != source_chain ||
+        result->size() != source_size ||
+        result->scale() != source_scale ||
+        result->GetNoiseScaleDeg() != source_scale_degree ||
+        result->is_ntt_form() != source_ntt) {
+      Fail("MUL_MONO_METADATA",
+           "observed q=%zu chain=%zu size=%zu scale=%.17g scale_degree=%zu "
+           "ntt=%d; expected q=%zu chain=%zu size=%zu scale=%.17g "
+           "scale_degree=%zu ntt=%d",
+           result_q, result->chain_index(), result->size(), result->scale(),
+           result->GetNoiseScaleDeg(), result->is_ntt_form(), source_q,
+           source_chain, source_size, source_scale, source_scale_degree,
+           source_ntt);
+    }
+    MarkCipher(result, ObjectState::kLive);
+  }
+
   void CopyCipher(Ciphertext* result, Ciphertext* source) {
     RequireWritableCipher(result, "COPY_DESTINATION");
     const ObjectState state = CipherState(source, "COPY_SOURCE", true);
@@ -688,18 +892,23 @@ private:
       if (normalized != 0) _rotation_steps.insert(normalized);
     }
     rotation_steps.assign(_rotation_steps.begin(), _rotation_steps.end());
-    if (!rotation_steps.empty()) {
+    const bool needs_conjugation =
+        (_resource_flags & PHANTOM_RESOURCE_CONJUGATION_KEY) != 0;
+    if (!rotation_steps.empty() || needs_conjugation) {
       _galois_key = std::make_unique<PhantomGaloisKey>(
           _secret_key->create_galois_keys_from_steps(*_context,
-                                                     rotation_steps));
+                                                     rotation_steps,
+                                                     needs_conjugation));
     }
   }
 
   void ValidateProgramManifest() const {
     constexpr uint32_t context_schema_version = 1;
-    constexpr uint32_t resource_schema_version = 1;
+    constexpr uint32_t resource_schema_version = 2;
     constexpr uint64_t known_resource_flags =
-        PHANTOM_RESOURCE_RELIN_KEY | PHANTOM_RESOURCE_ROTATION_KEYS;
+        PHANTOM_RESOURCE_RELIN_KEY | PHANTOM_RESOURCE_ROTATION_KEYS |
+        PHANTOM_RESOURCE_CONJUGATION_KEY | PHANTOM_RESOURCE_ROTATE_BATCH |
+        PHANTOM_RESOURCE_RAISE_MOD | PHANTOM_RESOURCE_MONOMIALS;
     if (_manifest == nullptr) {
       Fail("CONTEXT_MANIFEST_NULL", "context manifest is null");
     }
@@ -822,6 +1031,56 @@ private:
              "rotation step %d is zero, non-canonical, or duplicated",
              declared);
       }
+    }
+    const bool has_batch_flag =
+        (_resources->_flags & PHANTOM_RESOURCE_ROTATE_BATCH) != 0;
+    if (has_batch_flag != (_resources->_rotation_batch_count != 0) ||
+        (_resources->_rotation_batch_count != 0 &&
+         (_resources->_rotation_batch_offsets == nullptr ||
+          _resources->_rotation_batch_steps == nullptr))) {
+      Fail("RESOURCE_ROTATE_BATCH",
+           "rotate_batch flag, count, offsets, and steps must agree exactly");
+    }
+    if (_resources->_rotation_batch_count != 0 &&
+        _resources->_rotation_batch_offsets[0] != 0) {
+      Fail("RESOURCE_ROTATE_BATCH", "first rotate_batch offset must be zero");
+    }
+    for (size_t batch = 0; batch < _resources->_rotation_batch_count; ++batch) {
+      const size_t begin = _resources->_rotation_batch_offsets[batch];
+      const size_t end = _resources->_rotation_batch_offsets[batch + 1];
+      if (end <= begin) {
+        Fail("RESOURCE_ROTATE_BATCH",
+             "rotation batch %zu must be non-empty", batch);
+      }
+      for (size_t index = begin; index < end; ++index) {
+        const int normalized =
+            NormalizeRotation(_resources->_rotation_batch_steps[index],
+                              _logical_slots);
+        if (normalized != 0 && declared_rotations.count(normalized) == 0) {
+          Fail("RESOURCE_ROTATE_BATCH",
+               "rotation batch step %d has no canonical ordinary key",
+               _resources->_rotation_batch_steps[index]);
+        }
+      }
+    }
+    const bool has_monomial_flag =
+        (_resources->_flags & PHANTOM_RESOURCE_MONOMIALS) != 0;
+    if (has_monomial_flag != (_resources->_monomial_count != 0) ||
+        (_resources->_monomial_count != 0 &&
+         _resources->_monomial_powers == nullptr)) {
+      Fail("RESOURCE_MONOMIALS",
+           "monomial flag, count, and powers must agree exactly");
+    }
+    uint32_t previous_power = 0;
+    const uint64_t monomial_period =
+        static_cast<uint64_t>(_manifest->_poly_degree) * 2;
+    for (size_t index = 0; index < _resources->_monomial_count; ++index) {
+      const uint32_t power = _resources->_monomial_powers[index];
+      if (power >= monomial_period || (index != 0 && power <= previous_power)) {
+        Fail("RESOURCE_MONOMIALS",
+             "monomial powers must be canonical, sorted, and unique");
+      }
+      previous_power = power;
     }
   }
 
@@ -1028,7 +1287,7 @@ private:
       Fail(diagnostic, "ciphertext size %zu is outside {2, 3}", cipher->size());
     }
     if (!cipher->is_ntt_form()) {
-      Fail(diagnostic, "ordinary CKKS ciphertext must be in NTT form");
+      Fail(diagnostic, "observed NTT form 0, expected ordinary CKKS NTT form 1");
     }
     const size_t q_count = ChainIndexToActiveQ(
         cipher->chain_index(), _manifest->_data_q_count,
@@ -1259,6 +1518,24 @@ void Phantom_mul_ciph_const(CIPHER result, CIPHER left, double right) {
 
 void Phantom_rotate(CIPHER result, CIPHER source, int step) {
   PHANTOM_CONTEXT::Context()->Rotate(result, source, step);
+}
+
+void Phantom_conjugate(CIPHER result, CIPHER source) {
+  PHANTOM_CONTEXT::Context()->Conjugate(result, source);
+}
+
+void Phantom_rotate_batch(CIPHER outputs, CIPHER source,
+                          const int32_t* steps, size_t count) {
+  PHANTOM_CONTEXT::Context()->RotateBatch(outputs, source, steps, count);
+}
+
+void Phantom_raise_mod(CIPHER result, CIPHER source,
+                       uint32_t target_q_count) {
+  PHANTOM_CONTEXT::Context()->RaiseModulus(result, source, target_q_count);
+}
+
+void Phantom_mul_mono(CIPHER result, CIPHER source, uint32_t power) {
+  PHANTOM_CONTEXT::Context()->MultiplyMonomial(result, source, power);
 }
 
 void Phantom_rescale(CIPHER result, CIPHER source) {

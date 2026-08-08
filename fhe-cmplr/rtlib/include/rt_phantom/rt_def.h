@@ -38,6 +38,10 @@ enum PHANTOM_PACKING_CONVENTION : uint32_t {
 enum PHANTOM_RESOURCE_FLAG : uint64_t {
   PHANTOM_RESOURCE_RELIN_KEY     = UINT64_C(1) << 0,
   PHANTOM_RESOURCE_ROTATION_KEYS = UINT64_C(1) << 1,
+  PHANTOM_RESOURCE_CONJUGATION_KEY = UINT64_C(1) << 2,
+  PHANTOM_RESOURCE_ROTATE_BATCH  = UINT64_C(1) << 3,
+  PHANTOM_RESOURCE_RAISE_MOD     = UINT64_C(1) << 4,
+  PHANTOM_RESOURCE_MONOMIALS     = UINT64_C(1) << 5,
 };
 
 //! @brief Compiler-emitted, immutable inputs for Phantom CKKS construction.
@@ -66,6 +70,11 @@ typedef struct {
   uint64_t       _flags;
   size_t         _rotation_count;
   const int32_t* _rotation_steps;
+  size_t         _rotation_batch_count;
+  const size_t*  _rotation_batch_offsets;
+  const int32_t* _rotation_batch_steps;
+  size_t          _monomial_count;
+  const uint32_t* _monomial_powers;
 } PHANTOM_RESOURCE_MANIFEST;
 
 #endif  // RTLIB_RT_OPENFHE_RT_DEF_H
