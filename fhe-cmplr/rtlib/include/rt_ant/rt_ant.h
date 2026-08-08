@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "common/pt_mgr.h"
+#include "common/rt_api.h"
 #include "common/rt_stat.h"
 #include "common/rtlib_timing.h"
 #include "common/tensor.h"

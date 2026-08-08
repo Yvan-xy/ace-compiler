@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 TOOLS = Path(__file__).resolve().parents[1]
+REPOSITORY = TOOLS.parents[1]
 
 
 def _evidence_module():
@@ -221,6 +222,19 @@ def test_ant_oracle_uses_audited_installed_dependency_headers() -> None:
     assert 'ant_install_include="${INSTALL_ROOT}/rtlib/include/ant"' in host
     assert '[[ -r "${ant_install_include}/uthash.h" ]]' in host
     assert '"-I${ant_install_include}"' in host
+
+
+def test_ant_runtime_header_declares_generated_callbacks_with_c_abi() -> None:
+    ant_header = (
+        REPOSITORY / "fhe-cmplr/rtlib/include/rt_ant/rt_ant.h"
+    ).read_text(encoding="utf-8")
+    common_api = (
+        REPOSITORY / "fhe-cmplr/rtlib/include/common/rt_api.h"
+    ).read_text(encoding="utf-8")
+    assert '#include "common/rt_api.h"' in ant_header
+    assert 'extern "C" {' in common_api
+    assert "CKKS_PARAMS* Get_context_params();" in common_api
+    assert "RT_DATA_INFO* Get_rt_data_info();" in common_api
 
 
 def test_a100_gate_executes_fixture_owned_adapter_aliases() -> None:
