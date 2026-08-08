@@ -17,6 +17,10 @@ from typing import Any
 PIN_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+PHANTOM_POLY_DEGREE_MAX = 131072
+PHANTOM_USER_MODULUS_BITS_MIN = 2
+PHANTOM_USER_MODULUS_BITS_MAX = 60
+PHANTOM_COEFF_MODULUS_COUNT_MAX = 64
 
 
 def fail(message: str) -> None:
@@ -176,6 +180,7 @@ def verify_context_manifest(manifest: dict[str, Any]) -> None:
     if (
         not isinstance(degree, int)
         or degree < 2
+        or degree > PHANTOM_POLY_DEGREE_MAX
         or degree & (degree - 1)
         or manifest["packing"] != "full"
         or slots != degree // 2
@@ -184,10 +189,15 @@ def verify_context_manifest(manifest: dict[str, Any]) -> None:
     data_q = manifest["data_q_bit_sizes"]
     special_p = manifest["special_p_bit_sizes"]
     if not data_q or not special_p or not all(
-        isinstance(bits, int) and 0 < bits <= 60
+        isinstance(bits, int)
+        and PHANTOM_USER_MODULUS_BITS_MIN
+        <= bits
+        <= PHANTOM_USER_MODULUS_BITS_MAX
         for bits in data_q + special_p
     ):
         fail("compiler context manifest has invalid Q/P arrays")
+    if len(data_q) + len(special_p) > PHANTOM_COEFF_MODULUS_COUNT_MAX:
+        fail("compiler context manifest Q/P count exceeds provider limits")
     if data_q[0] != manifest["first_modulus_bits"] or any(
         bits != manifest["scaling_modulus_bits"] for bits in data_q[1:]
     ):

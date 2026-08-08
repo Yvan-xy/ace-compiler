@@ -25,6 +25,10 @@ namespace ckks {
 inline constexpr uint32_t PHANTOM_CONTEXT_SCHEMA_VERSION  = 1;
 inline constexpr uint32_t PHANTOM_RESOURCE_SCHEMA_VERSION = 1;
 inline constexpr uint32_t PHANTOM_PACKING_FULL             = 1;
+inline constexpr uint32_t PHANTOM_POLY_DEGREE_MAX          = 131072;
+inline constexpr uint32_t PHANTOM_USER_MODULUS_BITS_MIN    = 2;
+inline constexpr uint32_t PHANTOM_USER_MODULUS_BITS_MAX    = 60;
+inline constexpr uint32_t PHANTOM_COEFF_MODULUS_COUNT_MAX  = 64;
 
 inline constexpr uint64_t PHANTOM_RESOURCE_RELIN_KEY = uint64_t{1} << 0;
 inline constexpr uint64_t PHANTOM_RESOURCE_ROTATION_KEYS = uint64_t{1} << 1;
@@ -73,9 +77,11 @@ inline PHANTOM_CONTEXT_DESCRIPTOR Build_phantom_context_descriptor(
     const core::CTX_PARAM& parameters) {
   PHANTOM_CONTEXT_DESCRIPTOR result;
   result._poly_degree = parameters.Get_poly_degree();
-  if (!Is_power_of_two(result._poly_degree)) {
+  if (!Is_power_of_two(result._poly_degree) ||
+      result._poly_degree > PHANTOM_POLY_DEGREE_MAX) {
     throw std::invalid_argument(
-        "Phantom context manifest requires a power-of-two polynomial degree");
+        "Phantom context manifest requires a provider-supported power-of-two "
+        "polynomial degree");
   }
   result._logical_slots = result._poly_degree / 2;
 
@@ -83,10 +89,11 @@ inline PHANTOM_CONTEXT_DESCRIPTOR Build_phantom_context_descriptor(
   result._first_modulus_bits = parameters.Get_first_prime_bit_num();
   result._scaling_modulus_bits =
       parameters.Get_scaling_factor_bit_num();
-  if (data_q_count == 0 || result._first_modulus_bits == 0 ||
-      result._first_modulus_bits > 60 ||
-      result._scaling_modulus_bits == 0 ||
-      result._scaling_modulus_bits > 60) {
+  if (data_q_count == 0 ||
+      result._first_modulus_bits < PHANTOM_USER_MODULUS_BITS_MIN ||
+      result._first_modulus_bits > PHANTOM_USER_MODULUS_BITS_MAX ||
+      result._scaling_modulus_bits < PHANTOM_USER_MODULUS_BITS_MIN ||
+      result._scaling_modulus_bits > PHANTOM_USER_MODULUS_BITS_MAX) {
     throw std::invalid_argument(
         "Phantom context manifest requires valid data-Q metadata");
   }
@@ -103,9 +110,17 @@ inline PHANTOM_CONTEXT_DESCRIPTOR Build_phantom_context_descriptor(
   }
   const uint32_t special_p_count = parameters.Get_p_prime_num();
   const uint32_t special_p_bits = parameters.Get_p_prime_bit_num();
-  if (special_p_count == 0 || special_p_bits == 0 || special_p_bits > 60) {
+  if (special_p_count == 0 ||
+      special_p_bits < PHANTOM_USER_MODULUS_BITS_MIN ||
+      special_p_bits > PHANTOM_USER_MODULUS_BITS_MAX) {
     throw std::invalid_argument(
         "Phantom context manifest requires valid special-P metadata");
+  }
+  if (static_cast<uint64_t>(data_q_count) + special_p_count >
+      PHANTOM_COEFF_MODULUS_COUNT_MAX) {
+    throw std::invalid_argument(
+        "Phantom context manifest combined Q/P chain exceeds the provider "
+        "modulus-count limit");
   }
   result._special_p_bit_sizes.assign(special_p_count, special_p_bits);
 

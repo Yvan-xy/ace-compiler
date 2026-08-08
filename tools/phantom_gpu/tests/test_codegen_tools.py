@@ -92,6 +92,35 @@ def test_compiler_context_manifest_schema_is_checked() -> None:
     verify_context_manifest(CONTEXT)
 
 
+@pytest.mark.parametrize(
+    ("case", "diagnostic"),
+    (
+        ("degree", "invalid compiler-declared degree"),
+        ("data_bits", "invalid Q/P arrays"),
+        ("special_bits", "invalid Q/P arrays"),
+        ("modulus_count", "Q/P count exceeds provider limits"),
+    ),
+)
+def test_compiler_context_manifest_rejects_provider_unsupported_parameters(
+    case: str, diagnostic: str
+) -> None:
+    manifest = json.loads(json.dumps(CONTEXT))
+    if case == "degree":
+        manifest["polynomial_degree"] = 262144
+        manifest["logical_slot_capacity"] = 131072
+    elif case == "data_bits":
+        manifest["first_modulus_bits"] = 1
+        manifest["data_q_bit_sizes"][0] = 1
+    elif case == "special_bits":
+        manifest["special_p_bit_sizes"][0] = 1
+    elif case == "modulus_count":
+        manifest["data_q_bit_sizes"] = [60] + [56] * 63
+    else:  # pragma: no cover - the parameter table is closed above.
+        raise AssertionError(case)
+    with pytest.raises(SystemExit, match=diagnostic):
+        verify_context_manifest(manifest)
+
+
 def test_default_and_manifest_bound_source_audits(tmp_path: Path) -> None:
     context_path = write_context_manifest(tmp_path)
     result, report = run_audit(

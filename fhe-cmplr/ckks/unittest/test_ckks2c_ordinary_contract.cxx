@@ -41,6 +41,17 @@ extern "C" const PHANTOM_RESOURCE_MANIFEST*
 Get_phantom_resource_manifest() { return nullptr; }
 )";
 
+void SetValidContextParameters(fhe::core::CTX_PARAM& parameters) {
+  parameters.Set_poly_degree(32, false);
+  parameters.Set_mul_level(4, false);
+  parameters.Set_first_prime_bit_num(50);
+  parameters.Set_scaling_factor_bit_num(40);
+  parameters.Set_q_part_num(2);
+  parameters.Set_input_level(3);
+  parameters.Set_hamming_weight(8);
+  parameters.Set_security_level(0);
+}
+
 TEST(CKKS2COrdinaryContract, NormalizesScalarRotationKeys) {
   EXPECT_EQ(fhe::core::Normalize_scalar_rotation_index(-1, 8192), -1);
   EXPECT_EQ(fhe::core::Normalize_scalar_rotation_index(8192, 8192), 0);
@@ -56,14 +67,7 @@ TEST(CKKS2COrdinaryContract, TracksRelinearizationRequirementSeparately) {
 
 TEST(CKKS2COrdinaryContract, DerivesContextFromCompilerParameters) {
   fhe::core::CTX_PARAM parameters;
-  parameters.Set_poly_degree(32, false);
-  parameters.Set_mul_level(4, false);
-  parameters.Set_first_prime_bit_num(50);
-  parameters.Set_scaling_factor_bit_num(40);
-  parameters.Set_q_part_num(2);
-  parameters.Set_input_level(3);
-  parameters.Set_hamming_weight(8);
-  parameters.Set_security_level(0);
+  SetValidContextParameters(parameters);
 
   const auto context =
       fhe::ckks::Build_phantom_context_descriptor(parameters);
@@ -110,6 +114,38 @@ TEST(CKKS2COrdinaryContract, DistinguishesDifferentCompilerParameters) {
   const std::string second = fhe::ckks::Serialize_phantom_context_descriptor(
       fhe::ckks::Build_phantom_context_descriptor(second_parameters));
   EXPECT_NE(first, second);
+}
+
+TEST(CKKS2COrdinaryContract, RejectsProviderUnsupportedPolynomialDegree) {
+  fhe::core::CTX_PARAM parameters;
+  SetValidContextParameters(parameters);
+  parameters.Set_poly_degree(262144, false);
+  EXPECT_THROW(fhe::ckks::Build_phantom_context_descriptor(parameters),
+               std::invalid_argument);
+}
+
+TEST(CKKS2COrdinaryContract, RejectsProviderUnsupportedDataModulusBits) {
+  fhe::core::CTX_PARAM first_parameters;
+  SetValidContextParameters(first_parameters);
+  first_parameters.Set_first_prime_bit_num(1);
+  EXPECT_THROW(fhe::ckks::Build_phantom_context_descriptor(first_parameters),
+               std::invalid_argument);
+
+  fhe::core::CTX_PARAM scaling_parameters;
+  SetValidContextParameters(scaling_parameters);
+  scaling_parameters.Set_scaling_factor_bit_num(1);
+  EXPECT_THROW(fhe::ckks::Build_phantom_context_descriptor(scaling_parameters),
+               std::invalid_argument);
+}
+
+TEST(CKKS2COrdinaryContract, RejectsProviderUnsupportedModulusCount) {
+  fhe::core::CTX_PARAM parameters;
+  SetValidContextParameters(parameters);
+  parameters.Set_mul_level(64, false);
+  parameters.Set_q_part_num(64);
+  parameters.Set_input_level(1);
+  EXPECT_THROW(fhe::ckks::Build_phantom_context_descriptor(parameters),
+               std::invalid_argument);
 }
 
 TEST(CKKS2COrdinaryContract, RejectsMissingContextManifest) {
@@ -327,6 +363,34 @@ TEST_F(CKKS2COrdinaryAirVerifier, RejectsDynamicEncodeLength) {
             "Phantom CKKS2C encode requires constant length");
 }
 
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsDynamicEncodeScale) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  ADDR_DATUM_PTR dynamic_scale =
+      _func_scope->New_var(u32, "dynamic_scale", _spos);
+  NODE_PTR encode = Encode(
+      Float_constant(), _container->New_intconst(u32, 1, _spos),
+      _container->New_ld(dynamic_scale, _spos),
+      _container->New_intconst(u32, 1, _spos));
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(Use_plain(encode), &diagnostic));
+  EXPECT_EQ(diagnostic,
+            "Phantom CKKS2C encode requires constant scale_degree");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsDynamicEncodeLevel) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  ADDR_DATUM_PTR dynamic_level =
+      _func_scope->New_var(u32, "dynamic_level", _spos);
+  NODE_PTR encode = Encode(
+      Float_constant(), _container->New_intconst(u32, 1, _spos),
+      _container->New_intconst(u32, 1, _spos),
+      _container->New_ld(dynamic_level, _spos));
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(Use_plain(encode), &diagnostic));
+  EXPECT_EQ(diagnostic,
+            "Phantom CKKS2C encode requires constant logical_level");
+}
+
 TEST_F(CKKS2COrdinaryAirVerifier, RejectsIntegerEncodeInput) {
   TYPE_PTR i32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
   NODE_PTR encode = Encode(_container->New_intconst(i32, 7, _spos), 1, 1, 1);
@@ -406,6 +470,36 @@ TEST_F(CKKS2COrdinaryAirVerifier, RejectsDynamicScalarRotation) {
   EXPECT_FALSE(Verify(rotate, &diagnostic));
   EXPECT_EQ(diagnostic,
             "Phantom CKKS2C rotate requires a constant signed 32-bit step");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsMissingRotationAttribute) {
+  TYPE_PTR i32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
+  NODE_PTR rotate = _container->New_cust_node(
+      fhe::ckks::OPC_ROTATE, _cipher, _spos);
+  rotate->Set_child(0, _container->New_ld(_cipher_input, _spos));
+  rotate->Set_child(1, _container->New_intconst(i32, 1, _spos));
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(rotate, &diagnostic));
+  EXPECT_EQ(
+      diagnostic,
+      "Phantom CKKS2C rotate requires one RNUM entry matching its constant "
+      "step");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsMismatchedRotationAttribute) {
+  TYPE_PTR i32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
+  NODE_PTR rotate = _container->New_cust_node(
+      fhe::ckks::OPC_ROTATE, _cipher, _spos);
+  rotate->Set_child(0, _container->New_ld(_cipher_input, _spos));
+  rotate->Set_child(1, _container->New_intconst(i32, 1, _spos));
+  int32_t attr_step = -1;
+  rotate->Set_attr(nn::core::ATTR::RNUM, &attr_step, 1);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(rotate, &diagnostic));
+  EXPECT_EQ(
+      diagnostic,
+      "Phantom CKKS2C rotate requires one RNUM entry matching its constant "
+      "step");
 }
 
 }  // namespace
