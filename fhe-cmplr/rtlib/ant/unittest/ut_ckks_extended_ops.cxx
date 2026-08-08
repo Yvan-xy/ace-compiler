@@ -361,7 +361,8 @@ TEST_F(TEST_CKKS_EXTENDED_OPS,
   Conjugate_ciph(in_place, in_place);
   ExpectApprox(DecodeValues(in_place), expected_conjugate);
 
-  const std::array<std::int32_t, 4> steps = {5, 0, -7, 5};
+  const std::vector<std::int32_t> steps = {
+      5, 0, -7, 5, static_cast<std::int32_t>(_slots - 7)};
   CIPHER outputs =
       static_cast<CIPHER>(std::calloc(steps.size(), sizeof(CIPHERTEXT)));
   ASSERT_NE(outputs, nullptr);
@@ -380,10 +381,23 @@ TEST_F(TEST_CKKS_EXTENDED_OPS,
   }
   EXPECT_EQ(Snapshot(&outputs[1]), Snapshot(source));
   EXPECT_EQ(Snapshot(&outputs[0]), Snapshot(&outputs[3]));
+  EXPECT_EQ(Snapshot(&outputs[2]), Snapshot(&outputs[4]));
+  EXPECT_EQ(Snapshot(source), source_before);
+
+  CIPHER scalar_equivalent = Alloc_ciphertext();
+  Rotate_ciph(scalar_equivalent, source,
+              static_cast<std::int32_t>(_slots - 7));
+  EXPECT_EQ(Snapshot(scalar_equivalent), Snapshot(&outputs[2]));
+  CIPHER scalar_identity = Alloc_ciphertext();
+  Rotate_ciph(scalar_identity, source, static_cast<std::int32_t>(_slots));
+  EXPECT_EQ(Snapshot(scalar_identity), Snapshot(source));
+  Rotate_ciph(source, source, static_cast<std::int32_t>(_slots));
   EXPECT_EQ(Snapshot(source), source_before);
 
   Free_ciph_poly(outputs, steps.size());
   std::free(outputs);
+  Free_ciphertext(scalar_identity);
+  Free_ciphertext(scalar_equivalent);
   Free_ciphertext(in_place);
   Free_ciphertext(twice);
   Free_ciphertext(conjugated);

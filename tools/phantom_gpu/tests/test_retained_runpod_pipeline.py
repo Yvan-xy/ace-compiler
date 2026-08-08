@@ -277,6 +277,28 @@ def test_ant_oracle_provisions_only_its_internal_conjugation_sentinel() -> None:
     ]
 
 
+def test_ant_rotation_runtime_normalizes_steps_to_compiler_key_ids() -> None:
+    runtime = (
+        REPOSITORY / "fhe-cmplr/rtlib/ant/ckks/src/cipher.c"
+    ).read_text(encoding="utf-8")
+    batch = runtime[
+        runtime.index("static int32_t Normalize_rotation(") : runtime.index(
+            "\nCIPHER Conjugate_ciph("
+        )
+    ]
+    assert "Get_ciph_slots(ciph)" in batch
+    assert "normalized > (int64_t)(slots / 2U)" in batch
+    assert (
+        "const int32_t normalized = Normalize_rotation(ciph, rot_idx);" in batch
+    )
+    assert "if (normalized == 0)" in batch
+    assert "if (res != ciph) Copy_ciphertext(res, ciph);" in batch
+    assert "Normalize_rotation(ciph, rot_idx[idx])" in batch
+    assert batch.index("Normalize_rotation(ciph, rot_idx[idx])") < batch.index(
+        "if (rot == 0)"
+    )
+
+
 def test_a100_gate_executes_fixture_owned_adapter_aliases() -> None:
     runner = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
     retained_function = runner[

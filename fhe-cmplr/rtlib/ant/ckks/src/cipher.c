@@ -451,8 +451,22 @@ void Modswitch_ciph(CIPHER ciph) {
   Modswitch_ciphertext(ciph, (CKKS_EVALUATOR*)Eval());
 }
 
+static int32_t Normalize_rotation(CIPHER ciph, int32_t rotation) {
+  const uint32_t slots = Get_ciph_slots(ciph);
+  FMT_ASSERT(slots > 0, "cannot normalize a rotation without logical slots");
+  int64_t normalized = (int64_t)rotation % (int64_t)slots;
+  if (normalized < 0) normalized += slots;
+  if (normalized > (int64_t)(slots / 2U)) normalized -= slots;
+  return (int32_t)normalized;
+}
+
 CIPHER Rotate_ciph(CIPHER res, CIPHER ciph, int32_t rot_idx) {
-  Eval_fast_rotate(res, ciph, rot_idx, (CKKS_EVALUATOR*)Eval());
+  const int32_t normalized = Normalize_rotation(ciph, rot_idx);
+  if (normalized == 0) {
+    if (res != ciph) Copy_ciphertext(res, ciph);
+    return res;
+  }
+  Eval_fast_rotate(res, ciph, normalized, (CKKS_EVALUATOR*)Eval());
   return res;
 }
 
@@ -466,7 +480,7 @@ void Rotate_batch_ciph(CIPHER res_arr, CIPHER ciph, const int32_t* rot_idx,
   VALUE_LIST* precomputed = Alloc_precomp(Get_c1(ciph));
   for (uint32_t idx = 0; idx < count; ++idx) {
     CIPHERTEXT* out = &res_arr[idx];
-    int32_t     rot = rot_idx[idx];
+    int32_t     rot = Normalize_rotation(ciph, rot_idx[idx]);
     if (rot == 0) {
       Init_ciphertext_from_ciph(out, ciph, ciph->_scaling_factor,
                                 ciph->_sf_degree);
