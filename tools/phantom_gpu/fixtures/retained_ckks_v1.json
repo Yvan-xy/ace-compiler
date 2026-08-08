@@ -3,12 +3,10 @@
   "fixture_id": "retained_ckks_v1",
   "description": "Provider-neutral retained CKKS operation fixture",
   "qualification_bindings": {
-    "status": "unbound",
-    "required": [
-      "compiler_context_manifest_sha256",
-      "normalized_compiler_command_sha256",
-      "post_ckks_air_sha256"
-    ]
+    "status": "bound",
+    "compiler_context_manifest_sha256": "48e2f552aba8c64fcd24de4af09cd1ef74f276f778d5cd18fd50def897c6cc1b",
+    "normalized_compiler_command_sha256": "1a685a8902b914cd4571a8f6462094cec27a04110daee742fa6a9de86fea015c",
+    "post_ckks_air_sha256": "ea9a7405835d8339af0248da11ec6329be00c00ab1663384ef041af628a8ff68"
   },
   "determinism": {
     "seed": 20260808,
@@ -40,7 +38,7 @@
   ],
   "production_rotation_source": {
     "kind": "audited_default_post_ckks_air",
-    "post_ckks_air_sha256": null
+    "post_ckks_air_sha256": "bb614f8aa87a5ef999394ac602106e169517812455f117b14d7a8ee17eab6f7c"
   },
   "monomial_powers": ["0", "N/2", "N", "3N/2", "2N-1", "2N+1"],
   "exact_source_recipe": {
