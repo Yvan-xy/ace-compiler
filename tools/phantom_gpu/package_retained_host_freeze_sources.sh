@@ -117,6 +117,9 @@ tools/phantom_gpu/phase_helpers.sh
 tools/phantom_gpu/bootstrap_environment.sh
 tools/phantom_gpu/run_retained_host_freeze_snapshot.sh
 tools/phantom_gpu/retained_runpod_evidence.py
+tools/phantom_gpu/compare_retained_ckks_results.py
+tools/phantom_gpu/generate_retained_ckks_fixtures.py
+tools/phantom_gpu/transport_helpers.sh
 tools/phantom_gpu/configs/apt-packages.lock
 tools/phantom_gpu/configs/python-requirements-hashed.lock
 tools/phantom_gpu/configs/base-files.sha256
@@ -127,7 +130,10 @@ chmod 0755 \
   "${OUTPUT}/source_archive.py" \
   "${OUTPUT}/phase_helpers.sh" \
   "${OUTPUT}/bootstrap_environment.sh" \
-  "${OUTPUT}/run_retained_host_freeze_snapshot.sh"
+  "${OUTPUT}/run_retained_host_freeze_snapshot.sh" \
+  "${OUTPUT}/retained_runpod_evidence.py" \
+  "${OUTPUT}/compare_retained_ckks_results.py" \
+  "${OUTPUT}/generate_retained_ckks_fixtures.py"
 
 RUNNER_SOURCE="$(
   git -C "${REPO_ROOT}" show \

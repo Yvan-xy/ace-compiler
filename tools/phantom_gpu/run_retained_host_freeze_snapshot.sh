@@ -5,34 +5,79 @@ export LC_ALL=C
 export TZ=UTC
 
 usage() {
-  echo "usage: $0 --input-dir DIR --work-dir DIR --result-root DIR --binding-mode <provisional|formal>" >&2
+  echo "usage: $0 --input-dir DIR --work-dir DIR --result-archive FILE --binding-mode <provisional|formal>" >&2
   exit 2
 }
 
 INPUT=""
 WORK=""
-RESULT_ROOT=""
+RESULT_ARCHIVE=""
 BINDING_MODE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --input-dir) INPUT="$2"; shift 2 ;;
     --work-dir) WORK="$2"; shift 2 ;;
-    --result-root) RESULT_ROOT="$2"; shift 2 ;;
+    --result-archive) RESULT_ARCHIVE="$2"; shift 2 ;;
     --binding-mode) BINDING_MODE="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
-if [[ -z "${INPUT}" || -z "${WORK}" || -z "${RESULT_ROOT}" ]] ||
+if [[ -z "${INPUT}" || -z "${WORK}" || -z "${RESULT_ARCHIVE}" ]] ||
    [[ "${BINDING_MODE}" != provisional && "${BINDING_MODE}" != formal ]]; then
   usage
 fi
 INPUT="$(realpath -- "${INPUT}")"
 WORK="$(realpath -m -- "${WORK}")"
-RESULT_ROOT="$(realpath -m -- "${RESULT_ROOT}")"
-if [[ -e "${WORK}" || -e "${RESULT_ROOT}" ]]; then
-  echo "retained host-freeze work and result paths must not already exist" >&2
+RESULT_ARCHIVE="$(realpath -m -- "${RESULT_ARCHIVE}")"
+if [[ -e "${WORK}" || -e "${RESULT_ARCHIVE}" ||
+      -e "${RESULT_ARCHIVE}.sha256" ]]; then
+  echo "retained host-freeze work and result archive paths must not already exist" >&2
   exit 1
 fi
+
+RESULTS_DIR="${WORK}/results"
+RESULT_ROOT="${RESULTS_DIR}/qualification"
+STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+PIPELINE_EXIT=1
+mkdir -p "${RESULTS_DIR}"
+
+finalize() {
+  local incoming="$?"
+  trap - EXIT INT TERM
+  if [[ ${PIPELINE_EXIT} -eq 0 ]]; then
+    incoming=0
+  fi
+  local status=failed
+  [[ ${incoming} -eq 0 ]] && status=pass
+  if [[ "${status}" == pass ]]; then
+    printf '{"schema_version":"ace.phantom.result-completeness/1.0.0","status":"pass","mode":"retained-host-%s"}\n' \
+      "${BINDING_MODE}" >"${RESULTS_DIR}/result-completeness.json"
+  else
+    printf '{"schema_version":"ace.phantom.retained-host-freeze-failure/1.0.0","status":"failed","exit_code":%d}\n' \
+      "${incoming}" >"${RESULTS_DIR}/failure.json"
+  fi
+  printf '{"schema_version":"1.0.0","status":"%s","mode":"retained-host-%s","exit_code":%d,"started_utc":"%s","completed_utc":"%s"}\n' \
+    "${status}" "${BINDING_MODE}" "${incoming}" "${STARTED_UTC}" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${RESULTS_DIR}/pipeline-result.json"
+  (
+    cd "${RESULTS_DIR}"
+    find . -type f ! -path ./SHA256SUMS -print0 |
+      LC_ALL=C sort -z |
+      xargs -0 -r sha256sum >SHA256SUMS
+  )
+  mkdir -p "$(dirname -- "${RESULT_ARCHIVE}")"
+  local temporary="${RESULT_ARCHIVE}.tmp"
+  tar -C "${WORK}" -czf "${temporary}" results
+  mv "${temporary}" "${RESULT_ARCHIVE}"
+  (
+    cd "$(dirname -- "${RESULT_ARCHIVE}")"
+    sha256sum "$(basename -- "${RESULT_ARCHIVE}")" \
+      >"$(basename -- "${RESULT_ARCHIVE}").sha256"
+  )
+  exit "${incoming}"
+}
+trap finalize EXIT
+trap 'exit 130' INT TERM
 
 if [[ "${NVIDIA_VISIBLE_DEVICES:-void}" != void ]] ||
    compgen -G '/dev/nvidia*' >/dev/null; then
@@ -102,7 +147,6 @@ if payload.get("source_snapshots") != bindings:
     raise SystemExit("retained payload does not bind its source manifests")
 PY
 
-mkdir -p "${WORK}"
 ACE_APT_LOCK="${INPUT}/apt-packages.lock" \
 ACE_PYTHON_LOCK="${INPUT}/python-requirements-hashed.lock" \
 ACE_BASE_FILES_LOCK="${INPUT}/base-files.sha256" \
@@ -201,3 +245,4 @@ if compgen -G '/dev/nvidia*' >/dev/null; then
   exit 1
 fi
 echo "retained host freeze passed in ${BINDING_MODE} mode: ${RESULT_ROOT}"
+PIPELINE_EXIT=0

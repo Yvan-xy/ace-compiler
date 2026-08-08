@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import sys
+import tempfile
 
 
 TOOLS = Path(__file__).resolve().parents[1]
@@ -32,6 +35,44 @@ def test_payload_comes_only_from_exact_commit_objects() -> None:
     assert "requested Phantom commit does not match" in package
     assert "git diff" not in package
     assert "git status" not in package
+
+
+def test_host_validator_dependencies_are_commit_materialized() -> None:
+    package = source(PACKAGE)
+    for dependency in (
+        "retained_runpod_evidence.py",
+        "compare_retained_ckks_results.py",
+        "generate_retained_ckks_fixtures.py",
+        "transport_helpers.sh",
+    ):
+        assert f"tools/phantom_gpu/{dependency}" in package
+
+
+def test_materialized_validator_dependency_closure_imports() -> None:
+    dependencies = (
+        "retained_runpod_evidence.py",
+        "compare_retained_ckks_results.py",
+        "generate_retained_ckks_fixtures.py",
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        shutil.copyfile(TOOLS / dependencies[0], root / dependencies[0])
+        missing = subprocess.run(
+            [sys.executable, str(root / dependencies[0]), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert missing.returncode != 0
+        for dependency in dependencies[1:]:
+            shutil.copyfile(TOOLS / dependency, root / dependency)
+        complete = subprocess.run(
+            [sys.executable, str(root / dependencies[0]), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert complete.returncode == 0, complete.stderr
 
 
 def test_container_boundary_is_exact_and_gpu_free() -> None:
@@ -70,6 +111,41 @@ def test_binding_modes_are_separate_and_formal_is_validated() -> None:
     assert freeze.count("validate-frozen") == 1
     assert "candidate-for-review-not-frozen-evidence" in freeze
     assert "retained_ckks_v1.json" in freeze
+
+
+def test_only_verified_archive_extraction_is_consumed() -> None:
+    snapshot = source(SNAPSHOT)
+    freeze = source(FREEZE)
+    assert "--result-archive" in snapshot
+    assert "pipeline-result.json" in snapshot
+    assert "result-completeness.json" in snapshot
+    assert "find . -type f ! -path ./SHA256SUMS -print0" in snapshot
+    assert 'RESULT_ARCHIVE="${OUTPUT}/retained-host-result.tar.gz"' in freeze
+    assert '"${RESULT_ARCHIVE}.sha256"' in freeze
+    assert "verify_result_archive" in freeze
+    assert 'VERIFIED_RESULT_ROOT="${VERIFIED_EXTRACTION}/results/qualification"' in freeze
+    assert '--root "${VERIFIED_RESULT_ROOT}"' in freeze
+    assert '"${VERIFIED_RESULT_ROOT}/inputs/retained_ckks_fixture.json"' in freeze
+    assert "--result-root" not in freeze
+    assert "failure.json" in snapshot
+
+
+def test_candidate_export_rejects_non_binding_fixture_drift() -> None:
+    freeze = source(FREEZE)
+    for token in (
+        'normalized_candidate["qualification_bindings"]',
+        'normalized_candidate["production_rotation_source"]',
+        "normalized_candidate != template_value",
+        "compiler_context_manifest_sha256",
+        "normalized_compiler_command_sha256",
+        "post_ckks_air_sha256",
+        "retained_ckks_phantom_post.air",
+        "retained_ckks_production_post.air",
+        "exact-after-binding-field-normalization",
+        "retained_ckks_v1.unbound.json",
+        "verified fixture template differs from the selected commit",
+    ):
+        assert token in freeze
 
 
 def test_snapshot_entry_invokes_only_the_retained_host_gate() -> None:

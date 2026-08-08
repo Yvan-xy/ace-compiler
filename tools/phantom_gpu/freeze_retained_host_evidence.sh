@@ -64,8 +64,8 @@ mkdir -p "${OUTPUT}"
 chmod 0700 "${OUTPUT}"
 PAYLOAD="${OUTPUT}/payload"
 DOCKER_EVIDENCE="${OUTPUT}/docker"
-RESULT_ROOT="${OUTPUT}/retained-host-result"
-WORK_ROOT="${OUTPUT}/work"
+RESULT_ARCHIVE="${OUTPUT}/retained-host-result.tar.gz"
+VERIFIED_EXTRACTION="${OUTPUT}/verified-retained-host-result"
 mkdir -p "${DOCKER_EVIDENCE}"
 bash "${SCRIPT_DIR}/package_retained_host_freeze_sources.sh" \
   --ace-commit "${ACE_COMMIT}" \
@@ -156,8 +156,8 @@ CREATED_CONTAINER_ID="$(docker create \
   "${BASE_IMAGE}" \
   bash /retained-freeze/input/run_retained_host_freeze_snapshot.sh \
     --input-dir /retained-freeze/input \
-    --work-dir /retained-freeze/output/work \
-    --result-root /retained-freeze/output/retained-host-result \
+    --work-dir /retained-freeze/work \
+    --result-archive /retained-freeze/output/retained-host-result.tar.gz \
     --binding-mode "${BINDING_MODE}")"
 if [[ ! "${CREATED_CONTAINER_ID}" =~ ^[0-9a-f]{64}$ ]]; then
   echo "docker create did not return one exact full container ID" >&2
@@ -203,43 +203,123 @@ set -e
 docker inspect --type container "${CONTAINER_ID}" \
   >"${DOCKER_EVIDENCE}/container-completed.json"
 remove_exact_container
+if [[ ! -s "${RESULT_ARCHIVE}" || ! -s "${RESULT_ARCHIVE}.sha256" ]]; then
+  echo "retained host freeze did not publish its result archive and sidecar" >&2
+  exit 1
+fi
+(
+  cd "${OUTPUT}"
+  sha256sum -c "$(basename -- "${RESULT_ARCHIVE}.sha256")"
+)
+(
+  cd "${PAYLOAD}"
+  sha256sum -c SHA256SUMS >/dev/null
+)
+source "${PAYLOAD}/transport_helpers.sh"
+verify_result_archive \
+  "${RESULT_ARCHIVE}" "retained-host-${BINDING_MODE}" "${PIPELINE_EXIT}" \
+  "${VERIFIED_EXTRACTION}" \
+  >"${OUTPUT}/result-verification.json"
+VERIFIED_RESULT_ROOT="${VERIFIED_EXTRACTION}/results/qualification"
 if [[ ${PIPELINE_EXIT} -ne 0 ]]; then
-  echo "retained host freeze failed with exit ${PIPELINE_EXIT}" >&2
+  echo "retained host freeze failed with exit ${PIPELINE_EXIT}; verified diagnostics: ${VERIFIED_EXTRACTION}" >&2
   exit "${PIPELINE_EXIT}"
 fi
 
-(
-  cd "${RESULT_ROOT}"
-  sha256sum -c SHA256SUMS
-)
 if [[ "${BINDING_MODE}" == formal ]]; then
   python3 "${PAYLOAD}/retained_runpod_evidence.py" validate-frozen \
-    --root "${RESULT_ROOT}" \
+    --root "${VERIFIED_RESULT_ROOT}" \
     --ace-commit "${ACE_COMMIT}" \
     --phantom-commit "${PHANTOM_COMMIT}"
 else
   CANDIDATE="${OUTPUT}/candidate"
   mkdir "${CANDIDATE}"
-  cp -- "${RESULT_ROOT}/inputs/retained_ckks_fixture.json" \
+  git -C "${REPO_ROOT}" show \
+    "${ACE_COMMIT}:tools/phantom_gpu/fixtures/retained_ckks_v1.json" \
+    >"${CANDIDATE}/retained_ckks_v1.unbound.json"
+  cp -- "${VERIFIED_RESULT_ROOT}/inputs/retained_ckks_fixture.json" \
     "${CANDIDATE}/retained_ckks_v1.json"
-  python3 - "${CANDIDATE}" "${RESULT_ROOT}" \
+  python3 - "${CANDIDATE}" "${VERIFIED_RESULT_ROOT}" \
     "${ACE_COMMIT}" "${PHANTOM_COMMIT}" <<'PY'
+import copy
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 
 candidate, root = map(Path, sys.argv[1:3])
 fixture = candidate / "retained_ckks_v1.json"
+selected_template_path = candidate / "retained_ckks_v1.unbound.json"
+verified_template_path = root / "inputs/retained_ckks_fixture_template.json"
+context_path = root / "inputs/compiler_context_manifest.json"
+generation_path = root / "outputs/retained_ckks_generation.json"
+post_air_path = root / "outputs/retained_ckks_phantom_post.air"
+production_post_air_path = root / "outputs/retained_ckks_production_post.air"
+load = lambda path: json.loads(path.read_text(encoding="utf-8"))
+candidate_value = load(fixture)
+template_value = load(selected_template_path)
+if load(verified_template_path) != template_value:
+    raise SystemExit("verified fixture template differs from the selected commit")
+candidate_bindings = candidate_value.get("qualification_bindings")
+template_bindings = template_value.get("qualification_bindings")
+binding_names = (
+    "compiler_context_manifest_sha256",
+    "normalized_compiler_command_sha256",
+    "post_ckks_air_sha256",
+)
+if (
+    not isinstance(candidate_bindings, dict)
+    or candidate_bindings.get("status") != "bound"
+    or not isinstance(template_bindings, dict)
+    or template_bindings.get("status") != "unbound"
+    or any(name in template_bindings for name in binding_names)
+    or set(candidate_bindings) != set(template_bindings) | set(binding_names)
+):
+    raise SystemExit("provisional fixture has an invalid binding shape")
+digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+generation = load(generation_path)
+expected_bindings = {
+    "compiler_context_manifest_sha256": digest(context_path),
+    "normalized_compiler_command_sha256": generation.get(
+        "normalized_argv_sha256"
+    ),
+    "post_ckks_air_sha256": digest(post_air_path),
+}
+if any(
+    not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+    for value in expected_bindings.values()
+) or any(
+    candidate_bindings.get(key) != value
+    for key, value in expected_bindings.items()
+):
+    raise SystemExit("provisional fixture binding differs from verified artifacts")
+production_hash = digest(production_post_air_path)
+candidate_rotation = candidate_value.get("production_rotation_source")
+template_rotation = template_value.get("production_rotation_source")
+if (
+    not isinstance(candidate_rotation, dict)
+    or not isinstance(template_rotation, dict)
+    or template_rotation.get("post_ckks_air_sha256") is not None
+    or candidate_rotation.get("post_ckks_air_sha256") != production_hash
+):
+    raise SystemExit("provisional production rotation binding is invalid")
+normalized_candidate = copy.deepcopy(candidate_value)
+normalized_candidate["qualification_bindings"] = copy.deepcopy(template_bindings)
+normalized_candidate["production_rotation_source"]["post_ckks_air_sha256"] = None
+if normalized_candidate != template_value:
+    raise SystemExit("provisional fixture contains non-binding semantic drift")
 record = {
     "schema_version": "ace.phantom.retained-fixture-candidate/1.0.0",
     "status": "candidate-for-review-not-frozen-evidence",
     "ace_commit": sys.argv[3],
     "phantom_commit": sys.argv[4],
-    "fixture_sha256": hashlib.sha256(fixture.read_bytes()).hexdigest(),
-    "provisional_manifest_sha256": hashlib.sha256(
-        (root / "manifest.json").read_bytes()
-    ).hexdigest(),
+    "fixture_sha256": digest(fixture),
+    "unbound_template_sha256": digest(selected_template_path),
+    "provisional_manifest_sha256": digest(root / "manifest.json"),
+    "qualification_bindings": expected_bindings,
+    "production_rotation_source_post_ckks_air_sha256": production_hash,
+    "semantic_comparison": "exact-after-binding-field-normalization",
 }
 (candidate / "candidate-binding.json").write_text(
     json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -247,7 +327,8 @@ record = {
 PY
   (
     cd "${CANDIDATE}"
-    sha256sum candidate-binding.json retained_ckks_v1.json >SHA256SUMS
+    sha256sum candidate-binding.json retained_ckks_v1.json \
+      retained_ckks_v1.unbound.json >SHA256SUMS
     sha256sum -c SHA256SUMS
   )
 fi
