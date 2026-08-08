@@ -602,11 +602,6 @@ def _primitive_bootstrap_depth(
     return approx_mod_depth + enc_budget + dec_budget
 
 
-def _bootstrap_const_level(config: BootstrapConfig) -> int:
-    """Use the high bootstrap plaintext level for scalar constants too."""
-    return config.const_level
-
-
 def _bootstrap_ct_encode_enabled(config: BootstrapConfig) -> bool:
     return bool(config.ct_encode)
 
@@ -1175,7 +1170,7 @@ def _mul_plain_lazy_rescale(ct, plain):
 
 
 def _encode_scalar_like(x, value, scale_degree: int = 1, level: int = 0):
-    """Encode a scalar as CKKS plaintext with explicit level/scale."""
+    """Encode a scalar; level zero lets scale management bind it to the lhs."""
     if not hasattr(x, "container"):
         return value
 
@@ -1193,18 +1188,18 @@ def _encode_scalar_like(x, value, scale_degree: int = 1, level: int = 0):
 def _add_const_like(x, value, config: Optional[BootstrapConfig] = None):
     if not hasattr(x, "container"):
         return x + value
-    cfg = _require_bootstrap_config(config, "_add_const_like")
+    _require_bootstrap_config(config, "_add_const_like")
     return x + _encode_scalar_like(
-        x, value, scale_degree=1, level=_bootstrap_const_level(cfg)
+        x, value, scale_degree=1, level=0
     )
 
 
 def _mul_const_like(x, value, config: Optional[BootstrapConfig] = None):
     if not hasattr(x, "container"):
         return x * value
-    cfg = _require_bootstrap_config(config, "_mul_const_like")
+    _require_bootstrap_config(config, "_mul_const_like")
     return x * _encode_scalar_like(
-        x, value, scale_degree=1, level=_bootstrap_const_level(cfg)
+        x, value, scale_degree=1, level=0
     )
 
 

@@ -27,6 +27,44 @@ def _run_isolated(script: str) -> subprocess.CompletedProcess:
     )
 
 
+def test_bootstrap_scalar_constants_request_dynamic_encode_level(monkeypatch):
+    from ace_edsl.edsl.core import bootstrap_decomposition
+
+    encoded = []
+    encoded_value = object()
+
+    def capture_encode(x, value, *, scale_degree, level):
+        encoded.append((value, scale_degree, level))
+        return encoded_value
+
+    class Cipher:
+        container = object()
+
+        def __add__(self, rhs):
+            assert rhs is encoded_value
+            return "add-result"
+
+        def __mul__(self, rhs):
+            assert rhs is encoded_value
+            return "mul-result"
+
+    monkeypatch.setattr(
+        bootstrap_decomposition, "_encode_scalar_like", capture_encode
+    )
+    cipher = Cipher()
+    config = object()
+
+    assert (
+        bootstrap_decomposition._add_const_like(cipher, -1.0, config)
+        == "add-result"
+    )
+    assert (
+        bootstrap_decomposition._mul_const_like(cipher, 0.5, config)
+        == "mul-result"
+    )
+    assert encoded == [(-1.0, 1, 0), (0.5, 1, 0)]
+
+
 def test_phantom_add_mul_rotate_uses_only_dedicated_ckks2c():
     result = _run_isolated(
         r'''

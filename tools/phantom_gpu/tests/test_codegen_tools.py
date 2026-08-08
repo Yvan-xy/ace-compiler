@@ -30,7 +30,7 @@ extern "C" const PHANTOM_CONTEXT_MANIFEST* Get_phantom_context_manifest() {
   static const PHANTOM_CONTEXT_MANIFEST context = {
     1, PHANTOM_PACKING_FULL, 16384, 8192, 3,
     phantom_data_q_bit_sizes, 1, phantom_special_p_bit_sizes,
-    1, 1, 192, 0, 60, 56, 1
+    1, 1, 192, 0, 60, 56, 2
   };
   return &context;
 }
@@ -128,7 +128,7 @@ def test_default_and_manifest_bound_source_audits(tmp_path: Path) -> None:
     result, report = run_audit(
         tmp_path, CLEAN_SOURCE, "--context-manifest", str(context_path)
     )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
     assert report["status"] == "pass"
     assert report["context_mismatches"] == []
     assert report["emitted_context"] == CONTEXT
