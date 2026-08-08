@@ -1130,6 +1130,9 @@ RETV CKKS_SCALE_MANAGER::Handle_rotate(VISITOR* visitor, NODE_PTR node) {
 
 template <typename RETV, typename VISITOR>
 RETV CKKS_SCALE_MANAGER::Handle_rotate_batch(VISITOR* visitor, NODE_PTR node) {
+  if (node->Num_child() != 1 || node->Child(0) == air::base::Null_ptr) {
+    return RETV{SCALE_INFO(), node};
+  }
   SCALE_MNG_CTX& ctx   = visitor->Context();
   NODE_PTR       child = node->Child(0);
   RETV           retv0 = visitor->template Visit<RETV>(child);
@@ -1219,20 +1222,27 @@ RETV CKKS_SCALE_MANAGER::Handle_modswitch(VISITOR* visitor, NODE_PTR node) {
 
 template <typename RETV, typename VISITOR>
 RETV CKKS_SCALE_MANAGER::Handle_raise_mod(VISITOR* visitor, NODE_PTR node) {
+  if (node->Num_child() != 2 || node->Child(0) == air::base::Null_ptr ||
+      node->Child(1) == air::base::Null_ptr) {
+    return RETV{SCALE_INFO(), node};
+  }
   SCALE_MNG_CTX& ctx = visitor->Context();
   // child0: ciphertext operand
   RETV       retv0 = visitor->template Visit<RETV>(node->Child(0));
   SCALE_INFO si    = retv0.Scale_info();
   // child1: target level/mod size (constant/int expression)
   (void)visitor->template Visit<RETV>(node->Child(1));
-  // Raise_mod restores towers. Preserve scale degree but reset the rescale
-  // level according to the requested target modulus level.
-  NODE_PTR target = node->Child(1);
-  if (target->Opcode() == air::core::OPC_INTCONST) {
-    uint32_t q_cnt = ctx.Lower_ctx()->Get_ctx_param().Get_mul_level() + 1;
-    uint32_t raised_level = target->Intconst();
-    AIR_ASSERT_MSG(raised_level <= q_cnt, "raise_mod target exceeds q count");
-    si.Set_rescale_level(q_cnt - raised_level);
+  // Preserve the scale degree, but make the level coordinate describe the
+  // requested active data-Q tower. The Phantom legality verifier rejects a
+  // nonconstant, out-of-range, or partial v1 target.
+  if (node->Child(1)->Opcode() == air::core::OPC_INTCONST) {
+    const uint64_t target_q_count = node->Child(1)->Intconst();
+    const uint32_t full_q_count =
+        ctx.Lower_ctx()->Get_ctx_param().Get_mul_level();
+    if (target_q_count >= 1 && target_q_count <= full_q_count) {
+      const uint32_t q_coordinate_count = full_q_count + 1;
+      si.Set_rescale_level(q_coordinate_count - target_q_count);
+    }
   }
   ctx.Set_node_scale_info(node, si);
   return RETV{si, node};
@@ -1240,6 +1250,9 @@ RETV CKKS_SCALE_MANAGER::Handle_raise_mod(VISITOR* visitor, NODE_PTR node) {
 
 template <typename RETV, typename VISITOR>
 RETV CKKS_SCALE_MANAGER::Handle_conjugate(VISITOR* visitor, NODE_PTR node) {
+  if (node->Num_child() != 1 || node->Child(0) == air::base::Null_ptr) {
+    return RETV{SCALE_INFO(), node};
+  }
   SCALE_MNG_CTX& ctx  = visitor->Context();
   RETV           retv = visitor->template Visit<RETV>(node->Child(0));
   SCALE_INFO     si   = retv.Scale_info();
@@ -1250,6 +1263,10 @@ RETV CKKS_SCALE_MANAGER::Handle_conjugate(VISITOR* visitor, NODE_PTR node) {
 
 template <typename RETV, typename VISITOR>
 RETV CKKS_SCALE_MANAGER::Handle_mul_mono(VISITOR* visitor, NODE_PTR node) {
+  if (node->Num_child() != 2 || node->Child(0) == air::base::Null_ptr ||
+      node->Child(1) == air::base::Null_ptr) {
+    return RETV{SCALE_INFO(), node};
+  }
   SCALE_MNG_CTX& ctx = visitor->Context();
   // child0: ciphertext, child1: monomial power
   RETV       retv0 = visitor->template Visit<RETV>(node->Child(0));

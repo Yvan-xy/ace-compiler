@@ -27,6 +27,14 @@ namespace ckks {
 
 class IR2C_HANDLER : public INVALID_HANDLER {
 public:
+  [[noreturn]] static void Retained_diagnostic(air::base::NODE_PTR node,
+                                               const char* message) {
+    throw std::runtime_error(
+        std::string("CKKS2C malformed retained operation: ") + message +
+        " [opcode=" + node->Name() + ", AIR=node#" +
+        std::to_string(node->Id().Value()) + "]");
+  }
+
   template <typename RETV, typename VISITOR>
   void Handle_add(VISITOR* visitor, air::base::NODE_PTR node) {
     IR2C_CTX&           ctx    = visitor->Context();
@@ -123,12 +131,28 @@ public:
     IR2C_CTX&           ctx    = visitor->Context();
     air::base::NODE_PTR parent = ctx.Parent(1);
 
-    AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
-    AIR_ASSERT(parent->Addr_datum()->Type()->Is_array());
+    if (node->Num_child() != 1 ||
+        node->Child(0) == air::base::Null_ptr) {
+      Retained_diagnostic(node,
+                          "rotate_batch requires exactly one operand");
+    }
+    if (parent == air::base::Null_ptr || !parent->Is_st()) {
+      Retained_diagnostic(node, "rotate_batch requires a store destination");
+    }
+    if (!parent->Addr_datum()->Type()->Is_array()) {
+      Retained_diagnostic(node,
+                          "rotate_batch destination must be an array");
+    }
     uint32_t   rot_count = 0;
     const int* rotations =
         node->Attr<int>(nn::core::ATTR::RNUM, &rot_count);
-    AIR_ASSERT(rotations != nullptr && rot_count > 0);
+    if (rotations == nullptr || rot_count == 0) {
+      Retained_diagnostic(node,
+                          "rotate_batch requires a nonempty ordered RNUM");
+    }
+    if (ctx.Provider() == core::PROVIDER::PHANTOM) {
+      ctx.Observe_phantom_rotation_batch(rotations, rot_count);
+    }
     ctx << "{ static const int32_t _rot_batch_" << parent->Id().Value()
         << "[] = {";
     for (uint32_t i = 0; i < rot_count; ++i) {
@@ -190,7 +214,22 @@ public:
     IR2C_CTX&           ctx    = visitor->Context();
     air::base::NODE_PTR parent = ctx.Parent(1);
 
-    AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
+    if (node->Num_child() != 2 ||
+        node->Child(0) == air::base::Null_ptr ||
+        node->Child(1) == air::base::Null_ptr) {
+      Retained_diagnostic(node,
+                          "raise_mod requires ciphertext and target operands");
+    }
+    if (parent == air::base::Null_ptr || !parent->Is_st()) {
+      Retained_diagnostic(node, "raise_mod requires a store destination");
+    }
+    if (ctx.Provider() == core::PROVIDER::PHANTOM) {
+      if (node->Child(1)->Opcode() != air::core::OPC_INTCONST) {
+        Retained_diagnostic(
+            node, "raise_mod requires a constant target_q_count");
+      }
+      ctx.Require_phantom_raise_mod();
+    }
     ctx << "Raise_mod(&";
     ctx.Emit_st_var(parent);
     ctx << ", ";
@@ -198,7 +237,8 @@ public:
     ctx << ", ";
     const uint32_t* runtime_raise =
         node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::RUNTIME_RAISE_LEVEL);
-    if (runtime_raise != nullptr && *runtime_raise != 0 &&
+    if (ctx.Provider() != core::PROVIDER::PHANTOM &&
+        runtime_raise != nullptr && *runtime_raise != 0 &&
         ctx.Raise_mod_level_func()[0] != '\0') {
       ctx << ctx.Raise_mod_level_func() << "()";
     } else {
@@ -212,7 +252,17 @@ public:
     IR2C_CTX&           ctx    = visitor->Context();
     air::base::NODE_PTR parent = ctx.Parent(1);
 
-    AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
+    if (node->Num_child() != 1 ||
+        node->Child(0) == air::base::Null_ptr) {
+      Retained_diagnostic(node,
+                          "conjugate requires exactly one operand");
+    }
+    if (parent == air::base::Null_ptr || !parent->Is_st()) {
+      Retained_diagnostic(node, "conjugate requires a store destination");
+    }
+    if (ctx.Provider() == core::PROVIDER::PHANTOM) {
+      ctx.Require_phantom_conjugation_key();
+    }
     ctx << "Conjugate_ciph(&";
     ctx.Emit_st_var(parent);
     ctx << ", ";
@@ -225,13 +275,30 @@ public:
     IR2C_CTX&           ctx    = visitor->Context();
     air::base::NODE_PTR parent = ctx.Parent(1);
 
-    AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
+    if (node->Num_child() != 2 ||
+        node->Child(0) == air::base::Null_ptr ||
+        node->Child(1) == air::base::Null_ptr) {
+      Retained_diagnostic(node,
+                          "mul_mono requires ciphertext and power operands");
+    }
+    if (parent == air::base::Null_ptr || !parent->Is_st()) {
+      Retained_diagnostic(node, "mul_mono requires a store destination");
+    }
     ctx << "Mul_mono_ciph(&";
     ctx.Emit_st_var(parent);
     ctx << ", ";
     visitor->template Visit<RETV>(node->Child(0));
     ctx << ", ";
-    visitor->template Visit<RETV>(node->Child(1));
+    if (ctx.Provider() == core::PROVIDER::PHANTOM) {
+      if (node->Child(1)->Opcode() != air::core::OPC_INTCONST) {
+        Retained_diagnostic(node,
+                            "mul_mono requires a constant monomial power");
+      }
+      ctx << ctx.Require_phantom_monomial_power(
+          node->Child(1)->Intconst());
+    } else {
+      visitor->template Visit<RETV>(node->Child(1));
+    }
     ctx << ")";
   }
 

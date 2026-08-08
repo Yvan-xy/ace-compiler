@@ -135,7 +135,9 @@ def ckks_rotate_batch(ct: AIRValue, rotations: list[int]) -> AIRValue:
     if hasattr(container, 'new_ckks_rotate_batch'):
         result_node = container.new_ckks_rotate_batch(ct.value, rotations)
     else:
-        return ct
+        raise NotImplementedError(
+            "Container does not support rotate_batch operation"
+        )
     return AIRValue(result_node, container, shape=(len(rotations),))
 
 
@@ -270,7 +272,7 @@ def ckks_conjugate(ct: AIRValue) -> AIRValue:
     if hasattr(container, 'new_ckks_conjugate'):
         result_node = container.new_ckks_conjugate(ct.value)
     else:
-        return ct
+        raise NotImplementedError("Container does not support conjugate operation")
 
     return AIRValue(result_node, container)
 
@@ -291,18 +293,18 @@ def ckks_mul_mono(ct: AIRValue, power: int) -> AIRValue:
     if hasattr(container, 'new_ckks_mul_mono'):
         result_node = container.new_ckks_mul_mono(ct.value, int(power))
     else:
-        return ct
+        raise NotImplementedError("Container does not support mul_mono operation")
 
     return AIRValue(result_node, container)
 
 
-def ckks_raise_mod(ct: AIRValue, mod_size: int) -> AIRValue:
+def ckks_raise_mod(ct: AIRValue, target_q_count: int) -> AIRValue:
     """
     CKKS modulus raising operation.
 
     Args:
         ct: Input ciphertext
-        mod_size: Target modulus size/level
+        target_q_count: Exact number of data-Q moduli in the result
 
     Returns:
         AIRValue representing raised ciphertext
@@ -310,8 +312,10 @@ def ckks_raise_mod(ct: AIRValue, mod_size: int) -> AIRValue:
     container = ct.container
 
     if hasattr(container, 'new_ckks_raise_mod'):
-        result_node = container.new_ckks_raise_mod(ct.value, int(mod_size))
+        result_node = container.new_ckks_raise_mod(
+            ct.value, int(target_q_count)
+        )
     else:
-        return ct
+        raise NotImplementedError("Container does not support raise_mod operation")
 
     return AIRValue(result_node, container)

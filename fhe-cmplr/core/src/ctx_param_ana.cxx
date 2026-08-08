@@ -412,6 +412,17 @@ R_CODE CTX_PARAM_ANA::Run() {
   if (ana_ctx.Relin_key_required()) {
     ctx_param.Require_relin_key();
   }
+  if (ana_ctx.Conjugation_key_required()) {
+    ctx_param.Require_conjugation_key();
+  }
+  if (ana_ctx.Rotate_batch_required()) {
+    ctx_param.Require_rotate_batch();
+    ctx_param.Add_rotate_batches(ana_ctx.Get_rotate_batches());
+  }
+  if (ana_ctx.Raise_mod_required()) {
+    ctx_param.Require_raise_mod();
+  }
+  ctx_param.Add_monomial_powers(ana_ctx.Get_monomial_powers());
 
   // 4. update CTX_PARAM with Config
   R_CODE res = Update_ctx_param_with_config();

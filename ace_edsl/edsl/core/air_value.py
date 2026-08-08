@@ -1016,27 +1016,25 @@ class AIRValue:
         return self._flatten_result(result_node)
 
     def raise_mod(
-        self, mod_size: int, runtime_raise_level: bool = False
+        self, target_q_count: int, runtime_raise_level: bool = False
     ) -> 'AIRValue':
         """
         Emit CKKS raise_mod operation.
 
         Args:
-            mod_size: Target modulus size/level parameter used by compiler
-                analysis
-            runtime_raise_level: Emit the C raise target through the configured
-                runtime helper while preserving mod_size in AIR metadata
+            target_q_count: Exact number of data-Q moduli in the result
+            runtime_raise_level: Preserve the legacy ANT runtime-helper
+                attribute. The Phantom terminal verifier rejects this mode.
 
         Returns:
             AIRValue representing raised ciphertext
         """
         self._set_loc()
         self_node = self.value
-        mod_size = int(mod_size)
-
+        target_q_count = int(target_q_count)
         if hasattr(self._container, 'new_ckks_raise_mod'):
             result_node = self._container.new_ckks_raise_mod(
-                self_node, mod_size, runtime_raise_level
+                self_node, target_q_count, runtime_raise_level
             )
         else:
             raise NotImplementedError("Container does not support raise_mod operation")

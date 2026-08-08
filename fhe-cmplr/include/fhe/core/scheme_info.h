@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <iostream>
 #include <set>
+#include <vector>
 
 #include "air/util/debug.h"
 
@@ -100,6 +101,34 @@ public:
   }
   void Require_relin_key() { _relin_key_required = true; }
   bool Relin_key_required() const { return _relin_key_required; }
+  void Require_conjugation_key() { _conjugation_key_required = true; }
+  bool Conjugation_key_required() const {
+    return _conjugation_key_required;
+  }
+  void Require_rotate_batch() { _rotate_batch_required = true; }
+  bool Rotate_batch_required() const { return _rotate_batch_required; }
+  void Add_rotate_batch(const std::vector<int32_t>& steps) {
+    _rotate_batch_required = true;
+    _rotate_batches.push_back(steps);
+  }
+  void Add_rotate_batches(
+      const std::vector<std::vector<int32_t>>& batches) {
+    if (!batches.empty()) _rotate_batch_required = true;
+    _rotate_batches.insert(_rotate_batches.end(), batches.begin(),
+                           batches.end());
+  }
+  const std::vector<std::vector<int32_t>>& Get_rotate_batches() const {
+    return _rotate_batches;
+  }
+  void Require_raise_mod() { _raise_mod_required = true; }
+  bool Raise_mod_required() const { return _raise_mod_required; }
+  void Add_monomial_power(uint32_t power) { _monomial_powers.insert(power); }
+  void Add_monomial_powers(const std::set<uint32_t>& powers) {
+    _monomial_powers.insert(powers.begin(), powers.end());
+  }
+  const std::set<uint32_t>& Get_monomial_powers() const {
+    return _monomial_powers;
+  }
   void     Set_input_level(uint32_t lev) { _input_level = lev; }
   uint32_t Get_input_level(void) const { return _input_level; }
   uint32_t Get_tot_prime_num() const {
@@ -143,7 +172,12 @@ private:
   uint32_t          _q_part_num             = 0;
   uint32_t          _hamming_weight         = 0;
   bool              _relin_key_required     = false;
+  bool              _conjugation_key_required = false;
+  bool              _rotate_batch_required  = false;
+  bool              _raise_mod_required     = false;
   std::set<int32_t> _rotate_index;
+  std::vector<std::vector<int32_t>> _rotate_batches;
+  std::set<uint32_t> _monomial_powers;
 };
 
 }  // namespace core

@@ -52,6 +52,15 @@ bool Fail(const std::string& message, std::string* diagnostic) {
   return false;
 }
 
+bool Fail_node(NODE_PTR node, const std::string& message,
+               std::string* diagnostic) {
+  std::ostringstream os;
+  os << message << " [opcode="
+     << air::base::META_INFO::Op_name(node->Opcode())
+     << ", AIR=node#" << node->Id().Value() << ']';
+  return Fail(os.str(), diagnostic);
+}
+
 bool Has_record_name(TYPE_PTR type, const char* expected) {
   if (type == air::base::Null_ptr || !type->Is_record() ||
       type->Name() == air::base::Null_ptr) {
@@ -279,7 +288,6 @@ bool Verify_static_add_sub_metadata(NODE_PTR node, CKKS_OPERATOR op,
 }
 
 bool Verify_phantom_binary(NODE_PTR node, CKKS_OPERATOR op,
-                           bool strict_ordinary_metadata,
                            std::string* diagnostic) {
   if (node->Num_child() != 2) {
     std::ostringstream os;
@@ -320,12 +328,241 @@ bool Verify_phantom_binary(NODE_PTR node, CKKS_OPERATOR op,
           "operand";
     return Fail(os.str(), diagnostic);
   }
-  if (strict_ordinary_metadata &&
-      (op == CKKS_OPERATOR::ADD || op == CKKS_OPERATOR::SUB) &&
+  if ((op == CKKS_OPERATOR::ADD || op == CKKS_OPERATOR::SUB) &&
       rhs_kind != OPERAND_KIND::FLOAT_SCALAR) {
     return Verify_static_add_sub_metadata(node, op, diagnostic);
   }
   return true;
+}
+
+bool Verify_preserved_metadata(NODE_PTR node, NODE_PTR input,
+                               std::string* diagnostic) {
+  const char* metadata[] = {core::FHE_ATTR_KIND::LEVEL,
+                            core::FHE_ATTR_KIND::SCALE,
+                            core::FHE_ATTR_KIND::RESCALE_LEVEL};
+  for (const char* attr_name : metadata) {
+    const uint32_t* input_value = input->Attr<uint32_t>(attr_name);
+    const uint32_t* result_value = node->Attr<uint32_t>(attr_name);
+    if (input_value == nullptr || result_value == nullptr ||
+        *input_value != *result_value) {
+      std::ostringstream os;
+      os << "Phantom CKKS2C retained operation must preserve " << attr_name
+         << " metadata: observed input="
+         << (input_value == nullptr ? "missing" : std::to_string(*input_value))
+         << ", result="
+         << (result_value == nullptr ? "missing"
+                                     : std::to_string(*result_value));
+      return Fail_node(node, os.str(), diagnostic);
+    }
+  }
+  return true;
+}
+
+bool Verify_raise_metadata(NODE_PTR node, NODE_PTR input, uint32_t full_q,
+                           uint32_t target_q_count,
+                           std::string* diagnostic) {
+  const uint32_t* input_scale =
+      input->Attr<uint32_t>(core::FHE_ATTR_KIND::SCALE);
+  const uint32_t* result_scale =
+      node->Attr<uint32_t>(core::FHE_ATTR_KIND::SCALE);
+  if (input_scale == nullptr || result_scale == nullptr ||
+      *input_scale != *result_scale) {
+    std::ostringstream os;
+    os << "Phantom CKKS2C raise_mod must preserve SCALE metadata: observed "
+       << "input="
+       << (input_scale == nullptr ? "missing" : std::to_string(*input_scale))
+       << ", result="
+       << (result_scale == nullptr ? "missing"
+                                   : std::to_string(*result_scale));
+    return Fail_node(node, os.str(), diagnostic);
+  }
+
+  const uint32_t* input_rescale =
+      input->Attr<uint32_t>(core::FHE_ATTR_KIND::RESCALE_LEVEL);
+  const uint32_t* result_rescale =
+      node->Attr<uint32_t>(core::FHE_ATTR_KIND::RESCALE_LEVEL);
+  // RESCALE_LEVEL uses ACE's Q-coordinate count, which has the full data-Q
+  // count plus the level-zero coordinate. Thus bottom-Q is full_q and a
+  // target with k active Q moduli is (full_q + 1 - k).
+  const uint32_t q_coordinate_count = full_q + 1;
+  const uint32_t expected_input_rescale = full_q;
+  const uint32_t expected_result_rescale =
+      q_coordinate_count - target_q_count;
+  if (input_rescale == nullptr || result_rescale == nullptr ||
+      *input_rescale != expected_input_rescale ||
+      *result_rescale != expected_result_rescale) {
+    std::ostringstream os;
+    os << "Phantom CKKS2C raise_mod level coordinates disagree: observed "
+       << "input RESCALE_LEVEL="
+       << (input_rescale == nullptr ? "missing"
+                                    : std::to_string(*input_rescale))
+       << ", result RESCALE_LEVEL="
+       << (result_rescale == nullptr ? "missing"
+                                     : std::to_string(*result_rescale))
+       << "; expected input=" << expected_input_rescale
+       << ", result=" << expected_result_rescale;
+    return Fail_node(node, os.str(), diagnostic);
+  }
+  return true;
+}
+
+bool Verify_retained_cipher_result(NODE_PTR node, NODE_PTR input,
+                                   std::string* diagnostic) {
+  if (input == air::base::Null_ptr ||
+      Operand_kind(input->Rtype()) != OPERAND_KIND::CIPHER ||
+      Operand_kind(node->Rtype()) != OPERAND_KIND::CIPHER ||
+      input->Rtype_id() != node->Rtype_id()) {
+    return Fail_node(
+        node,
+        "Phantom CKKS2C retained operation requires matching CIPHERTEXT "
+        "input/result types",
+        diagnostic);
+  }
+  return Verify_preserved_metadata(node, input, diagnostic);
+}
+
+bool Verify_phantom_conjugate(NODE_PTR node, std::string* diagnostic) {
+  if (node->Num_child() != 1) {
+    return Fail_node(node,
+                     "Phantom CKKS2C conjugate requires exactly one operand",
+                     diagnostic);
+  }
+  return Verify_retained_cipher_result(node, node->Child(0), diagnostic);
+}
+
+bool Verify_phantom_rotate_batch(NODE_PTR node, std::string* diagnostic) {
+  if (node->Num_child() != 1) {
+    return Fail_node(
+        node, "Phantom CKKS2C rotate_batch requires exactly one operand",
+        diagnostic);
+  }
+  if (node->Child(0) == air::base::Null_ptr ||
+      Operand_kind(node->Child(0)->Rtype()) != OPERAND_KIND::CIPHER) {
+    return Fail_node(node,
+                     "Phantom CKKS2C rotate_batch requires a CIPHERTEXT "
+                     "operand",
+                     diagnostic);
+  }
+  TYPE_PTR result_type = node->Rtype();
+  uint32_t count = 0;
+  const int* rotations = node->Attr<int>(nn::core::ATTR::RNUM, &count);
+  if (rotations == nullptr || count == 0) {
+    return Fail_node(node,
+                     "Phantom CKKS2C rotate_batch requires a constant, "
+                     "non-empty ordered RNUM attribute",
+                     diagnostic);
+  }
+  if (result_type == air::base::Null_ptr || !result_type->Is_array() ||
+      result_type->Cast_to_arr()->Dim() != 1 ||
+      result_type->Cast_to_arr()->Elem_count() != count ||
+      Operand_kind(result_type->Cast_to_arr()->Elem_type()) !=
+          OPERAND_KIND::CIPHER ||
+      result_type->Cast_to_arr()->Elem_type_id() !=
+          node->Child(0)->Rtype_id()) {
+    return Fail_node(
+        node,
+        "Phantom CKKS2C rotate_batch requires a one-dimensional "
+        "CIPHERTEXT array whose exact length matches RNUM",
+        diagnostic);
+  }
+  return Verify_preserved_metadata(node, node->Child(0), diagnostic);
+}
+
+bool Verify_phantom_raise_mod(NODE_PTR node,
+                              const PHANTOM_CONTEXT_DESCRIPTOR& context,
+                              std::string* diagnostic) {
+  if (node->Attr<uint32_t>(core::FHE_ATTR_KIND::RUNTIME_RAISE_LEVEL) !=
+      nullptr) {
+    return Fail_node(
+        node,
+        "Phantom CKKS2C raise_mod forbids runtime target-level helpers",
+        diagnostic);
+  }
+  if (node->Num_child() != 2 ||
+      node->Child(1) == air::base::Null_ptr ||
+      node->Child(1)->Opcode() != air::core::OPC_INTCONST) {
+    return Fail_node(
+        node,
+        "Phantom CKKS2C raise_mod requires a constant target_q_count",
+        diagnostic);
+  }
+  const int64_t target = node->Child(1)->Intconst();
+  const int64_t full_q = static_cast<int64_t>(context._data_q_bit_sizes.size());
+  if (target < 1 || target > full_q) {
+    std::ostringstream os;
+    os << "Phantom CKKS2C raise_mod target_q_count must be in [1, "
+       << full_q << "], got " << target;
+    return Fail_node(node, os.str(), diagnostic);
+  }
+  if (target != full_q) {
+    std::ostringstream os;
+    os << "Phantom CKKS2C raise_mod v1 requires the full data-Q count "
+       << full_q << ", got " << target;
+    return Fail_node(node, os.str(), diagnostic);
+  }
+  NODE_PTR input = node->Child(0);
+  if (input == air::base::Null_ptr ||
+      Operand_kind(input->Rtype()) != OPERAND_KIND::CIPHER ||
+      Operand_kind(node->Rtype()) != OPERAND_KIND::CIPHER ||
+      input->Rtype_id() != node->Rtype_id()) {
+    return Fail_node(
+        node,
+        "Phantom CKKS2C raise_mod requires matching CIPHERTEXT input/result "
+        "types",
+        diagnostic);
+  }
+  const uint32_t* input_level =
+      input->Attr<uint32_t>(core::FHE_ATTR_KIND::LEVEL);
+  const uint32_t* result_level =
+      node->Attr<uint32_t>(core::FHE_ATTR_KIND::LEVEL);
+  if (input_level == nullptr || *input_level != 1) {
+    return Fail_node(node,
+                     "Phantom CKKS2C raise_mod requires a bottom one-Q input "
+                     "with LEVEL=1",
+                     diagnostic);
+  }
+  if (result_level == nullptr || *result_level != target) {
+    std::ostringstream os;
+    os << "Phantom CKKS2C raise_mod result LEVEL must equal target_q_count "
+       << target;
+    return Fail_node(node, os.str(), diagnostic);
+  }
+  return Verify_raise_metadata(node, input, static_cast<uint32_t>(full_q),
+                               static_cast<uint32_t>(target), diagnostic);
+}
+
+bool Verify_phantom_mul_mono(NODE_PTR node,
+                             const PHANTOM_CONTEXT_DESCRIPTOR& context,
+                             std::string* diagnostic) {
+  if (node->Num_child() != 2 ||
+      node->Child(1) == air::base::Null_ptr ||
+      node->Child(1)->Opcode() != air::core::OPC_INTCONST) {
+    return Fail_node(node,
+                     "Phantom CKKS2C mul_mono requires a constant monomial "
+                     "power",
+                     diagnostic);
+  }
+  uint32_t rnum_count = 0;
+  if (node->Attr<int>(nn::core::ATTR::RNUM, &rnum_count) != nullptr) {
+    return Fail_node(node,
+                     "Phantom CKKS2C mul_mono forbids rotation RNUM metadata",
+                     diagnostic);
+  }
+  if (context._poly_degree == 0) {
+    return Fail_node(node,
+                     "Phantom CKKS2C mul_mono requires a nonzero polynomial "
+                     "degree",
+                     diagnostic);
+  }
+  const int64_t power = node->Child(1)->Intconst();
+  const int64_t period = static_cast<int64_t>(context._poly_degree) * 2;
+  if (power < 0 || power >= period) {
+    std::ostringstream os;
+    os << "Phantom CKKS2C mul_mono power must be normalized into [0, "
+       << period << "), got " << power;
+    return Fail_node(node, os.str(), diagnostic);
+  }
+  return Verify_retained_cipher_result(node, node->Child(0), diagnostic);
 }
 
 bool Verify_phantom_rotate(NODE_PTR node, std::string* diagnostic) {
@@ -396,7 +633,6 @@ bool Verify_phantom_modulus_drop(NODE_PTR node, CKKS_OPERATOR op,
 bool Verify_ckks_node(NODE_PTR node,
                       const PHANTOM_CONTEXT_DESCRIPTOR& context,
                       core::PROVIDER provider,
-                      bool strict_ordinary_metadata,
                       std::string* diagnostic) {
   CKKS_OPERATOR op = static_cast<CKKS_OPERATOR>(node->Operator());
   if (provider == core::PROVIDER::PHANTOM) {
@@ -420,8 +656,7 @@ bool Verify_ckks_node(NODE_PTR node,
       case CKKS_OPERATOR::ADD:
       case CKKS_OPERATOR::SUB:
       case CKKS_OPERATOR::MUL:
-        return Verify_phantom_binary(node, op, strict_ordinary_metadata,
-                                     diagnostic);
+        return Verify_phantom_binary(node, op, diagnostic);
       case CKKS_OPERATOR::ROTATE:
         return Verify_phantom_rotate(node, diagnostic);
       case CKKS_OPERATOR::RELIN:
@@ -429,6 +664,14 @@ bool Verify_ckks_node(NODE_PTR node,
       case CKKS_OPERATOR::RESCALE:
       case CKKS_OPERATOR::MODSWITCH:
         return Verify_phantom_modulus_drop(node, op, diagnostic);
+      case CKKS_OPERATOR::CONJUGATE:
+        return Verify_phantom_conjugate(node, diagnostic);
+      case CKKS_OPERATOR::ROTATE_BATCH:
+        return Verify_phantom_rotate_batch(node, diagnostic);
+      case CKKS_OPERATOR::RAISE_MOD:
+        return Verify_phantom_raise_mod(node, context, diagnostic);
+      case CKKS_OPERATOR::MUL_MONO:
+        return Verify_phantom_mul_mono(node, context, diagnostic);
       default:
         break;
     }
@@ -502,7 +745,6 @@ bool Verify_ckks_node(NODE_PTR node,
 bool Verify_node(NODE_PTR node,
                  const PHANTOM_CONTEXT_DESCRIPTOR& context,
                  core::PROVIDER provider,
-                 bool strict_ordinary_metadata,
                  std::string* diagnostic) {
   if (node == air::base::Null_ptr) {
     return true;
@@ -511,57 +753,24 @@ bool Verify_node(NODE_PTR node,
     return Fail("CKKS2C input contains forbidden POLY AIR", diagnostic);
   }
   if (node->Domain() == CKKS_DOMAIN::ID &&
-      !Verify_ckks_node(node, context, provider, strict_ordinary_metadata,
-                        diagnostic)) {
+      !Verify_ckks_node(node, context, provider, diagnostic)) {
     return false;
   }
   if (node->Is_block()) {
     for (air::base::STMT_PTR stmt = node->Begin_stmt();
          stmt != node->End_stmt(); stmt = stmt->Next()) {
-      if (!Verify_node(stmt->Node(), context, provider,
-                       strict_ordinary_metadata, diagnostic)) {
+      if (!Verify_node(stmt->Node(), context, provider, diagnostic)) {
         return false;
       }
     }
     return true;
   }
   for (uint32_t i = 0; i < node->Num_child(); ++i) {
-    if (!Verify_node(node->Child(i), context, provider,
-                     strict_ordinary_metadata, diagnostic)) {
+    if (!Verify_node(node->Child(i), context, provider, diagnostic)) {
       return false;
     }
   }
   return true;
-}
-
-bool Contains_retained_operator(NODE_PTR node) {
-  if (node == air::base::Null_ptr) {
-    return false;
-  }
-  if (node->Domain() == CKKS_DOMAIN::ID) {
-    CKKS_OPERATOR op = static_cast<CKKS_OPERATOR>(node->Operator());
-    if (op == CKKS_OPERATOR::CONJUGATE ||
-        op == CKKS_OPERATOR::ROTATE_BATCH ||
-        op == CKKS_OPERATOR::RAISE_MOD ||
-        op == CKKS_OPERATOR::MUL_MONO) {
-      return true;
-    }
-  }
-  if (node->Is_block()) {
-    for (air::base::STMT_PTR stmt = node->Begin_stmt();
-         stmt != node->End_stmt(); stmt = stmt->Next()) {
-      if (Contains_retained_operator(stmt->Node())) {
-        return true;
-      }
-    }
-    return false;
-  }
-  for (uint32_t i = 0; i < node->Num_child(); ++i) {
-    if (Contains_retained_operator(node->Child(i))) {
-      return true;
-    }
-  }
-  return false;
 }
 
 }  // namespace
@@ -589,12 +798,7 @@ bool CKKS2C_VERIFIER::Verify(air::base::GLOB_SCOPE* glob,
   for (air::base::GLOB_SCOPE::FUNC_SCOPE_ITER it = glob->Begin_func_scope();
        it != glob->End_func_scope(); ++it) {
     NODE_PTR entry = (*it).Container().Entry_node();
-    // Retained operators are preserved only for the earlier source-generation
-    // gate. Their scale/level flow is intentionally not qualified until the
-    // later retained-operator work; ordinary-only functions remain strict.
-    bool strict_ordinary_metadata = !Contains_retained_operator(entry);
-    if (!Verify_node(entry, context, provider, strict_ordinary_metadata,
-                     diagnostic)) {
+    if (!Verify_node(entry, context, provider, diagnostic)) {
       return false;
     }
   }
@@ -651,6 +855,20 @@ bool CKKS2C_VERIFIER::Verify_source(const std::string& source,
       break;
     }
   }
+  const std::regex batch_steps(
+      R"(phantom_rotation_batch_steps\s*\[\s*\]\s*=\s*\{([^}]*)\})");
+  std::smatch batch_match;
+  if (std::regex_search(source, batch_match, batch_steps)) {
+    const std::regex integer(R"((-?[0-9]+))");
+    const std::string values = batch_match[1].str();
+    for (std::sregex_iterator it(values.begin(), values.end(), integer), end;
+         it != end; ++it) {
+      if (std::stoll((*it)[1].str()) != 0) {
+        has_nonzero_rotate_call = true;
+        break;
+      }
+    }
+  }
   bool requests_rotation_keys =
       source.find("PHANTOM_RESOURCE_ROTATION_KEYS") != std::string::npos;
   if (has_nonzero_rotate_call && !requests_rotation_keys) {
@@ -664,6 +882,30 @@ bool CKKS2C_VERIFIER::Verify_source(const std::string& source,
         "Phantom CKKS2C source requests PHANTOM_RESOURCE_ROTATION_KEYS "
         "without a nonzero Rotate_ciph call",
         diagnostic);
+  }
+
+  const struct {
+    const char* call;
+    const char* flag;
+    const char* description;
+  } retained_resources[] = {
+      {"Conjugate_ciph(", "PHANTOM_RESOURCE_CONJUGATION_KEY",
+       "conjugation"},
+      {"Rotate_batch_ciph(", "PHANTOM_RESOURCE_ROTATE_BATCH",
+       "rotate_batch"},
+      {"Raise_mod(", "PHANTOM_RESOURCE_RAISE_MOD", "raise_mod"},
+      {"Mul_mono_ciph(", "PHANTOM_RESOURCE_MONOMIALS", "mul_mono"},
+  };
+  for (const auto& resource : retained_resources) {
+    const bool has_call = source.find(resource.call) != std::string::npos;
+    const bool has_flag = source.find(resource.flag) != std::string::npos;
+    if (has_call != has_flag) {
+      std::ostringstream os;
+      os << "Phantom CKKS2C source " << resource.description
+         << (has_call ? " call has no matching " : " flag has no matching ")
+         << (has_call ? resource.flag : resource.call);
+      return Fail(os.str(), diagnostic);
+    }
   }
 
   const std::vector<std::pair<const char*, const char*>> forbidden = {

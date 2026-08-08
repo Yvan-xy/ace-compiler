@@ -6,6 +6,10 @@
 //
 //=============================================================================
 
+#include <algorithm>
+#include <regex>
+#include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -15,6 +19,8 @@
 #include "air/core/opcode.h"
 #include "ckks2c_verifier.h"
 #include "fhe/ckks/ckks_gen.h"
+#include "fhe/ckks/ckks2c_config.h"
+#include "fhe/ckks/ckks2c_driver.h"
 #include "fhe/ckks/ckks_opcode.h"
 #include "fhe/ckks/phantom_context_manifest.h"
 #include "fhe/core/ctx_param_ana.h"
@@ -63,6 +69,82 @@ TEST(CKKS2COrdinaryContract, TracksRelinearizationRequirementSeparately) {
   EXPECT_FALSE(param.Relin_key_required());
   param.Require_relin_key();
   EXPECT_TRUE(param.Relin_key_required());
+}
+
+TEST(CKKS2COrdinaryContract, SeparatesRetainedResourceRequirements) {
+  fhe::core::CTX_PARAM parameters;
+  SetValidContextParameters(parameters);
+  parameters.Add_rotate_index(17);
+  parameters.Add_rotate_batch({0, -1, -1, 17});
+  parameters.Add_rotate_batch({3, 0});
+  parameters.Require_conjugation_key();
+  parameters.Require_raise_mod();
+  parameters.Add_monomial_power(0);
+  parameters.Add_monomial_power(63);
+
+  const auto context =
+      fhe::ckks::Build_phantom_context_descriptor(parameters);
+  const auto resources =
+      fhe::ckks::Build_phantom_resource_descriptor(parameters, context);
+
+  EXPECT_EQ(context._resource_schema_version, 2u);
+  EXPECT_EQ(resources._schema_version, 2u);
+  EXPECT_EQ(resources._rotation_steps,
+            (std::vector<int32_t>{-1, 1, 3}));
+  EXPECT_EQ(resources._rotation_batches,
+            (std::vector<std::vector<int32_t>>{{0, -1, -1, 17}, {3, 0}}));
+  EXPECT_EQ(resources._monomial_powers,
+            (std::vector<uint32_t>{0, 63}));
+  EXPECT_NE(resources._flags & fhe::ckks::PHANTOM_RESOURCE_CONJUGATION_KEY,
+            0u);
+  EXPECT_NE(resources._flags & fhe::ckks::PHANTOM_RESOURCE_ROTATE_BATCH, 0u);
+  EXPECT_NE(resources._flags & fhe::ckks::PHANTOM_RESOURCE_RAISE_MOD, 0u);
+  EXPECT_NE(resources._flags & fhe::ckks::PHANTOM_RESOURCE_MONOMIALS, 0u);
+  EXPECT_EQ(std::find(resources._rotation_steps.begin(),
+                      resources._rotation_steps.end(), 63),
+            resources._rotation_steps.end());
+
+  const std::string json =
+      fhe::ckks::Serialize_phantom_resource_descriptor(resources);
+  EXPECT_NE(json.find("\"conjugation_key\":true"), std::string::npos);
+  EXPECT_NE(json.find("\"rotate_batch\":true"), std::string::npos);
+  EXPECT_NE(json.find("\"rotation_batches\":[[0,-1,-1,17],[3,0]]"),
+            std::string::npos);
+  EXPECT_NE(json.find("\"raise_mod\":true"), std::string::npos);
+  EXPECT_NE(json.find("\"monomial_powers\":[0,63]"),
+            std::string::npos);
+}
+
+TEST(CKKS2COrdinaryContract, NormalizesSignedMonomialPowers) {
+  EXPECT_EQ(fhe::core::Normalize_monomial_power(-1, 32), 63u);
+  EXPECT_EQ(fhe::core::Normalize_monomial_power(64, 32), 0u);
+  EXPECT_EQ(fhe::core::Normalize_monomial_power(65, 32), 1u);
+}
+
+TEST(CKKS2COrdinaryContract, EmitsClosedEmptyResourceSchema) {
+  fhe::core::CTX_PARAM parameters;
+  SetValidContextParameters(parameters);
+  const auto context =
+      fhe::ckks::Build_phantom_context_descriptor(parameters);
+  const auto resources =
+      fhe::ckks::Build_phantom_resource_descriptor(parameters, context);
+  EXPECT_EQ(fhe::ckks::Serialize_phantom_resource_descriptor(resources),
+            "{\"context_schema_version\":1,\"conjugation_key\":false,"
+            "\"monomial_powers\":[],\"raise_mod\":false,"
+            "\"relinearization_key\":false,\"rotate_batch\":false,"
+            "\"rotation_batches\":[],\"rotation_steps\":[],"
+            "\"schema_version\":2}");
+}
+
+TEST(CKKS2COrdinaryContract, RejectsNoncanonicalManifestMonomialPower) {
+  fhe::core::CTX_PARAM parameters;
+  SetValidContextParameters(parameters);
+  parameters.Add_monomial_power(64);
+  const auto context =
+      fhe::ckks::Build_phantom_context_descriptor(parameters);
+  EXPECT_THROW(
+      fhe::ckks::Build_phantom_resource_descriptor(parameters, context),
+      std::invalid_argument);
 }
 
 TEST(CKKS2COrdinaryContract, DerivesContextFromCompilerParameters) {
@@ -296,13 +378,52 @@ protected:
         _container->New_ld(_cipher_input, _spos), plain, _spos);
   }
 
+  NODE_PTR Cipher_load(uint32_t level = 2, uint32_t scale = 1,
+                       uint32_t rescale_level = 0) {
+    NODE_PTR load = _container->New_ld(_cipher_input, _spos);
+    load->Set_attr(fhe::core::FHE_ATTR_KIND::LEVEL, &level, 1);
+    load->Set_attr(fhe::core::FHE_ATTR_KIND::SCALE, &scale, 1);
+    load->Set_attr(fhe::core::FHE_ATTR_KIND::RESCALE_LEVEL, &rescale_level, 1);
+    return load;
+  }
+
+  void Set_metadata(NODE_PTR node, uint32_t level = 2,
+                    uint32_t scale = 1, uint32_t rescale_level = 0) {
+    node->Set_attr(fhe::core::FHE_ATTR_KIND::LEVEL, &level, 1);
+    node->Set_attr(fhe::core::FHE_ATTR_KIND::SCALE, &scale, 1);
+    node->Set_attr(fhe::core::FHE_ATTR_KIND::RESCALE_LEVEL, &rescale_level, 1);
+  }
+
+  TYPE_PTR Cipher_array(const std::vector<int64_t>& dimensions) {
+    return _glob->New_arr_type(_glob->New_str("cipher_array"), _cipher,
+                               dimensions, _spos);
+  }
+
+  bool Contains_opcode(NODE_PTR node, OPCODE opcode) const {
+    if (node == Null_ptr) return false;
+    if (node->Opcode() == opcode) return true;
+    if (node->Is_block()) {
+      for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+           stmt = stmt->Next()) {
+        if (Contains_opcode(stmt->Node(), opcode)) return true;
+      }
+      return false;
+    }
+    for (uint32_t index = 0; index < node->Num_child(); ++index) {
+      if (Contains_opcode(node->Child(index), opcode)) return true;
+    }
+    return false;
+  }
+
   bool Verify(NODE_PTR expression, std::string* diagnostic) {
     ADDR_DATUM_PTR result =
-        _func_scope->New_var(_cipher, "result", _spos);
+        _func_scope->New_var(expression->Rtype(), "result", _spos);
     _container->Stmt_list().Append(
         _container->New_st(expression, result, _spos));
-    _container->Stmt_list().Append(
-        _container->New_retv(_container->New_ld(result, _spos), _spos));
+    NODE_PTR returned = expression->Rtype()->Is_array()
+                            ? _container->New_ld(_cipher_input, _spos)
+                            : _container->New_ld(result, _spos);
+    _container->Stmt_list().Append(_container->New_retv(returned, _spos));
     return CKKS2C_VERIFIER::Verify(_glob, _lower_ctx.Get_ctx_param(),
                                    PROVIDER::PHANTOM, diagnostic);
   }
@@ -500,6 +621,483 @@ TEST_F(CKKS2COrdinaryAirVerifier, RejectsMismatchedRotationAttribute) {
       diagnostic,
       "Phantom CKKS2C rotate requires one RNUM entry matching its constant "
       "step");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, CodegenDoesNotRepairMissingKeyResources) {
+  fhe::ckks::CKKS2C_CONFIG config;
+  config.Set_provider("phantom");
+  std::ostringstream output;
+  fhe::ckks::CKKS2C_DRIVER driver(output, _lower_ctx, config);
+
+  EXPECT_EQ(driver.Ctx().Phantom_resource_descriptor()._flags, 0u);
+  EXPECT_TRUE(
+      driver.Ctx().Phantom_resource_descriptor()._rotation_steps.empty());
+  EXPECT_THROW(driver.Ctx().Require_phantom_relinearization_key(),
+               std::runtime_error);
+  EXPECT_THROW(driver.Ctx().Require_phantom_rotation_key(1),
+               std::runtime_error);
+  EXPECT_EQ(driver.Ctx().Phantom_resource_descriptor()._flags, 0u);
+  EXPECT_TRUE(
+      driver.Ctx().Phantom_resource_descriptor()._rotation_steps.empty());
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, AcceptsRetainedConjugateMetadata) {
+  NODE_PTR conjugate =
+      _container->New_cust_node(fhe::ckks::OPC_CONJUGATE, _cipher, _spos);
+  conjugate->Set_child(0, Cipher_load(2, 3, 1));
+  Set_metadata(conjugate, 2, 3, 1);
+  std::string diagnostic;
+  EXPECT_TRUE(Verify(conjugate, &diagnostic)) << diagnostic;
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsRetainedMetadataMismatchWithNode) {
+  NODE_PTR conjugate =
+      _container->New_cust_node(fhe::ckks::OPC_CONJUGATE, _cipher, _spos);
+  conjugate->Set_child(0, Cipher_load(2, 3, 1));
+  Set_metadata(conjugate, 2, 4, 1);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(conjugate, &diagnostic));
+  EXPECT_NE(diagnostic.find("opcode="), std::string::npos);
+  EXPECT_NE(diagnostic.find("conjugate"), std::string::npos);
+  EXPECT_NE(diagnostic.find("AIR="), std::string::npos);
+  EXPECT_NE(diagnostic.find("SCALE"), std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsMissingRetainedResultMetadata) {
+  NODE_PTR conjugate =
+      _container->New_cust_node(fhe::ckks::OPC_CONJUGATE, _cipher, _spos);
+  conjugate->Set_child(0, Cipher_load(2, 3, 1));
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(conjugate, &diagnostic));
+  EXPECT_NE(diagnostic.find("must preserve LEVEL metadata"),
+            std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, DiagnosesMissingRetainedOperands) {
+  NODE_PTR conjugate =
+      _container->New_cust_node(fhe::ckks::OPC_CONJUGATE, _cipher, _spos);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(conjugate, &diagnostic));
+  EXPECT_NE(diagnostic.find("matching CIPHERTEXT input/result types"),
+            std::string::npos);
+  EXPECT_NE(diagnostic.find("opcode="), std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, DiagnosesRotateBatchMissingOperand) {
+  NODE_PTR batch = _container->New_cust_node(
+      fhe::ckks::OPC_ROTATE_BATCH, Cipher_array({1}), _spos);
+  const int32_t step = 0;
+  batch->Set_attr(nn::core::ATTR::RNUM, &step, 1);
+  Set_metadata(batch);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(batch, &diagnostic));
+  EXPECT_NE(diagnostic.find("requires a CIPHERTEXT operand"),
+            std::string::npos);
+  EXPECT_NE(diagnostic.find("opcode="), std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, DiagnosesRaiseMissingOperand) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR raise =
+      _container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, _cipher, _spos);
+  raise->Set_child(1, _container->New_intconst(u32, 4, _spos));
+  Set_metadata(raise, 4, 1, 1);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(raise, &diagnostic));
+  EXPECT_NE(diagnostic.find("matching CIPHERTEXT input/result types"),
+            std::string::npos);
+  EXPECT_NE(diagnostic.find("opcode="), std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, DiagnosesMulMonoMissingOperand) {
+  TYPE_PTR i64 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+  NODE_PTR mono =
+      _container->New_cust_node(fhe::ckks::OPC_MUL_MONO, _cipher, _spos);
+  mono->Set_child(1, _container->New_intconst(i64, 1, _spos));
+  Set_metadata(mono);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(mono, &diagnostic));
+  EXPECT_NE(diagnostic.find("matching CIPHERTEXT input/result types"),
+            std::string::npos);
+  EXPECT_NE(diagnostic.find("opcode="), std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsMissingRetainedMetadataOnBothNodes) {
+  NODE_PTR conjugate =
+      _container->New_cust_node(fhe::ckks::OPC_CONJUGATE, _cipher, _spos);
+  conjugate->Set_child(0, _container->New_ld(_cipher_input, _spos));
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(conjugate, &diagnostic));
+  EXPECT_NE(diagnostic.find("observed input=missing, result=missing"),
+            std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsRetainedResultTypeChange) {
+  NODE_PTR conjugate =
+      _container->New_cust_node(fhe::ckks::OPC_CONJUGATE, _plain, _spos);
+  conjugate->Set_child(0, Cipher_load());
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(Use_plain(conjugate), &diagnostic));
+  EXPECT_NE(diagnostic.find("matching CIPHERTEXT input/result types"),
+            std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RetainedOpDoesNotBypassOrdinaryMetadata) {
+  NODE_PTR conjugate =
+      _container->New_cust_node(fhe::ckks::OPC_CONJUGATE, _cipher, _spos);
+  conjugate->Set_child(0, Cipher_load(1, 1, 0));
+  Set_metadata(conjugate, 1, 1, 0);
+  NODE_PTR add = _container->New_bin_arith(
+      fhe::ckks::OPC_ADD, _cipher, conjugate, Cipher_load(2, 1, 0), _spos);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(add, &diagnostic));
+  EXPECT_EQ(diagnostic,
+            "Phantom CKKS2C add requires matching logical levels when "
+            "statically known: lhs=1, rhs=2");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, AcceptsOrderedRotateBatchWithDuplicatesAndZero) {
+  NODE_PTR batch = _container->New_cust_node(
+      fhe::ckks::OPC_ROTATE_BATCH, Cipher_array({4}), _spos);
+  batch->Set_child(0, Cipher_load(2, 1, 0));
+  const int32_t steps[] = {0, -1, -1, 17};
+  batch->Set_attr(nn::core::ATTR::RNUM, steps, 4);
+  Set_metadata(batch, 2, 1, 0);
+  std::string diagnostic;
+  EXPECT_TRUE(Verify(batch, &diagnostic)) << diagnostic;
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsRotateBatchMissingRnum) {
+  NODE_PTR batch = _container->New_cust_node(
+      fhe::ckks::OPC_ROTATE_BATCH, Cipher_array({1}), _spos);
+  batch->Set_child(0, Cipher_load());
+  Set_metadata(batch);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(batch, &diagnostic));
+  EXPECT_NE(diagnostic.find("constant, non-empty ordered RNUM"),
+            std::string::npos);
+  EXPECT_NE(diagnostic.find("opcode="), std::string::npos);
+  EXPECT_NE(diagnostic.find("rotate_batch"), std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsRotateBatchWrongRank) {
+  NODE_PTR batch = _container->New_cust_node(
+      fhe::ckks::OPC_ROTATE_BATCH, Cipher_array({2, 2}), _spos);
+  batch->Set_child(0, Cipher_load());
+  const int32_t steps[] = {1, 2, 3, 4};
+  batch->Set_attr(nn::core::ATTR::RNUM, steps, 4);
+  Set_metadata(batch);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(batch, &diagnostic));
+  EXPECT_NE(diagnostic.find("one-dimensional CIPHERTEXT array"),
+            std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsRotateBatchLengthMismatch) {
+  NODE_PTR batch = _container->New_cust_node(
+      fhe::ckks::OPC_ROTATE_BATCH, Cipher_array({2}), _spos);
+  batch->Set_child(0, Cipher_load());
+  const int32_t steps[] = {0, 1, 2};
+  batch->Set_attr(nn::core::ATTR::RNUM, steps, 3);
+  Set_metadata(batch);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(batch, &diagnostic));
+  EXPECT_NE(diagnostic.find("exact length matches RNUM"), std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, AcceptsFullQRaiseFromBottom) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR raise =
+      _container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, _cipher, _spos);
+  raise->Set_child(0, Cipher_load(1, 2, 4));
+  raise->Set_child(1, _container->New_intconst(u32, 4, _spos));
+  Set_metadata(raise, 4, 2, 1);
+  std::string diagnostic;
+  EXPECT_TRUE(Verify(raise, &diagnostic)) << diagnostic;
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsPartialRaiseTarget) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR raise =
+      _container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, _cipher, _spos);
+  raise->Set_child(0, Cipher_load(1));
+  raise->Set_child(1, _container->New_intconst(u32, 3, _spos));
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(raise, &diagnostic));
+  EXPECT_NE(diagnostic.find("v1 requires the full data-Q count 4"),
+            std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsRaiseTargetBeyondContext) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR raise =
+      _container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, _cipher, _spos);
+  raise->Set_child(0, Cipher_load(1));
+  raise->Set_child(1, _container->New_intconst(u32, 5, _spos));
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(raise, &diagnostic));
+  EXPECT_NE(diagnostic.find("target_q_count must be in [1, 4], got 5"),
+            std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsRaiseFromNonBottomInput) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR raise =
+      _container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, _cipher, _spos);
+  raise->Set_child(0, Cipher_load(2, 1, 2));
+  raise->Set_child(1, _container->New_intconst(u32, 4, _spos));
+  Set_metadata(raise, 4, 1, 1);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(raise, &diagnostic));
+  EXPECT_NE(diagnostic.find("bottom one-Q input with LEVEL=1"),
+            std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsRaiseRescaleMetadataChange) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR raise =
+      _container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, _cipher, _spos);
+  raise->Set_child(0, Cipher_load(1, 2, 4));
+  raise->Set_child(1, _container->New_intconst(u32, 4, _spos));
+  Set_metadata(raise, 4, 2, 3);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(raise, &diagnostic));
+  EXPECT_NE(diagnostic.find("level coordinates disagree"),
+            std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsRaiseWithMissingScaleMetadata) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR input = _container->New_ld(_cipher_input, _spos);
+  uint32_t input_level = 1;
+  uint32_t input_rescale = 4;
+  input->Set_attr(fhe::core::FHE_ATTR_KIND::LEVEL, &input_level, 1);
+  input->Set_attr(fhe::core::FHE_ATTR_KIND::RESCALE_LEVEL, &input_rescale, 1);
+  NODE_PTR raise =
+      _container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, _cipher, _spos);
+  raise->Set_child(0, input);
+  raise->Set_child(1, _container->New_intconst(u32, 4, _spos));
+  uint32_t result_level = 4;
+  uint32_t result_rescale = 1;
+  raise->Set_attr(fhe::core::FHE_ATTR_KIND::LEVEL, &result_level, 1);
+  raise->Set_attr(fhe::core::FHE_ATTR_KIND::RESCALE_LEVEL, &result_rescale, 1);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(raise, &diagnostic));
+  EXPECT_NE(diagnostic.find("preserve SCALE metadata"), std::string::npos);
+  EXPECT_NE(diagnostic.find("input=missing, result=missing"),
+            std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsRuntimeRaiseHelperAttribute) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR raise =
+      _container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, _cipher, _spos);
+  raise->Set_child(0, Cipher_load(1));
+  raise->Set_child(1, _container->New_intconst(u32, 4, _spos));
+  uint32_t runtime = 1;
+  raise->Set_attr(fhe::core::FHE_ATTR_KIND::RUNTIME_RAISE_LEVEL, &runtime, 1);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(raise, &diagnostic));
+  EXPECT_NE(diagnostic.find("forbids runtime target-level helpers"),
+            std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsDynamicRaiseTarget) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  ADDR_DATUM_PTR target = _func_scope->New_var(u32, "target", _spos);
+  NODE_PTR raise =
+      _container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, _cipher, _spos);
+  raise->Set_child(0, Cipher_load(1));
+  raise->Set_child(1, _container->New_ld(target, _spos));
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(raise, &diagnostic));
+  EXPECT_NE(diagnostic.find("constant target_q_count"), std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsUnnormalizedSignedMulMonoPower) {
+  TYPE_PTR i64 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+  NODE_PTR mono =
+      _container->New_cust_node(fhe::ckks::OPC_MUL_MONO, _cipher, _spos);
+  mono->Set_child(0, Cipher_load(2, 3, 1));
+  mono->Set_child(1, _container->New_intconst(i64, -1, _spos));
+  Set_metadata(mono, 2, 3, 1);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(mono, &diagnostic));
+  EXPECT_NE(diagnostic.find("power must be normalized into [0, 64), got -1"),
+            std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, AcceptsNormalizedMulMonoPower) {
+  TYPE_PTR i64 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+  NODE_PTR mono =
+      _container->New_cust_node(fhe::ckks::OPC_MUL_MONO, _cipher, _spos);
+  mono->Set_child(0, Cipher_load(2, 3, 1));
+  mono->Set_child(1, _container->New_intconst(i64, 63, _spos));
+  Set_metadata(mono, 2, 3, 1);
+  std::string diagnostic;
+  EXPECT_TRUE(Verify(mono, &diagnostic)) << diagnostic;
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsMulMonoRotationMetadata) {
+  TYPE_PTR i64 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+  NODE_PTR mono =
+      _container->New_cust_node(fhe::ckks::OPC_MUL_MONO, _cipher, _spos);
+  mono->Set_child(0, Cipher_load());
+  mono->Set_child(1, _container->New_intconst(i64, -1, _spos));
+  int32_t invalid_rotation = -1;
+  mono->Set_attr(nn::core::ATTR::RNUM, &invalid_rotation, 1);
+  Set_metadata(mono);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(mono, &diagnostic));
+  EXPECT_NE(diagnostic.find("forbids rotation RNUM metadata"),
+            std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsDynamicMulMonoPower) {
+  TYPE_PTR i64 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+  ADDR_DATUM_PTR power = _func_scope->New_var(i64, "power", _spos);
+  NODE_PTR mono =
+      _container->New_cust_node(fhe::ckks::OPC_MUL_MONO, _cipher, _spos);
+  mono->Set_child(0, Cipher_load());
+  mono->Set_child(1, _container->New_ld(power, _spos));
+  Set_metadata(mono);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(mono, &diagnostic));
+  EXPECT_NE(diagnostic.find("constant monomial power"), std::string::npos);
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  TYPE_PTR i64 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+
+  NODE_PTR conjugate =
+      _container->New_cust_node(fhe::ckks::OPC_CONJUGATE, _cipher, _spos);
+  conjugate->Set_child(0, Cipher_load(2, 1, 0));
+  Set_metadata(conjugate, 2, 1, 0);
+  ADDR_DATUM_PTR conjugated =
+      _func_scope->New_var(_cipher, "conjugated", _spos);
+  _container->Stmt_list().Append(
+      _container->New_st(conjugate, conjugated, _spos));
+
+  TYPE_PTR batch_type = Cipher_array({4});
+  NODE_PTR batch = _container->New_cust_node(
+      fhe::ckks::OPC_ROTATE_BATCH, batch_type, _spos);
+  batch->Set_child(0, Cipher_load(2, 1, 0));
+  const int32_t batch_steps[] = {0, -1, -1, 17};
+  batch->Set_attr(nn::core::ATTR::RNUM, batch_steps, 4);
+  Set_metadata(batch, 2, 1, 0);
+  ADDR_DATUM_PTR rotated =
+      _func_scope->New_var(batch_type, "rotated", _spos);
+  _container->Stmt_list().Append(_container->New_st(batch, rotated, _spos));
+
+  NODE_PTR raise =
+      _container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, _cipher, _spos);
+  raise->Set_child(0, Cipher_load(1, 1, 4));
+  raise->Set_child(1, _container->New_intconst(u32, 4, _spos));
+  Set_metadata(raise, 4, 1, 1);
+  ADDR_DATUM_PTR raised = _func_scope->New_var(_cipher, "raised", _spos);
+  _container->Stmt_list().Append(_container->New_st(raise, raised, _spos));
+
+  NODE_PTR mono =
+      _container->New_cust_node(fhe::ckks::OPC_MUL_MONO, _cipher, _spos);
+  mono->Set_child(0, Cipher_load(2, 1, 0));
+  mono->Set_child(1, _container->New_intconst(i64, -1, _spos));
+  Set_metadata(mono, 2, 1, 0);
+  ADDR_DATUM_PTR monomial =
+      _func_scope->New_var(_cipher, "monomial", _spos);
+  _container->Stmt_list().Append(_container->New_st(mono, monomial, _spos));
+  _container->Stmt_list().Append(
+      _container->New_retv(_container->New_ld(monomial, _spos), _spos));
+
+  EXPECT_EQ(conjugate->Opcode(), fhe::ckks::OPC_CONJUGATE);
+  EXPECT_EQ(batch->Opcode(), fhe::ckks::OPC_ROTATE_BATCH);
+  EXPECT_EQ(raise->Opcode(), fhe::ckks::OPC_RAISE_MOD);
+  EXPECT_EQ(mono->Opcode(), fhe::ckks::OPC_MUL_MONO);
+
+  air::driver::DRIVER_CTX driver_context;
+  fhe::ckks::CKKS_CONFIG analysis_config;
+  {
+    fhe::core::CTX_PARAM_ANA analysis(_func_scope, &_lower_ctx,
+                                      &driver_context, &analysis_config);
+    ASSERT_EQ(analysis.Run(), air::driver::R_CODE::NORMAL);
+  }
+
+  const uint32_t* raise_result_level =
+      raise->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
+  const uint32_t* raise_source_level =
+      raise->Child(0)->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
+  ASSERT_NE(raise_result_level, nullptr);
+  ASSERT_NE(raise_source_level, nullptr);
+  EXPECT_EQ(*raise_result_level, 4u);
+  EXPECT_EQ(*raise_source_level, 1u);
+  EXPECT_EQ(mono->Child(1)->Intconst(), 63u);
+  EXPECT_EQ(conjugate->Opcode(), fhe::ckks::OPC_CONJUGATE);
+  EXPECT_EQ(batch->Opcode(), fhe::ckks::OPC_ROTATE_BATCH);
+  EXPECT_EQ(raise->Opcode(), fhe::ckks::OPC_RAISE_MOD);
+  EXPECT_EQ(mono->Opcode(), fhe::ckks::OPC_MUL_MONO);
+
+  const fhe::core::CTX_PARAM& parameters = _lower_ctx.Get_ctx_param();
+  EXPECT_TRUE(parameters.Conjugation_key_required());
+  EXPECT_TRUE(parameters.Rotate_batch_required());
+  EXPECT_EQ(parameters.Get_rotate_batches(),
+            (std::vector<std::vector<int32_t>>{{0, -1, -1, 17}}));
+  EXPECT_EQ(parameters.Get_rotate_index(), (std::set<int32_t>{-1, 1}));
+  EXPECT_TRUE(parameters.Raise_mod_required());
+  EXPECT_EQ(parameters.Get_monomial_powers(), (std::set<uint32_t>{63}));
+
+  fhe::ckks::CKKS2C_CONFIG config;
+  config.Set_provider("phantom");
+  std::ostringstream output;
+  fhe::ckks::CKKS2C_DRIVER driver(output, _lower_ctx, config);
+  driver.Verify_or_throw(_glob);
+  _glob = driver.Flatten(_glob);
+  auto flattened_function = _glob->Begin_func_scope();
+  ASSERT_NE(flattened_function, _glob->End_func_scope());
+  NODE_PTR flattened_entry = (*flattened_function).Container().Entry_node();
+  EXPECT_TRUE(Contains_opcode(flattened_entry, fhe::ckks::OPC_CONJUGATE));
+  EXPECT_TRUE(Contains_opcode(flattened_entry, fhe::ckks::OPC_ROTATE_BATCH));
+  EXPECT_TRUE(Contains_opcode(flattened_entry, fhe::ckks::OPC_RAISE_MOD));
+  EXPECT_TRUE(Contains_opcode(flattened_entry, fhe::ckks::OPC_MUL_MONO));
+  fhe::ckks::CKKS2C_VISITOR visitor(driver.Ctx());
+  driver.Run(_glob, visitor);
+  const std::string source = output.str();
+  fhe::ckks::CKKS2C_DRIVER::Verify_source_or_throw(source,
+                                                   PROVIDER::PHANTOM);
+
+  EXPECT_NE(source.find("Conjugate_ciph(&conjugated, &input)"),
+            std::string::npos);
+  EXPECT_NE(source.find(
+                "static const int32_t _rot_batch_"),
+            std::string::npos);
+  EXPECT_NE(source.find("[] = {0, -1, -1, 17}; Rotate_batch_ciph("),
+            std::string::npos);
+  EXPECT_TRUE(std::regex_search(
+      source,
+      std::regex(
+          R"(Rotate_batch_ciph\(rotated, &input, _rot_batch_[0-9]+, 4\))")));
+  EXPECT_NE(source.find("Raise_mod(&raised, &input, 4)"),
+            std::string::npos);
+  EXPECT_NE(source.find("Mul_mono_ciph(&monomial, &input, 63)"),
+            std::string::npos);
+  EXPECT_NE(source.find("phantom_rotation_batch_offsets[] = {0, 4}"),
+            std::string::npos);
+  EXPECT_NE(source.find(
+                "phantom_rotation_batch_steps[] = {0, -1, -1, 17}"),
+            std::string::npos);
+  EXPECT_NE(source.find("phantom_monomial_powers[] = {63}"),
+            std::string::npos);
+  EXPECT_EQ(source.find("Rotate_ciph("), std::string::npos);
+  EXPECT_EQ(source.find("Eval_bootstrap"), std::string::npos);
+  EXPECT_EQ(source.find("Bootstrap("), std::string::npos);
+  EXPECT_EQ(source.find("bootstrap_coeffs_to_slots"), std::string::npos);
+  EXPECT_EQ(source.find("bootstrap_eval_mod"), std::string::npos);
+  EXPECT_EQ(source.find("bootstrap_slots_to_coeffs"), std::string::npos);
+  EXPECT_EQ(source.find("rt_ant"), std::string::npos);
+  EXPECT_EQ(source.find("LIB_ANT"), std::string::npos);
+  EXPECT_EQ(source.find("Hw_"), std::string::npos);
+  EXPECT_EQ(source.find("Poly_"), std::string::npos);
+  EXPECT_EQ(source.find("rt_poly"), std::string::npos);
+  EXPECT_EQ(source.find("fhe/poly"), std::string::npos);
 }
 
 }  // namespace

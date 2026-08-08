@@ -2153,16 +2153,20 @@ public:
         return node;
     }
 
-    // CKKS raise_mod - raise ciphertext modulus with a target level/mod_size
+    // CKKS raise_mod - raise a bottom ciphertext to target_q_count data-Qs.
     std::shared_ptr<Node> new_ckks_raise_mod(
-        std::shared_ptr<Node> ct, int32_t mod_size,
+        std::shared_ptr<Node> ct, int32_t target_q_count,
         bool runtime_raise_level = false) {
         require_not_expired();
+        if (target_q_count < 1) {
+            throw std::invalid_argument(
+                "new_ckks_raise_mod target_q_count must be positive");
+        }
         if (container && ct->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::RAISE_MOD);
             TYPE_PTR u32_type = glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
             NODE_PTR mod_const = container->New_intconst(
-                u32_type, static_cast<uint32_t>(mod_size), get_spos());
+                u32_type, static_cast<uint32_t>(target_q_count), get_spos());
             TYPE_PTR rtype = get_compatible_type(ct->node->Rtype());
             NODE_PTR n = container->New_cust_node(op, rtype, get_spos());
             n->Set_child(0, ct->node);
@@ -2200,18 +2204,18 @@ public:
     }
 
     // CKKS multiply-by-monomial - helper used by bootstrap paths
-    std::shared_ptr<Node> new_ckks_mul_mono(std::shared_ptr<Node> ct, int32_t power) {
+    std::shared_ptr<Node> new_ckks_mul_mono(std::shared_ptr<Node> ct,
+                                            int64_t power) {
         require_not_expired();
         if (container && ct->has_node) {
             OPCODE op(fhe::ckks::CKKS_DOMAIN::ID, fhe::ckks::CKKS_OPERATOR::MUL_MONO);
-            TYPE_PTR u32_type = glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+            TYPE_PTR i64_type = glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
             NODE_PTR power_const = container->New_intconst(
-                u32_type, static_cast<uint32_t>(power), get_spos());
+                i64_type, power, get_spos());
             TYPE_PTR rtype = get_compatible_type(ct->node->Rtype());
             NODE_PTR n = container->New_cust_node(op, rtype, get_spos());
             n->Set_child(0, ct->node);
             n->Set_child(1, power_const);
-            Set_rotation_attr(n, power);
             auto node = wrap_node(n, "fhe::ckks::MUL_MONO");
             node->add_child(ct);
             return node;
@@ -10768,9 +10772,9 @@ PYBIND11_MODULE(air_builder, m) {
              py::arg("ct"), py::arg("num_slots") = 0,
              "CKKS bootstrap stage: slots-to-coeffs via runtime context/precom")
         .def("new_ckks_raise_mod", &Container::new_ckks_raise_mod,
-             py::arg("ct"), py::arg("mod_size"),
+             py::arg("ct"), py::arg("target_q_count"),
              py::arg("runtime_raise_level") = false,
-             "CKKS raise_mod: raise ciphertext modulus with a target mod size/level")
+             "CKKS raise_mod: raise a bottom ciphertext to target_q_count")
         .def("new_ckks_conjugate", &Container::new_ckks_conjugate,
              "CKKS conjugate: complex conjugation over slots")
         .def("new_ckks_mul_mono", &Container::new_ckks_mul_mono,

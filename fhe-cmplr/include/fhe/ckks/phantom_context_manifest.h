@@ -23,7 +23,7 @@ namespace fhe {
 namespace ckks {
 
 inline constexpr uint32_t PHANTOM_CONTEXT_SCHEMA_VERSION  = 1;
-inline constexpr uint32_t PHANTOM_RESOURCE_SCHEMA_VERSION = 1;
+inline constexpr uint32_t PHANTOM_RESOURCE_SCHEMA_VERSION = 2;
 inline constexpr uint32_t PHANTOM_PACKING_FULL             = 1;
 inline constexpr uint32_t PHANTOM_POLY_DEGREE_MAX          = 131072;
 inline constexpr uint32_t PHANTOM_USER_MODULUS_BITS_MIN    = 2;
@@ -32,6 +32,10 @@ inline constexpr uint32_t PHANTOM_COEFF_MODULUS_COUNT_MAX  = 64;
 
 inline constexpr uint64_t PHANTOM_RESOURCE_RELIN_KEY = uint64_t{1} << 0;
 inline constexpr uint64_t PHANTOM_RESOURCE_ROTATION_KEYS = uint64_t{1} << 1;
+inline constexpr uint64_t PHANTOM_RESOURCE_CONJUGATION_KEY = uint64_t{1} << 2;
+inline constexpr uint64_t PHANTOM_RESOURCE_ROTATE_BATCH = uint64_t{1} << 3;
+inline constexpr uint64_t PHANTOM_RESOURCE_RAISE_MOD = uint64_t{1} << 4;
+inline constexpr uint64_t PHANTOM_RESOURCE_MONOMIALS = uint64_t{1} << 5;
 
 struct PHANTOM_CONTEXT_DESCRIPTOR {
   uint32_t              _schema_version = PHANTOM_CONTEXT_SCHEMA_VERSION;
@@ -54,6 +58,8 @@ struct PHANTOM_RESOURCE_DESCRIPTOR {
   uint32_t             _context_schema_version = PHANTOM_CONTEXT_SCHEMA_VERSION;
   uint64_t             _flags = 0;
   std::vector<int32_t> _rotation_steps;
+  std::vector<std::vector<int32_t>> _rotation_batches;
+  std::vector<uint32_t> _monomial_powers;
 };
 
 inline bool Is_power_of_two(uint32_t value) {
@@ -158,9 +164,46 @@ inline PHANTOM_RESOURCE_DESCRIPTOR Build_phantom_resource_descriptor(
         Canonical_signed_rotation(step, context._logical_slots);
     if (normalized != 0) unique_steps.insert(normalized);
   }
+  for (const std::vector<int32_t>& batch : parameters.Get_rotate_batches()) {
+    if (batch.empty()) {
+      throw std::invalid_argument(
+          "Phantom resource manifest forbids empty rotation batches");
+    }
+    result._rotation_batches.push_back(batch);
+    for (int32_t step : batch) {
+      const int32_t normalized =
+          Canonical_signed_rotation(step, context._logical_slots);
+      if (normalized != 0) unique_steps.insert(normalized);
+    }
+  }
   result._rotation_steps.assign(unique_steps.begin(), unique_steps.end());
   if (!result._rotation_steps.empty()) {
     result._flags |= PHANTOM_RESOURCE_ROTATION_KEYS;
+  }
+  if (parameters.Conjugation_key_required()) {
+    result._flags |= PHANTOM_RESOURCE_CONJUGATION_KEY;
+  }
+  if (parameters.Rotate_batch_required()) {
+    if (result._rotation_batches.empty()) {
+      throw std::invalid_argument(
+          "Phantom resource manifest rotate-batch requirement has no batch");
+    }
+    result._flags |= PHANTOM_RESOURCE_ROTATE_BATCH;
+  }
+  if (parameters.Raise_mod_required()) {
+    result._flags |= PHANTOM_RESOURCE_RAISE_MOD;
+  }
+  const uint64_t monomial_period =
+      static_cast<uint64_t>(context._poly_degree) * 2;
+  for (uint32_t power : parameters.Get_monomial_powers()) {
+    if (power >= monomial_period) {
+      throw std::invalid_argument(
+          "Phantom resource manifest monomial power is not canonical");
+    }
+    result._monomial_powers.push_back(power);
+  }
+  if (!result._monomial_powers.empty()) {
+    result._flags |= PHANTOM_RESOURCE_MONOMIALS;
   }
   return result;
 }
@@ -172,6 +215,18 @@ inline void Emit_json_array(std::ostringstream& output,
   for (size_t index = 0; index < values.size(); ++index) {
     if (index != 0) output << ',';
     output << values[index];
+  }
+  output << ']';
+}
+
+template <typename VALUE>
+inline void Emit_json_arrays(
+    std::ostringstream& output,
+    const std::vector<std::vector<VALUE>>& values) {
+  output << '[';
+  for (size_t index = 0; index < values.size(); ++index) {
+    if (index != 0) output << ',';
+    Emit_json_array(output, values[index]);
   }
   output << ']';
 }
@@ -209,9 +264,24 @@ inline std::string Serialize_phantom_resource_descriptor(
   std::ostringstream output;
   output << "{\"context_schema_version\":"
          << resources._context_schema_version;
+  output << ",\"conjugation_key\":"
+         << ((resources._flags & PHANTOM_RESOURCE_CONJUGATION_KEY) != 0
+                 ? "true"
+                 : "false");
+  output << ",\"monomial_powers\":";
+  Emit_json_array(output, resources._monomial_powers);
+  output << ",\"raise_mod\":"
+         << ((resources._flags & PHANTOM_RESOURCE_RAISE_MOD) != 0 ? "true"
+                                                                   : "false");
   output << ",\"relinearization_key\":"
          << ((resources._flags & PHANTOM_RESOURCE_RELIN_KEY) != 0 ? "true"
                                                                   : "false");
+  output << ",\"rotate_batch\":"
+         << ((resources._flags & PHANTOM_RESOURCE_ROTATE_BATCH) != 0
+                 ? "true"
+                 : "false");
+  output << ",\"rotation_batches\":";
+  Emit_json_arrays(output, resources._rotation_batches);
   output << ",\"rotation_steps\":";
   Emit_json_array(output, resources._rotation_steps);
   output << ",\"schema_version\":" << resources._schema_version << '}';

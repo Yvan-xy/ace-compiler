@@ -12,7 +12,13 @@
 #include "air/base/container_decl.h"
 #include "air/base/st_decl.h"
 #include "air/util/debug.h"
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
+#include <vector>
 #include "fhe/core/ir2c_ctx.h"
 #include "fhe/ckks/phantom_context_manifest.h"
 #include "fhe/core/rt_context.h"
@@ -238,6 +244,11 @@ public:
   //! @brief Emit the runtime feature query without introducing BTS calls.
   void Emit_need_bts() {
     if (Provider() == core::PROVIDER::PHANTOM) {
+      if (_observed_rotation_batches !=
+          _phantom_resources._rotation_batches.size()) {
+        throw std::runtime_error(
+            "Phantom rotate_batch analysis/codegen requirements disagree");
+      }
       if (!_phantom_resources._rotation_steps.empty()) {
         _ir2c_util << "static const int32_t ";
         _ir2c_util.Emit_identifier(Function_name_prefix());
@@ -246,6 +257,40 @@ public:
              index < _phantom_resources._rotation_steps.size(); ++index) {
           if (index != 0) _ir2c_util << ", ";
           _ir2c_util << _phantom_resources._rotation_steps[index];
+        }
+        _ir2c_util << "};\n\n";
+      }
+      if (!_phantom_resources._rotation_batches.empty()) {
+        _ir2c_util << "static const size_t ";
+        _ir2c_util.Emit_identifier(Function_name_prefix());
+        _ir2c_util << "phantom_rotation_batch_offsets[] = {0";
+        size_t offset = 0;
+        for (const auto& batch : _phantom_resources._rotation_batches) {
+          offset += batch.size();
+          _ir2c_util << ", " << offset;
+        }
+        _ir2c_util << "};\n";
+        _ir2c_util << "static const int32_t ";
+        _ir2c_util.Emit_identifier(Function_name_prefix());
+        _ir2c_util << "phantom_rotation_batch_steps[] = {";
+        bool has_prior_step = false;
+        for (const auto& batch : _phantom_resources._rotation_batches) {
+          for (int32_t step : batch) {
+            if (has_prior_step) _ir2c_util << ", ";
+            _ir2c_util << step;
+            has_prior_step = true;
+          }
+        }
+        _ir2c_util << "};\n\n";
+      }
+      if (!_phantom_resources._monomial_powers.empty()) {
+        _ir2c_util << "static const uint32_t ";
+        _ir2c_util.Emit_identifier(Function_name_prefix());
+        _ir2c_util << "phantom_monomial_powers[] = {";
+        for (size_t index = 0;
+             index < _phantom_resources._monomial_powers.size(); ++index) {
+          if (index != 0) _ir2c_util << ", ";
+          _ir2c_util << _phantom_resources._monomial_powers[index];
         }
         _ir2c_util << "};\n\n";
       }
@@ -268,17 +313,58 @@ public:
         if ((_phantom_resources._flags & PHANTOM_RESOURCE_ROTATION_KEYS) != 0) {
           if (separator) _ir2c_util << " | ";
           _ir2c_util << "PHANTOM_RESOURCE_ROTATION_KEYS";
+          separator = true;
+        }
+        if ((_phantom_resources._flags & PHANTOM_RESOURCE_CONJUGATION_KEY) !=
+            0) {
+          if (separator) _ir2c_util << " | ";
+          _ir2c_util << "PHANTOM_RESOURCE_CONJUGATION_KEY";
+          separator = true;
+        }
+        if ((_phantom_resources._flags & PHANTOM_RESOURCE_ROTATE_BATCH) != 0) {
+          if (separator) _ir2c_util << " | ";
+          _ir2c_util << "PHANTOM_RESOURCE_ROTATE_BATCH";
+          separator = true;
+        }
+        if ((_phantom_resources._flags & PHANTOM_RESOURCE_RAISE_MOD) != 0) {
+          if (separator) _ir2c_util << " | ";
+          _ir2c_util << "PHANTOM_RESOURCE_RAISE_MOD";
+          separator = true;
+        }
+        if ((_phantom_resources._flags & PHANTOM_RESOURCE_MONOMIALS) != 0) {
+          if (separator) _ir2c_util << " | ";
+          _ir2c_util << "PHANTOM_RESOURCE_MONOMIALS";
         }
       }
       _ir2c_util << ",\n";
       _ir2c_util << "    " << _phantom_resources._rotation_steps.size()
                    << ",\n";
       if (_phantom_resources._rotation_steps.empty()) {
+        _ir2c_util << "    nullptr,\n";
+      } else {
+        _ir2c_util << "    ";
+        _ir2c_util.Emit_identifier(Function_name_prefix());
+        _ir2c_util << "phantom_rotation_steps,\n";
+      }
+      _ir2c_util << "    " << _phantom_resources._rotation_batches.size()
+                   << ",\n";
+      if (_phantom_resources._rotation_batches.empty()) {
+        _ir2c_util << "    nullptr,\n    nullptr,\n";
+      } else {
+        _ir2c_util << "    ";
+        _ir2c_util.Emit_identifier(Function_name_prefix());
+        _ir2c_util << "phantom_rotation_batch_offsets,\n    ";
+        _ir2c_util.Emit_identifier(Function_name_prefix());
+        _ir2c_util << "phantom_rotation_batch_steps,\n";
+      }
+      _ir2c_util << "    " << _phantom_resources._monomial_powers.size()
+                   << ",\n";
+      if (_phantom_resources._monomial_powers.empty()) {
         _ir2c_util << "    nullptr\n";
       } else {
         _ir2c_util << "    ";
         _ir2c_util.Emit_identifier(Function_name_prefix());
-        _ir2c_util << "phantom_rotation_steps\n";
+        _ir2c_util << "phantom_monomial_powers\n";
       }
       _ir2c_util << "  };\n";
       _ir2c_util << "  return &resources;\n";
@@ -315,7 +401,11 @@ public:
 
   void Require_phantom_relinearization_key() {
     if (!_has_phantom_manifests) return;
-    _phantom_resources._flags |= PHANTOM_RESOURCE_RELIN_KEY;
+    if ((_phantom_resources._flags & PHANTOM_RESOURCE_RELIN_KEY) == 0) {
+      throw std::runtime_error(
+          "Phantom relinearization analysis/codegen requirements disagree: "
+          "observed Relin call, expected a predeclared relinearization key");
+    }
   }
 
   void Require_phantom_rotation_key(int64_t step) {
@@ -323,14 +413,80 @@ public:
     const int32_t normalized =
         Canonical_signed_rotation(step, _phantom_context._logical_slots);
     if (normalized == 0) return;
-    auto position = std::lower_bound(_phantom_resources._rotation_steps.begin(),
-                                     _phantom_resources._rotation_steps.end(),
-                                     normalized);
-    if (position == _phantom_resources._rotation_steps.end() ||
-        *position != normalized) {
-      _phantom_resources._rotation_steps.insert(position, normalized);
+    if (!std::binary_search(_phantom_resources._rotation_steps.begin(),
+                            _phantom_resources._rotation_steps.end(),
+                            normalized)) {
+      throw std::runtime_error(
+          "Phantom rotation analysis/codegen requirements disagree: observed "
+          "normalized step " +
+          std::to_string(normalized) +
+          ", expected a predeclared ordinary rotation key");
     }
-    _phantom_resources._flags |= PHANTOM_RESOURCE_ROTATION_KEYS;
+  }
+
+  void Require_phantom_conjugation_key() {
+    if (!_has_phantom_manifests) return;
+    if ((_phantom_resources._flags & PHANTOM_RESOURCE_CONJUGATION_KEY) == 0) {
+      throw std::runtime_error(
+          "Phantom conjugation analysis/codegen requirements disagree");
+    }
+  }
+
+  void Observe_phantom_rotation_batch(const int* steps, uint32_t count) {
+    if (!_has_phantom_manifests) return;
+    std::vector<int32_t> observed(steps, steps + count);
+    if (_observed_rotation_batches <
+        _phantom_resources._rotation_batches.size()) {
+      if (_phantom_resources
+              ._rotation_batches[_observed_rotation_batches] != observed) {
+        throw std::runtime_error(
+            "Phantom rotate_batch analysis/codegen order disagrees");
+      }
+    } else {
+      throw std::runtime_error(
+          "Phantom rotate_batch was not recorded by context analysis");
+    }
+    ++_observed_rotation_batches;
+    if ((_phantom_resources._flags & PHANTOM_RESOURCE_ROTATE_BATCH) == 0) {
+      throw std::runtime_error(
+          "Phantom rotate_batch analysis/codegen flag disagrees");
+    }
+    for (int32_t step : observed) {
+      const int32_t normalized =
+          Canonical_signed_rotation(step, _phantom_context._logical_slots);
+      if (normalized != 0 &&
+          !std::binary_search(_phantom_resources._rotation_steps.begin(),
+                              _phantom_resources._rotation_steps.end(),
+                              normalized)) {
+        throw std::runtime_error(
+            "Phantom rotate_batch key analysis/codegen requirements disagree");
+      }
+    }
+  }
+
+  void Require_phantom_raise_mod() {
+    if (!_has_phantom_manifests) return;
+    if ((_phantom_resources._flags & PHANTOM_RESOURCE_RAISE_MOD) == 0) {
+      throw std::runtime_error(
+          "Phantom raise_mod analysis/codegen requirements disagree");
+    }
+  }
+
+  uint32_t Require_phantom_monomial_power(int64_t power) {
+    const int64_t period =
+        static_cast<int64_t>(_phantom_context._poly_degree) * 2;
+    int64_t normalized = power % period;
+    if (normalized < 0) normalized += period;
+    const uint32_t result = static_cast<uint32_t>(normalized);
+    if (!_has_phantom_manifests) return result;
+    if ((_phantom_resources._flags & PHANTOM_RESOURCE_MONOMIALS) == 0 ||
+        !std::binary_search(_phantom_resources._monomial_powers.begin(),
+                            _phantom_resources._monomial_powers.end(),
+                            result)) {
+      throw std::runtime_error(
+          "Phantom mul_mono analysis/codegen requirements disagree");
+    }
+    return result;
   }
 
   void Emit_get_input_data(air::base::ADDR_DATUM_PTR var) {
@@ -978,6 +1134,7 @@ public:
   bool                       _has_phantom_manifests = false;
   PHANTOM_CONTEXT_DESCRIPTOR _phantom_context;
   PHANTOM_RESOURCE_DESCRIPTOR _phantom_resources;
+  size_t                       _observed_rotation_batches = 0;
 };  // IR2C_CTX
 
 }  // namespace ckks

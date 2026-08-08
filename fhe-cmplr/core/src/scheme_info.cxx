@@ -123,6 +123,14 @@ void CTX_PARAM::Print(std::ostream& out) {
     out << idx << ", ";
   }
   out << "}, // rotate index" << std::endl;
+  out << indent << (Conjugation_key_required() ? 1 : 0)
+      << ", // conjugation key required" << std::endl;
+  out << indent << (Rotate_batch_required() ? 1 : 0)
+      << ", // rotate batch required" << std::endl;
+  out << indent << (Raise_mod_required() ? 1 : 0)
+      << ", // raise mod required" << std::endl;
+  out << indent << Get_monomial_powers().size()
+      << ", // monomial power count" << std::endl;
 
   out << "}" << std::endl;
 }

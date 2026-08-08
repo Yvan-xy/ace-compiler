@@ -11,7 +11,10 @@
 
 #include <algorithm>
 #include <list>
+#include <limits>
 #include <ostream>
+#include <set>
+#include <vector>
 
 #include "air/base/analyze_ctx.h"
 #include "air/base/container.h"
@@ -55,6 +58,17 @@ inline int32_t Normalize_scalar_rotation_index(int64_t index,
     normalized -= slot_count;
   }
   return static_cast<int32_t>(normalized);
+}
+
+//! Canonical representative of X^power in Z[X]/(X^N + 1).
+inline uint32_t Normalize_monomial_power(int64_t power,
+                                         uint32_t poly_degree) {
+  AIR_ASSERT_MSG(poly_degree > 0,
+                 "monomial normalization needs a polynomial degree");
+  const int64_t period = static_cast<int64_t>(poly_degree) * 2;
+  int64_t normalized = power % period;
+  if (normalized < 0) normalized += period;
+  return static_cast<uint32_t>(normalized);
 }
 
 // TODO: mv IV_INFO and related APIs into air_infra
@@ -158,6 +172,27 @@ public:
   const ROTATE_IDX_SET& Get_rotate_index() const { return _rot_idx; }
   void                  Require_relin_key() { _relin_key_required = true; }
   bool Relin_key_required() const { return _relin_key_required; }
+  void Require_conjugation_key() { _conjugation_key_required = true; }
+  bool Conjugation_key_required() const {
+    return _conjugation_key_required;
+  }
+  void Record_rotate_batch(NODE_ID node_id,
+                           const std::vector<int32_t>& steps) {
+    if (_rotate_batch_nodes.insert(node_id.Value()).second) {
+      _rotate_batches.push_back(steps);
+    }
+    _rotate_batch_required = true;
+  }
+  bool Rotate_batch_required() const { return _rotate_batch_required; }
+  const std::vector<std::vector<int32_t>>& Get_rotate_batches() const {
+    return _rotate_batches;
+  }
+  void Require_raise_mod() { _raise_mod_required = true; }
+  bool Raise_mod_required() const { return _raise_mod_required; }
+  void Add_monomial_power(uint32_t power) { _monomial_powers.insert(power); }
+  const std::set<uint32_t>& Get_monomial_powers() const {
+    return _monomial_powers;
+  }
   //! set mul_level attr for node result
   void Set_node_mul_level(NODE_PTR node, uint32_t mul_level) const {
     node->Set_attr(core::FHE_ATTR_KIND::LEVEL, &mul_level, 1);
@@ -226,6 +261,12 @@ private:
   const air::driver::DRIVER_CTX* _driver_ctx;
   uint32_t _func_mul_level     = 0;  // mul_level of current function
   bool     _relin_key_required = false;
+  bool     _conjugation_key_required = false;
+  bool     _rotate_batch_required = false;
+  bool     _raise_mod_required = false;
+  std::set<uint32_t> _rotate_batch_nodes;
+  std::vector<std::vector<int32_t>> _rotate_batches;
+  std::set<uint32_t> _monomial_powers;
 };
 
 //! @brief impl of CORE IR handler
@@ -819,6 +860,8 @@ public:
   template <typename RETV, typename VISITOR>
   RETV Handle_conjugate(VISITOR* visitor, NODE_PTR conjugate_node);
   template <typename RETV, typename VISITOR>
+  RETV Handle_raise_mod(VISITOR* visitor, NODE_PTR raise_node);
+  template <typename RETV, typename VISITOR>
   RETV Handle_relin(VISITOR* visitor, NODE_PTR relin_node);
   template <typename RETV, typename VISITOR>
   RETV Handle_modswitch(VISITOR* visitor, NODE_PTR mod_switch);
@@ -942,6 +985,10 @@ RETV CKKS_ANA_IMPL::Handle_rotate(VISITOR* visitor, NODE_PTR rot_node) {
 
 template <typename RETV, typename VISITOR>
 RETV CKKS_ANA_IMPL::Handle_rotate_batch(VISITOR* visitor, NODE_PTR rot_node) {
+  if (rot_node->Num_child() != 1 ||
+      rot_node->Child(0) == air::base::Null_ptr) {
+    return RETV{false, 0};
+  }
   CTX_PARAM_ANA_CTX& ana_ctx   = visitor->Context();
   uint32_t           mul_level = ana_ctx.Top_mul_level();
   ana_ctx.Set_node_mul_level(rot_node, mul_level);
@@ -955,11 +1002,17 @@ RETV CKKS_ANA_IMPL::Handle_rotate_batch(VISITOR* visitor, NODE_PTR rot_node) {
   const char* rot_idx_key   = nn::core::ATTR::RNUM;
   uint32_t    rot_idx_count = 0;
   const int*  rot_idx       = rot_node->Attr<int>(rot_idx_key, &rot_idx_count);
-  AIR_ASSERT(rot_idx != nullptr && rot_idx_count > 0);
-  for (uint32_t i = 0; i < rot_idx_count; ++i) {
-    if (rot_idx[i] != 0) {
-      visitor->Context().Add_rotate_index(rot_idx[i]);
-    }
+  if (rot_idx == nullptr || rot_idx_count == 0) return child0_res;
+  std::vector<int32_t> ordered_steps(rot_idx, rot_idx + rot_idx_count);
+  ana_ctx.Record_rotate_batch(rot_node->Id(), ordered_steps);
+  const uint32_t poly_degree =
+      ana_ctx.Lower_ctx()->Get_ctx_param().Get_poly_degree();
+  if (poly_degree < 2 || (poly_degree % 2) != 0) return child0_res;
+  const uint32_t slot_count = poly_degree / 2;
+  for (int32_t step : ordered_steps) {
+    const int32_t normalized =
+        Normalize_scalar_rotation_index(step, slot_count);
+    if (normalized != 0) ana_ctx.Add_rotate_index(normalized);
   }
 
   return child0_res;
@@ -967,6 +1020,11 @@ RETV CKKS_ANA_IMPL::Handle_rotate_batch(VISITOR* visitor, NODE_PTR rot_node) {
 
 template <typename RETV, typename VISITOR>
 RETV CKKS_ANA_IMPL::Handle_mul_mono(VISITOR* visitor, NODE_PTR mul_mono_node) {
+  if (mul_mono_node->Num_child() != 2 ||
+      mul_mono_node->Child(0) == air::base::Null_ptr ||
+      mul_mono_node->Child(1) == air::base::Null_ptr) {
+    return RETV{false, 0};
+  }
   CTX_PARAM_ANA_CTX& ana_ctx   = visitor->Context();
   uint32_t           mul_level = ana_ctx.Top_mul_level();
   ana_ctx.Set_node_mul_level(mul_mono_node, mul_level);
@@ -981,21 +1039,16 @@ RETV CKKS_ANA_IMPL::Handle_mul_mono(VISITOR* visitor, NODE_PTR mul_mono_node) {
                  "mul level inconsistent");
   ana_ctx.Pop_mul_level();
 
-  const char* rot_idx_key   = nn::core::ATTR::RNUM;
-  uint32_t    rot_idx_count = 0;
-  const int*  rot_idx       =
-      mul_mono_node->Attr<int>(rot_idx_key, &rot_idx_count);
-  if (rot_idx != nullptr && rot_idx_count > 0) {
-    for (uint32_t i = 0; i < rot_idx_count; ++i) {
-      if (rot_idx[i] != 0) {
-        ana_ctx.Add_rotate_index(rot_idx[i]);
-      }
-    }
-  } else if (mul_mono_node->Child(1)->Opcode() == air::core::OPC_INTCONST) {
-    int32_t int_rot_idx =
-        static_cast<int32_t>(mul_mono_node->Child(1)->Intconst());
-    if (int_rot_idx != 0) {
-      ana_ctx.Add_rotate_index(int_rot_idx);
+  if (mul_mono_node->Num_child() == 2 &&
+      mul_mono_node->Child(1) != air::base::Null_ptr &&
+      mul_mono_node->Child(1)->Opcode() == air::core::OPC_INTCONST) {
+    const uint32_t poly_degree =
+        ana_ctx.Lower_ctx()->Get_ctx_param().Get_poly_degree();
+    if (poly_degree != 0) {
+      const uint32_t normalized = Normalize_monomial_power(
+          mul_mono_node->Child(1)->Intconst(), poly_degree);
+      mul_mono_node->Child(1)->Set_intconst(normalized);
+      ana_ctx.Add_monomial_power(normalized);
     }
   }
 
@@ -1004,6 +1057,10 @@ RETV CKKS_ANA_IMPL::Handle_mul_mono(VISITOR* visitor, NODE_PTR mul_mono_node) {
 
 template <typename RETV, typename VISITOR>
 RETV CKKS_ANA_IMPL::Handle_conjugate(VISITOR* visitor, NODE_PTR conjugate_node) {
+  if (conjugate_node->Num_child() != 1 ||
+      conjugate_node->Child(0) == air::base::Null_ptr) {
+    return RETV{false, 0};
+  }
   CTX_PARAM_ANA_CTX& ana_ctx   = visitor->Context();
   uint32_t           mul_level = ana_ctx.Top_mul_level();
   ana_ctx.Set_node_mul_level(conjugate_node, mul_level);
@@ -1018,10 +1075,38 @@ RETV CKKS_ANA_IMPL::Handle_conjugate(VISITOR* visitor, NODE_PTR conjugate_node) 
                  "mul level inconsistent");
   ana_ctx.Pop_mul_level();
 
-  int32_t rot_idx = static_cast<int32_t>(
-      2 * ana_ctx.Lower_ctx()->Get_ctx_param().Get_poly_degree() - 1);
-  ana_ctx.Add_rotate_index(rot_idx);
+  ana_ctx.Require_conjugation_key();
   return child0_res;
+}
+
+template <typename RETV, typename VISITOR>
+RETV CKKS_ANA_IMPL::Handle_raise_mod(VISITOR* visitor, NODE_PTR raise_node) {
+  if (raise_node->Num_child() != 2 ||
+      raise_node->Child(0) == air::base::Null_ptr ||
+      raise_node->Child(1) == air::base::Null_ptr ||
+      raise_node->Child(1)->Opcode() != air::core::OPC_INTCONST) {
+    return RETV{false, 0};
+  }
+  CTX_PARAM_ANA_CTX& ana_ctx = visitor->Context();
+  ana_ctx.Require_raise_mod();
+  const int64_t target_value = raise_node->Child(1)->Intconst();
+  if (target_value < 1 ||
+      static_cast<uint64_t>(target_value) >
+          std::numeric_limits<uint32_t>::max()) {
+    return visitor->template Visit<RETV>(raise_node->Child(0));
+  }
+  const uint32_t target_q_count = static_cast<uint32_t>(target_value);
+  ana_ctx.Set_node_mul_level(raise_node, target_q_count);
+  ana_ctx.Update_mul_level(target_q_count);
+
+  constexpr uint32_t bottom_q_count = 1;
+  ana_ctx.Push_mul_level(bottom_q_count);
+  RETV child0_res = visitor->template Visit<RETV>(raise_node->Child(0));
+  AIR_ASSERT_MSG(bottom_q_count == ana_ctx.Top_mul_level(),
+                 "raise_mod source level inconsistent");
+  ana_ctx.Pop_mul_level();
+  (void)visitor->template Visit<RETV>(raise_node->Child(1));
+  return RETV{child0_res.Mul_level_inc(), target_q_count};
 }
 
 template <typename RETV, typename VISITOR>

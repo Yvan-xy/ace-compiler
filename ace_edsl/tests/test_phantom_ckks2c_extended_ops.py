@@ -229,3 +229,75 @@ def test_micrograph_dimensions_are_manifest_derived(tmp_path: Path) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_phantom_pipeline_rejects_runtime_raise_helper(tmp_path: Path) -> None:
+    context = tmp_path / "context.json"
+    _context(context)
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(REPOSITORY), str(EXAMPLES), environment.get("PYTHONPATH", ""))
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                f"""
+                import json
+                from pathlib import Path
+                from ace_edsl.edsl import (
+                    AceEDSL, AcePipeline, CkksCiphertext, ckks_kernel,
+                )
+
+                manifest = json.loads(
+                    Path({str(context)!r}).read_text(encoding="utf-8")
+                )
+
+                @ckks_kernel
+                def invalid_raise(ct: CkksCiphertext) -> CkksCiphertext:
+                    return ct.raise_mod(
+                        len(manifest["data_q_bit_sizes"]),
+                        runtime_raise_level=True,
+                    )
+
+                AceEDSL._get_dsl.cache_clear()
+                invalid_raise(
+                    CkksCiphertext(
+                        shape=(manifest["polynomial_degree"],), name="input_ct"
+                    )
+                )
+                module = AceEDSL._get_dsl().current_air_module
+                pipeline = AcePipeline(module).configure_fhe(
+                    poly_degree=manifest["polynomial_degree"],
+                    mul_level=len(manifest["data_q_bit_sizes"]),
+                    input_level=manifest["input_level"],
+                    security_level=manifest["security_level"],
+                    scaling_factor_bits=manifest["scaling_modulus_bits"],
+                    first_prime_bits=manifest["first_modulus_bits"],
+                    hamming_weight=manifest["hamming_weight"],
+                    data_file="",
+                    provider="phantom",
+                    codegen_ir="ckks",
+                )
+                compiled = pipeline.run(start_domain="fhe::ckks", verbose=False)
+                assert not compiled.success
+                assert "forbids runtime target-level helpers" in compiled.error
+                print("RETAINED_DYNAMIC_RAISE_REJECTED")
+                """
+            ),
+        ],
+        cwd=REPOSITORY,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if (
+        result.returncode != 0
+        and "forbids runtime target-level helpers" in result.stderr
+        and "ValueError" in result.stderr
+    ):
+        pytest.skip("local Python bindings predate provider-bound rejection")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RETAINED_DYNAMIC_RAISE_REJECTED" in result.stdout
