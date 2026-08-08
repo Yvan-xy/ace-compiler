@@ -332,7 +332,6 @@ void ValidateManifest(const Json &context, const Json &resources,
           "resource manifest does not contain every normalized retained "
           "monomial power");
 
-  const std::size_t slots = degree / 2U;
   std::set<std::int32_t> required_rotation_keys;
   for (const Json &batch : required_batches) {
     for (std::int32_t step : batch.get<std::vector<std::int32_t>>()) {
