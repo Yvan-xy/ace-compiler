@@ -280,6 +280,7 @@ configure_and_build() {
 run_host_tests() {
   local -a python_tests=(
     ace_edsl/tests/test_phantom_ckks2c_extended_ops.py
+    ace_edsl/tests/test_source_location_scope.py
     tools/phantom_gpu/tests/test_phantom_legacy_examples_cmake.py
     tools/phantom_gpu/tests/test_retained_ckks_oracles.py
     tools/phantom_gpu/tests/test_retained_freeze_wrapper.py

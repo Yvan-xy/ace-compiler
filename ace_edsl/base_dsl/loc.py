@@ -50,7 +50,7 @@ class SourceLoc:
         return f"{self.filename}:{self.line}"
 
 
-# Global file ID cache: filename -> file_id
+# File ID cache for the current GlobScope: filename -> file_id
 _file_id_cache: Dict[str, int] = {}
 
 # Global glob_scope reference for file registration
@@ -59,7 +59,12 @@ _glob_scope: Any = None
 
 def set_glob_scope(glob: Any):
     """Set the global GlobScope for file registration."""
-    global _glob_scope
+    global _glob_scope, _file_id_cache
+    if glob is not _glob_scope:
+        # File IDs belong to a GlobScope's string/file tables.  Reusing an ID
+        # cached for an earlier module skips registration in the new scope and
+        # leaves its AIR source-location table incomplete.
+        _file_id_cache.clear()
     _glob_scope = glob
 
 
@@ -300,4 +305,3 @@ def clear_file_cache():
     """Clear the file ID cache (for testing)."""
     global _file_id_cache
     _file_id_cache.clear()
-
