@@ -15,6 +15,7 @@
 #include "air/base/visitor.h"
 #include "air/core/handler.h"
 #include "fhe/ckks/ckks_gen.h"
+#include "fhe/ckks/ckks_handler.h"
 #include "fhe/ckks/config.h"
 #include "fhe/ckks/default_handler.h"
 #include "fhe/ckks/sihe2ckks_ctx.h"
@@ -31,7 +32,9 @@ class SIHE2CKKS_LOWER {
 public:
   using CORE_HANDLER  = air::core::HANDLER<air::core::DEFAULT_HANDLER>;
   using SIHE_HANDLER  = sihe::HANDLER<SIHE2CKKS_IMPL>;
-  using LOWER_VISITOR = VISITOR<SIHE2CKKS_CTX, CORE_HANDLER, SIHE_HANDLER>;
+  using CKKS_HANDLER  = ckks::HANDLER<ckks::DEFAULT_HANDLER>;
+  using LOWER_VISITOR =
+      VISITOR<SIHE2CKKS_CTX, CORE_HANDLER, SIHE_HANDLER, CKKS_HANDLER>;
 
   SIHE2CKKS_LOWER(GLOB_SCOPE* glob_scope, core::LOWER_CTX* ctx,
                   const CKKS_CONFIG* config)

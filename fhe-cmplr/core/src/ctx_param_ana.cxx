@@ -399,10 +399,12 @@ R_CODE CTX_PARAM_ANA::Run() {
   uint32_t   mul_lev   = ana_ctx.Get_mul_level();
   if (ana_ctx.Max_cipher_lvl() > 0) {
     if (mul_lev > ana_ctx.Max_cipher_lvl()) {
-      CMPLR_ASSERT(false,
-                   "Warning: The max cipher level set by the compiler option "
-                   "is less than the required value: ",
-                   mul_lev, "\n");
+      CMPLR_ERR_MSG(
+          Driver_ctx()->Tfile(),
+          "configured maximum ciphertext level is less than the required "
+          "full data-Q count: ",
+          mul_lev, " > ", ana_ctx.Max_cipher_lvl(), "\n");
+      return R_CODE::USER;
     } else {
       mul_lev = ana_ctx.Max_cipher_lvl();
     }

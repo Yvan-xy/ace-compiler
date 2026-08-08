@@ -22,6 +22,7 @@
 #include "fhe/ckks/ckks2c_config.h"
 #include "fhe/ckks/ckks2c_driver.h"
 #include "fhe/ckks/ckks_opcode.h"
+#include "fhe/ckks/config.h"
 #include "fhe/ckks/phantom_context_manifest.h"
 #include "fhe/core/ctx_param_ana.h"
 #include "fhe/core/lower_ctx.h"
@@ -196,6 +197,159 @@ TEST(CKKS2COrdinaryContract, DistinguishesDifferentCompilerParameters) {
   const std::string second = fhe::ckks::Serialize_phantom_context_descriptor(
       fhe::ckks::Build_phantom_context_descriptor(second_parameters));
   EXPECT_NE(first, second);
+}
+
+class CKKSFullQPipelineTest : public testing::Test {
+protected:
+  void SetUp() override {
+    META_INFO::Remove_all();
+    ASSERT_TRUE(air::core::Register_core());
+    ASSERT_TRUE(fhe::sihe::Register_sihe_domain());
+    ASSERT_TRUE(fhe::ckks::Register_ckks_domain());
+
+    _glob = new GLOB_SCOPE(0, true);
+    _spos = _glob->Unknown_simple_spos();
+    fhe::sihe::SIHE_GEN(_glob, &_lower_ctx).Register_sihe_types();
+    fhe::ckks::CKKS_GEN(_glob, &_lower_ctx).Register_ckks_types();
+    TYPE_PTR cipher = _lower_ctx.Get_cipher_type(_glob);
+
+    fhe::core::CTX_PARAM& parameters = _lower_ctx.Get_ctx_param();
+    parameters.Set_poly_degree(32, false);
+    parameters.Set_mul_level(1, false);
+    parameters.Set_first_prime_bit_num(60);
+    parameters.Set_scaling_factor_bit_num(56);
+    parameters.Set_q_part_num(1);
+    parameters.Set_input_level(1);
+    parameters.Set_hamming_weight(8);
+    parameters.Set_security_level(0);
+
+    FUNC_PTR           func       = _glob->New_func("raise_pipeline", _spos);
+    FUNC_SCOPE*        func_scope = &_glob->New_func_scope(func);
+    SIGNATURE_TYPE_PTR signature  = _glob->New_sig_type();
+    _glob->New_param("input", cipher, signature, _spos);
+    _glob->New_ret_param(cipher->Id(), signature->Id());
+    signature->Set_complete();
+    _glob->New_entry_point(signature, func, "raise_pipeline", _spos)
+        ->Set_program_entry();
+
+    CONTAINER*     container = &func_scope->Container();
+    ADDR_DATUM_PTR input = func_scope->New_formal(cipher->Id(), "input", _spos);
+    STMT_PTR       entry = container->New_func_entry(_spos, 1);
+    entry->Node()->Set_child(0, container->New_idname(input, _spos));
+
+    TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+    NODE_PTR raise =
+        container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, cipher, _spos);
+    raise->Set_child(0, container->New_ld(input, _spos));
+    raise->Set_child(1, container->New_intconst(u32, 4, _spos));
+    container->Stmt_list().Append(container->New_retv(raise, _spos));
+  }
+
+  void TearDown() override { delete _glob; }
+
+  NODE_PTR Find_raise(NODE_PTR node) const {
+    if (node == Null_ptr) return Null_ptr;
+    if (node->Opcode() == fhe::ckks::OPC_RAISE_MOD) return node;
+    if (node->Is_block()) {
+      for (STMT_PTR stmt = node->Begin_stmt(); stmt != node->End_stmt();
+           stmt          = stmt->Next()) {
+        NODE_PTR found = Find_raise(stmt->Node());
+        if (found != Null_ptr) return found;
+      }
+      return Null_ptr;
+    }
+    for (uint32_t index = 0; index < node->Num_child(); ++index) {
+      NODE_PTR found = Find_raise(node->Child(index));
+      if (found != Null_ptr) return found;
+    }
+    return Null_ptr;
+  }
+
+  fhe::ckks::CKKS_CONFIG Configured(uint32_t full_q_count) const {
+    fhe::ckks::CKKS_CONFIG config;
+    config._max_cipher_lvl   = full_q_count;
+    config._input_cipher_lvl = 1;
+    config._poly_deg         = 32;
+    config._hamming_weight   = 8;
+    return config;
+  }
+
+  GLOB_SCOPE*          _glob = nullptr;
+  fhe::core::LOWER_CTX _lower_ctx;
+  SPOS                 _spos;
+};
+
+TEST_F(CKKSFullQPipelineTest, ConfiguredFullQPrecedesScaleMetadata) {
+  fhe::ckks::CKKS_CONFIG  config = Configured(4);
+  air::driver::DRIVER_CTX driver_context;
+  R_CODE                  status = R_CODE::INTERNAL;
+  GLOB_SCOPE*             output = fhe::ckks::Ckks_driver(
+      _glob, &_lower_ctx, &driver_context, &config, &status);
+  ASSERT_EQ(status, R_CODE::NORMAL);
+  ASSERT_NE(output, nullptr);
+  _glob = output;
+
+  NODE_PTR raise =
+      Find_raise((*_glob->Begin_func_scope()).Container().Entry_node());
+  ASSERT_NE(raise, Null_ptr);
+  const uint32_t* input_rescale =
+      raise->Child(0)->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::RESCALE_LEVEL);
+  const uint32_t* result_rescale =
+      raise->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::RESCALE_LEVEL);
+  ASSERT_NE(input_rescale, nullptr);
+  ASSERT_NE(result_rescale, nullptr);
+  EXPECT_EQ(*input_rescale, 4u);
+  EXPECT_EQ(*result_rescale, 1u);
+  EXPECT_EQ(_lower_ctx.Get_ctx_param().Get_mul_level(), 4u);
+}
+
+TEST_F(CKKSFullQPipelineTest, MissingMclInfersRaiseTargetBeforeScaleMetadata) {
+  fhe::ckks::CKKS_CONFIG  config = Configured(0);
+  air::driver::DRIVER_CTX driver_context;
+  R_CODE                  status = R_CODE::INTERNAL;
+  GLOB_SCOPE*             output = fhe::ckks::Ckks_driver(
+      _glob, &_lower_ctx, &driver_context, &config, &status);
+  ASSERT_EQ(status, R_CODE::NORMAL);
+  ASSERT_NE(output, nullptr);
+  _glob = output;
+
+  NODE_PTR raise =
+      Find_raise((*_glob->Begin_func_scope()).Container().Entry_node());
+  ASSERT_NE(raise, Null_ptr);
+  const uint32_t* input_rescale =
+      raise->Child(0)->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::RESCALE_LEVEL);
+  const uint32_t* result_rescale =
+      raise->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::RESCALE_LEVEL);
+  ASSERT_NE(input_rescale, nullptr);
+  ASSERT_NE(result_rescale, nullptr);
+  EXPECT_EQ(*input_rescale, 4u);
+  EXPECT_EQ(*result_rescale, 1u);
+  EXPECT_EQ(_lower_ctx.Get_ctx_param().Get_mul_level(), 4u);
+}
+
+TEST_F(CKKSFullQPipelineTest, RaiseBeyondConfiguredFullQIsUserError) {
+  fhe::ckks::CKKS_CONFIG  config = Configured(3);
+  air::driver::DRIVER_CTX driver_context;
+  R_CODE                  status = R_CODE::NORMAL;
+
+  testing::internal::CaptureStderr();
+  GLOB_SCOPE* output = fhe::ckks::Ckks_driver(
+      _glob, &_lower_ctx, &driver_context, &config, &status);
+  const std::string stderr_text = testing::internal::GetCapturedStderr();
+
+  EXPECT_EQ(output, nullptr);
+  EXPECT_EQ(status, R_CODE::USER);
+  EXPECT_EQ(_lower_ctx.Get_ctx_param().Get_mul_level(), 1u);
+  NODE_PTR original_raise =
+      Find_raise((*_glob->Begin_func_scope()).Container().Entry_node());
+  ASSERT_NE(original_raise, Null_ptr);
+  EXPECT_EQ(
+      original_raise->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::RESCALE_LEVEL),
+      nullptr);
+  EXPECT_NE(
+      stderr_text.find(
+          "raise_mod target_q_count exceeds configured full data-Q count"),
+      std::string::npos);
 }
 
 TEST(CKKS2COrdinaryContract, RejectsProviderUnsupportedPolynomialDegree) {
@@ -1019,7 +1173,7 @@ TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
   {
     fhe::core::CTX_PARAM_ANA analysis(_func_scope, &_lower_ctx,
                                       &driver_context, &analysis_config);
-    ASSERT_EQ(analysis.Run(), air::driver::R_CODE::NORMAL);
+    ASSERT_EQ(analysis.Run(), R_CODE::NORMAL);
   }
 
   const uint32_t* raise_result_level =

@@ -32,9 +32,14 @@ R_CODE CKKS_PASS::Pre_run() {
 }
 
 R_CODE CKKS_PASS::Run() {
+  R_CODE                 result = R_CODE::NORMAL;
   air::base::GLOB_SCOPE* glob =
       Ckks_driver(Get_driver()->Glob_scope(), &Get_driver()->Lower_ctx(),
-                  Get_driver()->Context(), &_config);
+                  Get_driver()->Context(), &_config, &result);
+  if (result != R_CODE::NORMAL) {
+    AIR_ASSERT(glob == nullptr);
+    return result;
+  }
   Get_driver()->Update_glob_scope(glob);
   return R_CODE::NORMAL;
 }

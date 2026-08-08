@@ -99,7 +99,8 @@ private:
 air::base::GLOB_SCOPE* Ckks_driver(air::base::GLOB_SCOPE*         glob,
                                    core::LOWER_CTX*               lower_ctx,
                                    const air::driver::DRIVER_CTX* driver_ctx,
-                                   const CKKS_CONFIG*             config);
+                                   const CKKS_CONFIG*             config,
+                                   R_CODE* result = nullptr);
 
 }  // namespace ckks
 }  // namespace fhe
