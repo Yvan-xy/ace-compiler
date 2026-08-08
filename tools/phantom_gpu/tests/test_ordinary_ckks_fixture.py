@@ -181,7 +181,7 @@ def test_frozen_fixture_derives_coordinates_and_covers_aliases_and_tolerances(
     assert fixture["compiler_context_manifest"]["sha256"] == (
         "2a2927711c260f72257abebffd9f74f3cb9aeaffd5a8f44c4d7efa5764e6569f"
     )
-    assert digest == "10114d36488b06a12237fce96bf867eb6f06c42c9d9dd4d05bab771111b3a28e"
+    assert digest == "a21d2883bec45112ad1ced38e821af0dfbb32414ba585e3e9990119a16350e81"
     assert fixture["coordinate_rules"] == {
         "input_length": "compiler_context.logical_slot_capacity",
         "full_level": "compiler_context.data_q_count",
