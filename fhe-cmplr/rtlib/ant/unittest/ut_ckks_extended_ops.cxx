@@ -28,8 +28,10 @@ protected:
   void SetUp() override {
     _degree = 32;
     _slots = _degree / 2;
-    _rotation_steps = {5, 0, -7, 5,
-                       static_cast<std::int32_t>(2U * _degree - 1U)};
+    // ANT still represents conjugation internally with 2N-1, but the
+    // ordinary rotation list itself contains only unique, nonzero steps.
+    _rotation_steps = {
+        5, -7, static_cast<std::int32_t>(2U * _degree - 1U)};
     Set_context_params(_degree, 3, 33, 30, 0, 1, 0, _rotation_steps.size(),
                        _rotation_steps.data());
     Prepare_context();
@@ -180,7 +182,7 @@ protected:
   std::uint32_t _degree = 0;
   std::uint32_t _slots = 0;
   std::size_t _full_q_count = 0;
-  std::array<std::int32_t, 5> _rotation_steps{};
+  std::array<std::int32_t, 3> _rotation_steps{};
 };
 
 TEST_F(TEST_CKKS_EXTENDED_OPS, CenteredRaiseIsExactAndOutOfPlace) {
