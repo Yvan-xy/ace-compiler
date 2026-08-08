@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -250,6 +251,26 @@ def test_generator_consumes_seed_and_is_binary_deterministic(tmp_path: Path) -> 
         with pytest.raises(comparator.ComparisonError, match="case order"):
             comparator.validate_exact_case_order(invalid, expected_order, name)
 
+    resolved = fixture_tool.validate_context_manifest(fixture_tool.load_json(context))
+    comparator.load_analytic(
+        first_json,
+        first_bin,
+        fixture_tool.sha256_path(bound_path),
+        bound,
+        resolved,
+    )
+    invalid_analytic = fixture_tool.load_json(first_json)
+    invalid_analytic["records"][0]["metadata"]["unexpected"] = 1
+    _write_json(first_json, invalid_analytic)
+    with pytest.raises(comparator.ComparisonError, match="analytic metadata"):
+        comparator.load_analytic(
+            first_json,
+            first_bin,
+            fixture_tool.sha256_path(bound_path),
+            bound,
+            resolved,
+        )
+
 
 def test_exact_centered_lift_and_negacyclic_normalization() -> None:
     assert fixture_tool.centered_lift([0, 8, 9, 16], [17, 19]) == [
@@ -311,6 +332,220 @@ def test_strict_json_and_metric_reject_invalid_data(tmp_path: Path) -> None:
     assert result["status"] == "pass"
     assert result["comparison_count"] == 1
     assert result["maximum_absolute_error"] == 0
+
+
+def _write_source_manifest(path: Path, kind: str, commit: str) -> None:
+    prefix = f"{kind}-source"
+    member_path = f"{prefix}/README"
+    _write_json(
+        path,
+        {
+            "schema_version": "1.0.0",
+            "kind": kind,
+            "source_method": "git-commit-object-archive",
+            "commit": commit,
+            "commit_timestamp": 1,
+            "tree": "e" * 40,
+            "archive": f"{prefix}.tar.gz",
+            "archive_size": 1,
+            "archive_sha256": "f" * 64,
+            "allowed_paths": ["README"],
+            "excluded_paths": [],
+            "members": [
+                {
+                    "path": member_path,
+                    "type": "file",
+                    "mode": "0644",
+                    "size": 1,
+                    "sha256": "d" * 64,
+                }
+            ],
+            "member_count": 1,
+            "regular_bytes": 1,
+        },
+    )
+
+
+def test_identity_chain_hashes_sources_generation_build_run_and_artifacts(
+    tmp_path: Path,
+) -> None:
+    generation_fixture, context, generation_path, air = _qualification_files(tmp_path)
+    bound = fixture_tool.bind_fixture(
+        generation_fixture, context, generation_path, air
+    )
+    fixture = tmp_path / "bound-fixture.json"
+    _write_json(fixture, bound)
+    emitted_context = tmp_path / "emitted-context.json"
+    emitted_context.write_bytes(context.read_bytes())
+    resource = tmp_path / "resource.json"
+    generated_ant = tmp_path / "generated.cxx"
+    generated_phantom = tmp_path / "generated.cu"
+    ant_executable = tmp_path / "ant-executable"
+    phantom_executable = tmp_path / "phantom-executable"
+    ant_json, ant_bin = tmp_path / "ant.json", tmp_path / "ant.bin"
+    gpu_json, gpu_bin = tmp_path / "gpu.json", tmp_path / "gpu.bin"
+    exact_json, exact_bin = tmp_path / "exact.json", tmp_path / "exact.bin"
+    for path, contents in (
+        (resource, b"{}\n"),
+        (generated_ant, b"generated ant\n"),
+        (generated_phantom, b"generated phantom\n"),
+        (ant_executable, b"ant executable\n"),
+        (phantom_executable, b"phantom executable\n"),
+        (ant_json, b"ant json\n"),
+        (ant_bin, b"ant binary\n"),
+        (gpu_json, b"gpu json\n"),
+        (gpu_bin, b"gpu binary\n"),
+        (exact_json, b"exact json\n"),
+        (exact_bin, b"exact binary\n"),
+    ):
+        path.write_bytes(contents)
+
+    ace_commit, phantom_commit = "a" * 40, "b" * 40
+    ace_source = tmp_path / "ace-source.json"
+    phantom_source = tmp_path / "phantom-source.json"
+    _write_source_manifest(ace_source, "ace", ace_commit)
+    _write_source_manifest(phantom_source, "phantom", phantom_commit)
+
+    generation = fixture_tool.load_json(generation_path)
+    generation.update(
+        {
+            "ace_commit": ace_commit,
+            "emitted_context_manifest_sha256": fixture_tool.sha256_path(
+                emitted_context
+            ),
+            "resource_manifest_sha256": fixture_tool.sha256_path(resource),
+            "ant_source_sha256": fixture_tool.sha256_path(generated_ant),
+            "phantom_source_sha256": fixture_tool.sha256_path(generated_phantom),
+        }
+    )
+    _write_json(generation_path, generation)
+    build_path = tmp_path / "build.json"
+    build = {
+        "schema_version": comparator.BUILD_ATTESTATION_SCHEMA,
+        "status": "pass",
+        "architecture": "sm_80",
+        "ace_commit": ace_commit,
+        "phantom_commit": phantom_commit,
+        "source_mode": "snapshot",
+        "ace_source_manifest_sha256": fixture_tool.sha256_path(ace_source),
+        "phantom_source_manifest_sha256": fixture_tool.sha256_path(phantom_source),
+        "compiler_context_manifest_sha256": fixture_tool.sha256_path(context),
+        "compiler_resource_manifest_sha256": fixture_tool.sha256_path(resource),
+        "fixture_sha256": fixture_tool.sha256_path(fixture),
+        "compiler_invocation_sha256": fixture_tool.sha256_path(generation_path),
+        "generated_ant_source_sha256": fixture_tool.sha256_path(generated_ant),
+        "generated_phantom_source_sha256": fixture_tool.sha256_path(
+            generated_phantom
+        ),
+        "archives": {
+            "adapter": "1" * 64,
+            "provider": "2" * 64,
+            "common": "3" * 64,
+            "ant": "4" * 64,
+            "ant_encode": "5" * 64,
+        },
+        "executables": {
+            "ant_oracle": fixture_tool.sha256_path(ant_executable),
+            "phantom_sm80": fixture_tool.sha256_path(phantom_executable),
+        },
+        "link_commands_sha256": "6" * 64,
+        "container": {
+            "image": "pinned@example",
+            "config_digest": "sha256:" + "7" * 64,
+            "bootstrap_sha256": "8" * 64,
+        },
+        "link_mode": "explicit_compile-device-link-host-link",
+        "archive_inspection": "pass",
+        "undefined_symbol_inspection": "pass",
+        "cubin_architecture_inspection": "pass",
+        "host_tests": "pass",
+        "host_ant_oracle_was_run": True,
+        "gpu_executables_were_run": False,
+    }
+    _write_json(build_path, build)
+    run_path = tmp_path / "run.json"
+    run = {
+        "schema_version": comparator.RUN_ATTESTATION_SCHEMA,
+        "status": "pass",
+        "ace_commit": ace_commit,
+        "phantom_commit": phantom_commit,
+        "ace_source_manifest_sha256": fixture_tool.sha256_path(ace_source),
+        "phantom_source_manifest_sha256": fixture_tool.sha256_path(phantom_source),
+        "generation_attestation_sha256": fixture_tool.sha256_path(generation_path),
+        "build_attestation_sha256": fixture_tool.sha256_path(build_path),
+        "fixture_sha256": fixture_tool.sha256_path(fixture),
+        "compiler_context_manifest_sha256": fixture_tool.sha256_path(context),
+        "compiler_resource_manifest_sha256": fixture_tool.sha256_path(resource),
+        "executables": build["executables"],
+        "provider_results": {
+            "ant": {
+                "json_sha256": fixture_tool.sha256_path(ant_json),
+                "binary_sha256": fixture_tool.sha256_path(ant_bin),
+            },
+            "phantom": {
+                "json_sha256": fixture_tool.sha256_path(gpu_json),
+                "binary_sha256": fixture_tool.sha256_path(gpu_bin),
+            },
+        },
+        "exact_observed": {
+            "json_sha256": fixture_tool.sha256_path(exact_json),
+            "binary_sha256": fixture_tool.sha256_path(exact_bin),
+        },
+        "gpu": {"device_count": 1, "device_name": "NVIDIA A100-SXM4-80GB"},
+    }
+    _write_json(run_path, run)
+    arguments = argparse.Namespace(
+        ace_source_manifest=ace_source,
+        phantom_source_manifest=phantom_source,
+        generation_attestation=generation_path,
+        generation_fixture=generation_fixture,
+        context_manifest=context,
+        post_ckks_air=air,
+        ant_post_ckks_air=air,
+        emitted_context_manifest=emitted_context,
+        resource_manifest=resource,
+        fixture=fixture,
+        generated_ant_source=generated_ant,
+        generated_phantom_source=generated_phantom,
+        ant_executable=ant_executable,
+        phantom_executable=phantom_executable,
+        build_attestation=build_path,
+        run_attestation=run_path,
+        ant_json=ant_json,
+        ant_bin=ant_bin,
+        gpu_json=gpu_json,
+        gpu_bin=gpu_bin,
+        exact_observed_json=exact_json,
+        exact_observed_bin=exact_bin,
+    )
+    identity = comparator.load_identity_chain(arguments)
+    assert identity["identifiers"]["ant"]["ace_commit"] == ace_commit
+    assert identity["identifiers"]["phantom"]["phantom_commit"] == phantom_commit
+
+    valid_ace_source = fixture_tool.load_json(ace_source)
+    invalid_ace_source = dict(valid_ace_source, unexpected="open schema")
+    _write_json(ace_source, invalid_ace_source)
+    with pytest.raises(comparator.ComparisonError, match="source manifest keys differ"):
+        comparator.load_identity_chain(arguments)
+    _write_json(ace_source, valid_ace_source)
+
+    invalid_run = dict(run, unexpected="open schema")
+    _write_json(run_path, invalid_run)
+    with pytest.raises(comparator.ComparisonError, match="run attestation keys differ"):
+        comparator.load_identity_chain(arguments)
+    _write_json(run_path, run)
+
+    invalid_build = dict(build, phantom_commit="c" * 40)
+    _write_json(build_path, invalid_build)
+    with pytest.raises(comparator.ComparisonError, match="phantom_commit mismatch"):
+        comparator.load_identity_chain(arguments)
+    _write_json(build_path, build)
+    run["build_attestation_sha256"] = fixture_tool.sha256_path(build_path)
+    _write_json(run_path, run)
+
+    generated_phantom.write_bytes(b"mutated generated phantom\n")
+    with pytest.raises(comparator.ComparisonError, match="phantom_source_sha256"):
+        comparator.load_identity_chain(arguments)
 
 
 def test_provider_attestation_binds_identifiers_and_all_result_artifacts(
@@ -379,7 +614,10 @@ def test_provider_attestation_binds_identifiers_and_all_result_artifacts(
         attestation_path,
         fixture_sha256=fixture_sha,
         context_sha256=context_sha,
-        compiler_invocation=artifacts["compiler-invocation.json"],
+        generation_sha256=attestation["compiler_invocation_sha256"],
+        build_sha256=attestation["build_attestation_sha256"],
+        run_sha256=attestation["run_attestation_sha256"],
+        expected_identifiers=identifiers,
         ant_json=artifacts["ant.json"],
         ant_binary=artifacts["ant.bin"],
         gpu_json=artifacts["phantom.json"],
@@ -393,12 +631,15 @@ def test_provider_attestation_binds_identifiers_and_all_result_artifacts(
     invalid["providers"][1]["identifiers"]["executable_sha256"] = "7" * 64
     invalid_path = tmp_path / "invalid-provider-attestation.json"
     _write_json(invalid_path, invalid)
-    with pytest.raises(comparator.ComparisonError, match="exact observed artifact"):
+    with pytest.raises(comparator.ComparisonError, match="audited source/build identity"):
         comparator.load_provider_attestation(
             invalid_path,
             fixture_sha256=fixture_sha,
             context_sha256=context_sha,
-            compiler_invocation=artifacts["compiler-invocation.json"],
+            generation_sha256=attestation["compiler_invocation_sha256"],
+            build_sha256=attestation["build_attestation_sha256"],
+            run_sha256=attestation["run_attestation_sha256"],
+            expected_identifiers=identifiers,
             ant_json=artifacts["ant.json"],
             ant_binary=artifacts["ant.bin"],
             gpu_json=artifacts["phantom.json"],

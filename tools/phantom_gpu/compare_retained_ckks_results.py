@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import struct
 import sys
 from typing import Any, Sequence
@@ -30,7 +30,9 @@ from generate_retained_ckks_fixtures import (  # noqa: E402
     negacyclic_monomial,
     sha256_bytes,
     sha256_path,
+    _load_invocation,
     verify_bindings,
+    verify_invocation_context,
     write_json,
 )
 
@@ -42,6 +44,8 @@ EXACT_EVIDENCE_SCHEMA = "ace.phantom.retained_ckks.exact-evidence/2.0.0"
 PROVIDER_ATTESTATION_SCHEMA = (
     "ace.phantom.retained_ckks.provider-attestation/1.0.0"
 )
+BUILD_ATTESTATION_SCHEMA = "ace.phantom.retained_ckks.build-attestation/1.0.0"
+RUN_ATTESTATION_SCHEMA = "ace.phantom.retained_ckks.run-attestation/1.0.0"
 
 
 class ComparisonError(ValueError):
@@ -133,6 +137,274 @@ def hex_digest(value: Any, length: int, context: str) -> str:
         or any(character not in "0123456789abcdef" for character in value)
     ):
         fail(f"{context} must be a lowercase hexadecimal digest")
+    return value
+
+
+def load_source_manifest(path: Path, kind: str) -> dict[str, Any]:
+    manifest = expect_keys(
+        load_json(path),
+        {
+            "schema_version",
+            "kind",
+            "source_method",
+            "commit",
+            "commit_timestamp",
+            "tree",
+            "archive",
+            "archive_size",
+            "archive_sha256",
+            "allowed_paths",
+            "excluded_paths",
+            "members",
+            "member_count",
+            "regular_bytes",
+        },
+        f"{kind} source manifest",
+    )
+    if (
+        manifest["schema_version"] != "1.0.0"
+        or manifest["kind"] != kind
+        or manifest["source_method"] != "git-commit-object-archive"
+    ):
+        fail(f"{kind} source manifest identity is unsupported")
+    hex_digest(manifest["commit"], 40, f"{kind} source commit")
+    hex_digest(manifest["tree"], 40, f"{kind} source tree")
+    hex_digest(manifest["archive_sha256"], 64, f"{kind} source archive")
+    integer(manifest["commit_timestamp"], f"{kind} commit timestamp")
+    integer(manifest["archive_size"], f"{kind} archive size", 1)
+    integer(manifest["member_count"], f"{kind} member count", 1)
+    integer(manifest["regular_bytes"], f"{kind} regular bytes", 1)
+    if not isinstance(manifest["archive"], str) or not manifest["archive"]:
+        fail(f"{kind} source archive name must be nonempty")
+    for field in ("allowed_paths", "excluded_paths"):
+        values = manifest[field]
+        if not isinstance(values, list) or not all(
+            isinstance(value, str) and value for value in values
+        ):
+            fail(f"{kind} source manifest {field} must be a string array")
+        if values != sorted(set(values)):
+            fail(f"{kind} source manifest {field} is not unique canonical order")
+        for value in values:
+            manifest_path = PurePosixPath(value)
+            if (
+                manifest_path.is_absolute()
+                or not manifest_path.parts
+                or any(part in {"", ".", ".."} for part in manifest_path.parts)
+            ):
+                fail(f"{kind} source manifest {field} contains an unsafe path")
+    if not manifest["allowed_paths"]:
+        fail(f"{kind} source manifest allowed_paths must be nonempty")
+    members = manifest["members"]
+    if not isinstance(members, list) or len(members) != manifest["member_count"]:
+        fail(f"{kind} source manifest member count differs")
+    observed_paths: list[str] = []
+    observed_regular_bytes = 0
+    for index, raw_member in enumerate(members):
+        if not isinstance(raw_member, dict):
+            fail(f"{kind} source member {index} must be an object")
+        member_type = raw_member.get("type")
+        required = {"path", "type", "mode", "size"}
+        if member_type == "file":
+            required.add("sha256")
+        elif member_type == "symlink":
+            required.add("link_target")
+        elif member_type != "directory":
+            fail(f"{kind} source member {index} has an invalid type")
+        member = expect_keys(raw_member, required, f"{kind} source member {index}")
+        if not all(
+            isinstance(member[field], str) and member[field]
+            for field in ("path", "mode")
+        ):
+            fail(f"{kind} source member {index} has invalid string fields")
+        member_path = PurePosixPath(member["path"])
+        if (
+            member_path.is_absolute()
+            or len(member_path.parts) < 2
+            or member_path.parts[0] != f"{kind}-source"
+            or any(part in {"", ".", ".."} for part in member_path.parts)
+        ):
+            fail(f"{kind} source member {index} has an unsafe path")
+        if len(member["mode"]) != 4 or any(
+            character not in "01234567" for character in member["mode"]
+        ):
+            fail(f"{kind} source member {index} has an invalid mode")
+        integer(member["size"], f"{kind} source member {index} size")
+        observed_paths.append(member["path"])
+        if member_type == "file":
+            hex_digest(member["sha256"], 64, f"{kind} source member {index}")
+            observed_regular_bytes += member["size"]
+        elif member_type == "symlink":
+            if not isinstance(member["link_target"], str) or not member["link_target"]:
+                fail(f"{kind} source member {index} link target is invalid")
+            target = PurePosixPath(member["link_target"])
+            if target.is_absolute():
+                fail(f"{kind} source member {index} link target is absolute")
+            resolved_parts = list(member_path.parent.parts[1:])
+            for part in target.parts:
+                if part in {"", "."}:
+                    continue
+                if part == "..":
+                    if not resolved_parts:
+                        fail(f"{kind} source member {index} link target escapes")
+                    resolved_parts.pop()
+                else:
+                    resolved_parts.append(part)
+        if member_type != "file" and member["size"] != 0:
+            fail(f"{kind} source member {index} must have zero size")
+    if observed_paths != sorted(observed_paths) or len(set(observed_paths)) != len(
+        observed_paths
+    ):
+        fail(f"{kind} source manifest paths are not unique canonical order")
+    if observed_regular_bytes != manifest["regular_bytes"]:
+        fail(f"{kind} source manifest regular byte count differs")
+    return manifest
+
+
+def load_build_attestation(
+    path: Path,
+    *,
+    expected: dict[str, Any],
+) -> dict[str, Any]:
+    value = expect_keys(
+        load_json(path),
+        {
+            "schema_version",
+            "status",
+            "architecture",
+            "ace_commit",
+            "phantom_commit",
+            "source_mode",
+            "ace_source_manifest_sha256",
+            "phantom_source_manifest_sha256",
+            "compiler_context_manifest_sha256",
+            "compiler_resource_manifest_sha256",
+            "fixture_sha256",
+            "compiler_invocation_sha256",
+            "generated_ant_source_sha256",
+            "generated_phantom_source_sha256",
+            "archives",
+            "executables",
+            "link_commands_sha256",
+            "container",
+            "link_mode",
+            "archive_inspection",
+            "undefined_symbol_inspection",
+            "cubin_architecture_inspection",
+            "host_tests",
+            "host_ant_oracle_was_run",
+            "gpu_executables_were_run",
+        },
+        "build attestation",
+    )
+    if (
+        value["schema_version"] != BUILD_ATTESTATION_SCHEMA
+        or value["status"] != "pass"
+        or value["architecture"] != "sm_80"
+        or value["source_mode"] != "snapshot"
+        or value["link_mode"] != "explicit_compile-device-link-host-link"
+        or any(
+            value[field] != "pass"
+            for field in (
+                "archive_inspection",
+                "undefined_symbol_inspection",
+                "cubin_architecture_inspection",
+                "host_tests",
+            )
+        )
+        or value["host_ant_oracle_was_run"] is not True
+        or value["gpu_executables_were_run"] is not False
+    ):
+        fail("build attestation did not record the reviewed host build contract")
+    for field, expected_value in expected.items():
+        if value[field] != expected_value:
+            fail(f"build attestation {field} mismatch")
+    archives = expect_keys(
+        value["archives"],
+        {"adapter", "provider", "common", "ant", "ant_encode"},
+        "build attestation archives",
+    )
+    for name, digest in archives.items():
+        hex_digest(digest, 64, f"build archive {name}")
+    executables = expect_keys(
+        value["executables"],
+        {"ant_oracle", "phantom_sm80"},
+        "build attestation executables",
+    )
+    for name, digest in executables.items():
+        hex_digest(digest, 64, f"build executable {name}")
+    hex_digest(value["link_commands_sha256"], 64, "build link commands")
+    container = expect_keys(
+        value["container"],
+        {"image", "config_digest", "bootstrap_sha256"},
+        "build attestation container",
+    )
+    if not isinstance(container["image"], str) or not container["image"]:
+        fail("build container image must be nonempty")
+    config_digest = container["config_digest"]
+    if not isinstance(config_digest, str) or not config_digest.startswith("sha256:"):
+        fail("build container config digest must use the sha256 prefix")
+    hex_digest(config_digest.removeprefix("sha256:"), 64, "build container config")
+    hex_digest(container["bootstrap_sha256"], 64, "build container bootstrap")
+    return value
+
+
+def load_run_attestation(path: Path, *, expected: dict[str, Any]) -> dict[str, Any]:
+    value = expect_keys(
+        load_json(path),
+        {
+            "schema_version",
+            "status",
+            "ace_commit",
+            "phantom_commit",
+            "ace_source_manifest_sha256",
+            "phantom_source_manifest_sha256",
+            "generation_attestation_sha256",
+            "build_attestation_sha256",
+            "fixture_sha256",
+            "compiler_context_manifest_sha256",
+            "compiler_resource_manifest_sha256",
+            "executables",
+            "provider_results",
+            "exact_observed",
+            "gpu",
+        },
+        "run attestation",
+    )
+    if value["schema_version"] != RUN_ATTESTATION_SCHEMA or value["status"] != "pass":
+        fail("run attestation schema or status mismatch")
+    for field, expected_value in expected.items():
+        if value[field] != expected_value:
+            fail(f"run attestation {field} mismatch")
+    executables = expect_keys(
+        value["executables"],
+        {"ant_oracle", "phantom_sm80"},
+        "run attestation executables",
+    )
+    for name, digest in executables.items():
+        hex_digest(digest, 64, f"run executable {name}")
+    providers = expect_keys(
+        value["provider_results"], {"ant", "phantom"}, "run provider results"
+    )
+    for provider_name, raw_result in providers.items():
+        result = expect_keys(
+            raw_result,
+            {"json_sha256", "binary_sha256"},
+            f"run {provider_name} result",
+        )
+        for name, digest in result.items():
+            hex_digest(digest, 64, f"run {provider_name} {name}")
+    exact = expect_keys(
+        value["exact_observed"],
+        {"json_sha256", "binary_sha256"},
+        "run exact observed",
+    )
+    for name, digest in exact.items():
+        hex_digest(digest, 64, f"run exact observed {name}")
+    gpu = expect_keys(value["gpu"], {"device_count", "device_name"}, "run GPU")
+    if gpu["device_count"] != 1 or not isinstance(gpu["device_name"], str) or not gpu[
+        "device_name"
+    ]:
+        fail("run GPU identity is invalid")
     return value
 
 
@@ -398,8 +670,9 @@ def load_analytic(
     binary_path: Path,
     fixture_sha256: str,
     fixture: dict[str, Any],
-    slots: int,
+    resolved: dict[str, Any],
 ) -> tuple[dict[str, list[complex]], list[dict[str, Any]]]:
+    slots = resolved["logical_slots"]
     value = expect_keys(
         load_json(path),
         {
@@ -488,6 +761,32 @@ def load_analytic(
             fail(f"analytic batch step differs for {item['case_id']}")
         if item["source_input_id"] != "bounded_nonperiodic":
             fail(f"analytic source input differs for {item['case_id']}")
+        metadata = expect_keys(
+            item["metadata"],
+            {
+                "ace_level",
+                "active_q_count",
+                "scale_degree",
+                "logical_slots",
+                "ciphertext_size",
+                "ntt",
+            },
+            f"analytic metadata {item['case_id']}",
+        )
+        for field in (
+            "ace_level",
+            "active_q_count",
+            "scale_degree",
+            "logical_slots",
+            "ciphertext_size",
+        ):
+            integer(metadata[field], f"analytic metadata {item['case_id']}.{field}")
+        if not isinstance(metadata["ntt"], bool):
+            fail(f"analytic metadata {item['case_id']}.ntt must be a boolean")
+        if metadata != expected_metadata(
+            resolved, raised=item["operation"] == "raise_mod"
+        ):
+            fail(f"analytic metadata differs for {item['case_id']}")
         item = dict(item)
         item["decoded_values"] = read_complex(data, item["values"], item["case_id"])
         descriptors.append(item["values"])
@@ -640,12 +939,136 @@ def load_provider(
     return records, first_data_chain_index
 
 
+def load_identity_chain(arguments: argparse.Namespace) -> dict[str, Any]:
+    ace_source = load_source_manifest(arguments.ace_source_manifest, "ace")
+    phantom_source = load_source_manifest(arguments.phantom_source_manifest, "phantom")
+    ace_source_sha256 = sha256_path(arguments.ace_source_manifest)
+    phantom_source_sha256 = sha256_path(arguments.phantom_source_manifest)
+
+    generation, _normalized_argv_sha256, _generation_options = _load_invocation(
+        arguments.generation_attestation
+    )
+    verify_invocation_context(
+        generation,
+        arguments.context_manifest,
+        arguments.post_ckks_air,
+        arguments.generation_fixture,
+    )
+    generation_sha256 = sha256_path(arguments.generation_attestation)
+    generation_expected = {
+        "ace_commit": ace_source["commit"],
+        "fixture_sha256": sha256_path(arguments.generation_fixture),
+        "input_context_manifest_sha256": sha256_path(arguments.context_manifest),
+        "emitted_context_manifest_sha256": sha256_path(
+            arguments.emitted_context_manifest
+        ),
+        "resource_manifest_sha256": sha256_path(arguments.resource_manifest),
+        "post_ckks_air_sha256": sha256_path(arguments.post_ckks_air),
+        "ant_post_ckks_air_sha256": sha256_path(arguments.ant_post_ckks_air),
+        "phantom_post_ckks_air_sha256": sha256_path(arguments.post_ckks_air),
+        "ant_source_sha256": sha256_path(arguments.generated_ant_source),
+        "phantom_source_sha256": sha256_path(arguments.generated_phantom_source),
+    }
+    for field, expected in generation_expected.items():
+        if generation[field] != expected:
+            fail(f"generation attestation {field} mismatch")
+    if arguments.ant_post_ckks_air.read_bytes() != arguments.post_ckks_air.read_bytes():
+        fail("ANT and Phantom post-CKKS AIR artifacts differ")
+    if load_json(arguments.emitted_context_manifest) != load_json(
+        arguments.context_manifest
+    ):
+        fail("emitted and input compiler context manifests differ")
+
+    fixture_sha256 = sha256_path(arguments.fixture)
+    context_sha256 = sha256_path(arguments.context_manifest)
+    resource_sha256 = sha256_path(arguments.resource_manifest)
+    ant_executable_sha256 = sha256_path(arguments.ant_executable)
+    phantom_executable_sha256 = sha256_path(arguments.phantom_executable)
+    build_expected = {
+        "ace_commit": ace_source["commit"],
+        "phantom_commit": phantom_source["commit"],
+        "ace_source_manifest_sha256": ace_source_sha256,
+        "phantom_source_manifest_sha256": phantom_source_sha256,
+        "compiler_context_manifest_sha256": context_sha256,
+        "compiler_resource_manifest_sha256": resource_sha256,
+        "fixture_sha256": fixture_sha256,
+        "compiler_invocation_sha256": generation_sha256,
+        "generated_ant_source_sha256": sha256_path(arguments.generated_ant_source),
+        "generated_phantom_source_sha256": sha256_path(
+            arguments.generated_phantom_source
+        ),
+    }
+    build = load_build_attestation(arguments.build_attestation, expected=build_expected)
+    if build["executables"] != {
+        "ant_oracle": ant_executable_sha256,
+        "phantom_sm80": phantom_executable_sha256,
+    }:
+        fail("build attestation executable hashes mismatch")
+    build_sha256 = sha256_path(arguments.build_attestation)
+
+    run_expected = {
+        "ace_commit": ace_source["commit"],
+        "phantom_commit": phantom_source["commit"],
+        "ace_source_manifest_sha256": ace_source_sha256,
+        "phantom_source_manifest_sha256": phantom_source_sha256,
+        "generation_attestation_sha256": generation_sha256,
+        "build_attestation_sha256": build_sha256,
+        "fixture_sha256": fixture_sha256,
+        "compiler_context_manifest_sha256": context_sha256,
+        "compiler_resource_manifest_sha256": resource_sha256,
+    }
+    run = load_run_attestation(arguments.run_attestation, expected=run_expected)
+    if run["executables"] != build["executables"]:
+        fail("run and build executable hashes differ")
+    expected_provider_results = {
+        "ant": {
+            "json_sha256": sha256_path(arguments.ant_json),
+            "binary_sha256": sha256_path(arguments.ant_bin),
+        },
+        "phantom": {
+            "json_sha256": sha256_path(arguments.gpu_json),
+            "binary_sha256": sha256_path(arguments.gpu_bin),
+        },
+    }
+    if run["provider_results"] != expected_provider_results:
+        fail("run attestation provider result hashes mismatch")
+    if run["exact_observed"] != {
+        "json_sha256": sha256_path(arguments.exact_observed_json),
+        "binary_sha256": sha256_path(arguments.exact_observed_bin),
+    }:
+        fail("run attestation exact observed hashes mismatch")
+    return {
+        "ace_commit": ace_source["commit"],
+        "phantom_commit": phantom_source["commit"],
+        "ace_source_manifest_sha256": ace_source_sha256,
+        "phantom_source_manifest_sha256": phantom_source_sha256,
+        "generation_sha256": generation_sha256,
+        "build_sha256": build_sha256,
+        "run_sha256": sha256_path(arguments.run_attestation),
+        "identifiers": {
+            "ant": {
+                "ace_commit": ace_source["commit"],
+                "phantom_commit": phantom_source["commit"],
+                "executable_sha256": ant_executable_sha256,
+            },
+            "phantom": {
+                "ace_commit": ace_source["commit"],
+                "phantom_commit": phantom_source["commit"],
+                "executable_sha256": phantom_executable_sha256,
+            },
+        },
+    }
+
+
 def load_provider_attestation(
     path: Path,
     *,
     fixture_sha256: str,
     context_sha256: str,
-    compiler_invocation: Path,
+    generation_sha256: str,
+    build_sha256: str,
+    run_sha256: str,
+    expected_identifiers: dict[str, dict[str, Any]],
     ant_json: Path,
     ant_binary: Path,
     gpu_json: Path,
@@ -672,15 +1095,13 @@ def load_provider_attestation(
     expected_bindings = {
         "fixture_sha256": fixture_sha256,
         "context_manifest_sha256": context_sha256,
-        "compiler_invocation_sha256": sha256_path(compiler_invocation),
+        "compiler_invocation_sha256": generation_sha256,
+        "build_attestation_sha256": build_sha256,
+        "run_attestation_sha256": run_sha256,
     }
     for field, expected in expected_bindings.items():
         if value[field] != expected:
             fail(f"provider attestation {field} mismatch")
-    hex_digest(
-        value["build_attestation_sha256"], 64, "build_attestation_sha256"
-    )
-    hex_digest(value["run_attestation_sha256"], 64, "run_attestation_sha256")
     expected_artifacts = {
         "ant": (sha256_path(ant_json), sha256_path(ant_binary)),
         "phantom": (sha256_path(gpu_json), sha256_path(gpu_binary)),
@@ -714,6 +1135,11 @@ def load_provider_attestation(
                 digest,
                 64 if field == "executable_sha256" else 40,
                 f"provider attestation {provider_name}.{field}",
+            )
+        if identifiers != expected_identifiers[provider_name]:
+            fail(
+                f"provider attestation {provider_name} identifiers differ "
+                "from audited source/build identity"
             )
         expected_json, expected_binary = expected_artifacts[provider_name]
         if (
@@ -1306,7 +1732,7 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
     resolved = verify_bindings(
         fixture,
         arguments.context_manifest,
-        arguments.compiler_invocation,
+        arguments.generation_attestation,
         arguments.post_ckks_air,
         arguments.production_post_ckks_air,
     )
@@ -1317,17 +1743,21 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
         arguments.analytic_bin,
         fixture_sha256,
         fixture,
-        resolved["logical_slots"],
+        resolved,
     )
     analytic_ids = [record["case_id"] for record in analytic_records]
     expected_order = expected_provider_order(fixture)
     if analytic_ids != expected_order[: len(analytic_ids)]:
         fail("analytic cases are not the exact provider-order prefix")
+    identity = load_identity_chain(arguments)
     attested_identifiers = load_provider_attestation(
         arguments.provider_attestation,
         fixture_sha256=fixture_sha256,
         context_sha256=context_sha256,
-        compiler_invocation=arguments.compiler_invocation,
+        generation_sha256=identity["generation_sha256"],
+        build_sha256=identity["build_sha256"],
+        run_sha256=identity["run_sha256"],
+        expected_identifiers=identity["identifiers"],
         ant_json=arguments.ant_json,
         ant_binary=arguments.ant_bin,
         gpu_json=arguments.gpu_json,
@@ -1457,6 +1887,15 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
         },
         "metamorphic_checks": metamorphic,
         "artifact_hashes": {
+            "ace_source_manifest_sha256": identity[
+                "ace_source_manifest_sha256"
+            ],
+            "phantom_source_manifest_sha256": identity[
+                "phantom_source_manifest_sha256"
+            ],
+            "generation_attestation_sha256": identity["generation_sha256"],
+            "build_attestation_sha256": identity["build_sha256"],
+            "run_attestation_sha256": identity["run_sha256"],
             "analytic_json_sha256": sha256_path(arguments.analytic_json),
             "ant_json_sha256": sha256_path(arguments.ant_json),
             "gpu_json_sha256": sha256_path(arguments.gpu_json),
@@ -1479,8 +1918,14 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in (
-        "fixture", "context-manifest", "compiler-invocation", "post-ckks-air",
+        "fixture", "context-manifest", "post-ckks-air", "ant-post-ckks-air",
         "production-post-ckks-air",
+        "ace-source-manifest", "phantom-source-manifest",
+        "generation-attestation", "generation-fixture",
+        "emitted-context-manifest", "resource-manifest",
+        "generated-ant-source", "generated-phantom-source",
+        "ant-executable", "phantom-executable",
+        "build-attestation", "run-attestation",
         "provider-attestation",
         "analytic-json", "analytic-bin", "ant-json", "ant-bin", "gpu-json", "gpu-bin",
         "exact-source-json", "exact-source-bin",
