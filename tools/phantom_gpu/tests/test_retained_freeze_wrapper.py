@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 from pathlib import Path
 import re
 import shutil
@@ -146,6 +149,91 @@ def test_candidate_export_rejects_non_binding_fixture_drift() -> None:
         "verified fixture template differs from the selected commit",
     ):
         assert token in freeze
+
+
+def test_candidate_verifier_accepts_binder_shape_and_rejects_drift() -> None:
+    freeze = source(FREEZE)
+    verifier = freeze.split(
+        "# retained-candidate-verifier-start\n", 1
+    )[1].split("# retained-candidate-verifier-end", 1)[0]
+    names = (
+        "compiler_context_manifest_sha256",
+        "normalized_compiler_command_sha256",
+        "post_ckks_air_sha256",
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        candidate = base / "candidate"
+        root = base / "verified" / "results" / "qualification"
+        candidate.mkdir()
+        (root / "inputs").mkdir(parents=True)
+        (root / "outputs").mkdir()
+        template = {
+            "schema_version": "test",
+            "semantic_value": [1, 2, 3],
+            "qualification_bindings": {
+                "status": "unbound",
+                "required": list(names),
+            },
+            "production_rotation_source": {
+                "kind": "audited_default_post_ckks_air",
+                "post_ckks_air_sha256": None,
+            },
+        }
+        context = root / "inputs/compiler_context_manifest.json"
+        post_air = root / "outputs/retained_ckks_phantom_post.air"
+        production_air = root / "outputs/retained_ckks_production_post.air"
+        context.write_bytes(b"context\n")
+        post_air.write_bytes(b"post air\n")
+        production_air.write_bytes(b"production post air\n")
+        generation_hash = "a" * 64
+        (root / "outputs/retained_ckks_generation.json").write_text(
+            json.dumps({"normalized_argv_sha256": generation_hash}),
+            encoding="utf-8",
+        )
+        (root / "manifest.json").write_text("{}\n", encoding="utf-8")
+        bound = copy.deepcopy(template)
+        bound["qualification_bindings"] = {
+            "status": "bound",
+            "compiler_context_manifest_sha256": hashlib.sha256(
+                context.read_bytes()
+            ).hexdigest(),
+            "normalized_compiler_command_sha256": generation_hash,
+            "post_ckks_air_sha256": hashlib.sha256(
+                post_air.read_bytes()
+            ).hexdigest(),
+        }
+        bound["production_rotation_source"]["post_ckks_air_sha256"] = (
+            hashlib.sha256(production_air.read_bytes()).hexdigest()
+        )
+        for path in (
+            candidate / "retained_ckks_v1.unbound.json",
+            root / "inputs/retained_ckks_fixture_template.json",
+        ):
+            path.write_text(json.dumps(template), encoding="utf-8")
+        bound_path = candidate / "retained_ckks_v1.json"
+        bound_path.write_text(json.dumps(bound), encoding="utf-8")
+        command = [
+            sys.executable,
+            "-c",
+            verifier,
+            str(candidate),
+            str(root),
+            "b" * 40,
+            "c" * 40,
+        ]
+        accepted = subprocess.run(command, check=False, capture_output=True, text=True)
+        assert accepted.returncode == 0, accepted.stderr
+        assert json.loads(
+            (candidate / "candidate-binding.json").read_text(encoding="utf-8")
+        )["qualification_bindings"]["normalized_compiler_command_sha256"] == (
+            generation_hash
+        )
+        bound["semantic_value"].append(4)
+        bound_path.write_text(json.dumps(bound), encoding="utf-8")
+        rejected = subprocess.run(command, check=False, capture_output=True, text=True)
+        assert rejected.returncode != 0
+        assert "non-binding semantic drift" in rejected.stderr
 
 
 def test_snapshot_entry_invokes_only_the_retained_host_gate() -> None:

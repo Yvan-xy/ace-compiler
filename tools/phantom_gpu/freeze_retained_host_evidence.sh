@@ -241,6 +241,7 @@ else
     "${CANDIDATE}/retained_ckks_v1.json"
   python3 - "${CANDIDATE}" "${VERIFIED_RESULT_ROOT}" \
     "${ACE_COMMIT}" "${PHANTOM_COMMIT}" <<'PY'
+# retained-candidate-verifier-start
 import copy
 import hashlib
 import json
@@ -273,8 +274,9 @@ if (
     or candidate_bindings.get("status") != "bound"
     or not isinstance(template_bindings, dict)
     or template_bindings.get("status") != "unbound"
-    or any(name in template_bindings for name in binding_names)
-    or set(candidate_bindings) != set(template_bindings) | set(binding_names)
+    or set(template_bindings) != {"status", "required"}
+    or template_bindings.get("required") != list(binding_names)
+    or set(candidate_bindings) != {"status", *binding_names}
 ):
     raise SystemExit("provisional fixture has an invalid binding shape")
 digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -324,6 +326,7 @@ record = {
 (candidate / "candidate-binding.json").write_text(
     json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
 )
+# retained-candidate-verifier-end
 PY
   (
     cd "${CANDIDATE}"
