@@ -260,7 +260,10 @@ protected:
         container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, cipher, _spos);
     raise->Set_child(0, container->New_ld(input, _spos));
     raise->Set_child(1, container->New_intconst(u32, 4, _spos));
-    container->Stmt_list().Append(container->New_retv(raise, _spos));
+    ADDR_DATUM_PTR raised = func_scope->New_var(cipher, "raised", _spos);
+    container->Stmt_list().Append(container->New_st(raise, raised, _spos));
+    container->Stmt_list().Append(
+        container->New_retv(container->New_ld(raised, _spos), _spos));
   }
 
   void TearDown() override { delete _glob; }
@@ -366,7 +369,49 @@ TEST_F(CKKSFullQPipelineTest, RaiseBeyondConfiguredFullQIsUserError) {
       nullptr);
   EXPECT_NE(
       stderr_text.find(
-          "raise_mod target_q_count exceeds configured full data-Q count"),
+          "raise_mod target_q_count exceeds configured full data-Q count: "
+          "4 > 3"),
+      std::string::npos);
+}
+
+TEST_F(CKKSFullQPipelineTest,
+       ExistingFullQBeyondConfiguredMaximumIsUserError) {
+  _lower_ctx.Get_ctx_param().Set_mul_level(5, false);
+  fhe::ckks::CKKS_CONFIG  config = Configured(4);
+  air::driver::DRIVER_CTX driver_context;
+  R_CODE                  status = R_CODE::NORMAL;
+
+  testing::internal::CaptureStderr();
+  GLOB_SCOPE* output = fhe::ckks::Ckks_driver(
+      _glob, &_lower_ctx, &driver_context, &config, &status);
+  const std::string stderr_text = testing::internal::GetCapturedStderr();
+
+  EXPECT_EQ(output, nullptr);
+  EXPECT_EQ(status, R_CODE::USER);
+  EXPECT_NE(
+      stderr_text.find(
+          "configured maximum ciphertext level is less than the inferred "
+          "full data-Q count: 5"),
+      std::string::npos);
+}
+
+TEST_F(CKKSFullQPipelineTest,
+       AnalysisRequiredFullQBeyondMaximumIsUserError) {
+  fhe::ckks::CKKS_CONFIG  config = Configured(3);
+  air::driver::DRIVER_CTX driver_context;
+  FUNC_SCOPE*             function = &(*_glob->Begin_func_scope());
+
+  testing::internal::CaptureStderr();
+  fhe::core::CTX_PARAM_ANA analysis(function, &_lower_ctx,
+                                    &driver_context, &config);
+  const R_CODE status = analysis.Run();
+  const std::string stderr_text = testing::internal::GetCapturedStderr();
+
+  EXPECT_EQ(status, R_CODE::USER);
+  EXPECT_NE(
+      stderr_text.find(
+          "configured maximum ciphertext level is less than the required "
+          "full data-Q count: 4 > 3"),
       std::string::npos);
 }
 

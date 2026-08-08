@@ -402,8 +402,8 @@ R_CODE CTX_PARAM_ANA::Run() {
       CMPLR_ERR_MSG(
           Driver_ctx()->Tfile(),
           "configured maximum ciphertext level is less than the required "
-          "full data-Q count: ",
-          mul_lev, " > ", ana_ctx.Max_cipher_lvl(), "\n");
+          "full data-Q count: %u > %u\n",
+          mul_lev, ana_ctx.Max_cipher_lvl());
       return R_CODE::USER;
     } else {
       mul_lev = ana_ctx.Max_cipher_lvl();

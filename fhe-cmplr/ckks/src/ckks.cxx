@@ -84,15 +84,16 @@ R_CODE Establish_full_q_count(GLOB_SCOPE* glob, core::LOWER_CTX* lower_ctx,
       CMPLR_ERR_MSG(
           driver_ctx->Tfile(),
           "configured maximum ciphertext level is less than the inferred "
-          "full data-Q count: ",
-          parameters.Get_mul_level(), "\n");
+          "full data-Q count: %u\n",
+          parameters.Get_mul_level());
       return R_CODE::USER;
     }
     if (maximum_raise_target > configured_full_q) {
       CMPLR_ERR_MSG(
           driver_ctx->Tfile(),
-          "raise_mod target_q_count exceeds configured full data-Q count: ",
-          maximum_raise_target, " > ", configured_full_q, "\n");
+          "raise_mod target_q_count exceeds configured full data-Q count: "
+          "%u > %u\n",
+          maximum_raise_target, configured_full_q);
       return R_CODE::USER;
     }
     parameters.Set_mul_level(configured_full_q, true);
