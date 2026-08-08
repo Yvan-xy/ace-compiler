@@ -299,4 +299,7 @@ def test_archive_cli_reports_a_retained_mismatch(tmp_path: Path) -> None:
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["schema_version"] == "ace.phantom.environment-comparison/2.0.0"
     assert report["status"] == "fail"
-    assert set(report["mismatches"]) == {"retained_post_ckks_air_sha256"}
+    assert set(report["mismatches"]) == {
+        "retained_exact_artifacts",
+        "retained_post_ckks_air_sha256",
+    }
