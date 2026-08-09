@@ -249,7 +249,7 @@ set -euo pipefail
 export LC_ALL=C TZ=UTC
 INPUT=/bootstrap-freeze/input
 OUTPUT=/bootstrap-freeze/output
-WORK=${OUTPUT}/work
+WORK=/retained-qualification/work
 RESULTS=${WORK}/results
 RESULT_ARCHIVE=${OUTPUT}/bootstrap-host-result.tar.gz
 STARTED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)

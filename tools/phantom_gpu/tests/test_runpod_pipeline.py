@@ -584,8 +584,12 @@ def test_local_reproduction_does_not_restate_compiler_context() -> None:
         assert option not in source
 
 
-def test_local_reproduction_uses_a_distinct_container_work_root() -> None:
+def test_reproduction_uses_one_canonical_container_build_root() -> None:
     local = (TOOLS / "run_local_reproduction.sh").read_text(encoding="utf-8")
+    remote = (TOOLS / "runpod_transfer.sh").read_text(encoding="utf-8")
+    bootstrap_freeze = (
+        TOOLS / "freeze_bootstrap_host_evidence.sh"
+    ).read_text(encoding="utf-8")
     host_freeze = (TOOLS / "freeze_ordinary_host_evidence.sh").read_text(
         encoding="utf-8"
     )
@@ -593,7 +597,11 @@ def test_local_reproduction_uses_a_distinct_container_work_root() -> None:
     assert '"${PAYLOAD}:/retained-qualification/input:ro"' in local
     assert '"${OUTPUT}:/retained-qualification/output:rw"' in local
     assert "--input-dir /retained-qualification/input" in local
-    assert "--work-dir /retained-qualification/output/work" in local
+    assert "--work-dir /retained-qualification/work" in local
+    assert "--work-dir /retained-qualification/work" in remote
+    assert "WORK=/retained-qualification/work" in bootstrap_freeze
+    assert "/retained-qualification/output/work" not in local
+    assert "WORK=${OUTPUT}/work" not in bootstrap_freeze
     assert (
         "--result-archive /retained-qualification/output/local-result.tar.gz"
         in local

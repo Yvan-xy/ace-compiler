@@ -171,7 +171,7 @@ CONTAINER_ID="$(docker create --name "${CONTAINER_NAME}" \
   bash /retained-qualification/input/run_build_and_health.sh \
     --mode local \
     --input-dir /retained-qualification/input \
-    --work-dir /retained-qualification/output/work \
+    --work-dir /retained-qualification/work \
     --result-archive /retained-qualification/output/local-result.tar.gz)"
 docker inspect --type container "${CONTAINER_ID}" \
   >"${DOCKER_EVIDENCE}/disposable-container-created.json"
