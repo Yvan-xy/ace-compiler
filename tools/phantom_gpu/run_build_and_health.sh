@@ -1302,7 +1302,7 @@ run_retained_host_qualification() {
 verify_frozen_retained_reference() {
   jq -e '
     .contents ==
-      "audited-source-snapshots-and-frozen-provider-neutral-references-without-build-output"
+      "audited-source-snapshots-and-frozen-provider-neutral-references-with-bootstrap-qualification-regeneration-attestations-without-build-output"
     and .frozen_retained_reference.status == "pass"
     and .frozen_retained_reference.contents ==
       "provider-neutral-references-and-attestations-no-build-output"

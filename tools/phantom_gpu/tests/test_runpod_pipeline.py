@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import subprocess
 import tarfile
 
@@ -568,6 +569,87 @@ def test_source_packaging_requires_local_ordinary_evidence() -> None:
     assert "ordinary-run-manifest.json" in source
     assert "ordinary-host-qualification.json" in source
     assert "ordinary-artifact-manifest.json" in source
+
+
+def test_retained_replay_payload_descriptor_matches_packager_and_rejects_tamper(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("jq") is None:
+        pytest.skip("jq is required to exercise the retained payload predicate")
+
+    package = (TOOLS / "package_runpod_sources.sh").read_text(encoding="utf-8")
+    pipeline = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    package_start = package.index('"contents": (') + len('"contents": (')
+    package_end = package.index("\n    ),", package_start)
+    package_descriptor = "".join(
+        line.strip()[1:-1]
+        for line in package[package_start:package_end].splitlines()
+        if line.strip().startswith('"')
+    )
+    expected_descriptor = (
+        "audited-source-snapshots-and-frozen-provider-neutral-references-"
+        "with-bootstrap-qualification-regeneration-attestations-without-build-output"
+    )
+    assert package_descriptor == expected_descriptor
+
+    function_start = pipeline.index("verify_frozen_retained_reference() {")
+    function_end = pipeline.index("\nrun_retained_gpu_qualification()", function_start)
+    verifier = pipeline[function_start:function_end]
+    assert expected_descriptor in verifier
+
+    input_directory = tmp_path / "input"
+    result_directory = tmp_path / "results"
+    input_directory.mkdir()
+    result_directory.mkdir()
+    payload_path = input_directory / "payload.json"
+    payload = {
+        "contents": expected_descriptor,
+        "frozen_retained_reference": {
+            "status": "pass",
+            "contents": (
+                "provider-neutral-references-and-attestations-no-build-output"
+            ),
+        },
+    }
+    payload_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    (input_directory / "ace-source.manifest.json").write_text(
+        '{"commit":"' + "a" * 40 + '"}\n', encoding="utf-8"
+    )
+    (input_directory / "phantom-source.manifest.json").write_text(
+        '{"commit":"' + "b" * 40 + '"}\n', encoding="utf-8"
+    )
+    harness = (
+        "set -euo pipefail\n"
+        'INPUT="$1"\nRESULT_DIR="$2"\n'
+        'RETAINED_HOST_ROOT="$3"\nACE_PHANTOM_REPO_ROOT="$4"\n'
+        "cmp() { :; }\n"
+        "python3() {\n"
+        "  printf '%s\\n' "
+        "'{\"status\":\"pass\",\"provider_neutral_ant_reference_matches\":true,'"
+        "'\"exact_artifact_count\":1}'\n"
+        "}\n"
+        + verifier
+        + "\nverify_frozen_retained_reference\n"
+    )
+    arguments = [
+        "bash",
+        "-c",
+        harness,
+        "retained-descriptor-contract",
+        str(input_directory),
+        str(result_directory),
+        str(tmp_path / "retained"),
+        str(tmp_path / "ace"),
+    ]
+    subprocess.run(arguments, check=True)
+
+    payload["contents"] = (
+        "audited-source-snapshots-and-frozen-provider-neutral-references-"
+        "without-build-output"
+    )
+    payload_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    rejected = subprocess.run(arguments, check=False)
+    assert rejected.returncode != 0
 
 
 def test_local_reproduction_does_not_restate_compiler_context() -> None:
