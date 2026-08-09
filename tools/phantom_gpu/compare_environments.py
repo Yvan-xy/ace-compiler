@@ -783,7 +783,10 @@ def fields(root: Path) -> dict[str, Any]:
 def comparison_report(local: dict[str, Any], remote: dict[str, Any]) -> dict[str, Any]:
     if set(local) != set(remote):
         raise SystemExit("local and remote comparison field inventories differ")
-    stable = sorted(set(local) - {"generated_binary_sha256"})
+    stable = sorted(
+        set(local)
+        - {"bootstrap_frozen_reference_sha256", "generated_binary_sha256"}
+    )
     matching = [key for key in stable if local[key] == remote[key]]
     mismatches = {
         key: {"local": local[key], "remote": remote[key]}
@@ -809,6 +812,11 @@ def comparison_report(local: dict[str, Any], remote: dict[str, Any]) -> dict[str
                 "local": local["generated_binary_sha256"],
                 "remote": remote["generated_binary_sha256"],
                 "reason": "recorded but not required equal because tool output can embed build-host details",
+            },
+            "bootstrap_frozen_reference_sha256": {
+                "local": local["bootstrap_frozen_reference_sha256"],
+                "remote": remote["bootstrap_frozen_reference_sha256"],
+                "reason": "recorded but not required equal because it binds per-run artifact inventories",
             },
             "retained_per_run_receipts": [
                 "randomized ANT ciphertext-derived hashes and decoded bytes",

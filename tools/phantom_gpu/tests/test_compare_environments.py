@@ -553,6 +553,10 @@ def test_retained_stable_fields_match_while_per_run_receipts_differ(
     assert "retained_ant_semantic_summary_sha256" in report["matching_fields"]
     assert "bootstrap_linked_binary_sha256" in report["matching_fields"]
     assert "bootstrap_io_helper_closure_sha256" in report["matching_fields"]
+    assert (
+        "bootstrap_frozen_reference_sha256"
+        in report["allowed_differences"]
+    )
     assert "setup timing" in " ".join(
         report["allowed_differences"]["bootstrap_per_run_evidence"]
     )
@@ -592,10 +596,26 @@ def test_bootstrap_stable_archive_hash_tamper_is_reported(tmp_path: Path) -> Non
     report = module.comparison_report(module.fields(local), module.fields(remote))
 
     assert report["status"] == "fail"
-    assert set(report["mismatches"]) == {
-        "bootstrap_frozen_reference_sha256",
-        "bootstrap_provider_archive_sha256",
-    }
+    assert set(report["mismatches"]) == {"bootstrap_provider_archive_sha256"}
+
+
+def test_bootstrap_per_run_frozen_reference_hash_may_differ(tmp_path: Path) -> None:
+    module = load_module()
+    local = result_root(tmp_path / "local", retained_records("a", "b"))
+    remote = result_root(tmp_path / "remote", retained_records("a", "b"))
+    frozen_path = remote / "bootstrap-frozen-reference.json"
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    frozen["per_run_note"] = "different extraction root"
+    write_json(frozen_path, frozen)
+
+    report = module.comparison_report(module.fields(local), module.fields(remote))
+
+    assert report["status"] == "pass"
+    assert report["mismatches"] == {}
+    difference = report["allowed_differences"][
+        "bootstrap_frozen_reference_sha256"
+    ]
+    assert difference["local"] != difference["remote"]
 
 
 def test_bootstrap_cross_record_inconsistency_is_rejected(tmp_path: Path) -> None:

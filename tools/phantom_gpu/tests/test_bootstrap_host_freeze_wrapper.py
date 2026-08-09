@@ -23,6 +23,8 @@ def test_wrapper_is_valid_shell_and_uses_a_fresh_exact_snapshot() -> None:
     assert '"source_mode": "snapshot"' in source
     assert "tools/phantom_gpu/phase_helpers.sh" in source
     assert '"${PAYLOAD}/phase_helpers.sh"' in source
+    assert "export SOURCE_DATE_EPOCH" in source
+    assert r'[\"commit_timestamp\"]' in source
 
 
 def test_wrapper_freezes_the_exact_bootstrap_host_contract_without_a_gpu() -> None:

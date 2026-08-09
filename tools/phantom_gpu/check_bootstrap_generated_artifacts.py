@@ -619,7 +619,7 @@ def audit(
         raw = {name: path.read_bytes() for name, path in input_paths.items()}
         report["inputs"] = {
             name: {
-                "path": str(input_paths[name]),
+                "path": input_paths[name].name,
                 "sha256": _sha256_bytes(value),
                 "size_bytes": len(value),
             }

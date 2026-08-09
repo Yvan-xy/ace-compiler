@@ -1853,9 +1853,9 @@ build_bootstrap_host_qualification() {
   record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" \
     "${NVCC}" "${harness_compile_arguments[@]}"
   "${NVCC}" "${harness_compile_arguments[@]}"
-  nm -A -C --defined-only "${source_object}" \
+  nm -C --defined-only "${source_object}" \
     >"${BOOTSTRAP_RESULTS}/generated_object_symbols.txt"
-  nm -A -C --defined-only "${harness_object}" \
+  nm -C --defined-only "${harness_object}" \
     >"${BOOTSTRAP_RESULTS}/harness_object_symbols.txt"
   python3 - "${source}" "${harness_source}" \
     "${BOOTSTRAP_RESULTS}/generated_object_symbols.txt" \
@@ -1975,7 +1975,7 @@ PY
     "${BOOTSTRAP_RESULTS}/adapter_archive_members.txt" \
     "${BOOTSTRAP_RESULTS}/provider_archive_members.txt" \
     "${BOOTSTRAP_RESULTS}/common_archive_members.txt"
-  nm -A -C --defined-only "${binary}" \
+  nm -C --defined-only "${binary}" \
     >"${BOOTSTRAP_RESULTS}/linked_binary_symbols.txt"
   if rg 'Bootstrapper|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|cnn_phantom|conv_eval|FHErt_(ant|poly)|fhe::(ant|poly)|CoeffToSlot|SlotToCoeff|EvalMod|Native.*[Pp]recom|[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap' \
       "${BOOTSTRAP_RESULTS}/adapter_archive_symbols.txt" \

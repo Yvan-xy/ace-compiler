@@ -327,6 +327,8 @@ python3 "${INPUT}/source_archive.py" audit --kind phantom \
 ACE_SOURCE=${WORK}/ace-extract/ace-source
 PHANTOM_SOURCE=${WORK}/phantom-extract/phantom-source
 ACE_COMMIT=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[\"commit\"])" "${INPUT}/ace-source.manifest.json")
+export SOURCE_DATE_EPOCH
+SOURCE_DATE_EPOCH=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[\"commit_timestamp\"])" "${INPUT}/ace-source.manifest.json")
 ACE_MANIFEST_SHA=$(sha256sum "${INPUT}/ace-source.manifest.json" | awk "{print \$1}")
 PHANTOM_MANIFEST_SHA=$(sha256sum "${INPUT}/phantom-source.manifest.json" | awk "{print \$1}")
 BOOTSTRAP_SHA=$(sha256sum "${INPUT}/bootstrap_environment.sh" | awk "{print \$1}")

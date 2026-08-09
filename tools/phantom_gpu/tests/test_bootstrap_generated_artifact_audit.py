@@ -228,6 +228,19 @@ def test_complete_generated_artifact_closure_passes(tmp_path: Path) -> None:
     }
 
 
+def test_report_is_independent_of_absolute_input_root(tmp_path: Path) -> None:
+    local_root = tmp_path / "local" / "state"
+    remote_root = tmp_path / "remote" / "work"
+    local_root.mkdir(parents=True)
+    remote_root.mkdir(parents=True)
+
+    local = run_audit(local_root)
+    remote = run_audit(remote_root)
+
+    assert local == remote
+    assert local["inputs"]["source"]["path"] == "generated.cu"
+
+
 def test_cli_writes_a_checksum_bound_failure_report(tmp_path: Path) -> None:
     paths = write_inputs(tmp_path, source=SOURCE + "\nBootstrapper forbidden;\n")
     report_path = tmp_path / "audit.json"

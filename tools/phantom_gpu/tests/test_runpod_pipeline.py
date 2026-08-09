@@ -658,6 +658,48 @@ def test_bootstrap_qualification_is_frozen_rebuilt_and_executed_once() -> None:
     ) < phases.index("phase ordinary_gpu_qualification")
 
 
+def test_bootstrap_stable_symbol_inventories_are_root_independent(
+    tmp_path: Path,
+) -> None:
+    compile_only = (TOOLS / "compile_only.sh").read_text(encoding="utf-8")
+    bootstrap_start = compile_only.index("build_bootstrap_host_qualification() {")
+    bootstrap_end = compile_only.index(
+        "\nbuild_ordinary_conformance() {", bootstrap_start
+    )
+    bootstrap = compile_only[bootstrap_start:bootstrap_end]
+    for target in ("source_object", "harness_object", "binary"):
+        stable_command = 'nm -C --defined-only "$' + "{" + target + '}"'
+        prefixed_command = 'nm -A -C --defined-only "$' + "{" + target + '}"'
+        assert stable_command in bootstrap
+        assert prefixed_command not in bootstrap
+
+    source = tmp_path / "symbol.cc"
+    source.write_text("int stable_symbol() { return 7; }\n", encoding="utf-8")
+    local_object = tmp_path / "local" / "symbol.o"
+    remote_object = tmp_path / "remote" / "symbol.o"
+    local_object.parent.mkdir()
+    remote_object.parent.mkdir()
+    subprocess.run(
+        ["c++", "-c", str(source), "-o", str(local_object)],
+        check=True,
+    )
+    remote_object.write_bytes(local_object.read_bytes())
+
+    def symbols(path: Path) -> str:
+        return subprocess.run(
+            ["nm", "-C", "--defined-only", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    local_symbols = symbols(local_object)
+    remote_symbols = symbols(remote_object)
+    assert local_symbols == remote_symbols
+    assert str(local_object) not in local_symbols
+    assert str(remote_object) not in remote_symbols
+
+
 def test_host_freeze_runner_returns_fresh_candidate_without_frozen_checks() -> None:
     source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
     assert "<freeze-host|local|runpod>" in source
