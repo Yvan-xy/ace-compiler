@@ -580,14 +580,7 @@ if (
 ):
     raise SystemExit("bootstrap package compile handoff policy is invalid")
 
-expected_parameters = [
-    "--poly-degree", "16384", "--mul-level", "26",
-    "--input-level", "1", "--security-level", "0",
-    "--scaling-factor-bits", "56", "--first-prime-bits", "60",
-    "--hamming-weight", "192",
-]
-
-def validate_invocation(name, schema, expected):
+def validate_invocation(name, schema):
     invocation = load(name)
     if set(invocation) != {"schema_version", "argv", "normalized_argv_sha256"}:
         raise SystemExit(f"bootstrap invocation has an invalid shape: {name}")
@@ -597,7 +590,8 @@ def validate_invocation(name, schema, expected):
     ).encode("utf-8")
     if (
         invocation["schema_version"] != schema
-        or invocation["argv"] != expected
+        or not isinstance(invocation["argv"], list)
+        or not all(isinstance(item, str) and item for item in invocation["argv"])
         or invocation["normalized_argv_sha256"]
         != hashlib.sha256(encoded).hexdigest()
     ):
@@ -607,15 +601,48 @@ def validate_invocation(name, schema, expected):
 qualification_invocation = validate_invocation(
     "bootstrap-qualification-invocation.json",
     "ace.phantom.qualification-invocation/1.0.0",
-    ["tools/phantom_gpu/compile_only.sh", "--gate", "bootstrap"]
-    + expected_parameters,
 )
 generation_invocation = validate_invocation(
     "bootstrap-generation-invocation.json",
     "ace.phantom.bootstrap-qualification-invocation/1.0.0",
-    ["tools/phantom_gpu/generate_bootstrap_qualification.py",
-     "bootstrap_qualification"] + expected_parameters,
 )
+qualification_argv = qualification_invocation["argv"]
+generation_argv = generation_invocation["argv"]
+if qualification_argv[:1] != ["tools/phantom_gpu/compile_only.sh"]:
+    raise SystemExit("bootstrap qualification invocation executable is invalid")
+if generation_argv[:2] != [
+    "tools/phantom_gpu/generate_bootstrap_qualification.py",
+    "bootstrap_qualification",
+]:
+    raise SystemExit("bootstrap generation invocation executable/output is invalid")
+
+def option_map(arguments, label):
+    if len(arguments) % 2:
+        raise SystemExit(f"{label} has an unpaired option")
+    options = dict(zip(arguments[0::2], arguments[1::2]))
+    if len(options) != len(arguments) // 2:
+        raise SystemExit(f"{label} has duplicate options")
+    return options
+
+qualification_options = option_map(qualification_argv[1:], "qualification invocation")
+generation_options = option_map(generation_argv[2:], "generation invocation")
+compiler_option_names = {
+    "--poly-degree", "--vector-capacity", "--mul-level", "--input-level",
+    "--security-level", "--scaling-factor-bits", "--first-prime-bits",
+    "--hamming-weight", "--q-part-count", "--encode-transform-budget",
+    "--decode-transform-budget", "--ciphertext-constant-encoding", "--packing",
+    "--post-multiply-real", "--post-multiply-imag",
+    "--post-multiply-scale-degree", "--post-rotation-step",
+}
+if set(generation_options) != compiler_option_names:
+    raise SystemExit("bootstrap generation invocation omits an explicit option")
+if qualification_options.get("--gate") != "bootstrap":
+    raise SystemExit("bootstrap qualification invocation gate is invalid")
+if {
+    key: value for key, value in qualification_options.items()
+    if key in compiler_option_names
+} != generation_options:
+    raise SystemExit("bootstrap qualification and generation options differ")
 if (
     binding.get("normalized_qualification_argv_sha256")
     != qualification_invocation["normalized_argv_sha256"]
@@ -635,16 +662,17 @@ if (
     set(context) != context_keys
     or context.get("schema_version") != 1
     or context.get("resource_schema_version") != 3
-    or context.get("polynomial_degree") != 16384
-    or context.get("logical_slot_capacity") != 8192
-    or context.get("packing") != "full"
+    or context.get("polynomial_degree") != int(generation_options["--poly-degree"])
+    or context.get("logical_slot_capacity") != int(generation_options["--vector-capacity"])
+    or context.get("packing") != generation_options["--packing"]
     or not isinstance(context.get("data_q_bit_sizes"), list)
-    or len(context["data_q_bit_sizes"]) != 26
-    or context.get("input_level") != 1
-    or context.get("security_level") != 0
-    or context.get("scaling_modulus_bits") != 56
-    or context.get("first_modulus_bits") != 60
-    or context.get("hamming_weight") != 192
+    or len(context["data_q_bit_sizes"]) != int(generation_options["--mul-level"])
+    or context.get("input_level") != int(generation_options["--input-level"])
+    or context.get("security_level") != int(generation_options["--security-level"])
+    or context.get("scaling_modulus_bits") != int(generation_options["--scaling-factor-bits"])
+    or context.get("first_modulus_bits") != int(generation_options["--first-prime-bits"])
+    or context.get("hamming_weight") != int(generation_options["--hamming-weight"])
+    or context.get("q_part_count") != int(generation_options["--q-part-count"])
 ):
     raise SystemExit("packaged bootstrap context is not the exact schema-v3 contract")
 resources = load("bootstrap-resource-manifest.json")
@@ -717,24 +745,40 @@ expected_generation_keys = {
     "constant_count", "rotation_count", "rotation_batch_count", "monomial_count",
     "native_bootstrap_precompute", "generated_program_executed",
 }
-expected_compiler_parameters = {
-    "poly_degree": 16384,
-    "mul_level": 26,
-    "input_level": 1,
-    "security_level": 0,
-    "scaling_factor_bits": 56,
-    "first_prime_bits": 60,
-    "hamming_weight": 192,
+expected_compiler_parameters = generation.get("compiler_parameters")
+if not isinstance(expected_compiler_parameters, dict):
+    raise SystemExit("packaged bootstrap generation lacks typed compiler parameters")
+typed_option_keys = {
+    option.removeprefix("--").replace("-", "_"): value
+    for option, value in generation_options.items()
 }
+if set(expected_compiler_parameters) != set(typed_option_keys):
+    raise SystemExit("packaged bootstrap compiler parameter keys are incomplete")
+for key, value in expected_compiler_parameters.items():
+    command_value = typed_option_keys[key]
+    if isinstance(value, bool):
+        matches = command_value == ("enabled" if value else "disabled")
+    elif isinstance(value, int):
+        matches = command_value == str(value)
+    elif isinstance(value, float):
+        matches = math.isclose(float(command_value), value, rel_tol=0.0, abs_tol=0.0)
+    else:
+        matches = command_value == value
+    if not matches:
+        raise SystemExit(f"packaged bootstrap compiler parameter differs: {key}")
 if (
     set(generation) != expected_generation_keys
-    or generation.get("schema_version") != "ace.phantom.bootstrap-generation/2.0.0"
+    or generation.get("schema_version") != "ace.phantom.bootstrap-generation/3.0.0"
     or generation.get("status") != "pass"
     or generation.get("qualification_scope")
        != "full-generated-bootstrap-compile-only"
     or generation.get("compiler_parameters") != expected_compiler_parameters
     or generation.get("bootstrap_parameters") != {
-        "q_parts": 3, "enc_budget": 3, "dec_budget": 3, "ct_encode": False,
+        "q_parts": expected_compiler_parameters["q_part_count"],
+        "enc_budget": expected_compiler_parameters["encode_transform_budget"],
+        "dec_budget": expected_compiler_parameters["decode_transform_budget"],
+        "ct_encode": expected_compiler_parameters["ciphertext_constant_encoding"]
+        == "enabled",
     }
     or generation.get("stages_completed") != ["ckks_driver", "ckks2c"]
     or generation.get("constant_count") != len(constants["constants"])
@@ -752,7 +796,7 @@ if (
        != "ace.phantom.bootstrap-generated-artifact-audit/2.0.0"
     or audit.get("status") != "pass"
     or audit.get("counts", {}).get("constants") != len(constants["constants"])
-    or artifact.get("schema_version") != "ace.phantom.bootstrap-artifacts/2.0.0"
+    or artifact.get("schema_version") != "ace.phantom.bootstrap-artifacts/3.0.0"
     or artifact.get("status") != "bound"
     or qualification.get("status") != "pass"
     or qualification.get("gate") != "bootstrap"
@@ -2616,9 +2660,472 @@ verify_success_evidence() {
     >"${RESULT_DIR}/result-completeness.json"
 }
 
+verify_generated_bootstrap_correctness_payload() {
+  jq -e '
+    .schema_version ==
+      "ace.phantom.generated-bootstrap-correctness-payload/1.0.0"
+    and .status == "pass"
+    and .host_oracles_replayed == true
+    and (.files | type) == "object"
+    and ([.files[] | test("^[0-9a-f]{64}$")] | all)
+  ' "${INPUT}/payload.json" >/dev/null
+  jq -e '
+    .schema_version == "ace.phantom.bootstrap-host-oracle-replay/1.0.0"
+    and .status == "pass"
+    and (.cases | length) > 0
+    and ([.cases[].native_ant_vs_clear.status,
+          .cases[].generated_ant_vs_clear.status] | all(. == "pass"))
+  ' "${INPUT}/correctness-host-replay.json" >/dev/null
+  python3 - "${INPUT}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+payload = json.loads((root / "payload.json").read_text(encoding="utf-8"))
+observed = {
+    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted(root.iterdir())
+    if path.is_file() and path.name not in {"payload.json", "SHA256SUMS"}
+}
+if payload.get("files") != observed:
+    raise SystemExit("correctness payload file inventory or hashes differ")
+for kind in ("ace", "phantom"):
+    manifest = root / f"{kind}-source.manifest.json"
+    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    if payload.get("source_snapshots", {}).get(f"{kind}_manifest_sha256") != digest:
+        raise SystemExit(f"correctness payload {kind} source binding differs")
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    if value.get("commit") != payload.get(f"{kind}_commit"):
+        raise SystemExit(f"correctness payload {kind} commit differs")
+PY
+  mkdir -p "${RESULT_DIR}/correctness-input"
+  local payload_files="${WORK}/correctness-payload-files.list"
+  find "${INPUT}" -mindepth 1 -maxdepth 1 -type f -print0 >"${payload_files}"
+  local payload_file
+  while IFS= read -r -d '' payload_file; do
+    cp -- "${payload_file}" "${RESULT_DIR}/correctness-input/"
+  done <"${payload_files}"
+}
+
+CORRECTNESS_AUTHORITY=()
+set_correctness_authority_arguments() {
+  local root="$1"
+  local layout="${2:-generated}"
+  local invocation raw_air post_air context resources constants semantics
+  local post_operations_air post_operation_attestation
+  if [[ "${layout}" == "packaged" ]]; then
+    invocation="${root}/correctness-compiler-invocation.json"
+    raw_air="${root}/correctness-raw.air"
+    post_air="${root}/correctness-post-ckks.air"
+    context="${root}/correctness-context-manifest.json"
+    resources="${root}/correctness-resource-manifest.json"
+    constants="${root}/correctness-constant-manifest.json"
+    semantics="${root}/correctness-bootstrap-semantics.json"
+    post_operations_air="${root}/correctness-post-operations.air"
+    post_operation_attestation="${root}/correctness-post-operation-attestation.json"
+  else
+    invocation="${root}/compiler_invocation.json"
+    raw_air="${root}/bootstrap_raw.air"
+    post_air="${root}/bootstrap_post_ckks.air"
+    context="${root}/compiler_context_manifest.json"
+    resources="${root}/compiler_resource_manifest.json"
+    constants="${root}/compiler_constant_manifest.json"
+    semantics="${root}/bootstrap_semantics.json"
+    post_operations_air="${root}/bootstrap_post_operations.air"
+    post_operation_attestation="${root}/post_operations_attestation.json"
+  fi
+  CORRECTNESS_AUTHORITY=( \
+    --ace-source-manifest "${INPUT}/ace-source.manifest.json" \
+    --phantom-source-manifest "${INPUT}/phantom-source.manifest.json" \
+    --compiler-invocation "${invocation}" \
+    --raw-air "${raw_air}" \
+    --post-ckks-air "${post_air}" \
+    --context-manifest "${context}" \
+    --resource-manifest "${resources}" \
+    --constant-manifest "${constants}" \
+    --bootstrap-semantics "${semantics}" \
+    --post-operations-air "${post_operations_air}" \
+    --post-operation-attestation "${post_operation_attestation}" \
+  )
+}
+
+replay_packaged_bootstrap_host_oracles() {
+  set_correctness_authority_arguments "${INPUT}" packaged
+  python3 "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/bootstrap_correctness.py" \
+    verify-host \
+    --fixture "${INPUT}/correctness-fixture.json" \
+    "${CORRECTNESS_AUTHORITY[@]}" \
+    --native-record "${INPUT}/correctness-native-ant.json" \
+    --native-values "${INPUT}/correctness-native-ant.bin" \
+    --generated-record "${INPUT}/correctness-generated-ant.json" \
+    --generated-values "${INPUT}/correctness-generated-ant.bin" \
+    --output "${RESULT_DIR}/packaged-correctness-host-replay.json"
+}
+
+run_generated_bootstrap_correctness_build() {
+  local -a arguments status
+  local qualification_exit current run_root output
+  local arguments_file="${WORK}/correctness-qualification-arguments.txt"
+  jq -er '.argv[1:][]' \
+    "${INPUT}/correctness-qualification-invocation.json" >"${arguments_file}"
+  mapfile -t arguments <"${arguments_file}"
+  set +e
+  bash "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/compile_only.sh" \
+    "${arguments[@]}" 2>&1 | tee "${RESULT_DIR}/correctness-build.log"
+  status=("${PIPESTATUS[@]}")
+  set -e
+  qualification_exit="${status[0]}"
+  [[ "${qualification_exit}" -eq 0 && "${status[1]}" -eq 0 ]]
+  current="${ACE_PHANTOM_STATE_ROOT}/compile_only_results/current-bootstrap.json"
+  [[ "$(jq -er '.gate + ":" + .status' "${current}")" == \
+     "bootstrap:pass" ]]
+  run_root="$(jq -er .run_root "${current}")"
+  output="${run_root}/bootstrap_qualification"
+  local -a stable_pairs=(
+    "correctness-compiler-invocation.json:compiler_invocation.json"
+    "correctness-raw.air:bootstrap_raw.air"
+    "correctness-post-ckks.air:bootstrap_post_ckks.air"
+    "correctness-post-operations.air:bootstrap_post_operations.air"
+    "correctness-context-manifest.json:compiler_context_manifest.json"
+    "correctness-resource-manifest.json:compiler_resource_manifest.json"
+    "correctness-constant-manifest.json:compiler_constant_manifest.json"
+    "correctness-bootstrap-semantics.json:bootstrap_semantics.json"
+    "correctness-post-operation-attestation.json:post_operations_attestation.json"
+    "correctness-fixture.json:bootstrap_correctness_fixture.json"
+    "correctness-generation.json:generation.json"
+    "correctness-source-audit.json:source-audit.json"
+    "correctness-gpu-harness.cu:generated_bootstrap_phantom_correctness.cu"
+    "correctness-generated-phantom.cu:bootstrap_qualification.cu"
+    "correctness-generated-ant.cxx:bootstrap_qualification_ant.cxx"
+  )
+  local pair packaged regenerated
+  for pair in "${stable_pairs[@]}"; do
+    packaged="${pair%%:*}"
+    regenerated="${pair#*:}"
+    cmp "${INPUT}/${packaged}" "${output}/${regenerated}"
+  done
+  grep -q 'sm_80' "${output}/cuda_elf.txt"
+  jq -e '
+    .schema_version == "ace.phantom.bootstrap-artifacts/3.0.0"
+    and .status == "bound"
+  ' "${run_root}/artifact_manifest.json" >/dev/null
+  jq -e '
+    .schema_version == "ace.phantom.bootstrap-host-qualification/2.0.0"
+    and .status == "pass"
+  ' "${output}/qualification.json" >/dev/null
+  cp -- "${current}" "${RESULT_DIR}/correctness-build-current.json"
+  cp -- "${run_root}/artifact_manifest.json" \
+    "${RESULT_DIR}/correctness-build-artifact-manifest.json"
+  cp -- "${output}/qualification.json" \
+    "${RESULT_DIR}/correctness-build-host-qualification.json"
+  local -a evidence_pairs=(
+    "native-ant.stdout.txt:correctness-native-ant.stdout.txt"
+    "native-ant.stderr.txt:correctness-native-ant.stderr.txt"
+    "generated-ant.stdout.txt:correctness-generated-ant.stdout.txt"
+    "generated-ant.stderr.txt:correctness-generated-ant.stderr.txt"
+    "link-commands.txt:correctness-link-commands.txt"
+    "configuration.json:correctness-configuration.json"
+    "environment.txt:correctness-environment.txt"
+    "cuda_elf.txt:correctness-bootstrap-cuda-elf.txt"
+    "cuda_resources.txt:correctness-bootstrap-cuda-resources.txt"
+    "file.txt:correctness-bootstrap-file.txt"
+    "readelf.txt:correctness-bootstrap-readelf.txt"
+    "undefined_symbols.txt:correctness-bootstrap-undefined-symbols.txt"
+    "gpu-runner-inspection/cuda_elf.txt:correctness-gpu-runner-cuda-elf.txt"
+    "gpu-runner-inspection/cuda_resources.txt:correctness-gpu-runner-cuda-resources.txt"
+    "gpu-runner-inspection/file.txt:correctness-gpu-runner-file.txt"
+    "gpu-runner-inspection/readelf.txt:correctness-gpu-runner-readelf.txt"
+    "gpu-runner-inspection/undefined_symbols.txt:correctness-gpu-runner-undefined-symbols.txt"
+  )
+  for pair in "${evidence_pairs[@]}"; do
+    cp -- "${output}/${pair%%:*}" "${RESULT_DIR}/${pair#*:}"
+  done
+  printf '%s\n' "${output}" >"${WORK}/correctness-output-path.txt"
+}
+
+replay_regenerated_bootstrap_host_oracles() {
+  local output
+  output="$(<"${WORK}/correctness-output-path.txt")"
+  set_correctness_authority_arguments "${output}"
+  python3 "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/bootstrap_correctness.py" \
+    verify-host \
+    --fixture "${output}/bootstrap_correctness_fixture.json" \
+    "${CORRECTNESS_AUTHORITY[@]}" \
+    --native-record "${output}/native_ant_reference.json" \
+    --native-values "${output}/native_ant_reference.bin" \
+    --generated-record "${output}/generated_ant_reference.json" \
+    --generated-values "${output}/generated_ant_reference.bin" \
+    --output "${RESULT_DIR}/regenerated-correctness-host-replay.json"
+  cp -- "${output}/native_ant_reference.json" \
+    "${RESULT_DIR}/native-ant-reference.json"
+  cp -- "${output}/native_ant_reference.bin" \
+    "${RESULT_DIR}/native-ant-reference.bin"
+  cp -- "${output}/generated_ant_reference.json" \
+    "${RESULT_DIR}/generated-ant-reference.json"
+  cp -- "${output}/generated_ant_reference.bin" \
+    "${RESULT_DIR}/generated-ant-reference.bin"
+}
+
+run_generated_bootstrap_gpu_correctness() {
+  local output runner expected_gpu sanitizer_exit
+  output="$(<"${WORK}/correctness-output-path.txt")"
+  runner="${output}/generated_bootstrap_phantom_correctness_sm80"
+  [[ -x "${runner}" ]]
+  expected_gpu="${ACE_RUNPOD_EXPECTED_GPU_NAME:-}"
+  case "${expected_gpu}" in
+    "NVIDIA A100 80GB PCIe"|"NVIDIA A100-SXM4-80GB") ;;
+    *) echo "an exact supported A100 GPU identity is required" >&2; return 1 ;;
+  esac
+  command -v compute-sanitizer >/dev/null
+  compute-sanitizer --version \
+    >"${RESULT_DIR}/correctness-sanitizer-version.txt"
+  local record="${RESULT_DIR}/generated-phantom-correctness.json"
+  local values="${RESULT_DIR}/generated-phantom-correctness.bin"
+  local log="${RESULT_DIR}/correctness-sanitizer.log"
+  set +e
+  compute-sanitizer --error-exitcode 86 --log-file "${log}" \
+    "${runner}" \
+    "${output}/bootstrap_correctness_fixture.json" \
+    "${INPUT}/ace-source.manifest.json" \
+    "${INPUT}/phantom-source.manifest.json" \
+    "${output}/compiler_invocation.json" \
+    "${output}/bootstrap_raw.air" \
+    "${output}/bootstrap_post_ckks.air" \
+    "${output}/compiler_context_manifest.json" \
+    "${output}/compiler_resource_manifest.json" \
+    "${output}/compiler_constant_manifest.json" \
+    "${output}/bootstrap_semantics.json" \
+    "${output}/bootstrap_post_operations.air" \
+    "${output}/post_operations_attestation.json" \
+    "${expected_gpu}" "${record}" "${values}" \
+    >"${RESULT_DIR}/correctness-gpu.stdout.txt" \
+    2>"${RESULT_DIR}/correctness-gpu.stderr.txt"
+  sanitizer_exit="$?"
+  set -e
+  [[ "${sanitizer_exit}" -eq 0 ]]
+  python3 - "${runner}" "${record}" "${values}" "${log}" \
+    "${RESULT_DIR}/correctness-sanitizer-version.txt" \
+    "${RESULT_DIR}/correctness-sanitizer.json" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+runner, record, values, log, version, output = map(Path, sys.argv[1:])
+text = log.read_text(encoding="utf-8")
+if text.count("ERROR SUMMARY:") != 1 or text.count("ERROR SUMMARY: 0") != 1:
+    raise SystemExit("Compute Sanitizer did not report exactly one zero-error summary")
+digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+receipt = {
+    "schema_version": "ace.phantom.bootstrap-compute-sanitizer/1.0.0",
+    "status": "pass",
+    "bindings": {
+        "gpu_executable_sha256": digest(runner),
+        "gpu_record_sha256": digest(record),
+        "gpu_values_sha256": digest(values),
+        "log_sha256": digest(log),
+        "tool_version_sha256": digest(version),
+    },
+    "exit_status": 0,
+    "error_summary_occurrences": 1,
+    "error_count": 0,
+    "coverage": {
+        "bootstrap": True,
+        "post_operations": True,
+        "repeatability": True,
+        "teardown": True,
+    },
+}
+output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8")
+PY
+  set_correctness_authority_arguments "${output}"
+  python3 "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/bootstrap_correctness.py" \
+    compare \
+    --fixture "${output}/bootstrap_correctness_fixture.json" \
+    "${CORRECTNESS_AUTHORITY[@]}" \
+    --native-record "${output}/native_ant_reference.json" \
+    --native-values "${output}/native_ant_reference.bin" \
+    --generated-record "${output}/generated_ant_reference.json" \
+    --generated-values "${output}/generated_ant_reference.bin" \
+    --gpu-record "${record}" --gpu-values "${values}" \
+    --sanitizer-record "${RESULT_DIR}/correctness-sanitizer.json" \
+    --sanitizer-log "${log}" \
+    --sanitizer-tool-version \
+      "${RESULT_DIR}/correctness-sanitizer-version.txt" \
+    --gpu-executable "${runner}" \
+    --output "${RESULT_DIR}/generated-bootstrap-three-way-comparison.json"
+}
+
+write_generated_bootstrap_correctness_result() {
+  local execution_status="$1"
+  jq -n --arg execution_status "${execution_status}" \
+    '{schema_version:
+        "ace.phantom.generated-bootstrap-correctness-lifecycle/1.0.0",
+      status:"pass", host_oracles_replayed_before_gpu:true,
+      gpu_execution:$execution_status}' \
+    >"${RESULT_DIR}/generated-bootstrap-correctness-lifecycle.json"
+}
+
+verify_generated_bootstrap_correctness_completeness() {
+  local expected_gpu_status="$1"
+  local -a common=(
+    payload-verification.txt
+    ace-source-audit.json
+    phantom-source-audit.json
+    packaged-correctness-host-replay.json
+    correctness-build.log
+    correctness-build-current.json
+    correctness-build-artifact-manifest.json
+    correctness-build-host-qualification.json
+    regenerated-correctness-host-replay.json
+    native-ant-reference.json
+    native-ant-reference.bin
+    generated-ant-reference.json
+    generated-ant-reference.bin
+    generated-bootstrap-correctness-lifecycle.json
+    phase-timings.tsv
+  )
+  local name
+  for name in "${common[@]}"; do
+    [[ -s "${RESULT_DIR}/${name}" ]] || {
+      echo "correctness evidence is missing ${name}" >&2
+      return 1
+    }
+  done
+  local -a retained_build_evidence=(
+    correctness-native-ant.stdout.txt
+    correctness-native-ant.stderr.txt
+    correctness-generated-ant.stdout.txt
+    correctness-generated-ant.stderr.txt
+    correctness-link-commands.txt
+    correctness-configuration.json
+    correctness-environment.txt
+    correctness-bootstrap-cuda-elf.txt
+    correctness-bootstrap-cuda-resources.txt
+    correctness-bootstrap-file.txt
+    correctness-bootstrap-readelf.txt
+    correctness-bootstrap-undefined-symbols.txt
+    correctness-gpu-runner-cuda-elf.txt
+    correctness-gpu-runner-cuda-resources.txt
+    correctness-gpu-runner-file.txt
+    correctness-gpu-runner-readelf.txt
+    correctness-gpu-runner-undefined-symbols.txt
+  )
+  for name in "${retained_build_evidence[@]}"; do
+    [[ -e "${RESULT_DIR}/${name}" ]] || {
+      echo "correctness build evidence is missing ${name}" >&2
+      return 1
+    }
+  done
+  if awk -F '\t' 'NF != 5 || $5 != 0 {bad=1} END {exit bad ? 0 : 1}' \
+      "${TIMINGS}"; then
+    echo "a correctness lifecycle child phase did not close with status zero" >&2
+    return 1
+  fi
+  jq -e --arg expected "${expected_gpu_status}" '
+    .schema_version ==
+      "ace.phantom.generated-bootstrap-correctness-lifecycle/1.0.0"
+    and .status == "pass"
+    and .host_oracles_replayed_before_gpu == true
+    and .gpu_execution == $expected
+  ' "${RESULT_DIR}/generated-bootstrap-correctness-lifecycle.json" >/dev/null
+  for name in packaged-correctness-host-replay.json \
+      regenerated-correctness-host-replay.json; do
+    jq -e '
+      .schema_version == "ace.phantom.bootstrap-host-oracle-replay/1.0.0"
+      and .status == "pass"
+      and (.cases | length) > 0
+    ' "${RESULT_DIR}/${name}" >/dev/null
+  done
+  if [[ "${expected_gpu_status}" == "pass" ]]; then
+    local -a gpu=(
+      generated-phantom-correctness.json
+      generated-phantom-correctness.bin
+      correctness-sanitizer.json
+      correctness-sanitizer.log
+      correctness-sanitizer-version.txt
+      correctness-gpu.stdout.txt
+      correctness-gpu.stderr.txt
+      generated-bootstrap-three-way-comparison.json
+    )
+    for name in "${gpu[@]}"; do
+      [[ -e "${RESULT_DIR}/${name}" ]] || {
+        echo "GPU correctness evidence is missing ${name}" >&2
+        return 1
+      }
+    done
+    jq -e '
+      .schema_version == "ace.phantom.bootstrap-three-way-comparison/1.0.0"
+      and .status == "pass"
+      and (.comparisons | length) == 5
+      and ([.comparisons[].status] | all(. == "pass"))
+    ' "${RESULT_DIR}/generated-bootstrap-three-way-comparison.json" >/dev/null
+    jq -e '
+      .schema_version == "ace.phantom.bootstrap-compute-sanitizer/1.0.0"
+      and .status == "pass" and .exit_status == 0 and .error_count == 0
+      and .error_summary_occurrences == 1
+      and .coverage == {bootstrap:true, post_operations:true,
+                        repeatability:true, teardown:true}
+    ' "${RESULT_DIR}/correctness-sanitizer.json" >/dev/null
+  else
+    for name in generated-phantom-correctness.json \
+      generated-phantom-correctness.bin correctness-sanitizer.json \
+      generated-bootstrap-three-way-comparison.json; do
+      [[ ! -e "${RESULT_DIR}/${name}" ]]
+    done
+    jq -e '
+      .schema_version ==
+        "ace.phantom.generated-bootstrap-gpu-skipped/1.0.0"
+      and .status == "skipped"
+      and .reason == "local-environment-has-no-qualified-gpu"
+    ' "${RESULT_DIR}/generated-bootstrap-gpu-skipped.json" >/dev/null
+  fi
+  jq -n --arg mode "${MODE}" \
+    '{schema_version:"ace.phantom.result-completeness/1.0.0",
+      status:"pass", mode:$mode}' \
+    >"${RESULT_DIR}/result-completeness.json"
+}
+
 phase payload_verification verify_outer_payload
 phase environment_bootstrap bootstrap
 export PATH="/opt/ace-runpod-venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+if jq -e '
+  .schema_version ==
+    "ace.phantom.generated-bootstrap-correctness-payload/1.0.0"
+' "${INPUT}/payload.json" >/dev/null; then
+  [[ "${MODE}" != "freeze-host" ]]
+  phase source_audit_and_extraction extract_sources
+  CURRENT_PHASE=qualification_environment
+  configure_qualification_environment
+  CURRENT_PHASE=""
+  phase correctness_payload_validation \
+    verify_generated_bootstrap_correctness_payload
+  phase packaged_host_oracle_replay replay_packaged_bootstrap_host_oracles
+  phase correctness_build run_generated_bootstrap_correctness_build
+  phase regenerated_host_oracle_replay \
+    replay_regenerated_bootstrap_host_oracles
+  if [[ "${MODE}" == "runpod" ]]; then
+    phase generated_bootstrap_gpu_correctness \
+      run_generated_bootstrap_gpu_correctness
+    write_generated_bootstrap_correctness_result pass
+    phase correctness_result_completeness \
+      verify_generated_bootstrap_correctness_completeness pass
+  else
+    jq -n '{schema_version:
+        "ace.phantom.generated-bootstrap-gpu-skipped/1.0.0",
+      status:"skipped", reason:"local-environment-has-no-qualified-gpu"}' \
+      >"${RESULT_DIR}/generated-bootstrap-gpu-skipped.json"
+    write_generated_bootstrap_correctness_result skipped-local-no-gpu
+    phase correctness_result_completeness \
+      verify_generated_bootstrap_correctness_completeness \
+      skipped-local-no-gpu
+  fi
+  PIPELINE_EXIT=0
+  exit 0
+fi
 phase source_audit_and_extraction extract_sources
 CURRENT_PHASE=qualification_environment
 configure_qualification_environment

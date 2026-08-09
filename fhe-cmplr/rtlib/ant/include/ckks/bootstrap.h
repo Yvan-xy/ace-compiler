@@ -576,6 +576,32 @@ void Eval_approx_mod(CKKS_BTS_CTX* bts_ctx, CIPHERTEXT* out, CIPHERTEXT* in,
 CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
                            uint32_t raise_level, CKKS_BTS_CTX* bts_ctx);
 
+//! @brief Per-thread execution evidence for Eval_bootstrap.
+//!
+//! This record is observational only.  It lets correctness harnesses prove that
+//! a native bootstrap traversed the mathematical stages instead of taking the
+//! early identity-copy return.  Counters are reset explicitly and never affect
+//! bootstrap decisions or ciphertext state.
+typedef struct CKKS_BOOTSTRAP_EXECUTION_ATTESTATION {
+  uint64_t invocation_count;
+  uint64_t early_copy_return_count;
+  uint64_t full_execution_count;
+  uint64_t coeffs_to_slots_entry_count;
+  uint64_t coeffs_to_slots_completion_count;
+  uint64_t eval_mod_entry_count;
+  uint64_t eval_mod_completion_count;
+  uint64_t slots_to_coeffs_entry_count;
+  uint64_t slots_to_coeffs_completion_count;
+  uint64_t full_completion_count;
+} CKKS_BOOTSTRAP_EXECUTION_ATTESTATION;
+
+//! @brief Clear the current thread's native-bootstrap execution evidence.
+void Reset_bootstrap_execution_attestation(void);
+
+//! @brief Copy the current thread's native-bootstrap execution evidence.
+void Get_bootstrap_execution_attestation(
+    CKKS_BOOTSTRAP_EXECUTION_ATTESTATION* attestation);
+
 //! @brief Print CKKS_BTS_CTX
 void Print_ckks_bts_ctx(FILE* fp, CKKS_BTS_CTX* bts_ctx);
 

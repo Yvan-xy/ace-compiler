@@ -14,6 +14,9 @@ from typing import Any
 
 
 REPORT_SCHEMA = "ace.phantom.environment-comparison/2.0.0"
+CORRECTNESS_REPORT_SCHEMA = (
+    "ace.phantom.generated-bootstrap-correctness-environment-comparison/1.0.0"
+)
 RETAINED_REPLAY_SCHEMA = "ace.phantom.retained_ckks.local-replay/1.0.0"
 RETAINED_HOST_SCHEMA = "ace.phantom.retained_ckks.host-qualification/1.0.0"
 RETAINED_BUILD_SCHEMA = "ace.phantom.retained_ckks.build-attestation/1.0.0"
@@ -135,20 +138,24 @@ def canonical_json_sha256(value: Any) -> str:
 
 
 def validate_invocation(
-    path: Path, schema: str, expected_argv: list[str], label: str
+    path: Path, schema: str, expected_argv: list[str] | None, label: str
 ) -> tuple[str, str]:
     record = read_json(path)
     if set(record) != {"schema_version", "argv", "normalized_argv_sha256"}:
         raise SystemExit(f"{label} has an invalid shape")
-    require_fields(
-        record,
-        {"schema_version": schema, "argv": expected_argv},
-        label,
-    )
+    if record.get("schema_version") != schema:
+        raise SystemExit(f"{label} has an invalid schema")
+    argv = record.get("argv")
+    if not isinstance(argv, list) or not all(
+        isinstance(item, str) and item for item in argv
+    ):
+        raise SystemExit(f"{label} argv is invalid")
+    if expected_argv is not None and argv != expected_argv:
+        raise SystemExit(f"{label} argv violates the comparison contract")
     normalized = require_digest(
         record.get("normalized_argv_sha256"), f"{label} normalized argv"
     )
-    if normalized != canonical_json_sha256(expected_argv):
+    if normalized != canonical_json_sha256(argv):
         raise SystemExit(f"{label} normalized argv hash is inconsistent")
     return sha256(path), normalized
 
@@ -421,6 +428,8 @@ def validate_bootstrap_generation(
     manifest_paths: dict[str, Path],
     resource: dict[str, Any],
     constant_count: int,
+    compiler_parameters: dict[str, Any],
+    bootstrap_parameters: dict[str, Any],
 ) -> None:
     expected_keys = {
         "schema_version",
@@ -447,21 +456,8 @@ def validate_bootstrap_generation(
             "schema_version": BOOTSTRAP_GENERATION_SCHEMA,
             "status": "pass",
             "qualification_scope": "full-generated-bootstrap-compile-only",
-            "compiler_parameters": {
-                "poly_degree": 16384,
-                "mul_level": 26,
-                "input_level": 1,
-                "security_level": 0,
-                "scaling_factor_bits": 56,
-                "first_prime_bits": 60,
-                "hamming_weight": 192,
-            },
-            "bootstrap_parameters": {
-                "q_parts": 3,
-                "enc_budget": 3,
-                "dec_budget": 3,
-                "ct_encode": False,
-            },
+            "compiler_parameters": compiler_parameters,
+            "bootstrap_parameters": bootstrap_parameters,
             "stages_completed": ["ckks_driver", "ckks2c"],
             "constant_count": constant_count,
             "rotation_count": len(resource["rotation_steps"]),
@@ -595,12 +591,37 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
         "bootstrap Phantom source manifest",
     )
 
-    parameters = [
-        "--poly-degree", "16384", "--mul-level", "26",
-        "--input-level", "1", "--security-level", "0",
-        "--scaling-factor-bits", "56", "--first-prime-bits", "60",
-        "--hamming-weight", "192",
+    generation_invocation_path = evidence / "bootstrap_generation_invocation.json"
+    generation_invocation = read_json(generation_invocation_path)
+    generation_argv = generation_invocation.get("argv")
+    generation_prefix = [
+        "tools/phantom_gpu/generate_bootstrap_qualification.py",
+        "bootstrap_qualification",
     ]
+    if not isinstance(generation_argv, list) or generation_argv[:2] != generation_prefix:
+        raise SystemExit("bootstrap generation invocation executable/output is invalid")
+    parameters = generation_argv[2:]
+    if len(parameters) % 2:
+        raise SystemExit("bootstrap generation invocation has an unpaired option")
+    generation_options = dict(zip(parameters[0::2], parameters[1::2]))
+    if len(generation_options) != len(parameters) // 2:
+        raise SystemExit("bootstrap generation invocation options are not unique")
+    required_generation_options = {
+        "--poly-degree", "--mul-level", "--input-level", "--security-level",
+        "--scaling-factor-bits", "--first-prime-bits", "--hamming-weight",
+    }
+    if set(generation_options) != required_generation_options:
+        raise SystemExit("bootstrap generation invocation omits an explicit option")
+    compiler_options = {
+        option.removeprefix("--").replace("-", "_"): int(value)
+        for option, value in generation_options.items()
+    }
+    generation_invocation_sha, normalized_generation = validate_invocation(
+        generation_invocation_path,
+        BOOTSTRAP_GENERATION_INVOCATION_SCHEMA,
+        None,
+        "bootstrap generation invocation",
+    )
     qualification_invocation_path = evidence / "qualification_invocation.json"
     qualification_invocation_sha, normalized_qualification = validate_invocation(
         qualification_invocation_path,
@@ -608,17 +629,6 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
         ["tools/phantom_gpu/compile_only.sh", "--gate", "bootstrap"] + parameters,
         "bootstrap qualification invocation",
     )
-    generation_invocation_path = evidence / "bootstrap_generation_invocation.json"
-    generation_invocation_sha, normalized_generation = validate_invocation(
-        generation_invocation_path,
-        BOOTSTRAP_GENERATION_INVOCATION_SCHEMA,
-        [
-            "tools/phantom_gpu/generate_bootstrap_qualification.py",
-            "bootstrap_qualification",
-        ] + parameters,
-        "bootstrap generation invocation",
-    )
-
     required_context_keys = {
         "data_q_bit_sizes", "first_modulus_bits", "hamming_weight",
         "input_level", "logical_slot_capacity", "packing", "polynomial_degree",
@@ -632,18 +642,20 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
         {
             "schema_version": 1,
             "resource_schema_version": 3,
-            "polynomial_degree": 16384,
-            "logical_slot_capacity": 8192,
-            "packing": "full",
-            "input_level": 1,
-            "security_level": 0,
-            "scaling_modulus_bits": 56,
-            "first_modulus_bits": 60,
-            "hamming_weight": 192,
+            "polynomial_degree": int(generation_options["--poly-degree"]),
+            "logical_slot_capacity": int(generation_options["--poly-degree"]) // 2,
+            "packing": context.get("packing"),
+            "input_level": int(generation_options["--input-level"]),
+            "security_level": int(generation_options["--security-level"]),
+            "scaling_modulus_bits": int(generation_options["--scaling-factor-bits"]),
+            "first_modulus_bits": int(generation_options["--first-prime-bits"]),
+            "hamming_weight": int(generation_options["--hamming-weight"]),
         },
         "bootstrap context manifest",
     )
-    if len(context.get("data_q_bit_sizes", [])) != 26:
+    if len(context.get("data_q_bit_sizes", [])) != int(
+        generation_options["--mul-level"]
+    ):
         raise SystemExit("bootstrap context data-Q count is invalid")
 
     required_resource_keys = {
@@ -721,6 +733,8 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
         },
         resource,
         len(constant_entries),
+        compiler_options,
+        generation.get("bootstrap_parameters"),
     )
 
     audit_inputs = {
@@ -1253,10 +1267,7 @@ def comparison_report(local: dict[str, Any], remote: dict[str, Any]) -> dict[str
         "bootstrap_symbol_closure_sha256",
         "generated_binary_sha256",
     }
-    stable = sorted(
-        set(local)
-        - per_run_fields
-    )
+    stable = sorted(set(local) - per_run_fields)
     matching = [key for key in stable if local[key] == remote[key]]
     mismatches = {
         key: {"local": local[key], "remote": remote[key]}
@@ -1335,17 +1346,324 @@ def comparison_report(local: dict[str, Any], remote: dict[str, Any]) -> dict[str
     }
 
 
+def verify_result_checksum_closure(root: Path) -> None:
+    checksum_path = root / "SHA256SUMS"
+    listed: dict[str, str] = {}
+    for line in checksum_path.read_text(encoding="utf-8").splitlines():
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            raise SystemExit("result checksum record has a malformed line")
+        digest, name = parts
+        relative = name.removeprefix("*").removeprefix("./")
+        require_digest(digest, f"result checksum for {relative}")
+        if relative in listed:
+            raise SystemExit("result checksum record contains a duplicate path")
+        listed[relative] = digest
+    actual = {
+        str(path.relative_to(root)): sha256(path)
+        for path in root.rglob("*")
+        if path.is_file() and path != checksum_path
+    }
+    if listed != actual:
+        raise SystemExit("result checksum closure differs from the result tree")
+
+
+def correctness_host_executable_digests(
+    build_files: dict[str, Any],
+    native_record: dict[str, Any],
+    generated_record: dict[str, Any],
+) -> tuple[str, str]:
+    bindings = (
+        (
+            "native ANT",
+            "bootstrap_qualification/generated_bootstrap_native_ant_oracle",
+            native_record,
+        ),
+        (
+            "generated DSL/ANT",
+            "bootstrap_qualification/generated_bootstrap_dsl_ant_oracle",
+            generated_record,
+        ),
+    )
+    observed: list[str] = []
+    for label, artifact_name, record in bindings:
+        artifact_digest = require_digest(
+            build_files.get(artifact_name), f"rebuilt {label} executable"
+        )
+        record_digest = require_digest(
+            record.get("execution", {}).get("provenance", {}).get(
+                "executable_sha256"
+            ),
+            f"executed {label} executable",
+        )
+        if record_digest != artifact_digest:
+            raise SystemExit(
+                f"executed {label} binary differs from rebuilt provenance"
+            )
+        observed.append(record_digest)
+    return observed[0], observed[1]
+
+
+def correctness_fields(root: Path, expected_mode: str) -> dict[str, Any]:
+    verify_result_checksum_closure(root)
+    pipeline = read_json(root / "pipeline-result.json")
+    require_fields(
+        pipeline,
+        {"schema_version": "1.0.0", "status": "pass", "mode": expected_mode,
+         "exit_code": 0},
+        "correctness pipeline result",
+    )
+    lifecycle = read_json(root / "generated-bootstrap-correctness-lifecycle.json")
+    expected_execution = "pass" if expected_mode == "runpod" else "skipped-local-no-gpu"
+    require_fields(
+        lifecycle,
+        {
+            "schema_version":
+                "ace.phantom.generated-bootstrap-correctness-lifecycle/1.0.0",
+            "status": "pass",
+            "host_oracles_replayed_before_gpu": True,
+            "gpu_execution": expected_execution,
+        },
+        "correctness lifecycle",
+    )
+    for replay_name in (
+        "packaged-correctness-host-replay.json",
+        "regenerated-correctness-host-replay.json",
+    ):
+        replay = read_json(root / replay_name)
+        if (
+            replay.get("schema_version")
+            != "ace.phantom.bootstrap-host-oracle-replay/1.0.0"
+            or replay.get("status") != "pass"
+            or not replay.get("cases")
+        ):
+            raise SystemExit(f"host replay is incomplete: {replay_name}")
+
+    packaged = root / "correctness-input"
+    payload = read_json(packaged / "payload.json")
+    if (
+        payload.get("schema_version")
+        != "ace.phantom.generated-bootstrap-correctness-payload/1.0.0"
+        or payload.get("status") != "pass"
+        or payload.get("host_oracles_replayed") is not True
+    ):
+        raise SystemExit("correctness payload contract is invalid")
+    payload_files = payload.get("files")
+    observed_files = {
+        path.name: sha256(path)
+        for path in packaged.iterdir()
+        if path.is_file() and path.name not in {"payload.json", "SHA256SUMS"}
+    }
+    if payload_files != observed_files:
+        raise SystemExit("correctness payload file inventory differs")
+    compiler_invocation = read_json(
+        packaged / "correctness-compiler-invocation.json"
+    )
+    if (
+        compiler_invocation.get("schema_version")
+        != "ace.phantom.generated-bootstrap.compiler-invocation/1.0.0"
+        or compiler_invocation.get("status") != "pass"
+        or not isinstance(compiler_invocation.get("options"), dict)
+    ):
+        raise SystemExit("correctness compiler invocation is invalid")
+    artifact = read_json(packaged / "correctness-artifact-manifest.json")
+    source_audit = read_json(packaged / "correctness-source-audit.json")
+    host_qualification = read_json(
+        packaged / "correctness-host-qualification.json"
+    )
+    if (
+        artifact.get("schema_version") != "ace.phantom.bootstrap-artifacts/3.0.0"
+        or artifact.get("status") != "bound"
+        or source_audit.get("schema_version")
+        != "ace.phantom.bootstrap-generated-artifact-audit/3.0.0"
+        or source_audit.get("status") != "pass"
+        or host_qualification.get("schema_version")
+        != "ace.phantom.bootstrap-host-qualification/2.0.0"
+        or host_qualification.get("status") != "pass"
+        or host_qualification.get("architecture") != "sm_80"
+    ):
+        raise SystemExit("correctness artifact, source audit, or architecture is invalid")
+    for kind in ("ace", "phantom"):
+        source = read_json(packaged / f"{kind}-source.manifest.json")
+        if source.get("commit") != payload.get(f"{kind}_commit"):
+            raise SystemExit(f"correctness {kind} source commit differs")
+        if payload.get("source_snapshots", {}).get(f"{kind}_manifest_sha256") != sha256(
+            packaged / f"{kind}-source.manifest.json"
+        ):
+            raise SystemExit(f"correctness {kind} source manifest binding differs")
+
+    build_artifact = read_json(
+        root / "correctness-build-artifact-manifest.json"
+    )
+    build_qualification = read_json(
+        root / "correctness-build-host-qualification.json"
+    )
+    if (
+        build_artifact.get("schema_version")
+        != "ace.phantom.bootstrap-artifacts/3.0.0"
+        or build_artifact.get("status") != "bound"
+        or build_qualification.get("schema_version")
+        != "ace.phantom.bootstrap-host-qualification/2.0.0"
+        or build_qualification.get("status") != "pass"
+    ):
+        raise SystemExit("rebuilt correctness artifact provenance is invalid")
+    build_files = build_artifact.get("files")
+    if not isinstance(build_files, dict):
+        raise SystemExit("rebuilt correctness artifact file inventory is invalid")
+    gpu_executable = require_digest(
+        build_files.get(
+            "bootstrap_qualification/"
+            "generated_bootstrap_phantom_correctness_sm80"
+        ),
+        "rebuilt generated Phantom executable",
+    )
+    gpu_elf_report = require_digest(
+        build_files.get(
+            "bootstrap_qualification/gpu-runner-inspection/cuda_elf.txt"
+        ),
+        "rebuilt generated Phantom ELF report",
+    )
+    native_record = read_json(root / "native-ant-reference.json")
+    generated_record = read_json(root / "generated-ant-reference.json")
+    native_executable, generated_executable = correctness_host_executable_digests(
+        build_files, native_record, generated_record
+    )
+    archive_digests = {
+        name: require_digest(
+            build_qualification.get(f"{name}_archive_sha256"),
+            f"rebuilt {name} archive",
+        )
+        for name in ("adapter", "provider", "common")
+    }
+    if expected_mode == "runpod":
+        gpu_record = read_json(root / "generated-phantom-correctness.json")
+        if (
+            gpu_record.get("execution", {}).get("executable_sha256")
+            != gpu_executable
+        ):
+            raise SystemExit(
+                "executed generated Phantom binary differs from rebuilt provenance"
+            )
+
+    stable_names = (
+        "ace-source.manifest.json",
+        "phantom-source.manifest.json",
+        "correctness-qualification-invocation.json",
+        "correctness-generation-invocation.json",
+        "correctness-compiler-invocation.json",
+        "correctness-raw.air",
+        "correctness-post-ckks.air",
+        "correctness-post-operations.air",
+        "correctness-context-manifest.json",
+        "correctness-resource-manifest.json",
+        "correctness-constant-manifest.json",
+        "correctness-bootstrap-semantics.json",
+        "correctness-post-operation-attestation.json",
+        "correctness-fixture.json",
+        "correctness-generation.json",
+        "correctness-source-audit.json",
+        "correctness-gpu-harness.cu",
+        "correctness-generated-phantom.cu",
+        "correctness-generated-ant.cxx",
+        "run_build_and_health.sh",
+        "bootstrap_environment.sh",
+        "bootstrap_correctness.py",
+        "phase_helpers.sh",
+        "source_archive.py",
+        "dependencies.env",
+        "toolchain.env",
+        "apt-packages.lock",
+        "python-requirements-hashed.lock",
+        "base-files.sha256",
+    )
+    result: dict[str, Any] = {
+        "ace_commit": payload["ace_commit"],
+        "phantom_commit": payload["phantom_commit"],
+        **{name: sha256(packaged / name) for name in stable_names},
+        "per_run_ace_archive_sha256": read_json(root / "ace-source-audit.json").get(
+            "archive_sha256"
+        ),
+        "per_run_phantom_archive_sha256": read_json(
+            root / "phantom-source-audit.json"
+        ).get(
+            "archive_sha256"
+        ),
+        "per_run_gpu_executable_sha256": gpu_executable,
+        "per_run_gpu_elf_report_sha256": gpu_elf_report,
+        "per_run_native_ant_executable_sha256": native_executable,
+        "per_run_generated_ant_executable_sha256": generated_executable,
+        "per_run_adapter_archive_sha256": archive_digests["adapter"],
+        "per_run_provider_archive_sha256": archive_digests["provider"],
+        "per_run_common_archive_sha256": archive_digests["common"],
+    }
+    for name, value in result.items():
+        if name.endswith("sha256"):
+            require_digest(value, f"correctness comparison {name}")
+    if expected_mode == "runpod":
+        comparison = read_json(root / "generated-bootstrap-three-way-comparison.json")
+        sanitizer = read_json(root / "correctness-sanitizer.json")
+        if comparison.get("status") != "pass" or sanitizer.get("status") != "pass":
+            raise SystemExit("remote correctness or sanitizer result did not pass")
+    return result
+
+
+def correctness_comparison_report(
+    local: dict[str, Any], remote: dict[str, Any]
+) -> dict[str, Any]:
+    if set(local) != set(remote):
+        raise SystemExit("correctness comparison field inventories differ")
+    per_run = {key for key in local if key.startswith("per_run_")}
+    stable = set(local) - per_run
+    mismatches = {
+        key: {"local": local[key], "remote": remote[key]}
+        for key in sorted(stable)
+        if local[key] != remote[key]
+    }
+    return {
+        "schema_version": CORRECTNESS_REPORT_SCHEMA,
+        "status": "pass" if not mismatches else "fail",
+        "stable_field_count": len(stable),
+        "matching_fields": [
+            key for key in sorted(stable) if local[key] == remote[key]
+        ],
+        "mismatches": mismatches,
+        "per_run_provenance_policy": {
+            "cuda_binary_and_archive_bytes": "checksum-bound-per-run",
+            "gpu_execution": "required-remotely-and-skipped-locally",
+            "semantic_authorities": "byte-identical-and-replayed-in-each-environment",
+            "recorded_digests": {
+                key: {"local": local[key], "remote": remote[key]}
+                for key in sorted(per_run)
+            },
+        },
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode", choices=("full", "generated-bootstrap-correctness"),
+        default="full"
+    )
     parser.add_argument("--local", type=Path, required=True)
     parser.add_argument("--remote", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="ace-environment-compare-") as temporary:
         base = Path(temporary)
-        local = fields(safe_extract(arguments.local, base / "local"))
-        remote = fields(safe_extract(arguments.remote, base / "remote"))
-    report = comparison_report(local, remote)
+        local_root = safe_extract(arguments.local, base / "local")
+        remote_root = safe_extract(arguments.remote, base / "remote")
+        if arguments.mode == "generated-bootstrap-correctness":
+            local = correctness_fields(local_root, "local")
+            remote = correctness_fields(remote_root, "runpod")
+        else:
+            local = fields(local_root)
+            remote = fields(remote_root)
+    report = (
+        correctness_comparison_report(local, remote)
+        if arguments.mode == "generated-bootstrap-correctness"
+        else comparison_report(local, remote)
+    )
     arguments.output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

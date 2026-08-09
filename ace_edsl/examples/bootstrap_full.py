@@ -40,6 +40,9 @@ References:
 import sys
 import os
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterator, Optional
 
 # Setup path for imports
 def _setup_sys_path():
@@ -78,6 +81,15 @@ LOG_SLOTS = 3  # 8 slots for demo
 NUM_SLOTS = 1 << LOG_SLOTS
 NUM_DOUBLE_ANGLE = R_UNIFORM_HW_192  # 3, matches ANT
 CHEB_COEFF_COUNT = UNIFORM_COEFF_SIZE_HW_192  # 55
+UNIFORM_COEFFICIENT_HAMMING_WEIGHT_MAX = 192
+EVALMOD_COMPONENT_LOWER_BOUND = -1.0
+EVALMOD_COMPONENT_UPPER_BOUND = 1.0
+
+
+_EXPLICIT_TRACE_CONFIG: ContextVar[Optional[BootstrapConfig]] = ContextVar(
+    "bootstrap_full_explicit_trace_config",
+    default=None,
+)
 
 
 def _env_int(names, default: int, min_value: int = 1) -> int:
@@ -235,9 +247,58 @@ def _with_stage_probe_prologue(c_code: str) -> str:
     return prologue + c_code
 
 
-def _bootstrap_trace_config() -> BootstrapConfig:
-    """Build explicit trace-time bootstrap/FHE metadata for primitive lowering."""
+def build_bootstrap_trace_config(
+    *,
+    poly_degree: int,
+    mul_level: int,
+    first_prime_bits: int,
+    scaling_factor_bits: int,
+    hamming_weight: int,
+    q_parts: int,
+    enc_budget: int,
+    dec_budget: int,
+    ct_encode: bool,
+) -> BootstrapConfig:
+    """Build a trace config without reading process-global configuration."""
+    if hamming_weight > UNIFORM_COEFFICIENT_HAMMING_WEIGHT_MAX:
+        raise ValueError(
+            "the expanded uniform coefficient family supports hamming weight "
+            f"at most {UNIFORM_COEFFICIENT_HAMMING_WEIGHT_MAX}"
+        )
     return BootstrapConfig(
+        poly_degree=poly_degree,
+        mul_level=mul_level,
+        first_prime_bits=first_prime_bits,
+        scaling_factor_bits=scaling_factor_bits,
+        hamming_weight=hamming_weight,
+        q_parts=q_parts,
+        enc_budget=enc_budget,
+        dec_budget=dec_budget,
+        ct_encode=ct_encode,
+        eval_sin_upper_bound_k=EVAL_SIN_UPPER_BOUND_K,
+        chebyshev_coefficients=tuple(G_COEFFICIENTS_UNIFORM_HW_192),
+        double_angle_scalars=tuple(get_double_angle_scalars(NUM_DOUBLE_ANGLE)),
+    )
+
+
+@contextmanager
+def bootstrap_trace_configuration(
+    config: BootstrapConfig,
+) -> Iterator[None]:
+    """Scope one explicit configuration to a kernel trace."""
+    token = _EXPLICIT_TRACE_CONFIG.set(config)
+    try:
+        yield
+    finally:
+        _EXPLICIT_TRACE_CONFIG.reset(token)
+
+
+def _bootstrap_trace_config() -> BootstrapConfig:
+    """Build trace metadata, retaining environment defaults for the demo only."""
+    explicit = _EXPLICIT_TRACE_CONFIG.get()
+    if explicit is not None:
+        return explicit
+    return build_bootstrap_trace_config(
         poly_degree=_bootstrap_poly_degree(),
         mul_level=_bootstrap_mul_level(),
         first_prime_bits=_bootstrap_first_prime_bits(),
@@ -247,9 +308,6 @@ def _bootstrap_trace_config() -> BootstrapConfig:
         enc_budget=_bootstrap_enc_budget(),
         dec_budget=_bootstrap_dec_budget(),
         ct_encode=_bootstrap_ct_encode(),
-        eval_sin_upper_bound_k=EVAL_SIN_UPPER_BOUND_K,
-        chebyshev_coefficients=tuple(G_COEFFICIENTS_UNIFORM_HW_192),
-        double_angle_scalars=tuple(get_double_angle_scalars(NUM_DOUBLE_ANGLE)),
     )
 
 

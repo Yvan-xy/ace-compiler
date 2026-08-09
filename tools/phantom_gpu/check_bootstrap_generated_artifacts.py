@@ -19,6 +19,28 @@ SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 C_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_]\w*$")
 HEXFLOAT_PATTERN = re.compile(r"^0x[0-9a-f]+\.[0-9a-f]+p[+-][0-9]+$")
 SCHEMA = "ace.phantom.bootstrap-generated-artifact-audit/2.0.0"
+V3_SCHEMA = "ace.phantom.bootstrap-generated-artifact-audit/3.0.0"
+RAW_SCALE_COORDINATE_TOLERANCE = 1.0e-4
+
+INVOCATION_OPTION_KEYS = {
+    "ciphertext_constant_encoding",
+    "decode_transform_budget",
+    "encode_transform_budget",
+    "first_prime_bits",
+    "hamming_weight",
+    "input_level",
+    "mul_level",
+    "packing",
+    "post_multiply_imag",
+    "post_multiply_real",
+    "post_multiply_scale_degree",
+    "post_rotation_step",
+    "poly_degree",
+    "q_part_count",
+    "scaling_factor_bits",
+    "security_level",
+    "vector_capacity",
+}
 
 REQUIRED_AIR_OPCODES = (
     "ckks.conjugate",
@@ -192,6 +214,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--raw-air", required=True, type=Path)
     parser.add_argument("--post-ckks-air", required=True, type=Path)
     parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--ant-source", type=Path)
+    parser.add_argument("--generation-record", type=Path)
+    parser.add_argument("--compiler-invocation", type=Path)
+    parser.add_argument("--bootstrap-semantics", type=Path)
+    parser.add_argument("--post-operations-air", type=Path)
+    parser.add_argument("--post-operation-attestation", type=Path)
     parser.add_argument("--report", type=Path)
     return parser.parse_args()
 
@@ -662,6 +690,359 @@ def inspect_source(source: str) -> dict[str, Any]:
     }
 
 
+def _require_hash(value: object, label: str) -> str:
+    if not isinstance(value, str) or SHA256_PATTERN.fullmatch(value) is None:
+        raise AuditError(f"{label} must be lowercase SHA-256")
+    return value
+
+
+def _verify_file_record(record: object, path: Path, label: str) -> None:
+    if not isinstance(record, dict):
+        raise AuditError(f"{label} must be an object")
+    _require_exact_keys(record, {"path", "sha256", "bytes"}, label)
+    payload = path.read_bytes()
+    if record != {
+        "path": path.name,
+        "sha256": _sha256_bytes(payload),
+        "bytes": len(payload),
+    }:
+        raise AuditError(f"{label} differs from its artifact")
+
+
+def _operation_attributes(air: str, opcode: str) -> list[dict[str, int]]:
+    result = []
+    for value in re.findall(
+        rf"CKKS\.{re.escape(opcode)} ATTR\[([^\]]+)\]", air
+    ):
+        attributes = {}
+        for name in ("level", "rescale_level", "scale"):
+            match = re.search(rf"(?:^|,){name}=(-?[0-9]+)(?:,|$)", value)
+            if match is None:
+                raise AuditError(f"{opcode} AIR omits {name}")
+            attributes[name] = int(match.group(1))
+        result.append(attributes)
+    return result
+
+
+def _terminal_attributes(air: str) -> dict[str, int]:
+    matches = re.findall(
+        r'st "__ret_tmp_[^"]+"[^\n]*ATTR\[([^\]]+)\][^\n]*\n'
+        r'\s*ld "__ret_tmp_[^"]+"[^\n]*\n\s*retv\b',
+        air,
+    )
+    if len(matches) != 1:
+        raise AuditError("post-CKKS AIR must have one terminal return metadata record")
+    result = _operation_attributes(
+        "CKKS.terminal ATTR[" + matches[0] + "]", "terminal"
+    )
+    return result[0]
+
+
+BOOTSTRAP_ABI = re.compile(
+    r"\bCIPHERTEXT\s+bootstrap_full\s*\(\s*"
+    r"CIPHERTEXT\s+[A-Za-z_]\w*\s*,\s*"
+    r"CIPHERTEXT\s+[A-Za-z_]\w*\s*\)\s*\{"
+)
+
+
+def _verify_bootstrap_abi(source: str, label: str) -> None:
+    if len(BOOTSTRAP_ABI.findall(source)) != 1:
+        raise AuditError(
+            f"{label} must define exact bootstrap_full(CIPHERTEXT,CIPHERTEXT) ABI"
+        )
+
+
+def verify_v3_closure(
+    *,
+    context_path: Path,
+    resource_path: Path,
+    constant_path: Path,
+    raw_air_path: Path,
+    post_ckks_air_path: Path,
+    source_path: Path,
+    ant_source_path: Path,
+    generation_path: Path,
+    invocation_path: Path,
+    semantics_path: Path,
+    post_operations_air_path: Path,
+    post_operation_attestation_path: Path,
+) -> dict[str, Any]:
+    context = _read_json(context_path)
+    resource = _read_json(resource_path)
+    generation = _read_json(generation_path)
+    invocation = _read_json(invocation_path)
+    semantics = _read_json(semantics_path)
+    post_record = _read_json(post_operation_attestation_path)
+    post_air = post_ckks_air_path.read_text(encoding="utf-8")
+    operations_air = post_operations_air_path.read_text(encoding="utf-8")
+    phantom_source = source_path.read_text(encoding="utf-8")
+    ant_source = ant_source_path.read_text(encoding="utf-8")
+
+    if generation.get("schema_version") != "ace.phantom.bootstrap-generation/3.0.0":
+        raise AuditError("generation record is not schema version 3")
+    if generation.get("status") != "pass":
+        raise AuditError("generation record did not pass")
+    _verify_bootstrap_abi(phantom_source, "Phantom source")
+    _verify_bootstrap_abi(ant_source, "generated DSL/ANT source")
+    ant_inspection = inspect_source(ant_source)
+    if ant_inspection["forbidden_matches"]:
+        raise AuditError("generated DSL/ANT source contains forbidden bootstrap calls")
+
+    _verify_file_record(generation.get("source"), source_path, "generation source")
+    sources = generation.get("sources")
+    if not isinstance(sources, dict) or set(sources) != {
+        "phantom", "generated_dsl_ant"
+    }:
+        raise AuditError("generation sources keys differ from schema")
+    _verify_file_record(sources["phantom"], source_path, "Phantom source record")
+    _verify_file_record(
+        sources["generated_dsl_ant"], ant_source_path, "generated DSL/ANT source record"
+    )
+    _verify_file_record(
+        generation.get("normalized_compiler_invocation"),
+        invocation_path,
+        "normalized compiler invocation record",
+    )
+    _verify_file_record(
+        generation.get("bootstrap_semantics"), semantics_path, "bootstrap semantics record"
+    )
+    _verify_file_record(
+        generation.get("post_operations_air"),
+        post_operations_air_path,
+        "post-operations AIR record",
+    )
+    _verify_file_record(
+        generation.get("post_operations_attestation"),
+        post_operation_attestation_path,
+        "post-operation attestation record",
+    )
+    air = generation.get("air")
+    if not isinstance(air, dict) or set(air) != {"raw", "post_ckks"}:
+        raise AuditError("generation AIR keys differ from schema")
+    _verify_file_record(air["raw"], raw_air_path, "raw AIR record")
+    _verify_file_record(air["post_ckks"], post_ckks_air_path, "post-CKKS AIR record")
+    post_hash = _sha256_bytes(post_ckks_air_path.read_bytes())
+    paths = generation.get("terminal_paths")
+    if not isinstance(paths, dict) or set(paths) != {"phantom", "generated_dsl_ant"}:
+        raise AuditError("terminal path keys differ from schema")
+    expected_paths = {
+        "phantom": ("phantom", "ckks", ["ckks_driver", "ckks2c"]),
+        "generated_dsl_ant": (
+            "ant", "poly", ["ckks_driver", "poly_driver", "poly2c"]
+        ),
+    }
+    for name, (provider, codegen_ir, stages) in expected_paths.items():
+        if paths[name] != {
+            "provider": provider,
+            "codegen_ir": codegen_ir,
+            "stages_completed": stages,
+            "post_ckks_air_sha256": post_hash,
+        }:
+            raise AuditError(f"{name} terminal path binding differs")
+
+    _require_exact_keys(
+        invocation,
+        {
+            "schema_version", "status", "tool", "normalized_argv",
+            "normalized_argv_sha256", "options", "output_destination_in_identity",
+        },
+        "compiler invocation",
+    )
+    if (
+        invocation["schema_version"]
+        != "ace.phantom.generated-bootstrap.compiler-invocation/1.0.0"
+        or invocation["status"] != "pass"
+        or invocation["output_destination_in_identity"] is not False
+        or not isinstance(invocation["normalized_argv"], list)
+        or invocation["normalized_argv_sha256"]
+        != _sha256_bytes(
+            json.dumps(
+                invocation["normalized_argv"], separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+        )
+    ):
+        raise AuditError("normalized compiler invocation is invalid")
+    options = invocation["options"]
+    if not isinstance(options, dict):
+        raise AuditError("compiler invocation options must be an object")
+    _require_exact_keys(options, INVOCATION_OPTION_KEYS, "compiler invocation options")
+    expected_argv = [
+        invocation["tool"],
+        "--poly-degree", str(options["poly_degree"]),
+        "--vector-capacity", str(options["vector_capacity"]),
+        "--mul-level", str(options["mul_level"]),
+        "--input-level", str(options["input_level"]),
+        "--security-level", str(options["security_level"]),
+        "--scaling-factor-bits", str(options["scaling_factor_bits"]),
+        "--first-prime-bits", str(options["first_prime_bits"]),
+        "--hamming-weight", str(options["hamming_weight"]),
+        "--q-part-count", str(options["q_part_count"]),
+        "--encode-transform-budget", str(options["encode_transform_budget"]),
+        "--decode-transform-budget", str(options["decode_transform_budget"]),
+        "--ciphertext-constant-encoding",
+        str(options["ciphertext_constant_encoding"]),
+        "--packing", str(options["packing"]),
+        "--post-multiply-real", repr(options["post_multiply_real"]),
+        "--post-multiply-imag", repr(options["post_multiply_imag"]),
+        "--post-multiply-scale-degree",
+        str(options["post_multiply_scale_degree"]),
+        "--post-rotation-step", str(options["post_rotation_step"]),
+    ]
+    if invocation["normalized_argv"] != expected_argv:
+        raise AuditError("normalized compiler argv differs from typed options")
+    expected_context_options = {
+        "poly_degree": context["polynomial_degree"],
+        "vector_capacity": context["logical_slot_capacity"],
+        "mul_level": len(context["data_q_bit_sizes"]),
+        "input_level": context["input_level"],
+        "security_level": context["security_level"],
+        "scaling_factor_bits": context["scaling_modulus_bits"],
+        "first_prime_bits": context["first_modulus_bits"],
+        "hamming_weight": context["hamming_weight"],
+        "q_part_count": context["q_part_count"],
+        "packing": context["packing"],
+    }
+    for name, expected in expected_context_options.items():
+        if options.get(name) != expected:
+            raise AuditError(f"compiler invocation option {name} differs from context")
+    requested_rotation = options["post_rotation_step"]
+    logical_slots = context["logical_slot_capacity"]
+    normalized_rotation = requested_rotation % logical_slots
+    if normalized_rotation > logical_slots // 2:
+        normalized_rotation -= logical_slots
+    if requested_rotation != normalized_rotation:
+        raise AuditError("post-operation rotation step is not canonical")
+    if normalized_rotation not in resource.get("rotation_steps", []):
+        raise AuditError(
+            "post-operation rotation step is absent from resource manifest"
+        )
+
+    if semantics.get("schema_version") != "ace.phantom.generated-bootstrap.semantics/1.0.0" or semantics.get("status") != "pass":
+        raise AuditError("bootstrap semantics record is invalid")
+    bindings = semantics.get("bindings")
+    expected_bindings = {
+        "compiler_invocation_sha256": _sha256_bytes(invocation_path.read_bytes()),
+        "raw_air_sha256": _sha256_bytes(raw_air_path.read_bytes()),
+        "post_ckks_air_sha256": post_hash,
+        "post_operations_air_sha256": _sha256_bytes(post_operations_air_path.read_bytes()),
+        "post_operations_attestation_sha256": _sha256_bytes(post_operation_attestation_path.read_bytes()),
+        "context_manifest_sha256": _sha256_bytes(context_path.read_bytes()),
+        "resource_manifest_sha256": _sha256_bytes(resource_path.read_bytes()),
+        "constant_manifest_sha256": _sha256_bytes(constant_path.read_bytes()),
+        "phantom_source_sha256": _sha256_bytes(source_path.read_bytes()),
+        "generated_dsl_ant_source_sha256": _sha256_bytes(ant_source_path.read_bytes()),
+    }
+    if bindings != expected_bindings:
+        raise AuditError("bootstrap semantics bindings differ from artifacts")
+    terminal = _terminal_attributes(post_air)
+    contract = semantics.get("output_air_contract")
+    raw_scale_contract = (
+        contract.get("raw_scale_contract") if isinstance(contract, dict) else None
+    )
+    expected_nominal_scale = math.ldexp(
+        1,
+        terminal["scale"] * context["scaling_modulus_bits"],
+    ).hex()
+    if not isinstance(contract, dict) or (
+        contract.get("ace_logical_level") != terminal["level"]
+        or contract.get("active_q_count") != terminal["level"]
+        or contract.get("rescale_level") != terminal["rescale_level"]
+        or contract.get("scale_degree") != terminal["scale"]
+        or contract.get("logical_slots") != context["logical_slot_capacity"]
+        or raw_scale_contract
+        != {
+            "kind": "ace-log2-scale-coordinate",
+            "nominal_raw_scale": expected_nominal_scale,
+            "scaling_modulus_bits": context["scaling_modulus_bits"],
+            "expected_scale_degree": terminal["scale"],
+            "maximum_absolute_coordinate_error": (
+                RAW_SCALE_COORDINATE_TOLERANCE
+            ),
+        }
+    ):
+        raise AuditError("bootstrap output contract differs from final return AIR metadata")
+
+    if (
+        post_record.get("schema_version")
+        != "ace.phantom.bootstrap-post-operation-semantics/1.0.0"
+        or post_record.get("status") != "attested"
+    ):
+        raise AuditError("post-operation attestation is invalid")
+    expected_post_bindings = {
+        "compiler_invocation_sha256": _sha256_bytes(invocation_path.read_bytes()),
+        "post_ckks_air_sha256": post_hash,
+        "context_manifest_sha256": _sha256_bytes(context_path.read_bytes()),
+        "resource_manifest_sha256": _sha256_bytes(resource_path.read_bytes()),
+        "post_operations_air_sha256": _sha256_bytes(post_operations_air_path.read_bytes()),
+    }
+    if post_record.get("bindings") != expected_post_bindings:
+        raise AuditError("post-operation bindings differ from artifacts")
+    expected_input_coordinate = {
+        "ace_logical_level": terminal["level"],
+        "rescale_level": terminal["rescale_level"],
+        "scale_degree": terminal["scale"],
+    }
+    if post_record.get("input_coordinate") != expected_input_coordinate:
+        raise AuditError("post-operation input coordinate differs from bootstrap return")
+    expected_post_inputs = {
+        "multiply_constant": {
+            "real": options["post_multiply_real"],
+            "imaginary": options["post_multiply_imag"],
+            "plaintext_scale_degree": options["post_multiply_scale_degree"],
+        },
+        "rotation_step": options["post_rotation_step"],
+    }
+    if post_record.get("inputs") != expected_post_inputs:
+        raise AuditError("post-operation inputs differ from normalized compiler invocation")
+    expected_contracts = {
+        name: post_record[name]
+        for name in (
+            "input_coordinate",
+            "rotation",
+            "ciphertext_plaintext_multiply",
+        )
+    }
+    expected_contracts["status"] = "pass"
+    expected_contracts["air_sha256"] = expected_post_bindings[
+        "post_operations_air_sha256"
+    ]
+    if semantics.get("post_operation_contracts") != expected_contracts:
+        raise AuditError(
+            "bootstrap semantics and post-operation attestation contracts differ"
+        )
+    rotations = _operation_attributes(operations_air, "rotate")
+    multiplies = _operation_attributes(operations_air, "mul")
+    if rotations != [terminal] or multiplies != [terminal]:
+        raise AuditError("dedicated post-operation AIR does not preserve final metadata")
+    if (
+        post_record.get("rotation", {}).get("air_attributes") != terminal
+        or post_record.get("ciphertext_plaintext_multiply", {}).get("air_attributes")
+        != terminal
+        or post_record.get("inputs", {}).get("multiply_constant", {}).get(
+            "plaintext_scale_degree"
+        ) != 0
+    ):
+        raise AuditError("post-operation transition attestation differs from AIR")
+    required_transition = {
+        "ace_logical_level_delta": 0,
+        "active_q_count_delta": 0,
+        "phantom_chain_index_delta": 0,
+        "scale_degree_delta": 0,
+        "raw_scale_multiplier": 1.0,
+        "logical_slots": "preserved",
+        "ciphertext_size": "preserved",
+        "ntt_state": "preserved",
+    }
+    for name in ("rotation", "ciphertext_plaintext_multiply"):
+        if post_record[name].get("transition") != required_transition:
+            raise AuditError(f"{name} transition is not exact metadata preservation")
+    return {
+        "canonical_post_ckks_air_sha256": post_hash,
+        "output_air_contract": terminal,
+        "post_operations_attested": True,
+    }
+
+
 def audit(
     context_path: Path,
     resource_path: Path,
@@ -669,6 +1050,12 @@ def audit(
     raw_air_path: Path,
     post_ckks_air_path: Path,
     source_path: Path,
+    ant_source_path: Path | None = None,
+    generation_path: Path | None = None,
+    invocation_path: Path | None = None,
+    semantics_path: Path | None = None,
+    post_operations_air_path: Path | None = None,
+    post_operation_attestation_path: Path | None = None,
 ) -> dict[str, Any]:
     input_paths = {
         "context_manifest": context_path,
@@ -678,8 +1065,21 @@ def audit(
         "post_ckks_air": post_ckks_air_path,
         "source": source_path,
     }
+    v3_paths = {
+        "ant_source": ant_source_path,
+        "generation_record": generation_path,
+        "compiler_invocation": invocation_path,
+        "bootstrap_semantics": semantics_path,
+        "post_operations_air": post_operations_air_path,
+        "post_operation_attestation": post_operation_attestation_path,
+    }
+    missing_v3 = []
+    if any(path is not None for path in v3_paths.values()):
+        missing_v3 = sorted(name for name, path in v3_paths.items() if path is None)
+        input_paths.update({name: path for name, path in v3_paths.items() if path is not None})
+    v3_enabled = all(path is not None for path in v3_paths.values())
     report: dict[str, Any] = {
-        "schema_version": SCHEMA,
+        "schema_version": V3_SCHEMA if v3_enabled else SCHEMA,
         "status": "fail",
         "inputs": {},
         "errors": [],
@@ -699,6 +1099,10 @@ def audit(
         "forbidden_native_bts_matches": [],
     }
     try:
+        if missing_v3:
+            raise AuditError(
+                "version 3 audit inputs are incomplete: " + ", ".join(missing_v3)
+            )
         raw = {name: path.read_bytes() for name, path in input_paths.items()}
         report["inputs"] = {
             name: {
@@ -782,6 +1186,21 @@ def audit(
         ):
             if accessor not in source:
                 raise AuditError(f"required generated accessor is absent: {accessor}")
+        if v3_enabled:
+            report["qualification_closure"] = verify_v3_closure(
+                context_path=context_path,
+                resource_path=resource_path,
+                constant_path=constant_path,
+                raw_air_path=raw_air_path,
+                post_ckks_air_path=post_ckks_air_path,
+                source_path=source_path,
+                ant_source_path=ant_source_path,
+                generation_path=generation_path,
+                invocation_path=invocation_path,
+                semantics_path=semantics_path,
+                post_operations_air_path=post_operations_air_path,
+                post_operation_attestation_path=post_operation_attestation_path,
+            )
         report["counts"] = {
             "constants": len(constants["constants"]),
             "monomial_powers": len(resource["monomial_powers"]),
@@ -803,6 +1222,12 @@ def main() -> int:
         arguments.raw_air,
         arguments.post_ckks_air,
         arguments.source,
+        arguments.ant_source,
+        arguments.generation_record,
+        arguments.compiler_invocation,
+        arguments.bootstrap_semantics,
+        arguments.post_operations_air,
+        arguments.post_operation_attestation,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if arguments.report:

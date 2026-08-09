@@ -89,6 +89,11 @@ public:
   static constexpr const char* ENCODE_CACHE = "encode_cache";
   // bool, annotate CKKS.mul so the scale manager defers auto-rescale
   static constexpr const char* SKIP_AUTO_RESCALE = "skip_auto_rescale";
+  // bool, preserve an explicitly encoded plaintext at raw scale one
+  static constexpr const char* RAW_SCALE_ONE = "raw_scale_one";
+  // bool, preserve explicit scale and rescale attributes on a formal load
+  static constexpr const char* EXPLICIT_SCALE_COORDINATE =
+      "explicit_scale_coordinate";
   // bool, emit CKKS.raise_mod level via configured runtime helper in IR2C
   static constexpr const char* RUNTIME_RAISE_LEVEL = "runtime_raise_level";
 };

@@ -238,6 +238,340 @@ def run_audit(tmp_path: Path, **changes: Any) -> dict[str, Any]:
     return audit(*write_inputs(tmp_path, **changes))
 
 
+def artifact_record(path: Path) -> dict[str, Any]:
+    payload = path.read_bytes()
+    return {
+        "path": path.name,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "bytes": len(payload),
+    }
+
+
+def write_versioned_closure(tmp_path: Path) -> tuple[Path, ...]:
+    base = write_inputs(
+        tmp_path,
+        post_ckks_air=POST_CKKS_AIR
+        + """
+  st "__ret_tmp_0" VAR[4] ATTR[level=1,rescale_level=13,scale=1]
+    ld "__ret_tmp_0" VAR[4] ATTR[level=1,rescale_level=13,scale=1]
+  retv ID(5)
+""",
+        source=SOURCE
+        + "\nCIPHERTEXT bootstrap_full(CIPHERTEXT input, CIPHERTEXT zero) { return input; }\n",
+    )
+    context_path, resource_path, constant_path, raw_air_path, post_air_path, source_path = base
+    ant_source_path = tmp_path / "generated_ant.cxx"
+    ant_source_path.write_text(
+        "CIPHERTEXT bootstrap_full(CIPHERTEXT input, CIPHERTEXT zero) { return input; }\n",
+        encoding="utf-8",
+    )
+    operations_air_path = tmp_path / "bootstrap_post_operations.air"
+    operations_air_path.write_text(
+        """
+CKKS.rotate ATTR[level=1,rescale_level=13,scale=1]
+CKKS.mul ATTR[level=1,rescale_level=13,scale=1]
+""",
+        encoding="utf-8",
+    )
+    invocation_path = tmp_path / "compiler_invocation.json"
+    options = {
+        "poly_degree": CONTEXT["polynomial_degree"],
+        "vector_capacity": CONTEXT["logical_slot_capacity"],
+        "mul_level": len(CONTEXT["data_q_bit_sizes"]),
+        "input_level": CONTEXT["input_level"],
+        "security_level": CONTEXT["security_level"],
+        "scaling_factor_bits": CONTEXT["scaling_modulus_bits"],
+        "first_prime_bits": CONTEXT["first_modulus_bits"],
+        "hamming_weight": CONTEXT["hamming_weight"],
+        "q_part_count": CONTEXT["q_part_count"],
+        "packing": CONTEXT["packing"],
+        "encode_transform_budget": 1,
+        "decode_transform_budget": 1,
+        "ciphertext_constant_encoding": "disabled",
+        "post_multiply_real": -1.0,
+        "post_multiply_imag": 0.0,
+        "post_multiply_scale_degree": 0,
+        "post_rotation_step": 5,
+    }
+    normalized = [
+        "tools/phantom_gpu/generate_bootstrap_qualification.py",
+        "--poly-degree", str(options["poly_degree"]),
+        "--vector-capacity", str(options["vector_capacity"]),
+        "--mul-level", str(options["mul_level"]),
+        "--input-level", str(options["input_level"]),
+        "--security-level", str(options["security_level"]),
+        "--scaling-factor-bits", str(options["scaling_factor_bits"]),
+        "--first-prime-bits", str(options["first_prime_bits"]),
+        "--hamming-weight", str(options["hamming_weight"]),
+        "--q-part-count", str(options["q_part_count"]),
+        "--encode-transform-budget", str(options["encode_transform_budget"]),
+        "--decode-transform-budget", str(options["decode_transform_budget"]),
+        "--ciphertext-constant-encoding",
+        options["ciphertext_constant_encoding"],
+        "--packing", options["packing"],
+        "--post-multiply-real", repr(options["post_multiply_real"]),
+        "--post-multiply-imag", repr(options["post_multiply_imag"]),
+        "--post-multiply-scale-degree",
+        str(options["post_multiply_scale_degree"]),
+        "--post-rotation-step", str(options["post_rotation_step"]),
+    ]
+    invocation_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "ace.phantom.generated-bootstrap.compiler-invocation/1.0.0",
+                "status": "pass",
+                "tool": normalized[0],
+                "normalized_argv": normalized,
+                "normalized_argv_sha256": hashlib.sha256(
+                    json.dumps(normalized, separators=(",", ":"), sort_keys=True).encode()
+                ).hexdigest(),
+                "options": options,
+                "output_destination_in_identity": False,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    attestation_path = tmp_path / "post_operations_attestation.json"
+    common_transition = {
+        "ace_logical_level_delta": 0,
+        "active_q_count_delta": 0,
+        "phantom_chain_index_delta": 0,
+        "scale_degree_delta": 0,
+        "raw_scale_multiplier": 1.0,
+        "logical_slots": "preserved",
+        "ciphertext_size": "preserved",
+        "ntt_state": "preserved",
+    }
+    attrs = {"level": 1, "rescale_level": 13, "scale": 1}
+    attestation_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "ace.phantom.bootstrap-post-operation-semantics/1.0.0",
+                "status": "attested",
+                "bindings": {
+                    "compiler_invocation_sha256": hashlib.sha256(invocation_path.read_bytes()).hexdigest(),
+                    "post_ckks_air_sha256": hashlib.sha256(post_air_path.read_bytes()).hexdigest(),
+                    "context_manifest_sha256": hashlib.sha256(context_path.read_bytes()).hexdigest(),
+                    "resource_manifest_sha256": hashlib.sha256(resource_path.read_bytes()).hexdigest(),
+                    "post_operations_air_sha256": hashlib.sha256(operations_air_path.read_bytes()).hexdigest(),
+                },
+                "inputs": {
+                    "multiply_constant": {
+                        "real": -1.0,
+                        "imaginary": 0.0,
+                        "plaintext_scale_degree": 0,
+                    },
+                    "rotation_step": 5,
+                },
+                "input_coordinate": {
+                    "ace_logical_level": 1,
+                    "rescale_level": 13,
+                    "scale_degree": 1,
+                },
+                "rotation": {"air_attributes": attrs, "transition": common_transition},
+                "ciphertext_plaintext_multiply": {
+                    "air_attributes": attrs,
+                    "transition": common_transition,
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    semantics_path = tmp_path / "bootstrap_semantics.json"
+    semantics_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "ace.phantom.generated-bootstrap.semantics/1.0.0",
+                "status": "pass",
+                "bindings": {
+                    "compiler_invocation_sha256": hashlib.sha256(invocation_path.read_bytes()).hexdigest(),
+                    "raw_air_sha256": hashlib.sha256(raw_air_path.read_bytes()).hexdigest(),
+                    "post_ckks_air_sha256": hashlib.sha256(post_air_path.read_bytes()).hexdigest(),
+                    "post_operations_air_sha256": hashlib.sha256(operations_air_path.read_bytes()).hexdigest(),
+                    "post_operations_attestation_sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+                    "context_manifest_sha256": hashlib.sha256(context_path.read_bytes()).hexdigest(),
+                    "resource_manifest_sha256": hashlib.sha256(resource_path.read_bytes()).hexdigest(),
+                    "constant_manifest_sha256": hashlib.sha256(constant_path.read_bytes()).hexdigest(),
+                    "phantom_source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                    "generated_dsl_ant_source_sha256": hashlib.sha256(ant_source_path.read_bytes()).hexdigest(),
+                },
+                "output_air_contract": {
+                    "ace_logical_level": 1,
+                    "active_q_count": 1,
+                    "rescale_level": 13,
+                    "scale_degree": 1,
+                    "raw_scale_contract": {
+                        "kind": "ace-log2-scale-coordinate",
+                        "nominal_raw_scale": "0x1.0000000000000p+56",
+                        "scaling_modulus_bits": 56,
+                        "expected_scale_degree": 1,
+                        "maximum_absolute_coordinate_error": 1.0e-4,
+                    },
+                    "logical_slots": CONTEXT["logical_slot_capacity"],
+                },
+                "post_operation_contracts": {
+                    "status": "pass",
+                    "air_sha256": hashlib.sha256(
+                        operations_air_path.read_bytes()
+                    ).hexdigest(),
+                    "input_coordinate": {
+                        "ace_logical_level": 1,
+                        "rescale_level": 13,
+                        "scale_degree": 1,
+                    },
+                    "rotation": {
+                        "air_attributes": attrs,
+                        "transition": common_transition,
+                    },
+                    "ciphertext_plaintext_multiply": {
+                        "air_attributes": attrs,
+                        "transition": common_transition,
+                    },
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    generation_path = tmp_path / "generation.json"
+    post_hash = hashlib.sha256(post_air_path.read_bytes()).hexdigest()
+    generation_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "ace.phantom.bootstrap-generation/3.0.0",
+                "status": "pass",
+                "source": artifact_record(source_path),
+                "sources": {
+                    "phantom": artifact_record(source_path),
+                    "generated_dsl_ant": artifact_record(ant_source_path),
+                },
+                "normalized_compiler_invocation": artifact_record(invocation_path),
+                "bootstrap_semantics": artifact_record(semantics_path),
+                "post_operations_air": artifact_record(operations_air_path),
+                "post_operations_attestation": artifact_record(attestation_path),
+                "air": {
+                    "raw": artifact_record(raw_air_path),
+                    "post_ckks": artifact_record(post_air_path),
+                },
+                "terminal_paths": {
+                    "phantom": {
+                        "provider": "phantom",
+                        "codegen_ir": "ckks",
+                        "stages_completed": ["ckks_driver", "ckks2c"],
+                        "post_ckks_air_sha256": post_hash,
+                    },
+                    "generated_dsl_ant": {
+                        "provider": "ant",
+                        "codegen_ir": "poly",
+                        "stages_completed": ["ckks_driver", "poly_driver", "poly2c"],
+                        "post_ckks_air_sha256": post_hash,
+                    },
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return base + (
+        ant_source_path,
+        generation_path,
+        invocation_path,
+        semantics_path,
+        operations_air_path,
+        attestation_path,
+    )
+
+
+def run_versioned_audit(tmp_path: Path) -> dict[str, Any]:
+    return audit(*write_versioned_closure(tmp_path))
+
+
+def test_versioned_generated_artifact_closure_passes(tmp_path: Path) -> None:
+    report = run_versioned_audit(tmp_path)
+    assert report["status"] == "pass", report["errors"]
+    assert report["schema_version"] == "ace.phantom.bootstrap-generated-artifact-audit/3.0.0"
+    assert report["qualification_closure"]["post_operations_attested"] is True
+
+
+def test_versioned_ant_abi_tamper_is_rejected(tmp_path: Path) -> None:
+    paths = write_versioned_closure(tmp_path)
+    paths[6].write_text("CIPHERTEXT wrong(CIPHERTEXT a, CIPHERTEXT b) { return a; }\n")
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert "exact bootstrap_full" in report["errors"][0]
+
+
+def test_versioned_terminal_path_hash_tamper_is_rejected(tmp_path: Path) -> None:
+    paths = write_versioned_closure(tmp_path)
+    generation = json.loads(paths[7].read_text())
+    generation["terminal_paths"]["generated_dsl_ant"]["post_ckks_air_sha256"] = "0" * 64
+    paths[7].write_text(json.dumps(generation), encoding="utf-8")
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert "terminal path binding differs" in report["errors"][0]
+
+
+def test_versioned_post_operation_air_tamper_is_rejected(tmp_path: Path) -> None:
+    paths = write_versioned_closure(tmp_path)
+    paths[10].write_text(
+        paths[10].read_text().replace("CKKS.mul ATTR[level=1", "CKKS.mul ATTR[level=2"),
+        encoding="utf-8",
+    )
+    report = audit(*paths)
+    assert report["status"] == "fail"
+
+
+def test_versioned_invocation_option_set_tamper_is_rejected(tmp_path: Path) -> None:
+    paths = write_versioned_closure(tmp_path)
+    invocation = json.loads(paths[8].read_text())
+    invocation["options"]["unexpected"] = 1
+    paths[8].write_text(json.dumps(invocation), encoding="utf-8")
+    invocation_hash = hashlib.sha256(paths[8].read_bytes()).hexdigest()
+    attestation = json.loads(paths[11].read_text())
+    attestation["bindings"]["compiler_invocation_sha256"] = invocation_hash
+    paths[11].write_text(json.dumps(attestation), encoding="utf-8")
+    semantics = json.loads(paths[9].read_text())
+    semantics["bindings"]["compiler_invocation_sha256"] = invocation_hash
+    semantics["bindings"]["post_operations_attestation_sha256"] = hashlib.sha256(
+        paths[11].read_bytes()
+    ).hexdigest()
+    paths[9].write_text(json.dumps(semantics), encoding="utf-8")
+    generation = json.loads(paths[7].read_text())
+    generation["normalized_compiler_invocation"] = artifact_record(paths[8])
+    generation["bootstrap_semantics"] = artifact_record(paths[9])
+    generation["post_operations_attestation"] = artifact_record(paths[11])
+    paths[7].write_text(json.dumps(generation), encoding="utf-8")
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert "compiler invocation options keys differ" in report["errors"][0]
+
+
+def test_versioned_post_operation_coordinate_tamper_is_rejected(
+    tmp_path: Path,
+) -> None:
+    paths = write_versioned_closure(tmp_path)
+    attestation = json.loads(paths[11].read_text())
+    attestation["input_coordinate"]["rescale_level"] = 12
+    paths[11].write_text(json.dumps(attestation), encoding="utf-8")
+    semantics = json.loads(paths[9].read_text())
+    semantics["bindings"]["post_operations_attestation_sha256"] = hashlib.sha256(
+        paths[11].read_bytes()
+    ).hexdigest()
+    semantics["post_operation_contracts"]["input_coordinate"][
+        "rescale_level"
+    ] = 12
+    paths[9].write_text(json.dumps(semantics), encoding="utf-8")
+    generation = json.loads(paths[7].read_text())
+    generation["bootstrap_semantics"] = artifact_record(paths[9])
+    generation["post_operations_attestation"] = artifact_record(paths[11])
+    paths[7].write_text(json.dumps(generation), encoding="utf-8")
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert "input coordinate differs" in report["errors"][0]
+
+
 def test_complete_generated_artifact_closure_passes(tmp_path: Path) -> None:
     report = run_audit(tmp_path)
     assert report["status"] == "pass", report["errors"]

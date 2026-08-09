@@ -99,9 +99,9 @@ void ProviderCall(const char* diagnostic, FN&& fn) {
 }
 
 std::int64_t CheckedScaleDegree(SCALE_T degree, const char* diagnostic) {
-  if (!std::isfinite(degree) || degree < 1.0 ||
+  if (!std::isfinite(degree) || degree < 0.0 ||
       degree != std::nearbyint(degree)) {
-    Fail(diagnostic, "scale degree %.17g must be a positive integer", degree);
+    Fail(diagnostic, "scale degree %.17g must be a nonnegative integer", degree);
   }
   if (degree > static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
     Fail(diagnostic, "scale degree %.17g is out of range", degree);

@@ -8,7 +8,7 @@ source "${SCRIPT_DIR}/transport_helpers.sh"
 
 usage() {
   cat >&2 <<EOF
-usage: $0 --ace-commit COMMIT --phantom-commit COMMIT OUTPUT_DIRECTORY
+usage: $0 --ace-commit COMMIT --phantom-commit COMMIT [explicit qualification options] OUTPUT_DIRECTORY
 The reusable qualification root is
 OUTPUT_DIRECTORY/verified-bootstrap-host-result/results/qualification.
 Exact container cleanup evidence is written under OUTPUT_DIRECTORY/docker.
@@ -19,10 +19,22 @@ EOF
 ACE_COMMIT=""
 PHANTOM_COMMIT=""
 OUTPUT_ARGUMENT=""
+QUALIFICATION_ARGUMENTS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ace-commit) ACE_COMMIT="$2"; shift 2 ;;
     --phantom-commit) PHANTOM_COMMIT="$2"; shift 2 ;;
+    --poly-degree|--vector-capacity|--mul-level|--input-level|--security-level|\
+    --scaling-factor-bits|--first-prime-bits|--hamming-weight|--q-part-count|\
+    --encode-transform-budget|--decode-transform-budget|\
+    --ciphertext-constant-encoding|--packing|--post-multiply-real|\
+    --post-multiply-imag|--post-multiply-scale-degree|--post-rotation-step|\
+    --fixture-id|--fixture-seed|--inside-margin|--provider-clear-threshold|\
+    --gpu-native-threshold|--gpu-generated-threshold|--repeat-threshold|\
+    --host-oracle-timeout-seconds)
+      QUALIFICATION_ARGUMENTS+=("$1" "$2")
+      shift 2
+      ;;
     --)
       shift
       [[ $# -eq 1 && -z "${OUTPUT_ARGUMENT}" ]] || usage
@@ -39,7 +51,7 @@ while [[ $# -gt 0 ]]; do
 done
 if [[ ! "${ACE_COMMIT}" =~ ^[0-9a-f]{40}$ ||
       ! "${PHANTOM_COMMIT}" =~ ^[0-9a-f]{40}$ ||
-      -z "${OUTPUT_ARGUMENT}" ]]; then
+      -z "${OUTPUT_ARGUMENT}" || ${#QUALIFICATION_ARGUMENTS[@]} -eq 0 ]]; then
   usage
 fi
 git -C "${REPO_ROOT}" cat-file -e "${ACE_COMMIT}^{commit}"
@@ -131,15 +143,101 @@ chmod 0755 "${PAYLOAD}/source_archive.py" \
   "${PAYLOAD}/phase_helpers.sh" \
   "${PAYLOAD}/bootstrap_environment.sh"
 
-python3 - "${PAYLOAD}" "${ACE_COMMIT}" "${PHANTOM_COMMIT}" <<'PY'
+python3 - "${PAYLOAD}" "${ACE_COMMIT}" "${PHANTOM_COMMIT}" \
+  "${QUALIFICATION_ARGUMENTS[@]}" <<'PY'
 import hashlib
 import json
+import math
 from pathlib import Path
+import re
 import sys
 
 root = Path(sys.argv[1])
+arguments = sys.argv[4:]
+if len(arguments) % 2:
+    raise SystemExit("qualification arguments are not option/value pairs")
+qualification_arguments = dict(zip(arguments[0::2], arguments[1::2]))
+if len(qualification_arguments) != len(arguments) // 2:
+    raise SystemExit("qualification arguments are duplicated")
+expected = {
+    "--poly-degree", "--vector-capacity", "--mul-level", "--input-level",
+    "--security-level", "--scaling-factor-bits", "--first-prime-bits",
+    "--hamming-weight", "--q-part-count", "--encode-transform-budget",
+    "--decode-transform-budget", "--ciphertext-constant-encoding",
+    "--packing", "--post-multiply-real", "--post-multiply-imag",
+    "--post-multiply-scale-degree", "--post-rotation-step", "--fixture-id",
+    "--fixture-seed", "--inside-margin", "--provider-clear-threshold",
+    "--gpu-native-threshold", "--gpu-generated-threshold",
+    "--repeat-threshold",
+    "--host-oracle-timeout-seconds",
+}
+if set(qualification_arguments) != expected:
+    raise SystemExit("qualification arguments are incomplete or unexpected")
+integer_options = {
+    "--poly-degree", "--vector-capacity", "--mul-level", "--input-level",
+    "--security-level", "--scaling-factor-bits", "--first-prime-bits",
+    "--hamming-weight", "--q-part-count", "--encode-transform-budget",
+    "--decode-transform-budget", "--fixture-seed",
+    "--host-oracle-timeout-seconds",
+}
+for option in integer_options:
+    if re.fullmatch(r"[0-9]+", qualification_arguments[option]) is None:
+        raise SystemExit(f"qualification argument {option} is not unsigned")
+for option in {"--post-multiply-scale-degree", "--post-rotation-step"}:
+    if re.fullmatch(r"-?[0-9]+", qualification_arguments[option]) is None:
+        raise SystemExit(f"qualification argument {option} is not signed integer")
+if qualification_arguments["--packing"] != "full" or qualification_arguments[
+    "--ciphertext-constant-encoding"
+] not in {"enabled", "disabled"}:
+    raise SystemExit("qualification packing or constant encoding mode is invalid")
+for option in {
+    "--post-multiply-real", "--post-multiply-imag", "--inside-margin",
+    "--provider-clear-threshold", "--gpu-native-threshold",
+    "--gpu-generated-threshold", "--repeat-threshold",
+}:
+    try:
+        number = float(qualification_arguments[option])
+    except ValueError as error:
+        raise SystemExit(f"qualification argument {option} is not numeric") from error
+    if not math.isfinite(number):
+        raise SystemExit(f"qualification argument {option} is nonfinite")
+if not qualification_arguments["--fixture-id"]:
+    raise SystemExit("qualification fixture identifier is empty")
+numbers = {option: int(qualification_arguments[option]) for option in integer_options}
+for option in integer_options - {"--security-level", "--fixture-seed"}:
+    if numbers[option] <= 0:
+        raise SystemExit(f"qualification argument {option} is not positive")
+degree, slots = numbers["--poly-degree"], numbers["--vector-capacity"]
+if degree % 2 or slots != degree // 2:
+    raise SystemExit("qualification is not full-capacity packed")
+if numbers["--security-level"] not in {0, 128, 192, 256}:
+    raise SystemExit("qualification security level is unsupported")
+if numbers["--first-prime-bits"] < numbers["--scaling-factor-bits"]:
+    raise SystemExit("qualification first prime is smaller than scaling bits")
+if int(qualification_arguments["--post-multiply-scale-degree"]) != 0:
+    raise SystemExit("qualification multiply scale degree must be explicit zero")
+rotation = int(qualification_arguments["--post-rotation-step"])
+if rotation % slots == 0:
+    raise SystemExit("qualification rotation is zero modulo slot capacity")
+normalized_rotation = rotation % slots
+if normalized_rotation > slots // 2:
+    normalized_rotation -= slots
+if rotation != normalized_rotation:
+    raise SystemExit("qualification rotation is not canonical signed modulo capacity")
+real = float(qualification_arguments["--post-multiply-real"])
+imaginary = float(qualification_arguments["--post-multiply-imag"])
+if real == 0.0 and imaginary == 0.0:
+    raise SystemExit("qualification multiply constant is zero")
+if float(qualification_arguments["--provider-clear-threshold"]) != 1e-2:
+    raise SystemExit("qualification provider-clear threshold changed")
+for option in {
+    "--inside-margin", "--gpu-native-threshold",
+    "--gpu-generated-threshold", "--repeat-threshold",
+}:
+    if float(qualification_arguments[option]) <= 0.0:
+        raise SystemExit(f"qualification argument {option} is not positive")
 payload = {
-    "schema_version": "ace.phantom.bootstrap-host-freeze-payload/1.0.0",
+    "schema_version": "ace.phantom.bootstrap-host-freeze-payload/2.0.0",
     "ace_commit": sys.argv[2],
     "phantom_commit": sys.argv[3],
     "contents": "audited-exact-source-snapshots-and-pinned-bootstrap-only",
@@ -153,15 +251,8 @@ payload = {
     },
     "qualification": {
         "gate": "bootstrap",
-        "parameters": {
-            "poly_degree": 16384,
-            "mul_level": 26,
-            "input_level": 1,
-            "security_level": 0,
-            "scaling_factor_bits": 56,
-            "first_prime_bits": 60,
-            "hamming_weight": 192,
-        },
+        "arguments": arguments,
+        "options": qualification_arguments,
     },
     "files": sorted(path.name for path in root.iterdir() if path.is_file()),
 }
@@ -298,7 +389,7 @@ import hashlib, json, re, sys
 from pathlib import Path, PurePosixPath
 payload_path, ace_path, phantom_path = map(Path, sys.argv[1:])
 payload = json.loads(payload_path.read_text(encoding="utf-8"))
-if payload.get("schema_version") != "ace.phantom.bootstrap-host-freeze-payload/1.0.0":
+if payload.get("schema_version") != "ace.phantom.bootstrap-host-freeze-payload/2.0.0":
     raise SystemExit("bootstrap host-freeze payload schema mismatch")
 bindings = {}
 for kind, path in (("ace", ace_path), ("phantom", phantom_path)):
@@ -346,10 +437,22 @@ export ACE_PHANTOM_SOURCE_MANIFEST_SHA256=${ACE_MANIFEST_SHA}
 export ACE_PHANTOM_PROVIDER_SOURCE_MANIFEST=${INPUT}/phantom-source.manifest.json
 export ACE_PHANTOM_PROVIDER_SOURCE_MANIFEST_SHA256=${PHANTOM_MANIFEST_SHA}
 export ACE_RUNPOD_BOOTSTRAP_SHA256=${BOOTSTRAP_SHA}
+mapfile -d "" -t QUALIFICATION_ARGS < <(python3 - "${INPUT}/payload.json" <<"PY"
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+arguments = value.get("qualification", {}).get("arguments")
+if not isinstance(arguments, list) or not arguments or not all(
+    isinstance(item, str) and item for item in arguments
+):
+    raise SystemExit("payload qualification arguments are invalid")
+sys.stdout.buffer.write(b"\0".join(item.encode() for item in arguments) + b"\0")
+PY
+)
 bash "${ACE_SOURCE}/tools/phantom_gpu/compile_only.sh" \
-  --gate bootstrap --poly-degree 16384 --mul-level 26 --input-level 1 \
-  --security-level 0 --scaling-factor-bits 56 --first-prime-bits 60 \
-  --hamming-weight 192 2>&1 | tee "${RESULTS}/bootstrap-host-qualification.log"
+  --gate bootstrap "${QUALIFICATION_ARGS[@]}" 2>&1 |
+  tee "${RESULTS}/bootstrap-host-qualification.log"
 CURRENT=${ACE_PHANTOM_STATE_ROOT}/compile_only_results/current-bootstrap.json
 RUN_ROOT=$(python3 - "${CURRENT}" "${ACE_PHANTOM_STATE_ROOT}" <<"PY"
 import json, pathlib, sys
@@ -385,8 +488,12 @@ if ((root / "ace_source_manifest.json").read_bytes()
 qualification = json.loads(
     (root / "bootstrap_qualification/qualification.json").read_text(encoding="utf-8")
 )
-if (qualification.get("status"), qualification.get("gate"),
-        qualification.get("executable_was_run")) != ("pass", "bootstrap", False):
+if (qualification.get("schema_version"), qualification.get("status"), qualification.get("gate"),
+        qualification.get("host_oracle_executables_were_run"),
+        qualification.get("gpu_executable_was_run")) != (
+            "ace.phantom.bootstrap-host-qualification/2.0.0",
+            "pass", "bootstrap", True, False
+        ):
     raise SystemExit("bootstrap host qualification claims are inconsistent")
 PY
 printf "{\"schema_version\":\"ace.phantom.result-completeness/1.0.0\",\"status\":\"pass\",\"mode\":\"bootstrap-host-freeze\"}\n" \

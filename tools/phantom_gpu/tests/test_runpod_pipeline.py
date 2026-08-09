@@ -747,7 +747,7 @@ def test_reproduction_uses_one_canonical_container_build_root() -> None:
 def test_native_health_uses_the_exact_current_ordinary_run() -> None:
     source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
     start = source.index("run_native_health() {")
-    end = source.index("\nphase payload_verification", start)
+    end = source.index("\nverify_success_evidence() {", start)
     body = source[start:end]
 
     assert (

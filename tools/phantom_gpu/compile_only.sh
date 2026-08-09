@@ -27,6 +27,24 @@ COMPILER_SECURITY_LEVEL=""
 COMPILER_SCALING_BITS=""
 COMPILER_FIRST_PRIME_BITS=""
 COMPILER_HAMMING_WEIGHT=""
+COMPILER_VECTOR_CAPACITY=""
+COMPILER_Q_PART_COUNT=""
+COMPILER_ENCODE_BUDGET=""
+COMPILER_DECODE_BUDGET=""
+COMPILER_CONSTANT_ENCODING=""
+COMPILER_PACKING=""
+POST_MULTIPLY_REAL=""
+POST_MULTIPLY_IMAG=""
+POST_MULTIPLY_SCALE_DEGREE=""
+POST_ROTATION_STEP=""
+FIXTURE_ID=""
+FIXTURE_SEED=""
+FIXTURE_INSIDE_MARGIN=""
+PROVIDER_CLEAR_THRESHOLD=""
+GPU_NATIVE_THRESHOLD=""
+GPU_GENERATED_THRESHOLD=""
+REPEAT_THRESHOLD=""
+HOST_ORACLE_TIMEOUT_SECONDS=""
 ORDINARY_RESULTS=""
 
 usage() {
@@ -34,6 +52,7 @@ usage() {
   echo "CKKS2C/ordinary/bootstrap/all requires --poly-degree N --mul-level Q --input-level L"
   echo "  --security-level B --scaling-factor-bits B --first-prime-bits B"
   echo "  --hamming-weight W"
+  echo "bootstrap additionally requires explicit vector, transform, packing, post-operation, and fixture options"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -70,6 +89,24 @@ while [[ $# -gt 0 ]]; do
       COMPILER_HAMMING_WEIGHT="$2"
       shift 2
       ;;
+    --vector-capacity) COMPILER_VECTOR_CAPACITY="$2"; shift 2 ;;
+    --q-part-count) COMPILER_Q_PART_COUNT="$2"; shift 2 ;;
+    --encode-transform-budget) COMPILER_ENCODE_BUDGET="$2"; shift 2 ;;
+    --decode-transform-budget) COMPILER_DECODE_BUDGET="$2"; shift 2 ;;
+    --ciphertext-constant-encoding) COMPILER_CONSTANT_ENCODING="$2"; shift 2 ;;
+    --packing) COMPILER_PACKING="$2"; shift 2 ;;
+    --post-multiply-real) POST_MULTIPLY_REAL="$2"; shift 2 ;;
+    --post-multiply-imag) POST_MULTIPLY_IMAG="$2"; shift 2 ;;
+    --post-multiply-scale-degree) POST_MULTIPLY_SCALE_DEGREE="$2"; shift 2 ;;
+    --post-rotation-step) POST_ROTATION_STEP="$2"; shift 2 ;;
+    --fixture-id) FIXTURE_ID="$2"; shift 2 ;;
+    --fixture-seed) FIXTURE_SEED="$2"; shift 2 ;;
+    --inside-margin) FIXTURE_INSIDE_MARGIN="$2"; shift 2 ;;
+    --provider-clear-threshold) PROVIDER_CLEAR_THRESHOLD="$2"; shift 2 ;;
+    --gpu-native-threshold) GPU_NATIVE_THRESHOLD="$2"; shift 2 ;;
+    --gpu-generated-threshold) GPU_GENERATED_THRESHOLD="$2"; shift 2 ;;
+    --repeat-threshold) REPEAT_THRESHOLD="$2"; shift 2 ;;
+    --host-oracle-timeout-seconds) HOST_ORACLE_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --help|-h)
       usage
       exit 0
@@ -104,19 +141,6 @@ if [[ "${GATE}" != "toolchain" ]]; then
   done
 fi
 
-if [[ "${GATE}" == "bootstrap" ]]; then
-  if [[ "${COMPILER_POLY_DEGREE}" != "16384" ||
-        "${COMPILER_MUL_LEVEL}" != "26" ||
-        "${COMPILER_INPUT_LEVEL}" != "1" ||
-        "${COMPILER_SECURITY_LEVEL}" != "0" ||
-        "${COMPILER_SCALING_BITS}" != "56" ||
-        "${COMPILER_FIRST_PRIME_BITS}" != "60" ||
-        "${COMPILER_HAMMING_WEIGHT}" != "192" ]]; then
-    echo "bootstrap gate requires the exact bootstrap qualification context 16384/26/1/0/56/60/192" >&2
-    exit 2
-  fi
-fi
-
 python3 - "${GATE}" "${ORIGINAL_ARGUMENTS[@]}" <<'PY'
 import re
 import sys
@@ -137,11 +161,49 @@ else:
         "--security-level", "--scaling-factor-bits", "--first-prime-bits",
         "--hamming-weight",
     }
+    integer_options = expected - {"--gate"}
+    if gate == "bootstrap":
+        bootstrap = {
+            "--vector-capacity", "--q-part-count",
+            "--encode-transform-budget", "--decode-transform-budget",
+            "--ciphertext-constant-encoding", "--packing",
+            "--post-multiply-real", "--post-multiply-imag",
+            "--post-multiply-scale-degree",
+            "--post-rotation-step", "--fixture-id", "--fixture-seed",
+            "--inside-margin", "--provider-clear-threshold",
+            "--gpu-native-threshold", "--gpu-generated-threshold",
+            "--repeat-threshold",
+            "--host-oracle-timeout-seconds",
+        }
+        expected |= bootstrap
+        integer_options |= {
+            "--vector-capacity", "--q-part-count",
+            "--encode-transform-budget", "--decode-transform-budget",
+            "--fixture-seed",
+            "--host-oracle-timeout-seconds",
+        }
     if set(pairs) != expected or pairs["--gate"] != gate:
         raise SystemExit("qualification compiler context arguments are incomplete")
-    for option in expected - {"--gate"}:
+    for option in integer_options:
         if re.fullmatch(r"[0-9]+", pairs[option]) is None:
             raise SystemExit(f"qualification argument {option} is not an integer")
+    for option in {"--post-rotation-step", "--post-multiply-scale-degree"} & expected:
+        if re.fullmatch(r"-?[0-9]+", pairs[option]) is None:
+            raise SystemExit(f"qualification argument {option} is not a signed integer")
+    if gate == "bootstrap":
+        if pairs["--packing"] != "full" or pairs["--ciphertext-constant-encoding"] not in {"enabled", "disabled"}:
+            raise SystemExit("bootstrap packing or ciphertext constant mode is invalid")
+        if not pairs["--fixture-id"]:
+            raise SystemExit("bootstrap fixture identifier is empty")
+        for option in (
+            "--post-multiply-real", "--post-multiply-imag", "--inside-margin",
+            "--provider-clear-threshold", "--gpu-native-threshold",
+            "--gpu-generated-threshold", "--repeat-threshold",
+        ):
+            try:
+                float(pairs[option])
+            except ValueError as error:
+                raise SystemExit(f"qualification argument {option} is not numeric") from error
 PY
 
 set -a
@@ -302,10 +364,22 @@ files = {
 required = {
     "qualification_invocation.json",
     "bootstrap_generation_invocation.json",
+    "ckks2c/pytest_codegen.txt",
+    "ckks2c/pytest_regressions.txt",
     "bootstrap_qualification/bootstrap_raw.air",
     "bootstrap_qualification/bootstrap_post_ckks.air",
+    "bootstrap_qualification/bootstrap_post_operations.air",
     "bootstrap_qualification/bootstrap_qualification.cu",
+    "bootstrap_qualification/bootstrap_qualification_ant.cxx",
+    "bootstrap_qualification/compiler_invocation.json",
+    "bootstrap_qualification/bootstrap_semantics.json",
+    "bootstrap_qualification/post_operations_attestation.json",
+    "bootstrap_qualification/bootstrap_correctness_fixture.json",
     "bootstrap_qualification/bootstrap_phantom_constants.cu",
+    "bootstrap_qualification/generated_bootstrap_phantom_correctness.cu",
+    "bootstrap_qualification/generated_bootstrap_ant_common.h",
+    "bootstrap_qualification/generated_bootstrap_native_ant_oracle.cxx",
+    "bootstrap_qualification/generated_bootstrap_dsl_ant_oracle.cxx",
     "bootstrap_qualification/compiler_context_manifest.json",
     "bootstrap_qualification/compiler_resource_manifest.json",
     "bootstrap_qualification/compiler_constant_manifest.json",
@@ -318,6 +392,20 @@ required = {
     "bootstrap_qualification/bootstrap_phantom_constants.o",
     "bootstrap_qualification/bootstrap_qualification.dlink.o",
     "bootstrap_qualification/bootstrap_phantom_constants_sm80",
+    "bootstrap_qualification/generated_bootstrap_phantom_correctness.o",
+    "bootstrap_qualification/generated_bootstrap_phantom_correctness.dlink.o",
+    "bootstrap_qualification/generated_bootstrap_phantom_correctness_sm80",
+    "bootstrap_qualification/generated_bootstrap_native_ant_oracle",
+    "bootstrap_qualification/generated_bootstrap_dsl_ant_oracle",
+    "bootstrap_qualification/native_ant_reference.json",
+    "bootstrap_qualification/native_ant_reference.bin",
+    "bootstrap_qualification/generated_ant_reference.json",
+    "bootstrap_qualification/generated_ant_reference.bin",
+    "bootstrap_qualification/host_oracle_replay.json",
+    "bootstrap_qualification/native-ant.stdout.txt",
+    "bootstrap_qualification/native-ant.stderr.txt",
+    "bootstrap_qualification/generated-ant.stdout.txt",
+    "bootstrap_qualification/generated-ant.stderr.txt",
     "bootstrap_qualification/cuda_elf.txt",
     "bootstrap_qualification/cuda_resources.txt",
     "bootstrap_qualification/file.txt",
@@ -358,13 +446,16 @@ generation = json.loads(
 audit = json.loads(
     (run_root / "bootstrap_qualification/source-audit.json").read_text(encoding="utf-8")
 )
-if qualification.get("status") != "pass" or generation.get("status") != "pass":
+if (qualification.get("schema_version") !=
+        "ace.phantom.bootstrap-host-qualification/2.0.0"
+        or qualification.get("status") != "pass"
+        or generation.get("status") != "pass"):
     raise SystemExit("bootstrap qualification/generation status is not pass")
-if generation.get("schema_version") != "ace.phantom.bootstrap-generation/2.0.0":
+if generation.get("schema_version") != "ace.phantom.bootstrap-generation/3.0.0":
     raise SystemExit("bootstrap generation schema is not supported")
 if (
     audit.get("schema_version")
-    != "ace.phantom.bootstrap-generated-artifact-audit/2.0.0"
+    != "ace.phantom.bootstrap-generated-artifact-audit/3.0.0"
     or audit.get("status") != "pass"
 ):
     raise SystemExit("bootstrap generated-artifact audit status is not pass")
@@ -379,7 +470,7 @@ for stage, filename, audit_name in (
     if audit.get("inputs", {}).get(audit_name, {}).get("sha256") != files[relative]:
         raise SystemExit(f"bootstrap audit {stage} AIR binding is inconsistent")
 record = {
-    "schema_version": "ace.phantom.bootstrap-artifacts/2.0.0",
+    "schema_version": "ace.phantom.bootstrap-artifacts/3.0.0",
     "status": "bound",
     "ace_commit": ace_commit,
     "phantom_commit": phantom_commit,
@@ -404,6 +495,36 @@ record = {
     "raw_air_sha256": files["bootstrap_qualification/bootstrap_raw.air"],
     "post_ckks_air_sha256": files[
         "bootstrap_qualification/bootstrap_post_ckks.air"
+    ],
+    "post_operations_air_sha256": files[
+        "bootstrap_qualification/bootstrap_post_operations.air"
+    ],
+    "compiler_invocation_sha256": files[
+        "bootstrap_qualification/compiler_invocation.json"
+    ],
+    "bootstrap_semantics_sha256": files[
+        "bootstrap_qualification/bootstrap_semantics.json"
+    ],
+    "post_operation_attestation_sha256": files[
+        "bootstrap_qualification/post_operations_attestation.json"
+    ],
+    "fixture_sha256": files[
+        "bootstrap_qualification/bootstrap_correctness_fixture.json"
+    ],
+    "native_ant_reference_sha256": files[
+        "bootstrap_qualification/native_ant_reference.json"
+    ],
+    "native_ant_values_sha256": files[
+        "bootstrap_qualification/native_ant_reference.bin"
+    ],
+    "generated_ant_reference_sha256": files[
+        "bootstrap_qualification/generated_ant_reference.json"
+    ],
+    "generated_ant_values_sha256": files[
+        "bootstrap_qualification/generated_ant_reference.bin"
+    ],
+    "host_oracle_replay_sha256": files[
+        "bootstrap_qualification/host_oracle_replay.json"
     ],
     "generation_record_sha256": files["bootstrap_qualification/generation.json"],
     "generated_artifact_audit_sha256": files[
@@ -1175,6 +1296,11 @@ run_compiler_tests() {
     tools/phantom_gpu/tests/test_a100_evidence_archives.py
     tools/phantom_gpu/tests/test_codegen_tools.py
     tools/phantom_gpu/tests/test_bootstrap_generated_artifact_audit.py
+    tools/phantom_gpu/tests/test_generated_bootstrap_invocation.py
+    tools/phantom_gpu/tests/test_bootstrap_correctness.py
+    tools/phantom_gpu/tests/test_generated_bootstrap_host_oracle_sources.py
+    tools/phantom_gpu/tests/test_generated_bootstrap_correctness_lifecycle.py
+    tools/phantom_gpu/tests/test_bootstrap_host_freeze_wrapper.py
     tools/phantom_gpu/tests/test_ordinary_ckks_fixture.py
     tools/phantom_gpu/tests/test_ordinary_runtime_source.py
     tools/phantom_gpu/tests/test_phantom_constant_cache_source.py
@@ -1790,15 +1916,23 @@ build_bootstrap_host_qualification() {
   local runtime_build="${ACE_BUILD}/rtlib/build"
   local adapter_archive="${runtime_build}/phantom/libFHErt_phantom.a"
   local common_archive="${runtime_build}/common/libFHErt_common.a"
+  local ant_archive="${runtime_build}/ant/libFHErt_ant.a"
+  local ant_encode_archive="${runtime_build}/ant/libFHErt_ant_encode.a"
   local external_source="${runtime_build}/external/src/phantom_external"
   local provider_archive="${runtime_build}/external/src/phantom_external-build/lib/libphantom_ordinary.a"
   local source="${BOOTSTRAP_RESULTS}/bootstrap_qualification.cu"
+  local ant_source="${BOOTSTRAP_RESULTS}/bootstrap_qualification_ant.cxx"
   local raw_air="${BOOTSTRAP_RESULTS}/bootstrap_raw.air"
   local post_ckks_air="${BOOTSTRAP_RESULTS}/bootstrap_post_ckks.air"
+  local post_operations_air="${BOOTSTRAP_RESULTS}/bootstrap_post_operations.air"
   local context_manifest="${BOOTSTRAP_RESULTS}/compiler_context_manifest.json"
   local resource_manifest="${BOOTSTRAP_RESULTS}/compiler_resource_manifest.json"
   local constant_manifest="${BOOTSTRAP_RESULTS}/compiler_constant_manifest.json"
   local generation="${BOOTSTRAP_RESULTS}/generation.json"
+  local compiler_invocation="${BOOTSTRAP_RESULTS}/compiler_invocation.json"
+  local semantics="${BOOTSTRAP_RESULTS}/bootstrap_semantics.json"
+  local post_operation_attestation="${BOOTSTRAP_RESULTS}/post_operations_attestation.json"
+  local fixture="${BOOTSTRAP_RESULTS}/bootstrap_correctness_fixture.json"
   local source_audit="${BOOTSTRAP_RESULTS}/source-audit.json"
   local source_object="${BOOTSTRAP_RESULTS}/bootstrap_qualification.o"
   local checked_harness_source="${SCRIPT_DIR}/harness/bootstrap_phantom_constants.cu"
@@ -1806,12 +1940,20 @@ build_bootstrap_host_qualification() {
   local harness_object="${BOOTSTRAP_RESULTS}/bootstrap_phantom_constants.o"
   local device_link="${BOOTSTRAP_RESULTS}/bootstrap_qualification.dlink.o"
   local binary="${BOOTSTRAP_RESULTS}/bootstrap_phantom_constants_sm80"
+  local checked_correctness_source="${SCRIPT_DIR}/harness/generated_bootstrap_phantom_correctness.cu"
+  local correctness_source="${BOOTSTRAP_RESULTS}/generated_bootstrap_phantom_correctness.cu"
+  local correctness_object="${BOOTSTRAP_RESULTS}/generated_bootstrap_phantom_correctness.o"
+  local correctness_device_link="${BOOTSTRAP_RESULTS}/generated_bootstrap_phantom_correctness.dlink.o"
+  local correctness_binary="${BOOTSTRAP_RESULTS}/generated_bootstrap_phantom_correctness_sm80"
   local nvcc_common=(-std=c++17 -arch=sm_80 -rdc=true)
 
   test -s "${adapter_archive}"
   test -s "${common_archive}"
+  test -s "${ant_archive}"
+  test -s "${ant_encode_archive}"
   test -s "${provider_archive}"
   test -s "${checked_harness_source}"
+  test -s "${checked_correctness_source}"
   if [[ "${SOURCE_MODE}" == "snapshot" ]]; then
     external_source="${PINNED_SOURCE}"
     test ! -e "${external_source}/.git"
@@ -1822,12 +1964,22 @@ build_bootstrap_host_qualification() {
   local generator_arguments=(
     bootstrap_qualification
     --poly-degree "${COMPILER_POLY_DEGREE}"
+    --vector-capacity "${COMPILER_VECTOR_CAPACITY}"
     --mul-level "${COMPILER_MUL_LEVEL}"
     --input-level "${COMPILER_INPUT_LEVEL}"
     --security-level "${COMPILER_SECURITY_LEVEL}"
     --scaling-factor-bits "${COMPILER_SCALING_BITS}"
     --first-prime-bits "${COMPILER_FIRST_PRIME_BITS}"
     --hamming-weight "${COMPILER_HAMMING_WEIGHT}"
+    --q-part-count "${COMPILER_Q_PART_COUNT}"
+    --encode-transform-budget "${COMPILER_ENCODE_BUDGET}"
+    --decode-transform-budget "${COMPILER_DECODE_BUDGET}"
+    --ciphertext-constant-encoding "${COMPILER_CONSTANT_ENCODING}"
+    --packing "${COMPILER_PACKING}"
+    --post-multiply-real "${POST_MULTIPLY_REAL}"
+    --post-multiply-imag "${POST_MULTIPLY_IMAG}"
+    --post-multiply-scale-degree "${POST_MULTIPLY_SCALE_DEGREE}"
+    --post-rotation-step "${POST_ROTATION_STEP}"
   )
   write_invocation "${RUN_ROOT}/bootstrap_generation_invocation.json" \
     "ace.phantom.bootstrap-qualification-invocation/1.0.0" \
@@ -1838,23 +1990,42 @@ build_bootstrap_host_qualification() {
       "${generator_arguments[@]}"
   )
   test -s "${source}"
+  test -s "${ant_source}"
   test -s "${raw_air}"
   test -s "${post_ckks_air}"
+  test -s "${post_operations_air}"
   test -s "${context_manifest}"
   test -s "${resource_manifest}"
   test -s "${constant_manifest}"
   test -s "${generation}"
+  test -s "${compiler_invocation}"
+  test -s "${semantics}"
+  test -s "${post_operation_attestation}"
+  if rg '(Eval_bootstrap|Bootstrap_precom|[[:space:]]Bootstrap[[:space:]]*\()' \
+      "${ant_source}" >/dev/null; then
+    echo "generated DSL/ANT source contains a native bootstrap call" >&2
+    exit 1
+  fi
   cp -- "${checked_harness_source}" "${harness_source}"
-  jq -e '
+  cp -- "${checked_correctness_source}" "${correctness_source}"
+  jq -e --argjson degree "${COMPILER_POLY_DEGREE}" \
+    --argjson slots "${COMPILER_VECTOR_CAPACITY}" \
+    --argjson q_count "${COMPILER_MUL_LEVEL}" \
+    --argjson input_level "${COMPILER_INPUT_LEVEL}" \
+    --argjson security "${COMPILER_SECURITY_LEVEL}" \
+    --argjson scaling "${COMPILER_SCALING_BITS}" \
+    --argjson first "${COMPILER_FIRST_PRIME_BITS}" \
+    --argjson weight "${COMPILER_HAMMING_WEIGHT}" '
     .schema_version == 1 and
     .resource_schema_version == 3 and
-    .polynomial_degree == 16384 and
-    (.data_q_bit_sizes | length) == 26 and
-    .input_level == 1 and
-    .security_level == 0 and
-    .scaling_modulus_bits == 56 and
-    .first_modulus_bits == 60 and
-    .hamming_weight == 192
+    .polynomial_degree == $degree and
+    .logical_slot_capacity == $slots and
+    (.data_q_bit_sizes | length) == $q_count and
+    .input_level == $input_level and
+    .security_level == $security and
+    .scaling_modulus_bits == $scaling and
+    .first_modulus_bits == $first and
+    .hamming_weight == $weight
   ' "${context_manifest}" >/dev/null
   python3 "${SCRIPT_DIR}/check_bootstrap_generated_artifacts.py" \
     --raw-air "${raw_air}" \
@@ -1863,8 +2034,143 @@ build_bootstrap_host_qualification() {
     --resource-manifest "${resource_manifest}" \
     --constant-manifest "${constant_manifest}" \
     --source "${source}" \
+    --ant-source "${ant_source}" \
+    --generation-record "${generation}" \
+    --compiler-invocation "${compiler_invocation}" \
+    --bootstrap-semantics "${semantics}" \
+    --post-operations-air "${post_operations_air}" \
+    --post-operation-attestation "${post_operation_attestation}" \
     --report "${source_audit}"
   record_common_configuration "${BOOTSTRAP_RESULTS}" "${context_manifest}"
+
+  if [[ "${SOURCE_MODE}" != "snapshot" ]]; then
+    echo "bootstrap correctness host oracles require audited source manifests" >&2
+    exit 1
+  fi
+  local ace_source_authority="${ACE_PHANTOM_SOURCE_MANIFEST}"
+  local phantom_source_authority="${ACE_PHANTOM_PROVIDER_SOURCE_MANIFEST}"
+  test -s "${ace_source_authority}"
+  test -s "${phantom_source_authority}"
+  python3 "${SCRIPT_DIR}/bootstrap_correctness.py" freeze-fixture \
+    --fixture-id "${FIXTURE_ID}" \
+    --seed "${FIXTURE_SEED}" \
+    --inside-margin "${FIXTURE_INSIDE_MARGIN}" \
+    --provider-clear-threshold "${PROVIDER_CLEAR_THRESHOLD}" \
+    --gpu-native-threshold "${GPU_NATIVE_THRESHOLD}" \
+    --gpu-generated-threshold "${GPU_GENERATED_THRESHOLD}" \
+    --repeat-threshold "${REPEAT_THRESHOLD}" \
+    --ace-source-manifest "${ace_source_authority}" \
+    --phantom-source-manifest "${phantom_source_authority}" \
+    --compiler-invocation "${compiler_invocation}" \
+    --raw-air "${raw_air}" \
+    --post-ckks-air "${post_ckks_air}" \
+    --context-manifest "${context_manifest}" \
+    --resource-manifest "${resource_manifest}" \
+    --constant-manifest "${constant_manifest}" \
+    --bootstrap-semantics "${semantics}" \
+    --post-operations-air "${post_operations_air}" \
+    --post-operation-attestation "${post_operation_attestation}" \
+    --output "${fixture}"
+
+  local ant_install_include="${INSTALL_ROOT}/rtlib/include/ant"
+  local checked_common_harness="${SCRIPT_DIR}/harness/generated_bootstrap_ant_common.h"
+  local checked_native_harness="${SCRIPT_DIR}/harness/generated_bootstrap_native_ant_oracle.cxx"
+  local checked_generated_harness="${SCRIPT_DIR}/harness/generated_bootstrap_dsl_ant_oracle.cxx"
+  local common_harness="${BOOTSTRAP_RESULTS}/generated_bootstrap_ant_common.h"
+  local native_harness="${BOOTSTRAP_RESULTS}/generated_bootstrap_native_ant_oracle.cxx"
+  local generated_harness="${BOOTSTRAP_RESULTS}/generated_bootstrap_dsl_ant_oracle.cxx"
+  local native_harness_object="${BOOTSTRAP_RESULTS}/generated_bootstrap_native_ant_oracle.o"
+  local generated_harness_object="${BOOTSTRAP_RESULTS}/generated_bootstrap_dsl_ant_oracle.o"
+  local generated_ant_object="${BOOTSTRAP_RESULTS}/bootstrap_qualification_ant.o"
+  local native_oracle="${BOOTSTRAP_RESULTS}/generated_bootstrap_native_ant_oracle"
+  local generated_oracle="${BOOTSTRAP_RESULTS}/generated_bootstrap_dsl_ant_oracle"
+  local -a ant_includes=(
+    "-I${ant_install_include}"
+    "-I${REPO_ROOT}/fhe-cmplr/rtlib/include"
+    "-I${REPO_ROOT}/fhe-cmplr/rtlib/ant/include"
+  )
+  cp -- "${checked_common_harness}" "${common_harness}"
+  cp -- "${checked_native_harness}" "${native_harness}"
+  cp -- "${checked_generated_harness}" "${generated_harness}"
+  test -s "${ant_install_include}/uthash.h"
+  local post_air_sha generated_ant_source_sha
+  post_air_sha="$(sha256sum "${post_ckks_air}" | awk '{print $1}')"
+  generated_ant_source_sha="$(sha256sum "${ant_source}" | awk '{print $1}')"
+  record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" \
+    c++ -std=c++17 "${ant_includes[@]}" -c "${native_harness}" \
+    -o "${native_harness_object}"
+  c++ -std=c++17 "${ant_includes[@]}" -c "${native_harness}" \
+    -o "${native_harness_object}"
+  record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" \
+    c++ -std=c++17 "${ant_includes[@]}" -c "${ant_source}" \
+    -o "${generated_ant_object}"
+  c++ -std=c++17 "${ant_includes[@]}" -c "${ant_source}" \
+    -o "${generated_ant_object}"
+  local -a generated_harness_compile=(
+    -std=c++17
+    "${ant_includes[@]}"
+    "-DACE_POST_CKKS_AIR_SHA256=${post_air_sha}"
+    "-DACE_GENERATED_DSL_ANT_SOURCE_SHA256=${generated_ant_source_sha}"
+    -c "${generated_harness}"
+    -o "${generated_harness_object}"
+  )
+  record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" \
+    c++ "${generated_harness_compile[@]}"
+  c++ "${generated_harness_compile[@]}"
+  local -a native_link=(
+    -std=c++17 "${native_harness_object}" -Wl,--start-group
+    "${ant_archive}" "${ant_encode_archive}" "${common_archive}"
+    -lntl -lgmpxx -lgmp -Wl,--end-group -pthread -fopenmp -ldl -lrt -lm
+    -o "${native_oracle}"
+  )
+  local -a generated_link=(
+    -std=c++17 "${generated_ant_object}" "${generated_harness_object}"
+    -Wl,--start-group "${ant_archive}" "${ant_encode_archive}"
+    "${common_archive}" -lntl -lgmpxx -lgmp -Wl,--end-group
+    -pthread -fopenmp -ldl -lrt -lm -o "${generated_oracle}"
+  )
+  record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" c++ "${native_link[@]}"
+  c++ "${native_link[@]}"
+  record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" c++ "${generated_link[@]}"
+  c++ "${generated_link[@]}"
+  local -a oracle_authorities=(
+    "${fixture}" "${ace_source_authority}" "${phantom_source_authority}"
+    "${compiler_invocation}" "${raw_air}" "${post_ckks_air}"
+    "${context_manifest}" "${resource_manifest}" "${constant_manifest}"
+    "${semantics}" "${post_operations_air}" "${post_operation_attestation}"
+  )
+  RTLIB_DISABLE_BOOTSTRAP_PRECOM=1 timeout "${HOST_ORACLE_TIMEOUT_SECONDS}" \
+    "${native_oracle}" \
+    "${oracle_authorities[@]}" \
+    "${BOOTSTRAP_RESULTS}/native_ant_reference.json" \
+    "${BOOTSTRAP_RESULTS}/native_ant_reference.bin" \
+    >"${BOOTSTRAP_RESULTS}/native-ant.stdout.txt" \
+    2>"${BOOTSTRAP_RESULTS}/native-ant.stderr.txt"
+  RTLIB_DISABLE_BOOTSTRAP_PRECOM=1 timeout "${HOST_ORACLE_TIMEOUT_SECONDS}" \
+    "${generated_oracle}" \
+    "${oracle_authorities[@]}" \
+    "${BOOTSTRAP_RESULTS}/generated_ant_reference.json" \
+    "${BOOTSTRAP_RESULTS}/generated_ant_reference.bin" \
+    >"${BOOTSTRAP_RESULTS}/generated-ant.stdout.txt" \
+    2>"${BOOTSTRAP_RESULTS}/generated-ant.stderr.txt"
+  python3 "${SCRIPT_DIR}/bootstrap_correctness.py" verify-host \
+    --fixture "${fixture}" \
+    --native-record "${BOOTSTRAP_RESULTS}/native_ant_reference.json" \
+    --native-values "${BOOTSTRAP_RESULTS}/native_ant_reference.bin" \
+    --generated-record "${BOOTSTRAP_RESULTS}/generated_ant_reference.json" \
+    --generated-values "${BOOTSTRAP_RESULTS}/generated_ant_reference.bin" \
+    --ace-source-manifest "${ace_source_authority}" \
+    --phantom-source-manifest "${phantom_source_authority}" \
+    --compiler-invocation "${compiler_invocation}" \
+    --raw-air "${raw_air}" \
+    --post-ckks-air "${post_ckks_air}" \
+    --context-manifest "${context_manifest}" \
+    --resource-manifest "${resource_manifest}" \
+    --constant-manifest "${constant_manifest}" \
+    --bootstrap-semantics "${semantics}" \
+    --post-operations-air "${post_operations_air}" \
+    --post-operation-attestation "${post_operation_attestation}" \
+    --output "${BOOTSTRAP_RESULTS}/host_oracle_replay.json"
 
   local context_manifest_sha
   context_manifest_sha="$(sha256sum "${context_manifest}" | awk '{print $1}')"
@@ -1999,6 +2305,38 @@ PY
   c++ "${host_link_arguments[@]}"
   inspect_binary "${binary}" "${BOOTSTRAP_RESULTS}"
 
+  local correctness_compile_arguments=(
+    "${nvcc_common[@]}" -dc
+    -I"${REPO_ROOT}/fhe-cmplr/rtlib/include"
+    -I"${external_source}/include"
+    "${correctness_source}" -o "${correctness_object}"
+  )
+  record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" \
+    "${NVCC}" "${correctness_compile_arguments[@]}"
+  "${NVCC}" "${correctness_compile_arguments[@]}"
+  local correctness_device_link_arguments=(
+    "${nvcc_common[@]}" -dlink "${source_object}" "${correctness_object}"
+    "${adapter_archive}" "${provider_archive}" "${common_archive}"
+    -L"${CUDA_ROOT}/lib64" -lcudadevrt -o "${correctness_device_link}"
+  )
+  record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" \
+    "${NVCC}" "${correctness_device_link_arguments[@]}"
+  "${NVCC}" "${correctness_device_link_arguments[@]}"
+  local correctness_link_arguments=(
+    -std=c++17 "${source_object}" "${correctness_object}"
+    "${correctness_device_link}" -Wl,--start-group "${adapter_archive}"
+    "${provider_archive}" "${common_archive}" -lntl -lgmpxx -lgmp
+    -Wl,--end-group -L"${CUDA_ROOT}/lib64"
+    -Wl,-rpath,"${CUDA_ROOT}/lib64" -lcudadevrt -lcudart
+    -pthread -fopenmp -ldl -lrt -lm -o "${correctness_binary}"
+  )
+  record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" \
+    c++ "${correctness_link_arguments[@]}"
+  c++ "${correctness_link_arguments[@]}"
+  mkdir -p "${BOOTSTRAP_RESULTS}/gpu-runner-inspection"
+  inspect_binary "${correctness_binary}" \
+    "${BOOTSTRAP_RESULTS}/gpu-runner-inspection"
+
   nm -A -C --defined-only "${adapter_archive}" \
     >"${BOOTSTRAP_RESULTS}/adapter_archive_symbols.txt"
   nm -A -C --defined-only "${provider_archive}" \
@@ -2084,6 +2422,7 @@ if missing:
 PY
 
   atomic_json "${BOOTSTRAP_RESULTS}/qualification.json" -n \
+    --arg schema_version "ace.phantom.bootstrap-host-qualification/2.0.0" \
     --arg status pass \
     --arg gate bootstrap \
     --arg architecture sm_80 \
@@ -2091,6 +2430,7 @@ PY
     --arg source_sha256 "$(sha256sum "${source}" | awk '{print $1}')" \
     --arg raw_air_sha256 "$(sha256sum "${raw_air}" | awk '{print $1}')" \
     --arg post_ckks_air_sha256 "$(sha256sum "${post_ckks_air}" | awk '{print $1}')" \
+    --arg post_operations_air_sha256 "$(sha256sum "${post_operations_air}" | awk '{print $1}')" \
     --arg context_sha256 "${context_manifest_sha}" \
     --arg resource_sha256 "$(sha256sum "${resource_manifest}" | awk '{print $1}')" \
     --arg constant_sha256 "$(sha256sum "${constant_manifest}" | awk '{print $1}')" \
@@ -2104,9 +2444,27 @@ PY
     --arg adapter_archive_sha256 "$(sha256sum "${adapter_archive}" | awk '{print $1}')" \
     --arg provider_archive_sha256 "$(sha256sum "${provider_archive}" | awk '{print $1}')" \
     --arg common_archive_sha256 "$(sha256sum "${common_archive}" | awk '{print $1}')" \
+    --arg fixture_sha256 "$(sha256sum "${fixture}" | awk '{print $1}')" \
+    --arg native_record_sha256 "$(sha256sum "${BOOTSTRAP_RESULTS}/native_ant_reference.json" | awk '{print $1}')" \
+    --arg native_values_sha256 "$(sha256sum "${BOOTSTRAP_RESULTS}/native_ant_reference.bin" | awk '{print $1}')" \
+    --arg generated_record_sha256 "$(sha256sum "${BOOTSTRAP_RESULTS}/generated_ant_reference.json" | awk '{print $1}')" \
+    --arg generated_values_sha256 "$(sha256sum "${BOOTSTRAP_RESULTS}/generated_ant_reference.bin" | awk '{print $1}')" \
+    --arg gpu_runner_sha256 "$(sha256sum "${correctness_binary}" | awk '{print $1}')" \
+    --arg gpu_runner_source_sha256 "$(sha256sum "${correctness_source}" | awk '{print $1}')" \
+    --arg host_replay_sha256 "$(sha256sum "${BOOTSTRAP_RESULTS}/host_oracle_replay.json" | awk '{print $1}')" \
+    --argjson polynomial_degree "${COMPILER_POLY_DEGREE}" \
+    --argjson vector_capacity "${COMPILER_VECTOR_CAPACITY}" \
+    --argjson mul_level "${COMPILER_MUL_LEVEL}" \
+    --argjson input_level "${COMPILER_INPUT_LEVEL}" \
+    --argjson security_level "${COMPILER_SECURITY_LEVEL}" \
+    --argjson scaling_factor_bits "${COMPILER_SCALING_BITS}" \
+    --argjson first_prime_bits "${COMPILER_FIRST_PRIME_BITS}" \
+    --argjson hamming_weight "${COMPILER_HAMMING_WEIGHT}" \
+    --argjson q_part_count "${COMPILER_Q_PART_COUNT}" \
     --arg image_id "${ACE_PHANTOM_IMAGE_ID}" \
     --arg definition_sha256 "${ACE_PHANTOM_DEFINITION_SHA256}" \
     '{
+      schema_version: $schema_version,
       status: $status,
       gate: $gate,
       architecture: $architecture,
@@ -2114,6 +2472,7 @@ PY
       generated_source_sha256: $source_sha256,
       raw_air_sha256: $raw_air_sha256,
       post_ckks_air_sha256: $post_ckks_air_sha256,
+      post_operations_air_sha256: $post_operations_air_sha256,
       compiler_context_manifest_sha256: $context_sha256,
       compiler_resource_manifest_sha256: $resource_sha256,
       compiler_constant_manifest_sha256: $constant_sha256,
@@ -2127,18 +2486,34 @@ PY
       adapter_archive_sha256: $adapter_archive_sha256,
       provider_archive_sha256: $provider_archive_sha256,
       common_archive_sha256: $common_archive_sha256,
+      fixture_sha256: $fixture_sha256,
+      native_ant_reference_sha256: $native_record_sha256,
+      native_ant_values_sha256: $native_values_sha256,
+      generated_ant_reference_sha256: $generated_record_sha256,
+      generated_ant_values_sha256: $generated_values_sha256,
+      gpu_correctness_runner_sha256: $gpu_runner_sha256,
+      gpu_correctness_runner_source_sha256: $gpu_runner_source_sha256,
+      host_oracle_replay_sha256: $host_replay_sha256,
       development_image_id: $image_id,
       development_definition_sha256: $definition_sha256,
       context_contract: {
-        polynomial_degree: 16384, mul_level: 26, input_level: 1,
-        security_level: 0, scaling_factor_bits: 56,
-        first_prime_bits: 60, hamming_weight: 192
+        polynomial_degree: $polynomial_degree,
+        vector_capacity: $vector_capacity,
+        mul_level: $mul_level,
+        input_level: $input_level,
+        security_level: $security_level,
+        scaling_factor_bits: $scaling_factor_bits,
+        first_prime_bits: $first_prime_bits,
+        hamming_weight: $hamming_weight,
+        q_part_count: $q_part_count
       },
       generated_source_contains_native_bootstrap: false,
       production_archive_contains_native_bootstrap: false,
       primitive_only_provider_archive: true,
       link_mode: "manual_static_closure",
-      executable_was_run: false
+      host_oracle_executables_were_run: true,
+      gpu_executable_was_run: false,
+      executable_was_run: true
     }'
   echo "bootstrap qualification bootstrap resource/constant compile and static-link qualification passed"
 }

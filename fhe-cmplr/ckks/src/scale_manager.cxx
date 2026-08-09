@@ -146,7 +146,15 @@ SCALE_INFO PARS::Downscale_analysis(NODE_PTR node) {
   LOWER_CTX* lower_ctx = ctx->Lower_ctx();
   // at runtime scale of plaintext operand of CKKS.mul is set as scale_factor
   if (!lower_ctx->Is_cipher_type(rtype) && !lower_ctx->Is_cipher3_type(rtype)) {
-    return SCALE_INFO(iter0->second.Scale_deg() + 1,
+    uint32_t plain_scale_deg = 1;
+    if (child1->Opcode() == OPC_ENCODE) {
+      const uint32_t* raw_scale_one = child1->Attr<uint32_t>(
+          fhe::core::FHE_ATTR_KIND::RAW_SCALE_ONE);
+      if (raw_scale_one != nullptr && *raw_scale_one != 0) {
+        plain_scale_deg = 0;
+      }
+    }
+    return SCALE_INFO(iter0->second.Scale_deg() + plain_scale_deg,
                       iter0->second.Rescale_level());
   }
 
@@ -433,6 +441,16 @@ void CKKS_SCALE_MANAGER::Handle_encode_in_bin_arith_node(
   if (!preserve_explicit_level) {
     NODE_PTR new_level = ckks_gen.Gen_get_level(child0);
     encode_node->Set_child(level_child_id, new_level);
+  }
+  const uint32_t* raw_scale_one =
+      encode_node->Attr<uint32_t>(core::FHE_ATTR_KIND::RAW_SCALE_ONE);
+  if (raw_scale_one != nullptr && *raw_scale_one != 0) {
+    AIR_ASSERT_MSG(scale->Opcode() == air::core::OPC_INTCONST &&
+                       scale->Intconst() == 0,
+                   "raw-scale-one encode requires explicit scale degree zero");
+    uint32_t zero_scale = 0;
+    encode_node->Set_attr(core::FHE_ATTR_KIND::SCALE, &zero_scale, 1);
+    return;
   }
   if (ana_ctx->Enc_scl_cst()) {
     TYPE_PTR u32_type  = cntr->Glob_scope()->Prim_type(PRIMITIVE_TYPE::INT_U32);

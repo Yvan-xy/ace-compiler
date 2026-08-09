@@ -7,6 +7,8 @@
 //=============================================================================
 #include "ckks/bootstrap.h"
 
+#include <string.h>
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -21,6 +23,27 @@
 
 typedef VALUE_LIST
     VL_VL_VL_DCMPLX;  // VALUE_LIST<VALUE_LIST<VALUE_LIST<DCMPLX>>>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define BOOTSTRAP_ATTESTATION_TLS __thread
+#else
+#define BOOTSTRAP_ATTESTATION_TLS
+#endif
+
+static BOOTSTRAP_ATTESTATION_TLS CKKS_BOOTSTRAP_EXECUTION_ATTESTATION
+    Bootstrap_execution_attestation = {0};
+
+void Reset_bootstrap_execution_attestation(void) {
+  memset(&Bootstrap_execution_attestation, 0,
+         sizeof(Bootstrap_execution_attestation));
+}
+
+void Get_bootstrap_execution_attestation(
+    CKKS_BOOTSTRAP_EXECUTION_ATTESTATION* attestation) {
+  FMT_ASSERT(attestation != NULL,
+             "Bootstrap execution attestation destination is null");
+  *attestation = Bootstrap_execution_attestation;
+}
 
 static const EVAL_SIN_POLY_INFO Eval_sin_poly_info[] = {
     {SPARSE_KIND,               K_SPARSE,              R_SPARSE,              UNIFORM_COEFF_SIZE,
@@ -1549,6 +1572,7 @@ void Eval_approx_mod(CKKS_BTS_CTX* bts_ctx, CIPHERTEXT* out, CIPHERTEXT* in,
 CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
                            uint32_t level_after_bts, CKKS_BTS_CTX* bts_ctx) {
   RTLIB_TM_START(RTM_BS_EVAL, rtm);
+  ++Bootstrap_execution_attestation.invocation_count;
 
   uint32_t            slots  = Get_ciph_slots(ciph);
   CKKS_BTS_PRECOM*    precom = Get_bts_precom(bts_ctx, slots);
@@ -1583,6 +1607,7 @@ CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
   // just return the original ciphertext
   if (Get_ciph_prime_cnt(ciph) - (Get_ciph_sf_degree(ciph) - 1) >=
       level_after_bts) {
+    ++Bootstrap_execution_attestation.early_copy_return_count;
     RTLIB_TM_START(RTM_BS_COPY, rtm);
     if (res != ciph) {
       Copy_ciphertext(res, ciph);
@@ -1591,6 +1616,7 @@ CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
     RTLIB_TM_END(RTM_BS_EVAL, rtm);
     return res;
   }
+  ++Bootstrap_execution_attestation.full_execution_count;
 
   size_t ring_degree = params->_poly_degree;
   size_t m           = ring_degree * 2;
@@ -1660,6 +1686,7 @@ CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
     IS_TRUE(Get_ciph_sf_degree(new_ciph) == 1,
             "scale factor degree of new_ciph is 1");
     CIPHERTEXT* enc_ciph = Alloc_ciphertext();
+    ++Bootstrap_execution_attestation.coeffs_to_slots_entry_count;
     RTLIB_TM_START(RTM_BS_COEFF_TO_SLOT, rtm_c2s);
     if (is_lt_bts) {
       Linear_transform(enc_ciph, new_ciph, conj_hat_pre, bts_ctx);
@@ -1667,6 +1694,7 @@ CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
       Coeffs_to_slots(enc_ciph, new_ciph, conj_hat_pre_fft, bts_ctx);
     }
     RTLIB_TM_END(RTM_BS_COEFF_TO_SLOT, rtm_c2s);
+    ++Bootstrap_execution_attestation.coeffs_to_slots_completion_count;
     IS_TRACE_CMD(
         Print_cipher_poly(Get_trace_file(), "coeffs2_slots", enc_ciph));
 
@@ -1691,6 +1719,7 @@ CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
     }
 
     // step 2: approximate mod reduction
+    ++Bootstrap_execution_attestation.eval_mod_entry_count;
     RTLIB_TM_START(RTM_BS_APPROX_MOD, rtm_mod);
 #pragma omp parallel
 #pragma omp single
@@ -1703,11 +1732,13 @@ CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
                       coeff_lower_bound, coeff_upper_bound);
     }
     RTLIB_TM_END(RTM_BS_APPROX_MOD, rtm_mod);
+    ++Bootstrap_execution_attestation.eval_mod_completion_count;
 
     Mul_by_monomial(enc_ciph_sub, enc_ciph_sub, m / 4, eval);
     Add_ciphertext(enc_ciph, enc_ciph, enc_ciph_sub, eval);
 
     // step 3: running Slots_to_coeffs
+    ++Bootstrap_execution_attestation.slots_to_coeffs_entry_count;
     RTLIB_TM_START(RTM_BS_SLOT_TO_COEFF, rtm_s2c);
     if (AUTO_SCALE) {
       Rescale_ciphertext(enc_ciph, enc_ciph, eval);
@@ -1720,6 +1751,7 @@ CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
       Slots_to_coeffs(res, enc_ciph, conj_pre_fft, bts_ctx);
     }
     RTLIB_TM_END(RTM_BS_SLOT_TO_COEFF, rtm_s2c);
+    ++Bootstrap_execution_attestation.slots_to_coeffs_completion_count;
     IS_TRACE_CMD(Print_cipher_poly(Get_trace_file(), "slots2coeffs", enc_ciph));
 
     Free_ciphertext(enc_ciph);
@@ -1742,6 +1774,7 @@ CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
             "scale factor degree of new_ciph is 1");
 
     CIPHERTEXT* enc_ciph = Alloc_ciphertext();
+    ++Bootstrap_execution_attestation.coeffs_to_slots_entry_count;
     RTLIB_TM_START(RTM_BS_COEFF_TO_SLOT, rtm_c2s);
     if (is_lt_bts) {
       Linear_transform(enc_ciph, new_ciph, conj_hat_pre, bts_ctx);
@@ -1749,6 +1782,7 @@ CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
       Coeffs_to_slots(enc_ciph, new_ciph, conj_hat_pre_fft, bts_ctx);
     }
     RTLIB_TM_END(RTM_BS_COEFF_TO_SLOT, rtm_c2s);
+    ++Bootstrap_execution_attestation.coeffs_to_slots_completion_count;
 
     // double real part, clear imag part
     CIPHERTEXT* conj_ciph = Alloc_ciphertext();
@@ -1767,12 +1801,15 @@ CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
     }
 
     // step 3: approximate mod reduction
+    ++Bootstrap_execution_attestation.eval_mod_entry_count;
     RTLIB_TM_START(RTM_BS_APPROX_MOD, rtm_mod);
     Eval_approx_mod(bts_ctx, enc_ciph, enc_ciph, coefficient, coeff_lower_bound,
                     coeff_upper_bound);
     RTLIB_TM_END(RTM_BS_APPROX_MOD, rtm_mod);
+    ++Bootstrap_execution_attestation.eval_mod_completion_count;
 
     // step 3: running Slots_to_coeffs
+    ++Bootstrap_execution_attestation.slots_to_coeffs_entry_count;
     RTLIB_TM_START(RTM_BS_SLOT_TO_COEFF, rtm_s2c);
     if (AUTO_SCALE) {
       Rescale_ciphertext(enc_ciph, enc_ciph, eval);
@@ -1784,6 +1821,7 @@ CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
       Slots_to_coeffs(res, enc_ciph, conj_pre_fft, bts_ctx);
     }
     RTLIB_TM_END(RTM_BS_SLOT_TO_COEFF, rtm_s2c);
+    ++Bootstrap_execution_attestation.slots_to_coeffs_completion_count;
 
     CIPHERTEXT* rot_ciph = Alloc_ciphertext();
     Eval_fast_rotate(rot_ciph, res, slots, eval);
@@ -1825,6 +1863,7 @@ CIPHERTEXT* Eval_bootstrap(CIPHERTEXT* res, CIPHERTEXT* ciph,
 
   IS_TRACE_CMD(
       Print_cipher_msg(Get_trace_file(), "after bts", res, DEF_MSG_LEN));
+  ++Bootstrap_execution_attestation.full_completion_count;
   RTLIB_TM_END(RTM_BS_EVAL, rtm);
   return res;
 }

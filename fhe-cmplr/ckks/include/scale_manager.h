@@ -639,7 +639,18 @@ RETV CORE_SCALE_MANAGER::Handle_ld(VISITOR* visitor, NODE_PTR node) {
     list.For_each(visit, &ctx, ssa_ver);
   }
 
-  const SCALE_INFO& scale_info = ctx.Get_scale_info(ssa_ver->Id());
+  SCALE_INFO scale_info = ctx.Get_scale_info(ssa_ver->Id());
+  const uint32_t* explicit_coordinate =
+      node->Attr<uint32_t>(core::FHE_ATTR_KIND::EXPLICIT_SCALE_COORDINATE);
+  if (explicit_coordinate != nullptr && *explicit_coordinate != 0) {
+    const uint32_t* explicit_scale =
+        node->Attr<uint32_t>(core::FHE_ATTR_KIND::SCALE);
+    const uint32_t* explicit_rescale =
+        node->Attr<uint32_t>(core::FHE_ATTR_KIND::RESCALE_LEVEL);
+    AIR_ASSERT_MSG(explicit_scale != nullptr && explicit_rescale != nullptr,
+                   "explicit formal scale coordinate is incomplete");
+    scale_info = SCALE_INFO(*explicit_scale, *explicit_rescale);
+  }
   ctx.Set_node_scale_info(node, scale_info);
 
   ctx.Trace(TD_CKKS_SCALE_MGT, std::string(ctx.Indent(), ' '),
@@ -661,7 +672,18 @@ RETV CORE_SCALE_MANAGER::Handle_ldp(VISITOR* visitor, NODE_PTR node) {
   }
 
   air::opt::SSA_VER_PTR ssa_ver    = ctx.Ssa_cntr()->Node_ver(node->Id());
-  const SCALE_INFO&     scale_info = ctx.Get_scale_info(ssa_ver->Id());
+  SCALE_INFO scale_info = ctx.Get_scale_info(ssa_ver->Id());
+  const uint32_t* explicit_coordinate =
+      node->Attr<uint32_t>(core::FHE_ATTR_KIND::EXPLICIT_SCALE_COORDINATE);
+  if (explicit_coordinate != nullptr && *explicit_coordinate != 0) {
+    const uint32_t* explicit_scale =
+        node->Attr<uint32_t>(core::FHE_ATTR_KIND::SCALE);
+    const uint32_t* explicit_rescale =
+        node->Attr<uint32_t>(core::FHE_ATTR_KIND::RESCALE_LEVEL);
+    AIR_ASSERT_MSG(explicit_scale != nullptr && explicit_rescale != nullptr,
+                   "explicit formal scale coordinate is incomplete");
+    scale_info = SCALE_INFO(*explicit_scale, *explicit_rescale);
+  }
   ctx.Set_node_scale_info(node, scale_info);
 
   ctx.Trace(TD_CKKS_SCALE_MGT, std::string(ctx.Indent(), ' '),
@@ -969,10 +991,18 @@ RETV CKKS_SCALE_MANAGER::Handle_mul(VISITOR* visitor, NODE_PTR node) {
   } else if (lower_ctx->Is_plain_type(rtype_child1)) {
     if (child1->Opcode() == OPC_ENCODE) {
       Handle_encode_in_bin_arith_node(&ctx, node, 1);
+      const uint32_t* raw_scale_one = child1->Attr<uint32_t>(
+          core::FHE_ATTR_KIND::RAW_SCALE_ONE);
+      if (raw_scale_one != nullptr && *raw_scale_one != 0) {
+        RETV retv1 = visitor->template Visit<RETV>(child1);
+        si1        = retv1.Scale_info();
+      } else {
+        si1.Set_scale_deg(1);
+      }
     } else {
       Templ_print(std::cout, "TODO: handle plaintext expr or var");
+      si1.Set_scale_deg(1);
     }
-    si1.Set_scale_deg(1);
   } else if (child1->Rtype()->Is_scalar()) {
     // scale of scalar is set as sf in runtime. no need to handle it in cmplr.
     si1.Set_scale_deg(1);
@@ -1164,7 +1194,11 @@ RETV CKKS_SCALE_MANAGER::Handle_encode(VISITOR* visitor, NODE_PTR node) {
   uint32_t       scale_deg      = 0;
   if (scale_node->Opcode() == air::core::OPC_INTCONST) {
     scale_deg = scale_node->Intconst();
-    scale_deg = (scale_deg != 0) ? scale_deg : 1;
+    const uint32_t* raw_scale_one =
+        node->Attr<uint32_t>(core::FHE_ATTR_KIND::RAW_SCALE_ONE);
+    bool preserve_raw_scale_one =
+        raw_scale_one != nullptr && *raw_scale_one != 0;
+    scale_deg = (scale_deg != 0 || preserve_raw_scale_one) ? scale_deg : 1;
   } else {
     AIR_ASSERT(scale_node->Opcode() == OPC_SCALE);
     NODE_PTR cipher_node = scale_node->Child(0);

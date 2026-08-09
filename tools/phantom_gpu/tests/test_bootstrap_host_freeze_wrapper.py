@@ -31,20 +31,16 @@ def test_wrapper_is_valid_shell_and_uses_a_fresh_exact_snapshot() -> None:
 
 def test_wrapper_freezes_the_exact_bootstrap_host_contract_without_a_gpu() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
-    assert "--gate bootstrap --poly-degree 16384 --mul-level 26" in source
-    assert "--input-level 1" in source
-    assert "--security-level 0 --scaling-factor-bits 56" in source
-    assert "--first-prime-bits 60" in source
-    assert "--hamming-weight 192" in source
+    assert '--gate bootstrap "${QUALIFICATION_ARGS[@]}"' in source
+    assert '"arguments": arguments' in source
+    assert "ace.phantom.bootstrap-host-freeze-payload/2.0.0" in source
+    assert '"parameters": {' not in source
     assert "--runtime runc" in source
     assert "--env NVIDIA_VISIBLE_DEVICES=void" in source
     assert "--env NVIDIA_DRIVER_CAPABILITIES=none" in source
     assert 'host.get("DeviceRequests") not in (None, [])' in source
-    assert (
-        'qualification.get("executable_was_run")) '
-        '!= ("pass", "bootstrap", False)'
-        in source
-    )
+    assert 'qualification.get("host_oracle_executables_were_run"),' in source
+    assert 'qualification.get("gpu_executable_was_run"))' in source
 
 
 def test_wrapper_checksum_closes_results_and_removes_only_its_container() -> None:

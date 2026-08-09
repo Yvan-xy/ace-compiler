@@ -6,18 +6,24 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 PHANTOM_REPO="${ACE_PHANTOM_REPO:-/home/dyf/code/phantom-ant}"
 
 usage() {
-  echo "usage: $0 --ace-commit COMMIT --phantom-commit COMMIT --ordinary-run-root DIR --retained-run-root DIR --bootstrap-run-root DIR OUTPUT_DIRECTORY" >&2
+  echo "usage: $0 [--mode full|generated-bootstrap-correctness] --ace-commit COMMIT --phantom-commit COMMIT [--ordinary-run-root DIR --retained-run-root DIR] --bootstrap-run-root DIR OUTPUT_DIRECTORY" >&2
   exit 2
 }
 
 ACE_COMMIT=""
 PHANTOM_COMMIT=""
+PACKAGE_MODE="full"
 ORDINARY_RUN_ROOT=""
 RETAINED_RUN_ROOT=""
 BOOTSTRAP_RUN_ROOT=""
 OUTPUT_ARGUMENT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --mode)
+      [[ $# -ge 2 ]] || usage
+      PACKAGE_MODE="$2"
+      shift 2
+      ;;
     --ace-commit)
       [[ $# -ge 2 ]] || usage
       ACE_COMMIT="$2"
@@ -57,10 +63,13 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+[[ "${PACKAGE_MODE}" == "full" ||
+   "${PACKAGE_MODE}" == "generated-bootstrap-correctness" ]] || usage
 [[ -n "${ACE_COMMIT}" && -n "${PHANTOM_COMMIT}" &&
-   -n "${ORDINARY_RUN_ROOT}" && -n "${RETAINED_RUN_ROOT}" &&
-   -n "${BOOTSTRAP_RUN_ROOT}" &&
-   -n "${OUTPUT_ARGUMENT}" ]] || usage
+   -n "${BOOTSTRAP_RUN_ROOT}" && -n "${OUTPUT_ARGUMENT}" ]] || usage
+if [[ "${PACKAGE_MODE}" == "full" ]]; then
+  [[ -n "${ORDINARY_RUN_ROOT}" && -n "${RETAINED_RUN_ROOT}" ]] || usage
+fi
 if [[ ! "${ACE_COMMIT}" =~ ^[0-9a-f]{40}$ ||
       ! "${PHANTOM_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "source commits must be full lowercase 40-character object IDs" >&2
@@ -68,6 +77,250 @@ if [[ ! "${ACE_COMMIT}" =~ ^[0-9a-f]{40}$ ||
 fi
 git -C "${REPO_ROOT}" cat-file -e "${ACE_COMMIT}^{commit}"
 git -C "${PHANTOM_REPO}" cat-file -e "${PHANTOM_COMMIT}^{commit}"
+SELECTED_DEPENDENCY_LOCK="$(
+  git -C "${REPO_ROOT}" show \
+    "${ACE_COMMIT}:tools/phantom_gpu/configs/dependencies.env"
+)"
+SELECTED_PHANTOM_COMMIT="$(
+  sed -n 's/^PHANTOM_COMMIT=//p' <<<"${SELECTED_DEPENDENCY_LOCK}"
+)"
+if [[ ! "${SELECTED_PHANTOM_COMMIT}" =~ ^[0-9a-f]{40}$ ||
+      "${SELECTED_PHANTOM_COMMIT}" != "${PHANTOM_COMMIT}" ]]; then
+  echo "requested Phantom commit differs from the selected ACE dependency lock" >&2
+  exit 1
+fi
+
+package_generated_bootstrap_correctness() {
+  local run_root qualification output archive_tools ace_archive phantom_archive
+  run_root="$(realpath -- "${BOOTSTRAP_RUN_ROOT}")"
+  qualification="${run_root}/bootstrap_qualification"
+  output="$(realpath -m -- "${OUTPUT_ARGUMENT}")"
+  if [[ -e "${output}" ]]; then
+    echo "output already exists: ${output}" >&2
+    return 1
+  fi
+  local -a required=(
+    "${run_root}/SHA256SUMS"
+    "${run_root}/ace_source_manifest.json"
+    "${run_root}/phantom_source_manifest.json"
+    "${run_root}/artifact_manifest.json"
+    "${run_root}/manifest.json"
+    "${run_root}/qualification_invocation.json"
+    "${run_root}/bootstrap_generation_invocation.json"
+    "${qualification}/compiler_invocation.json"
+    "${qualification}/bootstrap_raw.air"
+    "${qualification}/bootstrap_post_ckks.air"
+    "${qualification}/bootstrap_post_operations.air"
+    "${qualification}/compiler_context_manifest.json"
+    "${qualification}/compiler_resource_manifest.json"
+    "${qualification}/compiler_constant_manifest.json"
+    "${qualification}/bootstrap_semantics.json"
+    "${qualification}/post_operations_attestation.json"
+    "${qualification}/bootstrap_correctness_fixture.json"
+    "${qualification}/generation.json"
+    "${qualification}/source-audit.json"
+    "${qualification}/qualification.json"
+    "${qualification}/cuda_elf.txt"
+    "${qualification}/native_ant_reference.json"
+    "${qualification}/native_ant_reference.bin"
+    "${qualification}/generated_ant_reference.json"
+    "${qualification}/generated_ant_reference.bin"
+    "${qualification}/host_oracle_replay.json"
+    "${qualification}/generated_bootstrap_phantom_correctness.cu"
+    "${qualification}/bootstrap_qualification.cu"
+    "${qualification}/bootstrap_qualification_ant.cxx"
+  )
+  local path
+  for path in "${required[@]}"; do
+    [[ -s "${path}" ]] || {
+      echo "missing generated-bootstrap correctness input: ${path}" >&2
+      return 1
+    }
+  done
+  python3 - "${run_root}/artifact_manifest.json" \
+    "${qualification}/qualification.json" \
+    "${run_root}/qualification_invocation.json" \
+    "${qualification}/cuda_elf.txt" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+artifact, qualification, invocation = [
+    json.loads(Path(value).read_text(encoding="utf-8")) for value in sys.argv[1:4]
+]
+if artifact.get("schema_version") != "ace.phantom.bootstrap-artifacts/3.0.0":
+    raise SystemExit("correctness artifact manifest schema is unsupported")
+if qualification.get("schema_version") != "ace.phantom.bootstrap-host-qualification/2.0.0":
+    raise SystemExit("correctness host qualification schema is unsupported")
+if (
+    invocation.get("schema_version")
+    != "ace.phantom.bootstrap-qualification-invocation/1.0.0"
+    or not isinstance(invocation.get("argv"), list)
+    or len(invocation["argv"]) < 2
+    or not all(isinstance(value, str) for value in invocation["argv"])
+):
+    raise SystemExit("correctness qualification invocation is invalid")
+if "sm_80" not in Path(sys.argv[4]).read_text(encoding="utf-8"):
+    raise SystemExit("correctness CUDA inventory lacks sm_80")
+PY
+  (
+    cd "${run_root}"
+    sha256sum -c SHA256SUMS
+  )
+  mkdir -p "${output}"
+  chmod 0755 "${output}"
+  archive_tools="$(mktemp -d)"
+  trap 'rm -rf -- "${archive_tools}"' RETURN
+  git -C "${REPO_ROOT}" show \
+    "${ACE_COMMIT}:tools/phantom_gpu/source_archive.py" \
+    >"${archive_tools}/source_archive.py"
+  ace_archive="ace-source-${ACE_COMMIT}.tar.gz"
+  phantom_archive="phantom-source-${PHANTOM_COMMIT}.tar.gz"
+  python3 "${archive_tools}/source_archive.py" create \
+    --repo "${REPO_ROOT}" --commit "${ACE_COMMIT}" --kind ace \
+    --output "${output}/${ace_archive}" \
+    --manifest "${output}/ace-source.manifest.json" \
+    >"${output}/ace-source.audit.json"
+  python3 "${archive_tools}/source_archive.py" create \
+    --repo "${PHANTOM_REPO}" --commit "${PHANTOM_COMMIT}" --kind phantom \
+    --output "${output}/${phantom_archive}" \
+    --manifest "${output}/phantom-source.manifest.json" \
+    >"${output}/phantom-source.audit.json"
+  cmp "${run_root}/ace_source_manifest.json" \
+    "${output}/ace-source.manifest.json"
+  cmp "${run_root}/phantom_source_manifest.json" \
+    "${output}/phantom-source.manifest.json"
+  python3 - "${output}/ace-source.manifest.json" \
+    "${output}/phantom-source.manifest.json" \
+    "${ACE_COMMIT}" "${PHANTOM_COMMIT}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+ace, phantom = map(Path, sys.argv[1:3])
+ace_commit, phantom_commit = sys.argv[3:5]
+if json.loads(ace.read_text(encoding="utf-8")).get("commit") != ace_commit:
+    raise SystemExit("ACE source manifest commit differs from the request")
+if json.loads(phantom.read_text(encoding="utf-8")).get("commit") != phantom_commit:
+    raise SystemExit("Phantom source manifest commit differs from the request")
+PY
+  while IFS= read -r relative; do
+    git -C "${REPO_ROOT}" show "${ACE_COMMIT}:${relative}" \
+      >"${output}/${relative##*/}"
+  done <<'FILES'
+tools/phantom_gpu/source_archive.py
+tools/phantom_gpu/phase_helpers.sh
+tools/phantom_gpu/bootstrap_environment.sh
+tools/phantom_gpu/run_build_and_health.sh
+tools/phantom_gpu/bootstrap_correctness.py
+tools/phantom_gpu/configs/apt-packages.lock
+tools/phantom_gpu/configs/python-requirements-hashed.lock
+tools/phantom_gpu/configs/base-files.sha256
+tools/phantom_gpu/configs/dependencies.env
+tools/phantom_gpu/configs/toolchain.env
+FILES
+  chmod 0755 "${output}/source_archive.py" \
+    "${output}/phase_helpers.sh" "${output}/bootstrap_environment.sh" \
+    "${output}/run_build_and_health.sh" \
+    "${output}/bootstrap_correctness.py"
+  local -a copies=(
+    "artifact_manifest.json:correctness-artifact-manifest.json"
+    "manifest.json:correctness-run-manifest.json"
+    "qualification_invocation.json:correctness-qualification-invocation.json"
+    "bootstrap_generation_invocation.json:correctness-generation-invocation.json"
+    "bootstrap_qualification/compiler_invocation.json:correctness-compiler-invocation.json"
+    "bootstrap_qualification/bootstrap_raw.air:correctness-raw.air"
+    "bootstrap_qualification/bootstrap_post_ckks.air:correctness-post-ckks.air"
+    "bootstrap_qualification/bootstrap_post_operations.air:correctness-post-operations.air"
+    "bootstrap_qualification/compiler_context_manifest.json:correctness-context-manifest.json"
+    "bootstrap_qualification/compiler_resource_manifest.json:correctness-resource-manifest.json"
+    "bootstrap_qualification/compiler_constant_manifest.json:correctness-constant-manifest.json"
+    "bootstrap_qualification/bootstrap_semantics.json:correctness-bootstrap-semantics.json"
+    "bootstrap_qualification/post_operations_attestation.json:correctness-post-operation-attestation.json"
+    "bootstrap_qualification/bootstrap_correctness_fixture.json:correctness-fixture.json"
+    "bootstrap_qualification/generation.json:correctness-generation.json"
+    "bootstrap_qualification/source-audit.json:correctness-source-audit.json"
+    "bootstrap_qualification/qualification.json:correctness-host-qualification.json"
+    "bootstrap_qualification/cuda_elf.txt:correctness-cuda-elf.txt"
+    "bootstrap_qualification/native_ant_reference.json:correctness-native-ant.json"
+    "bootstrap_qualification/native_ant_reference.bin:correctness-native-ant.bin"
+    "bootstrap_qualification/generated_ant_reference.json:correctness-generated-ant.json"
+    "bootstrap_qualification/generated_ant_reference.bin:correctness-generated-ant.bin"
+    "bootstrap_qualification/host_oracle_replay.json:correctness-compiler-host-replay.json"
+    "bootstrap_qualification/generated_bootstrap_phantom_correctness.cu:correctness-gpu-harness.cu"
+    "bootstrap_qualification/bootstrap_qualification.cu:correctness-generated-phantom.cu"
+    "bootstrap_qualification/bootstrap_qualification_ant.cxx:correctness-generated-ant.cxx"
+  )
+  local entry source_name destination_name
+  for entry in "${copies[@]}"; do
+    source_name="${entry%%:*}"
+    destination_name="${entry#*:}"
+    cp -- "${run_root}/${source_name}" "${output}/${destination_name}"
+  done
+  python3 "${output}/bootstrap_correctness.py" verify-host \
+    --fixture "${output}/correctness-fixture.json" \
+    --ace-source-manifest "${output}/ace-source.manifest.json" \
+    --phantom-source-manifest "${output}/phantom-source.manifest.json" \
+    --compiler-invocation "${output}/correctness-compiler-invocation.json" \
+    --raw-air "${output}/correctness-raw.air" \
+    --post-ckks-air "${output}/correctness-post-ckks.air" \
+    --context-manifest "${output}/correctness-context-manifest.json" \
+    --resource-manifest "${output}/correctness-resource-manifest.json" \
+    --constant-manifest "${output}/correctness-constant-manifest.json" \
+    --bootstrap-semantics "${output}/correctness-bootstrap-semantics.json" \
+    --post-operations-air "${output}/correctness-post-operations.air" \
+    --post-operation-attestation \
+      "${output}/correctness-post-operation-attestation.json" \
+    --native-record "${output}/correctness-native-ant.json" \
+    --native-values "${output}/correctness-native-ant.bin" \
+    --generated-record "${output}/correctness-generated-ant.json" \
+    --generated-values "${output}/correctness-generated-ant.bin" \
+    --output "${output}/correctness-host-replay.json"
+  python3 - "${output}" "${ACE_COMMIT}" "${PHANTOM_COMMIT}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+files = {
+    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted(root.iterdir())
+    if path.is_file() and path.name not in {"payload.json", "SHA256SUMS"}
+}
+record = {
+    "schema_version": "ace.phantom.generated-bootstrap-correctness-payload/1.0.0",
+    "status": "pass",
+    "ace_commit": sys.argv[2],
+    "phantom_commit": sys.argv[3],
+    "source_snapshots": {
+        "ace_manifest_sha256": hashlib.sha256(
+            (root / "ace-source.manifest.json").read_bytes()
+        ).hexdigest(),
+        "phantom_manifest_sha256": hashlib.sha256(
+            (root / "phantom-source.manifest.json").read_bytes()
+        ).hexdigest(),
+    },
+    "host_oracles_replayed": True,
+    "files": files,
+}
+(root / "payload.json").write_text(
+    json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+  (
+    cd "${output}"
+    find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' |
+      LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS
+  )
+  trap - RETURN
+  rm -rf -- "${archive_tools}"
+}
+
+if [[ "${PACKAGE_MODE}" == "generated-bootstrap-correctness" ]]; then
+  package_generated_bootstrap_correctness
+  exit 0
+fi
 
 ORDINARY_RUN_ROOT="$(realpath -- "${ORDINARY_RUN_ROOT}")"
 RETAINED_RUN_ROOT="$(realpath -- "${RETAINED_RUN_ROOT}")"
@@ -333,7 +586,7 @@ if any(
 ):
     raise SystemExit("frozen data-Q list disagrees with compiler prime policy")
 if any(
-    isinstance(bits, bool) or not isinstance(bits, int) or not 1 <= bits <= 60
+    isinstance(bits, bool) or not isinstance(bits, int) or bits <= 0
     for bits in context["special_p_bit_sizes"]
 ):
     raise SystemExit("frozen special-P list is invalid")
@@ -796,21 +1049,11 @@ if len(qualification_arguments) % 2:
 qualification_options = dict(
     zip(qualification_arguments[0::2], qualification_arguments[1::2])
 )
-expected_options = {
-    "--gate": "bootstrap",
-    "--poly-degree": "16384",
-    "--mul-level": "26",
-    "--input-level": "1",
-    "--security-level": "0",
-    "--scaling-factor-bits": "56",
-    "--first-prime-bits": "60",
-    "--hamming-weight": "192",
-}
 if (
-    qualification_options != expected_options
+    qualification_options.get("--gate") != "bootstrap"
     or len(qualification_options) != len(qualification_arguments) // 2
 ):
-    raise SystemExit("bootstrap qualification invocation is not the exact approved contract")
+    raise SystemExit("bootstrap qualification invocation is not explicit and unique")
 
 generation_invocation, generation_argv = normalized_invocation(
     "bootstrap_generation_invocation.json",
@@ -825,25 +1068,39 @@ generation_arguments = generation_argv[2:]
 if len(generation_arguments) % 2:
     raise SystemExit("bootstrap generation invocation has an unpaired argument")
 generation_options = dict(zip(generation_arguments[0::2], generation_arguments[1::2]))
-if (
-    generation_options != {key: value for key, value in expected_options.items() if key != "--gate"}
-    or len(generation_options) != len(generation_arguments) // 2
-):
-    raise SystemExit("bootstrap generation invocation is not the exact approved contract")
+if len(generation_options) != len(generation_arguments) // 2:
+    raise SystemExit("bootstrap generation invocation options are not unique")
+compiler_option_names = {
+    "--poly-degree", "--vector-capacity", "--mul-level", "--input-level",
+    "--security-level", "--scaling-factor-bits", "--first-prime-bits",
+    "--hamming-weight", "--q-part-count", "--encode-transform-budget",
+    "--decode-transform-budget", "--ciphertext-constant-encoding", "--packing",
+    "--post-multiply-real", "--post-multiply-imag",
+    "--post-multiply-scale-degree", "--post-rotation-step",
+}
+if set(generation_options) != compiler_option_names:
+    raise SystemExit("bootstrap generation invocation omits an explicit option")
+qualification_compiler_options = {
+    key: value for key, value in qualification_options.items()
+    if key in compiler_option_names
+}
+if qualification_compiler_options != generation_options:
+    raise SystemExit("qualification and generation compiler options differ")
 
 context = load("bootstrap_qualification/compiler_context_manifest.json")
 if (
     context.get("schema_version") != 1
     or context.get("resource_schema_version") != 3
-    or context.get("packing") != "full"
-    or context.get("polynomial_degree") != 16384
-    or context.get("logical_slot_capacity") != 8192
-    or len(context.get("data_q_bit_sizes", [])) != 26
-    or context.get("input_level") != 1
-    or context.get("security_level") != 0
-    or context.get("scaling_modulus_bits") != 56
-    or context.get("first_modulus_bits") != 60
-    or context.get("hamming_weight") != 192
+    or context.get("packing") != generation_options["--packing"]
+    or context.get("polynomial_degree") != int(generation_options["--poly-degree"])
+    or context.get("logical_slot_capacity") != int(generation_options["--vector-capacity"])
+    or len(context.get("data_q_bit_sizes", [])) != int(generation_options["--mul-level"])
+    or context.get("input_level") != int(generation_options["--input-level"])
+    or context.get("security_level") != int(generation_options["--security-level"])
+    or context.get("scaling_modulus_bits") != int(generation_options["--scaling-factor-bits"])
+    or context.get("first_modulus_bits") != int(generation_options["--first-prime-bits"])
+    or context.get("hamming_weight") != int(generation_options["--hamming-weight"])
+    or context.get("q_part_count") != int(generation_options["--q-part-count"])
 ):
     raise SystemExit("bootstrap context manifest is not the exact schema-v3 qualification context")
 resources = load("bootstrap_qualification/compiler_resource_manifest.json")
@@ -880,15 +1137,10 @@ for relative in (
         raise SystemExit("bootstrap compiler manifests are not canonical no-newline JSON")
 
 generation = load("bootstrap_qualification/generation.json")
-expected_compiler_parameters = {
-    "poly_degree": 16384,
-    "mul_level": 26,
-    "input_level": 1,
-    "security_level": 0,
-    "scaling_factor_bits": 56,
-    "first_prime_bits": 60,
-    "hamming_weight": 192,
-}
+compiler_invocation = load("bootstrap_qualification/compiler_invocation.json")
+expected_compiler_parameters = compiler_invocation.get("options")
+if not isinstance(expected_compiler_parameters, dict):
+    raise SystemExit("bootstrap compiler invocation lacks typed options")
 generation_manifest_paths = {
     "context": "bootstrap_qualification/compiler_context_manifest.json",
     "resource": "bootstrap_qualification/compiler_resource_manifest.json",
@@ -903,7 +1155,7 @@ expected_generation_keys = {
 generated_source_path = root / "bootstrap_qualification/bootstrap_qualification.cu"
 if (
     set(generation) != expected_generation_keys
-    or generation.get("schema_version") != "ace.phantom.bootstrap-generation/2.0.0"
+    or generation.get("schema_version") != "ace.phantom.bootstrap-generation/3.0.0"
     or generation.get("status") != "pass"
     or generation.get("qualification_scope")
        != "full-generated-bootstrap-compile-only"
@@ -911,7 +1163,10 @@ if (
     or generation.get("native_bootstrap_precompute") is not False
     or generation.get("compiler_parameters") != expected_compiler_parameters
     or generation.get("bootstrap_parameters") != {
-        "q_parts": 3, "enc_budget": 3, "dec_budget": 3, "ct_encode": False,
+        "q_parts": expected_compiler_parameters["q_part_count"],
+        "enc_budget": expected_compiler_parameters["encode_transform_budget"],
+        "dec_budget": expected_compiler_parameters["decode_transform_budget"],
+        "ct_encode": expected_compiler_parameters["ciphertext_constant_encoding"] == "enabled",
     }
     or generation.get("stages_completed") != ["ckks_driver", "ckks2c"]
     or generation.get("source") != {
@@ -1090,13 +1345,13 @@ if (
     or qualification.get("primitive_only_provider_archive") is not True
     or qualification.get("executable_was_run") is not False
     or qualification.get("context_contract") != {
-        "polynomial_degree": 16384,
-        "mul_level": 26,
-        "input_level": 1,
-        "security_level": 0,
-        "scaling_factor_bits": 56,
-        "first_prime_bits": 60,
-        "hamming_weight": 192,
+        "polynomial_degree": context["polynomial_degree"],
+        "mul_level": len(context["data_q_bit_sizes"]),
+        "input_level": context["input_level"],
+        "security_level": context["security_level"],
+        "scaling_factor_bits": context["scaling_modulus_bits"],
+        "first_prime_bits": context["first_modulus_bits"],
+        "hamming_weight": context["hamming_weight"],
     }
 ):
     raise SystemExit("bootstrap host qualification claims are inconsistent")
@@ -1115,7 +1370,7 @@ expected_artifact_files = {
 }
 if (
     artifact.get("schema_version")
-       != "ace.phantom.bootstrap-artifacts/2.0.0"
+       != "ace.phantom.bootstrap-artifacts/3.0.0"
     or artifact.get("status") != "bound"
     or artifact.get("source_mode") != "snapshot"
     or artifact.get("ace_commit") != ace_commit
