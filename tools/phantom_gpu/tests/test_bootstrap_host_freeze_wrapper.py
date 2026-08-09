@@ -45,6 +45,7 @@ def test_wrapper_freezes_the_exact_bootstrap_host_contract_without_a_gpu() -> No
 
 def test_wrapper_checksum_closes_results_and_removes_only_its_container() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
+    assert 'tee "${RESULTS}/bootstrap-host-qualification.log"' in source
     assert "find . -type f ! -path ./SHA256SUMS -print0" in source
     assert '"${RESULT_ARCHIVE}" bootstrap-host-freeze "${PIPELINE_EXIT}"' in source
     assert 'docker rm -f "${exact_id}"' in source

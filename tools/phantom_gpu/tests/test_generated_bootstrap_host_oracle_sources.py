@@ -180,17 +180,29 @@ def test_compile_gate_builds_and_runs_both_host_oracles_before_gpu_use() -> None
     host_replay = script.index("bootstrap_correctness.py\" verify-host", generated_run)
     gpu_build = script.index('local correctness_compile_arguments=', generated_run)
     assert native_run < generated_run < host_replay < gpu_build
+    native_failure = script.index(
+        'echo "native ANT oracle failed with exit ${native_oracle_exit}"',
+        native_run,
+    )
+    generated_failure = script.index(
+        'echo "generated DSL/ANT oracle failed with exit '
+        '${generated_oracle_exit}"',
+        generated_run,
+    )
+    assert native_run < native_failure < generated_run
+    assert generated_run < generated_failure < host_replay
+    assert '2>"${BOOTSTRAP_RESULTS}/native-ant.stderr.txt" || native_oracle_exit=$?' in script
+    assert 'cat -- "${BOOTSTRAP_RESULTS}/native-ant.stdout.txt" >&2' in script
+    assert 'cat -- "${BOOTSTRAP_RESULTS}/native-ant.stderr.txt" >&2' in script
+    assert 'return "${native_oracle_exit}"' in script
+    assert '2>"${BOOTSTRAP_RESULTS}/generated-ant.stderr.txt" || generated_oracle_exit=$?' in script
+    assert 'cat -- "${BOOTSTRAP_RESULTS}/generated-ant.stdout.txt" >&2' in script
+    assert 'cat -- "${BOOTSTRAP_RESULTS}/generated-ant.stderr.txt" >&2' in script
+    assert 'return "${generated_oracle_exit}"' in script
     assert "bootstrap_correctness_fixture.json" in script
     assert "native_ant_reference.json" in script
     assert "generated_ant_reference.json" in script
     assert "host_oracle_replay.json" in script
-    assert 'echo "native ANT oracle failed with exit ${native_oracle_exit}"' in script
-    assert (
-        'echo "generated DSL/ANT oracle failed with exit '
-        '${generated_oracle_exit}"' in script
-    )
-    assert 'cat -- "${BOOTSTRAP_RESULTS}/native-ant.stderr.txt" >&2' in script
-    assert 'cat -- "${BOOTSTRAP_RESULTS}/generated-ant.stderr.txt" >&2' in script
     assert "generated_bootstrap_phantom_correctness_sm80" in script
     assert "ace.phantom.bootstrap-artifacts/3.0.0" in script
     assert "ace.phantom.bootstrap-host-qualification/2.0.0" in script
