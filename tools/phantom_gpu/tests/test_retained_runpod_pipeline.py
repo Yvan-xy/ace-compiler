@@ -69,7 +69,7 @@ def test_retained_pipeline_replays_frozen_provider_neutral_evidence() -> None:
     runner = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
     assert "--retained-run-root" in package
     assert "export-frozen" in package
-    assert "without-build-output" in package
+    assert '"frozen_retained_reference": json.loads(' in package
     assert "--retained-run-root" in local
     assert "verify-replay" in runner
     assert "provider_neutral_ant_reference_matches" in runner
