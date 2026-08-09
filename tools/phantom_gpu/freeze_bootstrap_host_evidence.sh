@@ -119,6 +119,7 @@ while IFS= read -r relative; do
     >"${PAYLOAD}/${relative##*/}"
 done <<'FILES'
 tools/phantom_gpu/source_archive.py
+tools/phantom_gpu/phase_helpers.sh
 tools/phantom_gpu/bootstrap_environment.sh
 tools/phantom_gpu/configs/apt-packages.lock
 tools/phantom_gpu/configs/python-requirements-hashed.lock
@@ -127,6 +128,7 @@ tools/phantom_gpu/configs/dependencies.env
 tools/phantom_gpu/configs/toolchain.env
 FILES
 chmod 0755 "${PAYLOAD}/source_archive.py" \
+  "${PAYLOAD}/phase_helpers.sh" \
   "${PAYLOAD}/bootstrap_environment.sh"
 
 python3 - "${PAYLOAD}" "${ACE_COMMIT}" "${PHANTOM_COMMIT}" <<'PY'
