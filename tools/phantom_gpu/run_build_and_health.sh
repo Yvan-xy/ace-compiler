@@ -224,7 +224,7 @@ configure_qualification_environment() {
   export ACE_PHANTOM_SOURCE_MODE=snapshot
   export ACE_PHANTOM_REPO_ROOT="${WORK}/ace-extract/ace-source"
   export ACE_PHANTOM_SOURCE_DIR="${WORK}/phantom-extract/phantom-source"
-  export ACE_PHANTOM_STATE_ROOT="${WORK}/build-state"
+  export ACE_PHANTOM_STATE_ROOT="${WORK}/state"
   export ACE_PHANTOM_ACE_COMMIT="${ace_commit}"
   export ACE_PHANTOM_SOURCE_MANIFEST="${INPUT}/ace-source.manifest.json"
   export ACE_PHANTOM_SOURCE_MANIFEST_SHA256="${source_manifest_sha}"
@@ -838,15 +838,22 @@ verify_frozen_bootstrap_qualification() {
   python3 - "${INPUT}/payload.json" "${frozen_artifact}" \
     "${generated_artifact}" "${output}/qualification.json" \
     "${output}/source-audit.json" \
+    "${output}/bootstrap_phantom_constants_sm80" \
     "${RESULT_DIR}/bootstrap-frozen-reference.json" <<'PY'
 import hashlib
 import json
 from pathlib import Path
 import sys
 
-payload_path, frozen_path, generated_path, qualification_path, audit_path, output_path = map(
-    Path, sys.argv[1:]
-)
+(
+    payload_path,
+    frozen_path,
+    generated_path,
+    qualification_path,
+    audit_path,
+    binary_file_path,
+    output_path,
+) = map(Path, sys.argv[1:])
 load = lambda path: json.loads(path.read_text(encoding="utf-8"))
 digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
 binding = load(payload_path)["bootstrap_qualification"]
@@ -854,49 +861,70 @@ frozen = load(frozen_path)
 generated = load(generated_path)
 qualification = load(qualification_path)
 audit = load(audit_path)
-paths = (
+stable_paths = (
     "bootstrap_qualification/bootstrap_qualification.cu",
     "bootstrap_qualification/bootstrap_phantom_constants.cu",
-    "bootstrap_qualification/bootstrap_phantom_constants_sm80",
     "bootstrap_qualification/compiler_context_manifest.json",
     "bootstrap_qualification/compiler_resource_manifest.json",
     "bootstrap_qualification/compiler_constant_manifest.json",
     "bootstrap_qualification/generation.json",
 )
-for relative in paths:
+binary_path = "bootstrap_qualification/bootstrap_phantom_constants_sm80"
+for relative in stable_paths:
     if generated["files"].get(relative) != frozen["files"].get(relative):
         raise SystemExit(f"regenerated bootstrap artifact differs: {relative}")
-expected = {
-    "expected_generated_source_sha256": generated["files"][paths[0]],
-    "expected_harness_source_sha256": generated["files"][paths[1]],
-    "expected_linked_binary_sha256": generated["files"][paths[2]],
-}
-if any(binding.get(field) != value for field, value in expected.items()):
-    raise SystemExit("regenerated bootstrap hashes differ from the packaged host freeze")
+packaged_source_sha = binding["expected_generated_source_sha256"]
+packaged_harness_sha = binding["expected_harness_source_sha256"]
+packaged_binary_sha = binding["expected_linked_binary_sha256"]
+regenerated_source_sha = generated["files"][stable_paths[0]]
+regenerated_harness_sha = generated["files"][stable_paths[1]]
+regenerated_binary_sha = generated["files"][binary_path]
+if (
+    packaged_source_sha != regenerated_source_sha
+    or packaged_harness_sha != regenerated_harness_sha
+):
+    raise SystemExit("regenerated bootstrap source differs from the packaged host freeze")
+for label, value in (
+    ("packaged linked binary", packaged_binary_sha),
+    ("regenerated linked binary", regenerated_binary_sha),
+):
+    if not isinstance(value, str) or len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise SystemExit(f"{label} hash is invalid")
+if digest(binary_file_path) != regenerated_binary_sha:
+    raise SystemExit("regenerated linked binary bytes differ from its artifact manifest")
 qualification_expected = {
-    "generated_source_sha256": expected["expected_generated_source_sha256"],
-    "linked_binary_sha256": expected["expected_linked_binary_sha256"],
-    "harness_source_sha256": expected["expected_harness_source_sha256"],
-    "compiler_context_manifest_sha256": generated["files"][paths[3]],
-    "compiler_resource_manifest_sha256": generated["files"][paths[4]],
-    "compiler_constant_manifest_sha256": generated["files"][paths[5]],
-    "generation_record_sha256": generated["files"][paths[6]],
+    "generated_source_sha256": regenerated_source_sha,
+    "linked_binary_sha256": regenerated_binary_sha,
+    "harness_source_sha256": regenerated_harness_sha,
+    "compiler_context_manifest_sha256": generated["files"][stable_paths[2]],
+    "compiler_resource_manifest_sha256": generated["files"][stable_paths[3]],
+    "compiler_constant_manifest_sha256": generated["files"][stable_paths[4]],
+    "generation_record_sha256": generated["files"][stable_paths[5]],
 }
 if any(qualification.get(field) != value for field, value in qualification_expected.items()):
     raise SystemExit("regenerated bootstrap qualification hash binding is stale")
 if audit.get("status") != "pass" or not audit.get("counts", {}).get("constants"):
     raise SystemExit("regenerated bootstrap source audit did not pass")
 record = {
-    "schema_version": "ace.phantom.bootstrap-frozen-reference/1.0.0",
+    "schema_version": "ace.phantom.bootstrap-frozen-reference/1.1.0",
     "status": "pass",
-    "comparison": "deterministic-host-artifact-hashes",
+    "comparison": "exact-source-and-setup-with-per-run-cuda-artifacts",
+    "source_and_setup_match": True,
+    "linked_binary_byte_identity_required": False,
     "packaged_artifact_manifest_sha256": digest(frozen_path),
     "packaged_host_qualification_sha256": binding["host_qualification_sha256"],
     "packaged_source_audit_sha256": binding["source_audit_sha256"],
     "regenerated_artifact_manifest_sha256": digest(generated_path),
     "regenerated_host_qualification_sha256": digest(qualification_path),
     "regenerated_source_audit_sha256": digest(audit_path),
-    **expected,
+    "packaged_generated_source_sha256": packaged_source_sha,
+    "regenerated_generated_source_sha256": regenerated_source_sha,
+    "packaged_harness_source_sha256": packaged_harness_sha,
+    "regenerated_harness_source_sha256": regenerated_harness_sha,
+    "packaged_linked_binary_sha256": packaged_binary_sha,
+    "regenerated_linked_binary_sha256": regenerated_binary_sha,
 }
 output_path.write_text(
     json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -1944,15 +1972,28 @@ verify_success_evidence() {
         .gate == "bootstrap" and .status == "pass" and .exit_code == 0
       '
       require_terminal_record bootstrap-frozen-reference.json '
-        .schema_version == "ace.phantom.bootstrap-frozen-reference/1.0.0"
+        .schema_version == "ace.phantom.bootstrap-frozen-reference/1.1.0"
         and .status == "pass"
-        and .comparison == "deterministic-host-artifact-hashes"
+        and .comparison ==
+          "exact-source-and-setup-with-per-run-cuda-artifacts"
+        and .source_and_setup_match == true
+        and .linked_binary_byte_identity_required == false
+        and .packaged_generated_source_sha256 ==
+          .regenerated_generated_source_sha256
+        and .packaged_harness_source_sha256 ==
+          .regenerated_harness_source_sha256
         and ([.packaged_artifact_manifest_sha256,
               .packaged_host_qualification_sha256,
               .packaged_source_audit_sha256,
               .regenerated_artifact_manifest_sha256,
               .regenerated_host_qualification_sha256,
-              .regenerated_source_audit_sha256] |
+              .regenerated_source_audit_sha256,
+              .packaged_generated_source_sha256,
+              .regenerated_generated_source_sha256,
+              .packaged_harness_source_sha256,
+              .regenerated_harness_source_sha256,
+              .packaged_linked_binary_sha256,
+              .regenerated_linked_binary_sha256] |
              all(test("^[0-9a-f]{64}$")))
       '
       require_terminal_record bootstrap-constant-cache.json \
@@ -1975,15 +2016,28 @@ verify_success_evidence() {
         .gate == "bootstrap" and .status == "pass" and .exit_code == 0
       '
       require_terminal_record bootstrap-frozen-reference.json '
-        .schema_version == "ace.phantom.bootstrap-frozen-reference/1.0.0"
+        .schema_version == "ace.phantom.bootstrap-frozen-reference/1.1.0"
         and .status == "pass"
-        and .comparison == "deterministic-host-artifact-hashes"
+        and .comparison ==
+          "exact-source-and-setup-with-per-run-cuda-artifacts"
+        and .source_and_setup_match == true
+        and .linked_binary_byte_identity_required == false
+        and .packaged_generated_source_sha256 ==
+          .regenerated_generated_source_sha256
+        and .packaged_harness_source_sha256 ==
+          .regenerated_harness_source_sha256
         and ([.packaged_artifact_manifest_sha256,
               .packaged_host_qualification_sha256,
               .packaged_source_audit_sha256,
               .regenerated_artifact_manifest_sha256,
               .regenerated_host_qualification_sha256,
-              .regenerated_source_audit_sha256] |
+              .regenerated_source_audit_sha256,
+              .packaged_generated_source_sha256,
+              .regenerated_generated_source_sha256,
+              .packaged_harness_source_sha256,
+              .regenerated_harness_source_sha256,
+              .packaged_linked_binary_sha256,
+              .regenerated_linked_binary_sha256] |
              all(test("^[0-9a-f]{64}$")))
       '
       require_terminal_record bootstrap-constant-cache.json '

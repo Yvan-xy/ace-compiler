@@ -6,10 +6,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import re
 import tarfile
 import tempfile
+from pathlib import Path
 from typing import Any
 
 
@@ -23,7 +23,7 @@ SEMANTIC_REPLAY_MODE = "semantic-summary-only-no-decoded-byte-comparison"
 BOOTSTRAP_ARTIFACT_SCHEMA = "ace.phantom.bootstrap-artifacts/1.0.0"
 BOOTSTRAP_GENERATION_SCHEMA = "ace.phantom.bootstrap-generation/1.0.0"
 BOOTSTRAP_FROZEN_REFERENCE_SCHEMA = (
-    "ace.phantom.bootstrap-frozen-reference/1.0.0"
+    "ace.phantom.bootstrap-frozen-reference/1.1.0"
 )
 BOOTSTRAP_QUALIFICATION_INVOCATION_SCHEMA = (
     "ace.phantom.qualification-invocation/1.0.0"
@@ -39,6 +39,25 @@ BOOTSTRAP_IO_HELPER_CLOSURE_SCHEMA = (
 )
 ARCHIVE_MEMBER_AUDIT_SCHEMA = (
     "ace.phantom.production-archive-members/1.0.0"
+)
+BOOTSTRAP_REQUIRED_SYMBOLS = (
+    "Get_phantom_context_manifest",
+    "Get_phantom_resource_manifest",
+    "Get_phantom_constant_manifest",
+    "Load_cached_plain",
+    "main",
+)
+BOOTSTRAP_IO_HELPERS = (
+    "Get_input_count",
+    "Get_output_count",
+    "Get_encode_scheme",
+    "Get_decode_scheme",
+)
+FORBIDDEN_BOOTSTRAP_SYMBOL_PATTERN = re.compile(
+    r"Bootstrapper|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|"
+    r"cnn_phantom|conv_eval|FHErt_(?:ant|poly)|fhe::(?:ant|poly)|"
+    r"CoeffToSlot|SlotToCoeff|EvalMod|Native.*[Pp]recom|"
+    r"[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap"
 )
 
 
@@ -116,6 +135,124 @@ def validate_invocation(
     return sha256(path), normalized
 
 
+def bootstrap_symbol_projection(
+    record: dict[str, Any], inventory_path: Path
+) -> dict[str, Any]:
+    expected_keys = {
+        "schema_version",
+        "status",
+        "linked_binary_symbols_sha256",
+        "required_symbols",
+        "missing_symbols",
+        "native_bootstrap_symbol_count",
+    }
+    if set(record) != expected_keys:
+        raise SystemExit("bootstrap symbol closure has an invalid shape")
+    inventory = inventory_path.read_text(encoding="utf-8")
+    require_fields(
+        record,
+        {
+            "schema_version": BOOTSTRAP_SYMBOL_CLOSURE_SCHEMA,
+            "status": "pass",
+            "linked_binary_symbols_sha256": sha256(inventory_path),
+            "required_symbols": list(BOOTSTRAP_REQUIRED_SYMBOLS),
+            "missing_symbols": [],
+            "native_bootstrap_symbol_count": 0,
+        },
+        "bootstrap symbol closure",
+    )
+    missing = [
+        symbol for symbol in BOOTSTRAP_REQUIRED_SYMBOLS if symbol not in inventory
+    ]
+    forbidden_count = len(FORBIDDEN_BOOTSTRAP_SYMBOL_PATTERN.findall(inventory))
+    if missing or forbidden_count != 0:
+        raise SystemExit("bootstrap raw symbol inventory violates its closure record")
+    return {
+        "schema_version": record["schema_version"],
+        "status": record["status"],
+        "required_symbols": record["required_symbols"],
+        "missing_symbols": record["missing_symbols"],
+        "native_bootstrap_symbol_count": record[
+            "native_bootstrap_symbol_count"
+        ],
+    }
+
+
+def _helper_counts(path: Path, source: bool) -> dict[str, int]:
+    value = path.read_text(encoding="utf-8")
+    if source:
+        return {
+            helper: len(re.findall(r"\b" + re.escape(helper) + r"\s*\(", value))
+            for helper in BOOTSTRAP_IO_HELPERS
+        }
+    lines = value.splitlines()
+    return {
+        helper: sum(
+            re.search(r"\b" + re.escape(helper) + r"(?:\(.*\))?$", line)
+            is not None
+            for line in lines
+        )
+        for helper in BOOTSTRAP_IO_HELPERS
+    }
+
+
+def bootstrap_io_helper_projection(
+    record: dict[str, Any],
+    source_path: Path,
+    harness_path: Path,
+    generated_symbols_path: Path,
+    harness_symbols_path: Path,
+) -> dict[str, Any]:
+    expected_keys = {
+        "schema_version",
+        "status",
+        "helpers",
+        "counts",
+        "generated_source_sha256",
+        "harness_source_sha256",
+        "generated_object_symbols_sha256",
+        "harness_object_symbols_sha256",
+    }
+    if set(record) != expected_keys:
+        raise SystemExit("bootstrap I/O-helper closure has an invalid shape")
+    counts = {
+        "generated_source": _helper_counts(source_path, True),
+        "harness_source": _helper_counts(harness_path, True),
+        "generated_object": _helper_counts(generated_symbols_path, False),
+        "harness_object": _helper_counts(harness_symbols_path, False),
+    }
+    require_fields(
+        record,
+        {
+            "schema_version": BOOTSTRAP_IO_HELPER_CLOSURE_SCHEMA,
+            "status": "pass",
+            "helpers": list(BOOTSTRAP_IO_HELPERS),
+            "counts": counts,
+            "generated_source_sha256": sha256(source_path),
+            "harness_source_sha256": sha256(harness_path),
+            "generated_object_symbols_sha256": sha256(generated_symbols_path),
+            "harness_object_symbols_sha256": sha256(harness_symbols_path),
+        },
+        "bootstrap I/O-helper closure",
+    )
+    for helper in BOOTSTRAP_IO_HELPERS:
+        if (
+            counts["generated_source"][helper] != 0
+            or counts["generated_object"][helper] != 0
+            or counts["harness_source"][helper] != 1
+            or counts["harness_object"][helper] != 1
+        ):
+            raise SystemExit("bootstrap I/O-helper ownership is not exact")
+    return {
+        "schema_version": record["schema_version"],
+        "status": record["status"],
+        "helpers": record["helpers"],
+        "counts": record["counts"],
+        "generated_source_sha256": record["generated_source_sha256"],
+        "harness_source_sha256": record["harness_source_sha256"],
+    }
+
+
 def bootstrap_fields(root: Path) -> dict[str, Any]:
     evidence = root / "bootstrap-qualification"
     output = evidence / "bootstrap_qualification"
@@ -132,8 +269,11 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
     qualification = read_json(qualification_path)
     symbol_closure_path = output / "symbol-closure.json"
     symbol_closure = read_json(symbol_closure_path)
+    linked_symbols_path = output / "linked_binary_symbols.txt"
     io_helper_closure_path = output / "io-helper-closure.json"
     io_helper_closure = read_json(io_helper_closure_path)
+    generated_symbols_path = output / "generated_object_symbols.txt"
+    harness_symbols_path = output / "harness_object_symbols.txt"
     archive_audit_path = output / "archive-member-audit.json"
     archive_audit = read_json(archive_audit_path)
     context_path = output / "compiler_context_manifest.json"
@@ -337,26 +477,16 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
     if audit.get("counts", {}).get("constants") != len(constant_entries):
         raise SystemExit("bootstrap source audit constant count is inconsistent")
 
-    require_fields(
-        symbol_closure,
-        {
-            "schema_version": BOOTSTRAP_SYMBOL_CLOSURE_SCHEMA,
-            "status": "pass",
-            "missing_symbols": [],
-            "native_bootstrap_symbol_count": 0,
-        },
-        "bootstrap symbol closure",
+    symbol_projection = bootstrap_symbol_projection(
+        symbol_closure, linked_symbols_path
     )
-    require_fields(
+    io_helper_projection = bootstrap_io_helper_projection(
         io_helper_closure,
-        {"schema_version": BOOTSTRAP_IO_HELPER_CLOSURE_SCHEMA, "status": "pass"},
-        "bootstrap I/O-helper closure",
+        source_path,
+        harness_path,
+        generated_symbols_path,
+        harness_symbols_path,
     )
-    if (
-        io_helper_closure.get("generated_source_sha256") != source_sha
-        or io_helper_closure.get("harness_source_sha256") != harness_sha
-    ):
-        raise SystemExit("bootstrap I/O-helper closure source hashes are inconsistent")
     require_fields(
         archive_audit,
         {
@@ -422,6 +552,15 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
         "bootstrap_qualification/bootstrap_qualification.cu": source_sha,
         "bootstrap_qualification/bootstrap_phantom_constants.cu": harness_sha,
         "bootstrap_qualification/bootstrap_phantom_constants_sm80": binary_sha,
+        "bootstrap_qualification/linked_binary_symbols.txt": sha256(
+            linked_symbols_path
+        ),
+        "bootstrap_qualification/generated_object_symbols.txt": sha256(
+            generated_symbols_path
+        ),
+        "bootstrap_qualification/harness_object_symbols.txt": sha256(
+            harness_symbols_path
+        ),
         "bootstrap_qualification/symbol-closure.json": symbol_closure_sha,
         "bootstrap_qualification/io-helper-closure.json": io_helper_closure_sha,
         "bootstrap_qualification/archive-member-audit.json": archive_audit_sha,
@@ -466,18 +605,48 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
         },
         "bootstrap run manifest",
     )
+    frozen_keys = {
+        "schema_version",
+        "status",
+        "comparison",
+        "packaged_artifact_manifest_sha256",
+        "packaged_host_qualification_sha256",
+        "packaged_source_audit_sha256",
+        "regenerated_artifact_manifest_sha256",
+        "regenerated_host_qualification_sha256",
+        "regenerated_source_audit_sha256",
+        "packaged_generated_source_sha256",
+        "regenerated_generated_source_sha256",
+        "packaged_harness_source_sha256",
+        "regenerated_harness_source_sha256",
+        "packaged_linked_binary_sha256",
+        "regenerated_linked_binary_sha256",
+        "source_and_setup_match",
+        "linked_binary_byte_identity_required",
+    }
+    if set(frozen_reference) != frozen_keys:
+        raise SystemExit("bootstrap frozen reference has an invalid shape")
+    for field in frozen_keys:
+        if field.endswith("_sha256"):
+            require_digest(
+                frozen_reference.get(field), f"bootstrap frozen reference {field}"
+            )
     require_fields(
         frozen_reference,
         {
             "schema_version": BOOTSTRAP_FROZEN_REFERENCE_SCHEMA,
             "status": "pass",
-            "comparison": "deterministic-host-artifact-hashes",
-            "artifact_manifest_sha256": sha256(artifact_path),
-            "host_qualification_sha256": qualification_sha,
-            "source_audit_sha256": audit_sha,
-            "expected_generated_source_sha256": source_sha,
-            "expected_harness_source_sha256": harness_sha,
-            "expected_linked_binary_sha256": binary_sha,
+            "comparison": "exact-source-and-setup-with-per-run-cuda-artifacts",
+            "regenerated_artifact_manifest_sha256": sha256(artifact_path),
+            "regenerated_host_qualification_sha256": qualification_sha,
+            "regenerated_source_audit_sha256": audit_sha,
+            "packaged_generated_source_sha256": source_sha,
+            "regenerated_generated_source_sha256": source_sha,
+            "packaged_harness_source_sha256": harness_sha,
+            "regenerated_harness_source_sha256": harness_sha,
+            "regenerated_linked_binary_sha256": binary_sha,
+            "source_and_setup_match": True,
+            "linked_binary_byte_identity_required": False,
         },
         "bootstrap frozen reference",
     )
@@ -501,7 +670,9 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
         "bootstrap_linked_binary_sha256": binary_sha,
         "bootstrap_archive_member_audit_sha256": archive_audit_sha,
         "bootstrap_symbol_closure_sha256": symbol_closure_sha,
+        "bootstrap_symbol_closure_projection": symbol_projection,
         "bootstrap_io_helper_closure_sha256": io_helper_closure_sha,
+        "bootstrap_io_helper_closure_projection": io_helper_projection,
         "bootstrap_frozen_reference_sha256": sha256(frozen_reference_path),
         **{f"bootstrap_{name}": value for name, value in archive_hashes.items()},
     }
@@ -783,9 +954,18 @@ def fields(root: Path) -> dict[str, Any]:
 def comparison_report(local: dict[str, Any], remote: dict[str, Any]) -> dict[str, Any]:
     if set(local) != set(remote):
         raise SystemExit("local and remote comparison field inventories differ")
+    per_run_fields = {
+        "bootstrap_adapter_archive_sha256",
+        "bootstrap_frozen_reference_sha256",
+        "bootstrap_io_helper_closure_sha256",
+        "bootstrap_linked_binary_sha256",
+        "bootstrap_provider_archive_sha256",
+        "bootstrap_symbol_closure_sha256",
+        "generated_binary_sha256",
+    }
     stable = sorted(
         set(local)
-        - {"bootstrap_frozen_reference_sha256", "generated_binary_sha256"}
+        - per_run_fields
     )
     matching = [key for key in stable if local[key] == remote[key]]
     mismatches = {
@@ -811,12 +991,36 @@ def comparison_report(local: dict[str, Any], remote: dict[str, Any]) -> dict[str
             "generated_binary_sha256": {
                 "local": local["generated_binary_sha256"],
                 "remote": remote["generated_binary_sha256"],
-                "reason": "recorded but not required equal because tool output can embed build-host details",
+                "reason": (
+                    "recorded but not required equal because tool output can "
+                    "embed build-host details"
+                ),
             },
             "bootstrap_frozen_reference_sha256": {
                 "local": local["bootstrap_frozen_reference_sha256"],
                 "remote": remote["bootstrap_frozen_reference_sha256"],
-                "reason": "recorded but not required equal because it binds per-run artifact inventories",
+                "reason": (
+                    "recorded but not required equal because it binds per-run "
+                    "artifact inventories"
+                ),
+            },
+            "bootstrap_cuda_toolchain_provenance": {
+                field: {
+                    "local": local[field],
+                    "remote": remote[field],
+                    "reason": (
+                        "recorded and internally validated per run; raw CUDA 12.4 "
+                        "objects, archives, binaries, and symbol inventories may "
+                        "contain nondeterministic toolchain bytes"
+                    ),
+                }
+                for field in sorted(
+                    per_run_fields
+                    - {
+                        "bootstrap_frozen_reference_sha256",
+                        "generated_binary_sha256",
+                    }
+                )
             },
             "retained_per_run_receipts": [
                 "randomized ANT ciphertext-derived hashes and decoded bytes",

@@ -587,6 +587,7 @@ def test_local_reproduction_does_not_restate_compiler_context() -> None:
 def test_reproduction_uses_one_canonical_container_build_root() -> None:
     local = (TOOLS / "run_local_reproduction.sh").read_text(encoding="utf-8")
     remote = (TOOLS / "runpod_transfer.sh").read_text(encoding="utf-8")
+    pipeline = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
     bootstrap_freeze = (
         TOOLS / "freeze_bootstrap_host_evidence.sh"
     ).read_text(encoding="utf-8")
@@ -600,6 +601,8 @@ def test_reproduction_uses_one_canonical_container_build_root() -> None:
     assert "--work-dir /retained-qualification/work" in local
     assert "--work-dir /retained-qualification/work" in remote
     assert "WORK=/retained-qualification/work" in bootstrap_freeze
+    assert 'ACE_PHANTOM_STATE_ROOT="${WORK}/state"' in pipeline
+    assert 'ACE_PHANTOM_STATE_ROOT="${WORK}/build-state"' not in pipeline
     assert "/retained-qualification/output/work" not in local
     assert "WORK=${OUTPUT}/work" not in bootstrap_freeze
     assert (
@@ -664,6 +667,99 @@ def test_bootstrap_qualification_is_frozen_rebuilt_and_executed_once() -> None:
     assert phases.index("phase native_a100_health") < phases.index(
         "phase bootstrap_constant_cache_qualification"
     ) < phases.index("phase ordinary_gpu_qualification")
+
+
+def test_bootstrap_freeze_requires_exact_source_but_allows_fresh_cuda_bytes(
+    tmp_path: Path,
+) -> None:
+    source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    function_start = source.index("verify_frozen_bootstrap_qualification() {")
+    heredoc_start = source.index("<<'PY'\n", function_start) + len("<<'PY'\n")
+    heredoc_end = source.index("\nPY\n", heredoc_start)
+    verifier = source[heredoc_start:heredoc_end]
+
+    stable_paths = (
+        "bootstrap_qualification/bootstrap_qualification.cu",
+        "bootstrap_qualification/bootstrap_phantom_constants.cu",
+        "bootstrap_qualification/compiler_context_manifest.json",
+        "bootstrap_qualification/compiler_resource_manifest.json",
+        "bootstrap_qualification/compiler_constant_manifest.json",
+        "bootstrap_qualification/generation.json",
+    )
+    binary_path = "bootstrap_qualification/bootstrap_phantom_constants_sm80"
+    stable_hashes = {
+        path: f"{index + 1:064x}" for index, path in enumerate(stable_paths)
+    }
+    packaged_binary = "a" * 64
+    regenerated_binary_path = tmp_path / "bootstrap_phantom_constants_sm80"
+    regenerated_binary_path.write_bytes(b"fresh CUDA compiler output")
+    regenerated_binary = hashlib.sha256(
+        regenerated_binary_path.read_bytes()
+    ).hexdigest()
+    payload = {
+        "bootstrap_qualification": {
+            "expected_generated_source_sha256": stable_hashes[stable_paths[0]],
+            "expected_harness_source_sha256": stable_hashes[stable_paths[1]],
+            "expected_linked_binary_sha256": packaged_binary,
+            "host_qualification_sha256": "c" * 64,
+            "source_audit_sha256": "d" * 64,
+        }
+    }
+    frozen = {"files": dict(stable_hashes) | {binary_path: packaged_binary}}
+    generated = {
+        "files": dict(stable_hashes) | {binary_path: regenerated_binary}
+    }
+    qualification = {
+        "generated_source_sha256": stable_hashes[stable_paths[0]],
+        "linked_binary_sha256": regenerated_binary,
+        "harness_source_sha256": stable_hashes[stable_paths[1]],
+        "compiler_context_manifest_sha256": stable_hashes[stable_paths[2]],
+        "compiler_resource_manifest_sha256": stable_hashes[stable_paths[3]],
+        "compiler_constant_manifest_sha256": stable_hashes[stable_paths[4]],
+        "generation_record_sha256": stable_hashes[stable_paths[5]],
+    }
+    audit = {"status": "pass", "counts": {"constants": 1}}
+    inputs = {
+        "payload.json": payload,
+        "frozen.json": frozen,
+        "generated.json": generated,
+        "qualification.json": qualification,
+        "audit.json": audit,
+    }
+    for name, value in inputs.items():
+        (tmp_path / name).write_text(
+            json.dumps(value) + "\n", encoding="utf-8"
+        )
+    output = tmp_path / "reference.json"
+    arguments = [
+        "python3",
+        "-c",
+        verifier,
+        *(str(tmp_path / name) for name in inputs),
+        str(regenerated_binary_path),
+        str(output),
+    ]
+
+    subprocess.run(arguments, check=True)
+    reference = json.loads(output.read_text(encoding="utf-8"))
+    assert reference["source_and_setup_match"] is True
+    assert reference["linked_binary_byte_identity_required"] is False
+    assert reference["packaged_linked_binary_sha256"] == packaged_binary
+    assert reference["regenerated_linked_binary_sha256"] == regenerated_binary
+
+    regenerated_binary_path.write_bytes(b"post-manifest mutation")
+    rejected = subprocess.run(arguments, check=False, capture_output=True, text=True)
+    assert rejected.returncode != 0
+    assert "linked binary bytes differ" in rejected.stderr
+    regenerated_binary_path.write_bytes(b"fresh CUDA compiler output")
+
+    frozen["files"][stable_paths[0]] = "e" * 64
+    (tmp_path / "frozen.json").write_text(
+        json.dumps(frozen) + "\n", encoding="utf-8"
+    )
+    rejected = subprocess.run(arguments, check=False, capture_output=True, text=True)
+    assert rejected.returncode != 0
+    assert "regenerated bootstrap artifact differs" in rejected.stderr
 
 
 def test_bootstrap_stable_symbol_inventories_are_root_independent(
@@ -924,15 +1020,23 @@ def test_runpod_success_completeness_requires_every_terminal_record(
             "exit_code": 0,
         },
         "bootstrap-frozen-reference.json": {
-            "schema_version": "ace.phantom.bootstrap-frozen-reference/1.0.0",
+            "schema_version": "ace.phantom.bootstrap-frozen-reference/1.1.0",
             "status": "pass",
-            "comparison": "deterministic-host-artifact-hashes",
+            "comparison": "exact-source-and-setup-with-per-run-cuda-artifacts",
+            "source_and_setup_match": True,
+            "linked_binary_byte_identity_required": False,
             "packaged_artifact_manifest_sha256": "1" * 64,
             "packaged_host_qualification_sha256": "2" * 64,
             "packaged_source_audit_sha256": "3" * 64,
             "regenerated_artifact_manifest_sha256": "4" * 64,
             "regenerated_host_qualification_sha256": "5" * 64,
             "regenerated_source_audit_sha256": "6" * 64,
+            "packaged_generated_source_sha256": "7" * 64,
+            "regenerated_generated_source_sha256": "7" * 64,
+            "packaged_harness_source_sha256": "8" * 64,
+            "regenerated_harness_source_sha256": "8" * 64,
+            "packaged_linked_binary_sha256": "9" * 64,
+            "regenerated_linked_binary_sha256": bootstrap_binary_sha256,
         },
         "bootstrap-constant-cache.json": {
             "status": "pass",

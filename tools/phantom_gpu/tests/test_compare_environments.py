@@ -251,9 +251,43 @@ def bootstrap_evidence(root: Path, ace_commit: str, phantom_commit: str) -> tupl
         "int generated_bootstrap_source;\n", encoding="utf-8"
     )
     (output / "bootstrap_phantom_constants.cu").write_text(
-        "int bootstrap_harness;\n", encoding="utf-8"
+        """\
+int Get_input_count() { return 0; }
+int Get_output_count() { return 0; }
+int Get_encode_scheme() { return 0; }
+int Get_decode_scheme() { return 0; }
+int bootstrap_harness;
+""",
+        encoding="utf-8",
     )
     (output / "bootstrap_phantom_constants_sm80").write_bytes(b"binary")
+    required_symbols = [
+        "Get_phantom_context_manifest",
+        "Get_phantom_resource_manifest",
+        "Get_phantom_constant_manifest",
+        "Load_cached_plain",
+        "main",
+    ]
+    (output / "linked_binary_symbols.txt").write_text(
+        "\n".join(f"00000000 T {symbol}" for symbol in required_symbols) + "\n",
+        encoding="utf-8",
+    )
+    (output / "generated_object_symbols.txt").write_text(
+        "00000000 T generated_bootstrap_source\n", encoding="utf-8"
+    )
+    (output / "harness_object_symbols.txt").write_text(
+        "\n".join(
+            f"00000000 T {helper}()"
+            for helper in (
+                "Get_input_count",
+                "Get_output_count",
+                "Get_encode_scheme",
+                "Get_decode_scheme",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     hashes = {
         name: hashlib.sha256((output / path).read_bytes()).hexdigest()
         for name, path in {
@@ -290,14 +324,37 @@ def bootstrap_evidence(root: Path, ace_commit: str, phantom_commit: str) -> tupl
     symbol_closure = {
         "schema_version": "ace.phantom.bootstrap-symbol-closure/1.0.0",
         "status": "pass",
+        "linked_binary_symbols_sha256": hashlib.sha256(
+            (output / "linked_binary_symbols.txt").read_bytes()
+        ).hexdigest(),
+        "required_symbols": required_symbols,
         "missing_symbols": [],
         "native_bootstrap_symbol_count": 0,
     }
+    helpers = [
+        "Get_input_count",
+        "Get_output_count",
+        "Get_encode_scheme",
+        "Get_decode_scheme",
+    ]
     io_helper_closure = {
         "schema_version": "ace.phantom.bootstrap-io-helper-closure/1.0.0",
         "status": "pass",
+        "helpers": helpers,
+        "counts": {
+            "generated_source": {helper: 0 for helper in helpers},
+            "harness_source": {helper: 1 for helper in helpers},
+            "generated_object": {helper: 0 for helper in helpers},
+            "harness_object": {helper: 1 for helper in helpers},
+        },
         "generated_source_sha256": hashes["source"],
         "harness_source_sha256": hashes["harness"],
+        "generated_object_symbols_sha256": hashlib.sha256(
+            (output / "generated_object_symbols.txt").read_bytes()
+        ).hexdigest(),
+        "harness_object_symbols_sha256": hashlib.sha256(
+            (output / "harness_object_symbols.txt").read_bytes()
+        ).hexdigest(),
     }
     archive_audit = {
         "schema_version": "ace.phantom.production-archive-members/1.0.0",
@@ -372,6 +429,9 @@ def bootstrap_evidence(root: Path, ace_commit: str, phantom_commit: str) -> tupl
                 "bootstrap_qualification.cu",
                 "bootstrap_phantom_constants.cu",
                 "bootstrap_phantom_constants_sm80",
+                "linked_binary_symbols.txt",
+                "generated_object_symbols.txt",
+                "harness_object_symbols.txt",
                 "symbol-closure.json",
                 "io-helper-closure.json",
                 "archive-member-audit.json",
@@ -431,17 +491,27 @@ def bootstrap_evidence(root: Path, ace_commit: str, phantom_commit: str) -> tupl
     write_json(
         root / "bootstrap-frozen-reference.json",
         {
-            "schema_version": "ace.phantom.bootstrap-frozen-reference/1.0.0",
+            "schema_version": "ace.phantom.bootstrap-frozen-reference/1.1.0",
             "status": "pass",
-            "comparison": "deterministic-host-artifact-hashes",
-            "artifact_manifest_sha256": hashlib.sha256(
+            "comparison": "exact-source-and-setup-with-per-run-cuda-artifacts",
+            "packaged_artifact_manifest_sha256": hashlib.sha256(
                 (evidence / "artifact_manifest.json").read_bytes()
             ).hexdigest(),
-            "host_qualification_sha256": qualification_sha,
-            "source_audit_sha256": hashes["audit"],
-            "expected_generated_source_sha256": hashes["source"],
-            "expected_harness_source_sha256": hashes["harness"],
-            "expected_linked_binary_sha256": hashes["binary"],
+            "packaged_host_qualification_sha256": qualification_sha,
+            "packaged_source_audit_sha256": hashes["audit"],
+            "regenerated_artifact_manifest_sha256": hashlib.sha256(
+                (evidence / "artifact_manifest.json").read_bytes()
+            ).hexdigest(),
+            "regenerated_host_qualification_sha256": qualification_sha,
+            "regenerated_source_audit_sha256": hashes["audit"],
+            "packaged_generated_source_sha256": hashes["source"],
+            "regenerated_generated_source_sha256": hashes["source"],
+            "packaged_harness_source_sha256": hashes["harness"],
+            "regenerated_harness_source_sha256": hashes["harness"],
+            "packaged_linked_binary_sha256": hashes["binary"],
+            "regenerated_linked_binary_sha256": hashes["binary"],
+            "source_and_setup_match": True,
+            "linked_binary_byte_identity_required": False,
         },
     )
     return ace_source_sha, phantom_source_sha
@@ -513,6 +583,75 @@ def result_root(base: Path, records: dict[str, dict]) -> Path:
     return root
 
 
+def rebind_bootstrap_per_run_provenance(
+    root: Path, *, packaged_binary_sha256: str | None = None
+) -> None:
+    evidence = root / "bootstrap-qualification"
+    output = evidence / "bootstrap_qualification"
+    symbol_path = output / "symbol-closure.json"
+    symbol = json.loads(symbol_path.read_text(encoding="utf-8"))
+    symbol["linked_binary_symbols_sha256"] = hashlib.sha256(
+        (output / "linked_binary_symbols.txt").read_bytes()
+    ).hexdigest()
+    write_json(symbol_path, symbol)
+    io_path = output / "io-helper-closure.json"
+    io = json.loads(io_path.read_text(encoding="utf-8"))
+    io["generated_object_symbols_sha256"] = hashlib.sha256(
+        (output / "generated_object_symbols.txt").read_bytes()
+    ).hexdigest()
+    io["harness_object_symbols_sha256"] = hashlib.sha256(
+        (output / "harness_object_symbols.txt").read_bytes()
+    ).hexdigest()
+    write_json(io_path, io)
+
+    binary_sha = hashlib.sha256(
+        (output / "bootstrap_phantom_constants_sm80").read_bytes()
+    ).hexdigest()
+    symbol_sha = hashlib.sha256(symbol_path.read_bytes()).hexdigest()
+    io_sha = hashlib.sha256(io_path.read_bytes()).hexdigest()
+    qualification_path = output / "qualification.json"
+    qualification = json.loads(qualification_path.read_text(encoding="utf-8"))
+    qualification["linked_binary_sha256"] = binary_sha
+    qualification["symbol_closure_sha256"] = symbol_sha
+    qualification["io_helper_closure_sha256"] = io_sha
+    write_json(qualification_path, qualification)
+    qualification_sha = hashlib.sha256(qualification_path.read_bytes()).hexdigest()
+
+    artifact_path = evidence / "artifact_manifest.json"
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact["linked_binary_sha256"] = binary_sha
+    for relative in (
+        "bootstrap_phantom_constants_sm80",
+        "linked_binary_symbols.txt",
+        "generated_object_symbols.txt",
+        "harness_object_symbols.txt",
+        "symbol-closure.json",
+        "io-helper-closure.json",
+        "qualification.json",
+    ):
+        artifact["files"][f"bootstrap_qualification/{relative}"] = (
+            hashlib.sha256((output / relative).read_bytes()).hexdigest()
+        )
+    write_json(artifact_path, artifact)
+    artifact_sha = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+
+    run_path = evidence / "manifest.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    run["bootstrap_linked_binary_sha256"] = binary_sha
+    run["bootstrap_host_qualification_sha256"] = qualification_sha
+    run["artifact_manifest_sha256"] = artifact_sha
+    write_json(run_path, run)
+
+    frozen_path = root / "bootstrap-frozen-reference.json"
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    if packaged_binary_sha256 is not None:
+        frozen["packaged_linked_binary_sha256"] = packaged_binary_sha256
+    frozen["regenerated_artifact_manifest_sha256"] = artifact_sha
+    frozen["regenerated_host_qualification_sha256"] = qualification_sha
+    frozen["regenerated_linked_binary_sha256"] = binary_sha
+    write_json(frozen_path, frozen)
+
+
 def archive(root: Path, output: Path) -> Path:
     with tarfile.open(output, "w:gz") as target:
         target.add(root, arcname="results")
@@ -551,19 +690,28 @@ def test_retained_stable_fields_match_while_per_run_receipts_differ(
     assert report["comparison_contract"]["bootstrap_field_count"] > 15
     assert "retained_exact_artifacts" in report["matching_fields"]
     assert "retained_ant_semantic_summary_sha256" in report["matching_fields"]
-    assert "bootstrap_linked_binary_sha256" in report["matching_fields"]
-    assert "bootstrap_io_helper_closure_sha256" in report["matching_fields"]
+    assert "bootstrap_common_archive_sha256" in report["matching_fields"]
+    assert "bootstrap_symbol_closure_projection" in report["matching_fields"]
+    assert "bootstrap_io_helper_closure_projection" in report["matching_fields"]
     assert (
         "bootstrap_frozen_reference_sha256"
         in report["allowed_differences"]
     )
+    cuda_provenance = report["allowed_differences"][
+        "bootstrap_cuda_toolchain_provenance"
+    ]
+    assert "bootstrap_linked_binary_sha256" in cuda_provenance
+    assert "bootstrap_adapter_archive_sha256" in cuda_provenance
+    assert "bootstrap_provider_archive_sha256" in cuda_provenance
+    assert "bootstrap_symbol_closure_sha256" in cuda_provenance
+    assert "bootstrap_io_helper_closure_sha256" in cuda_provenance
     assert "setup timing" in " ".join(
         report["allowed_differences"]["bootstrap_per_run_evidence"]
     )
     assert report["mismatches"] == {}
 
 
-def test_bootstrap_stable_archive_hash_tamper_is_reported(tmp_path: Path) -> None:
+def test_bootstrap_common_archive_hash_tamper_is_reported(tmp_path: Path) -> None:
     module = load_module()
     local = result_root(tmp_path / "local", retained_records("a", "b"))
     remote = result_root(tmp_path / "remote", retained_records("a", "b"))
@@ -572,31 +720,14 @@ def test_bootstrap_stable_archive_hash_tamper_is_reported(tmp_path: Path) -> Non
         / "bootstrap-qualification/bootstrap_qualification/qualification.json"
     )
     qualification = json.loads(qualification_path.read_text(encoding="utf-8"))
-    qualification["provider_archive_sha256"] = digest("0")
+    qualification["common_archive_sha256"] = digest("0")
     write_json(qualification_path, qualification)
-    qualification_sha = hashlib.sha256(qualification_path.read_bytes()).hexdigest()
-    artifact_path = remote / "bootstrap-qualification/artifact_manifest.json"
-    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-    artifact["files"][
-        "bootstrap_qualification/qualification.json"
-    ] = qualification_sha
-    write_json(artifact_path, artifact)
-    run_path = remote / "bootstrap-qualification/manifest.json"
-    run = json.loads(run_path.read_text(encoding="utf-8"))
-    run["bootstrap_host_qualification_sha256"] = qualification_sha
-    artifact_sha = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
-    run["artifact_manifest_sha256"] = artifact_sha
-    write_json(run_path, run)
-    frozen_path = remote / "bootstrap-frozen-reference.json"
-    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
-    frozen["artifact_manifest_sha256"] = artifact_sha
-    frozen["host_qualification_sha256"] = qualification_sha
-    write_json(frozen_path, frozen)
+    rebind_bootstrap_per_run_provenance(remote)
 
     report = module.comparison_report(module.fields(local), module.fields(remote))
 
     assert report["status"] == "fail"
-    assert set(report["mismatches"]) == {"bootstrap_provider_archive_sha256"}
+    assert set(report["mismatches"]) == {"bootstrap_common_archive_sha256"}
 
 
 def test_bootstrap_per_run_frozen_reference_hash_may_differ(tmp_path: Path) -> None:
@@ -605,7 +736,7 @@ def test_bootstrap_per_run_frozen_reference_hash_may_differ(tmp_path: Path) -> N
     remote = result_root(tmp_path / "remote", retained_records("a", "b"))
     frozen_path = remote / "bootstrap-frozen-reference.json"
     frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
-    frozen["per_run_note"] = "different extraction root"
+    frozen["packaged_linked_binary_sha256"] = digest("0")
     write_json(frozen_path, frozen)
 
     report = module.comparison_report(module.fields(local), module.fields(remote))
@@ -616,6 +747,121 @@ def test_bootstrap_per_run_frozen_reference_hash_may_differ(tmp_path: Path) -> N
         "bootstrap_frozen_reference_sha256"
     ]
     assert difference["local"] != difference["remote"]
+
+
+def test_bootstrap_cuda_bytes_may_differ_when_semantic_closure_matches(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    local = result_root(tmp_path / "local", retained_records("a", "b"))
+    remote = result_root(tmp_path / "remote", retained_records("a", "b"))
+    output = remote / "bootstrap-qualification/bootstrap_qualification"
+    packaged_binary_sha = hashlib.sha256(
+        (output / "bootstrap_phantom_constants_sm80").read_bytes()
+    ).hexdigest()
+    (output / "bootstrap_phantom_constants_sm80").write_bytes(
+        b"different valid CUDA 12.4 linked image"
+    )
+    (output / "linked_binary_symbols.txt").write_text(
+        "\n".join(
+            f"0000{index:04x} T {symbol}"
+            for index, symbol in enumerate(module.BOOTSTRAP_REQUIRED_SYMBOLS)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (output / "generated_object_symbols.txt").write_text(
+        "00000010 T generated_bootstrap_source\n", encoding="utf-8"
+    )
+    (output / "harness_object_symbols.txt").write_text(
+        "\n".join(
+            f"0000{index + 32:04x} T {helper}()"
+            for index, helper in enumerate(module.BOOTSTRAP_IO_HELPERS)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    qualification_path = output / "qualification.json"
+    qualification = json.loads(qualification_path.read_text(encoding="utf-8"))
+    qualification["adapter_archive_sha256"] = digest("d")
+    qualification["provider_archive_sha256"] = digest("e")
+    write_json(qualification_path, qualification)
+    rebind_bootstrap_per_run_provenance(
+        remote, packaged_binary_sha256=packaged_binary_sha
+    )
+
+    local_fields = module.fields(local)
+    remote_fields = module.fields(remote)
+    report = module.comparison_report(local_fields, remote_fields)
+
+    assert report["status"] == "pass"
+    assert report["mismatches"] == {}
+    assert (
+        local_fields["bootstrap_symbol_closure_projection"]
+        == remote_fields["bootstrap_symbol_closure_projection"]
+    )
+    assert (
+        local_fields["bootstrap_io_helper_closure_projection"]
+        == remote_fields["bootstrap_io_helper_closure_projection"]
+    )
+    assert (
+        local_fields["bootstrap_linked_binary_sha256"]
+        != remote_fields["bootstrap_linked_binary_sha256"]
+    )
+    assert (
+        local_fields["bootstrap_symbol_closure_sha256"]
+        != remote_fields["bootstrap_symbol_closure_sha256"]
+    )
+    assert (
+        local_fields["bootstrap_io_helper_closure_sha256"]
+        != remote_fields["bootstrap_io_helper_closure_sha256"]
+    )
+
+
+def test_bootstrap_raw_required_symbol_tamper_is_rejected(tmp_path: Path) -> None:
+    module = load_module()
+    root = result_root(tmp_path, retained_records("a", "b"))
+    output = root / "bootstrap-qualification/bootstrap_qualification"
+    symbols_path = output / "linked_binary_symbols.txt"
+    symbols_path.write_text(
+        symbols_path.read_text(encoding="utf-8").replace(
+            "Load_cached_plain", "Load_uncached_plain"
+        ),
+        encoding="utf-8",
+    )
+    rebind_bootstrap_per_run_provenance(root)
+
+    with pytest.raises(SystemExit, match="raw symbol inventory"):
+        module.fields(root)
+
+
+def test_bootstrap_io_helper_count_tamper_is_rejected(tmp_path: Path) -> None:
+    module = load_module()
+    root = result_root(tmp_path, retained_records("a", "b"))
+    closure_path = (
+        root
+        / "bootstrap-qualification/bootstrap_qualification/io-helper-closure.json"
+    )
+    closure = json.loads(closure_path.read_text(encoding="utf-8"))
+    closure["counts"]["harness_object"]["Get_input_count"] = 2
+    write_json(closure_path, closure)
+    rebind_bootstrap_per_run_provenance(root)
+
+    with pytest.raises(SystemExit, match="I/O-helper closure counts"):
+        module.fields(root)
+
+
+def test_bootstrap_generated_source_tamper_is_rejected(tmp_path: Path) -> None:
+    module = load_module()
+    root = result_root(tmp_path, retained_records("a", "b"))
+    source_path = (
+        root
+        / "bootstrap-qualification/bootstrap_qualification/bootstrap_qualification.cu"
+    )
+    source_path.write_text("int changed_bootstrap_source;\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="generation source hash"):
+        module.fields(root)
 
 
 def test_bootstrap_cross_record_inconsistency_is_rejected(tmp_path: Path) -> None:
