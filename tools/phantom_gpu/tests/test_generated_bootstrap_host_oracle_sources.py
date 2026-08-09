@@ -126,6 +126,16 @@ def test_generated_oracle_calls_only_the_linked_decomposition() -> None:
     assert 'constexpr char kProvider[] = "generated-ant"' in generated
     assert "Decode(&result, inputs.slots)" in generated
     assert '"context_attestation", context_attestation' in generated
+    io_block = generated[generated.index('extern "C" {') : generated.index(
+        "\n}\n\nnamespace {", generated.index('extern "C" {')
+    )]
+    for helper in (
+        "Get_input_count",
+        "Get_output_count",
+        "Get_encode_scheme",
+        "Get_decode_scheme",
+    ):
+        assert len(re.findall(rf"\b{helper}\s*\(", io_block)) == 1
 
 
 def test_owned_paths_do_not_embed_milestone_tokens() -> None:
