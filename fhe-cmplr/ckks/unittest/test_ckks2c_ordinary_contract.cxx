@@ -23,6 +23,7 @@
 #include "fhe/ckks/ckks2c_driver.h"
 #include "fhe/ckks/ckks_opcode.h"
 #include "fhe/ckks/config.h"
+#include "fhe/ckks/phantom_constant_manifest.h"
 #include "fhe/ckks/phantom_context_manifest.h"
 #include "fhe/core/ctx_param_ana.h"
 #include "fhe/core/lower_ctx.h"
@@ -46,6 +47,8 @@ extern "C" const PHANTOM_CONTEXT_MANIFEST*
 Get_phantom_context_manifest() { return nullptr; }
 extern "C" const PHANTOM_RESOURCE_MANIFEST*
 Get_phantom_resource_manifest() { return nullptr; }
+extern "C" const PHANTOM_CONSTANT_MANIFEST*
+Get_phantom_constant_manifest() { return nullptr; }
 )";
 
 void SetValidContextParameters(fhe::core::CTX_PARAM& parameters) {
@@ -106,8 +109,8 @@ TEST(CKKS2COrdinaryContract, SeparatesRetainedResourceRequirements) {
   const auto resources =
       fhe::ckks::Build_phantom_resource_descriptor(parameters, context);
 
-  EXPECT_EQ(context._resource_schema_version, 2u);
-  EXPECT_EQ(resources._schema_version, 2u);
+  EXPECT_EQ(context._resource_schema_version, 3u);
+  EXPECT_EQ(resources._schema_version, 3u);
   EXPECT_EQ(resources._rotation_steps,
             (std::vector<int32_t>{-1, 1, 3}));
   EXPECT_EQ(resources._rotation_batches,
@@ -119,6 +122,12 @@ TEST(CKKS2COrdinaryContract, SeparatesRetainedResourceRequirements) {
   EXPECT_NE(resources._flags & fhe::ckks::PHANTOM_RESOURCE_ROTATE_BATCH, 0u);
   EXPECT_NE(resources._flags & fhe::ckks::PHANTOM_RESOURCE_RAISE_MOD, 0u);
   EXPECT_NE(resources._flags & fhe::ckks::PHANTOM_RESOURCE_MONOMIALS, 0u);
+  EXPECT_EQ(resources._flags &
+                fhe::ckks::PHANTOM_RESOURCE_COMPLEX_PLAINTEXT,
+            0u);
+  EXPECT_EQ(resources._flags &
+                fhe::ckks::PHANTOM_RESOURCE_NATIVE_BOOTSTRAP_PRECOMPUTE,
+            0u);
   EXPECT_EQ(std::find(resources._rotation_steps.begin(),
                       resources._rotation_steps.end(), 63),
             resources._rotation_steps.end());
@@ -131,6 +140,33 @@ TEST(CKKS2COrdinaryContract, SeparatesRetainedResourceRequirements) {
             std::string::npos);
   EXPECT_NE(json.find("\"raise_mod\":true"), std::string::npos);
   EXPECT_NE(json.find("\"monomial_powers\":[0,63]"),
+            std::string::npos);
+  EXPECT_NE(json.find("\"complex_plaintext\":false"), std::string::npos);
+  EXPECT_NE(json.find("\"native_bootstrap_precompute\":false"),
+            std::string::npos);
+}
+
+TEST(CKKS2COrdinaryContract,
+     RecordsComplexPlaintextWithoutNativeBootstrapPrecompute) {
+  fhe::core::CTX_PARAM parameters;
+  SetValidContextParameters(parameters);
+  parameters.Require_complex_plaintext();
+
+  const auto context =
+      fhe::ckks::Build_phantom_context_descriptor(parameters);
+  const auto resources =
+      fhe::ckks::Build_phantom_resource_descriptor(parameters, context);
+
+  EXPECT_NE(resources._flags &
+                fhe::ckks::PHANTOM_RESOURCE_COMPLEX_PLAINTEXT,
+            0u);
+  EXPECT_EQ(resources._flags &
+                fhe::ckks::PHANTOM_RESOURCE_NATIVE_BOOTSTRAP_PRECOMPUTE,
+            0u);
+  const std::string json =
+      fhe::ckks::Serialize_phantom_resource_descriptor(resources);
+  EXPECT_NE(json.find("\"complex_plaintext\":true"), std::string::npos);
+  EXPECT_NE(json.find("\"native_bootstrap_precompute\":false"),
             std::string::npos);
 }
 
@@ -148,11 +184,12 @@ TEST(CKKS2COrdinaryContract, EmitsClosedEmptyResourceSchema) {
   const auto resources =
       fhe::ckks::Build_phantom_resource_descriptor(parameters, context);
   EXPECT_EQ(fhe::ckks::Serialize_phantom_resource_descriptor(resources),
-            "{\"context_schema_version\":1,\"conjugation_key\":false,"
-            "\"monomial_powers\":[],\"raise_mod\":false,"
+            "{\"context_schema_version\":1,\"complex_plaintext\":false,"
+            "\"conjugation_key\":false,\"monomial_powers\":[],"
+            "\"native_bootstrap_precompute\":false,\"raise_mod\":false,"
             "\"relinearization_key\":false,\"rotate_batch\":false,"
             "\"rotation_batches\":[],\"rotation_steps\":[],"
-            "\"schema_version\":2}");
+            "\"schema_version\":3}");
 }
 
 TEST(CKKS2COrdinaryContract, RejectsNoncanonicalManifestMonomialPower) {
@@ -189,6 +226,52 @@ TEST(CKKS2COrdinaryContract, DerivesContextFromCompilerParameters) {
   const std::string second = fhe::ckks::Serialize_phantom_context_descriptor(
       fhe::ckks::Build_phantom_context_descriptor(parameters));
   EXPECT_EQ(first, second);
+}
+
+TEST(CKKS2COrdinaryContract, HashesCanonicalConstantCacheIdentity) {
+  EXPECT_EQ(
+      fhe::ckks::Phantom_sha256("abc"),
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  EXPECT_EQ(fhe::ckks::Phantom_raw_scale_text(std::ldexp(1.0, 56)),
+            "0x1.0000000000000p+56");
+  const std::string context_sha256(64, 'a');
+  const std::string key = fhe::ckks::Build_phantom_cache_key_json(
+      60, context_sha256, 1, "0x1.0000000000000p+56", "complex_f64",
+      8192);
+  EXPECT_EQ(
+      fhe::ckks::Phantom_sha256(key),
+      "94fda595e8d9fc908e413437750320afa0a072ebbd22ae8df6f68d72424acead");
+}
+
+TEST(CKKS2COrdinaryContract, SerializesClosedConstantManifest) {
+  fhe::ckks::PHANTOM_CONSTANT_DESCRIPTOR constant;
+  constant._entry_id = 0;
+  constant._constant_id = 60;
+  constant._symbol = "_cst_60";
+  constant._slot_count = 16;
+  constant._ace_level = 4;
+  constant._chain_index = 1;
+  constant._scale_degree = 1;
+  constant._raw_scale = std::ldexp(1.0, 40);
+  constant._raw_scale_text =
+      fhe::ckks::Phantom_raw_scale_text(constant._raw_scale);
+  constant._payload_sha256 = std::string(64, 'b');
+  constant._cache_key_sha256 = std::string(64, 'c');
+  const std::string context_sha256(64, 'a');
+  EXPECT_EQ(
+      fhe::ckks::Serialize_phantom_constant_manifest(
+          context_sha256, 1, 3, {constant}),
+      "{\"constants\":[{\"ace_level\":4,\"cache_key_sha256\":\"" +
+          std::string(64, 'c') +
+          "\",\"chain_index\":1,\"constant_id\":60,\"element_type\":"
+          "\"complex_f64\",\"entry_id\":0,\"payload_sha256\":\"" +
+          std::string(64, 'b') +
+          "\",\"raw_scale\":\"0x1.0000000000000p+40\",\"scale_degree\":1,"
+          "\"slot_count\":16,\"symbol\":\"_cst_60\"}],"
+          "\"context_manifest_sha256\":\"" +
+          context_sha256 +
+          "\",\"context_schema_version\":1,\"resource_schema_version\":3,"
+          "\"schema_version\":1}");
 }
 
 TEST(CKKS2COrdinaryContract, DistinguishesDifferentCompilerParameters) {
@@ -800,6 +883,31 @@ TEST_F(CKKS2COrdinaryAirVerifier, AcceptsContextDerivedEncodeLimits) {
   EXPECT_TRUE(Verify(Use_plain(encode), &diagnostic)) << diagnostic;
 }
 
+TEST_F(CKKS2COrdinaryAirVerifier,
+       AnalysisTracksComplexPlaintextRequirement) {
+  NODE_PTR encode = Encode(Float_constant(), 16, 1, 4);
+  const uint32_t complex_plaintext = 1;
+  encode->Set_attr(fhe::core::FHE_ATTR_KIND::ENCODE_DCMPLX,
+                   &complex_plaintext, 1);
+  NODE_PTR product = Use_plain(encode);
+  ADDR_DATUM_PTR result =
+      _func_scope->New_var(product->Rtype(), "complex_product", _spos);
+  _container->Stmt_list().Append(
+      _container->New_st(product, result, _spos));
+  _container->Stmt_list().Append(
+      _container->New_retv(_container->New_ld(result, _spos), _spos));
+
+  fhe::ckks::CKKS_CONFIG config;
+  config._poly_deg         = 32;
+  config._max_cipher_lvl   = 4;
+  config._input_cipher_lvl = 4;
+  air::driver::DRIVER_CTX driver_context;
+  fhe::core::CTX_PARAM_ANA analysis(_func_scope, &_lower_ctx,
+                                    &driver_context, &config);
+  ASSERT_EQ(analysis.Run(), R_CODE::NORMAL);
+  EXPECT_TRUE(_lower_ctx.Get_ctx_param().Complex_plaintext_required());
+}
+
 TEST_F(CKKS2COrdinaryAirVerifier, RejectsEncodeLengthBeyondContextSlots) {
   std::string diagnostic;
   NODE_PTR encode = Encode(Float_constant(), 17, 1, 4);
@@ -1110,6 +1218,41 @@ TEST_F(CKKS2COrdinaryAirVerifier, CodegenDoesNotRepairMissingKeyResources) {
   EXPECT_EQ(driver.Ctx().Phantom_resource_descriptor()._flags, 0u);
   EXPECT_TRUE(
       driver.Ctx().Phantom_resource_descriptor()._rotation_steps.empty());
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier,
+       PhantomDataFileDoesNotSelectAntOfflineEncode) {
+  TYPE_PTR f32 = _glob->Prim_type(PRIMITIVE_TYPE::FLOAT_32);
+  TYPE_PTR array_type = _glob->New_arr_type(
+      _glob->New_str("ordinary_float_payload"), f32, {1}, _spos);
+  float payload = 1.0f;
+  CONSTANT_PTR constant = _glob->New_const(
+      CONSTANT_KIND::ARRAY, array_type, &payload, sizeof(payload));
+  NODE_PTR encode =
+      Encode(_container->New_ldc(constant, _spos), 1, 1, 4);
+  ADDR_DATUM_PTR encoded =
+      _func_scope->New_var(_plain, "ordinary_encoded", _spos);
+  _container->Stmt_list().Append(
+      _container->New_st(encode, encoded, _spos));
+  _container->Stmt_list().Append(
+      _container->New_retv(_container->New_ld(_cipher_input, _spos), _spos));
+
+  fhe::ckks::CKKS2C_CONFIG config;
+  config.Set_provider("phantom");
+  config._data_file = "/dev/null";
+  config.Set_ifile("ordinary-contract-test");
+  std::ostringstream output;
+  fhe::ckks::CKKS2C_DRIVER driver(output, _lower_ctx, config);
+  driver.Verify_or_throw(_glob);
+  _glob = driver.Flatten(_glob);
+  fhe::ckks::CKKS2C_VISITOR visitor(driver.Ctx());
+  driver.Run(_glob, visitor);
+
+  const std::string source = output.str();
+  fhe::ckks::CKKS2C_DRIVER::Verify_source_or_throw(source,
+                                                   PROVIDER::PHANTOM);
+  EXPECT_NE(source.find("Encode_float("), std::string::npos);
+  EXPECT_EQ(source.find("Pt_from_msg"), std::string::npos);
 }
 
 TEST_F(CKKS2COrdinaryAirVerifier, AcceptsRetainedConjugateMetadata) {

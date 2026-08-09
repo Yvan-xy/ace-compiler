@@ -23,7 +23,9 @@
 #include "util/modulus.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -31,10 +33,12 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -54,6 +58,23 @@ std::unordered_map<std::string, OperationStats> operation_stats;
 namespace {
 
 enum class ObjectState : uint8_t { kUninitialized, kLive, kZero, kFreed };
+
+struct ConstantCacheKey {
+  uint64_t               _constant_id = 0;
+  phantom::parms_id_type _parameter_fingerprint{};
+  size_t                 _chain_index = 0;
+  double                 _raw_scale = 0.0;
+  uint32_t               _element_type = 0;
+  size_t                 _slot_count = 0;
+
+  [[nodiscard]] bool operator<(const ConstantCacheKey& other) const noexcept {
+    return std::tie(_constant_id, _parameter_fingerprint, _chain_index,
+                    _raw_scale, _element_type, _slot_count) <
+           std::tie(other._constant_id, other._parameter_fingerprint,
+                    other._chain_index, other._raw_scale,
+                    other._element_type, other._slot_count);
+  }
+};
 
 [[noreturn]] void Fail(const char* diagnostic, const char* format, ...) {
   std::fprintf(stderr, "ACE_PHANTOM_ORDINARY_ERROR[%s]: ", diagnostic);
@@ -133,8 +154,19 @@ public:
                    "failed during teardown: %s\n",
                    cudaGetErrorString(status));
     }
+    // Cached plaintexts own device allocations and must retire while the
+    // provider context and its streams are still alive.
+    _constant_cache.clear();
+    _constant_entries.clear();
     _owned_outputs.clear();
     _owned_inputs.clear();
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      std::fprintf(stderr,
+                   "ACE_PHANTOM_ORDINARY_ERROR[CTX_CACHE_SYNC]: CUDA "
+                   "synchronization failed after cache teardown: %s\n",
+                   cudaGetErrorString(status));
+    }
   }
 
   void PrepareInput(TENSOR* input, const char* name) {
@@ -206,6 +238,31 @@ public:
     std::vector<std::complex<double>> values(input, input + len);
     EncodeVector(plain, values, degree, level, "ENCODE_COMPLEX");
   }
+
+  void EncodeManifestConstant(Plaintext* plain, uint32_t entry_id) {
+    RequireWritablePlain(plain, "ENCODE_MANIFEST_CONSTANT");
+    const PHANTOM_CONSTANT_ENTRY& entry = FindConstantEntry(entry_id);
+    const ConstantCacheKey key = ConstantKey(entry, "ENCODE_MANIFEST_CONSTANT");
+    EncodeConstantPayload(plain, entry, "ENCODE_MANIFEST_CONSTANT");
+    MarkPlain(plain, ObjectState::kLive);
+    ValidateConstantPlain(*plain, entry, key, "ENCODE_MANIFEST_CONSTANT");
+  }
+
+  void LoadCachedConstant(Plaintext* plain, uint32_t entry_id) {
+    RequireWritablePlain(plain, "LOAD_CACHED_CONSTANT");
+    const PHANTOM_CONSTANT_ENTRY& entry = FindConstantEntry(entry_id);
+    const ConstantCacheKey key = ConstantKey(entry, "LOAD_CACHED_CONSTANT");
+    const auto cached = _constant_cache.find(key);
+    if (cached == _constant_cache.end()) {
+      Fail("CONSTANT_CACHE_MISS",
+           "constant entry %u has no context-owned cached plaintext", entry_id);
+    }
+    ProviderCall("LOAD_CACHED_CONSTANT", [&] { *plain = cached->second; });
+    MarkPlain(plain, ObjectState::kLive);
+    ValidateConstantPlain(*plain, entry, key, "LOAD_CACHED_CONSTANT");
+  }
+
+  PHANTOM_SETUP_METRICS SetupMetrics() const { return _setup_metrics; }
 
   template <typename T>
   void EncodeMask(Plaintext* plain, T value, size_t len, SCALE_T degree,
@@ -894,7 +951,10 @@ private:
   PHANTOM_CONTEXT()
       : _manifest(Get_phantom_context_manifest()),
         _resources(Get_phantom_resource_manifest()),
+        _constants(Get_phantom_constant_manifest()),
         _logical_slots(_manifest == nullptr ? 0 : _manifest->_logical_slots) {
+    const auto setup_start = std::chrono::steady_clock::now();
+    const size_t setup_free_before = FreeDeviceBytes("CONTEXT_SETUP_MEMORY");
     ValidateProgramManifest();
     _resource_flags = _resources->_flags;
 
@@ -949,15 +1009,302 @@ private:
                                                      rotation_steps,
                                                      needs_conjugation));
     }
+    SynchronizeDevice("CONTEXT_SETUP_SYNC");
+    const size_t setup_free_after = FreeDeviceBytes("CONTEXT_SETUP_MEMORY");
+    _setup_metrics._context_and_key_setup_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      setup_start)
+            .count();
+    _setup_metrics._context_and_key_device_bytes =
+        DeviceBytesUsed(setup_free_before, setup_free_after);
+
+    // Constant payload encoding and upload are context setup, never graph work.
+    BuildConstantCache();
+  }
+
+  static void SynchronizeDevice(const char* diagnostic) {
+    const cudaError_t status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      Fail(diagnostic, "CUDA synchronization failed: %s",
+           cudaGetErrorString(status));
+    }
+  }
+
+  static size_t FreeDeviceBytes(const char* diagnostic) {
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    const cudaError_t status = cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (status != cudaSuccess) {
+      Fail(diagnostic, "CUDA memory query failed: %s",
+           cudaGetErrorString(status));
+    }
+    return free_bytes;
+  }
+
+  static uint64_t DeviceBytesUsed(size_t before, size_t after) {
+    return before > after ? static_cast<uint64_t>(before - after) : 0;
+  }
+
+  static bool IsSha256(const char* value) {
+    if (value == nullptr || std::strlen(value) != 64) return false;
+    for (size_t index = 0; index < 64; ++index) {
+      const unsigned char byte = static_cast<unsigned char>(value[index]);
+      if (!std::isdigit(byte) && (byte < 'a' || byte > 'f')) return false;
+    }
+    return true;
+  }
+
+  void ValidateConstantManifest() const {
+    constexpr uint32_t constant_schema_version = 1;
+    constexpr uint32_t context_schema_version = 1;
+    constexpr uint32_t resource_schema_version = 3;
+    if (_constants == nullptr) {
+      Fail("CONSTANT_MANIFEST_NULL", "constant manifest is null");
+    }
+    if (_constants->_schema_version != constant_schema_version ||
+        _constants->_context_schema_version != context_schema_version ||
+        _constants->_resource_schema_version != resource_schema_version) {
+      Fail("CONSTANT_MANIFEST_SCHEMA",
+           "unsupported constant/context/resource manifest schema");
+    }
+    if (!IsSha256(_constants->_context_manifest_sha256)) {
+      Fail("CONSTANT_CONTEXT_SHA",
+           "context manifest SHA-256 must be 64 lowercase hexadecimal digits");
+    }
+    if ((_constants->_entry_count == 0) != (_constants->_entries == nullptr)) {
+      Fail("CONSTANT_MANIFEST_ENTRIES",
+           "constant entry count and array must agree exactly");
+    }
+    if (_constants->_entry_count != 0 &&
+        (_resource_flags & PHANTOM_RESOURCE_COMPLEX_PLAINTEXT) == 0) {
+      Fail("CONSTANT_RESOURCE",
+           "complex plaintext constants require the declared resource bit");
+    }
+  }
+
+  ConstantCacheKey ConstantKey(const PHANTOM_CONSTANT_ENTRY& entry,
+                               const char* diagnostic) const {
+    size_t expected_chain = 0;
+    double expected_scale = 0.0;
+    try {
+      expected_chain = AceLevelToChainIndex(
+          entry._ace_level, _manifest->_data_q_count,
+          _first_data_chain_index);
+      expected_scale = ScaleForDegree(entry._scale_degree,
+                                      _manifest->_scaling_modulus_bits);
+    } catch (const std::exception& error) {
+      Fail(diagnostic, "constant entry %u: %s", entry._entry_id,
+           error.what());
+    }
+    if (entry._chain_index != expected_chain ||
+        entry._raw_scale != expected_scale) {
+      Fail(diagnostic,
+           "constant entry %u level/chain/scale tuple is inconsistent",
+           entry._entry_id);
+    }
+    const auto& context_data = _context->get_context_data(expected_chain);
+    if (std::log2(expected_scale) >=
+        context_data.total_coeff_modulus_bit_count()) {
+      Fail(diagnostic,
+           "constant entry %u scale does not fit its declared chain",
+           entry._entry_id);
+    }
+    return ConstantCacheKey{
+        entry._constant_id, context_data.parms().parms_id(), expected_chain,
+        expected_scale, entry._element_type, entry._slot_count};
+  }
+
+  void ValidateConstantEntry(const PHANTOM_CONSTANT_ENTRY& entry) const {
+    if (entry._element_type != PHANTOM_CONSTANT_COMPLEX_F64) {
+      Fail("CONSTANT_ELEMENT_TYPE",
+           "constant entry %u has unsupported element type %u",
+           entry._entry_id, entry._element_type);
+    }
+    if (entry._scale_degree <= 0) {
+      Fail("CONSTANT_SCALE_DEGREE",
+           "constant entry %u scale degree must be positive",
+           entry._entry_id);
+    }
+    if (entry._slot_count == 0 || entry._slot_count > _logical_slots ||
+        entry._slot_count > std::numeric_limits<size_t>::max() / 2 ||
+        entry._interleaved_value_count != entry._slot_count * 2 ||
+        entry._interleaved_values == nullptr) {
+      Fail("CONSTANT_PAYLOAD_SHAPE",
+           "constant entry %u has an invalid interleaved complex payload",
+           entry._entry_id);
+    }
+    if (entry._symbol == nullptr || entry._symbol[0] == '\0' ||
+        !IsSha256(entry._payload_sha256) ||
+        !IsSha256(entry._cache_key_sha256)) {
+      Fail("CONSTANT_IDENTITY",
+           "constant entry %u has an invalid symbol or SHA-256",
+           entry._entry_id);
+    }
+    for (size_t index = 0; index < entry._interleaved_value_count; ++index) {
+      if (!std::isfinite(entry._interleaved_values[index])) {
+        Fail("CONSTANT_PAYLOAD_VALUE",
+             "constant entry %u payload value %zu is not finite",
+             entry._entry_id, index);
+      }
+    }
+    (void)ConstantKey(entry, "CONSTANT_METADATA");
+  }
+
+  std::vector<std::complex<double>> ConstantValues(
+      const PHANTOM_CONSTANT_ENTRY& entry) const {
+    std::vector<std::complex<double>> values;
+    values.reserve(entry._slot_count);
+    for (size_t index = 0; index < entry._slot_count; ++index) {
+      values.emplace_back(entry._interleaved_values[index * 2],
+                          entry._interleaved_values[index * 2 + 1]);
+    }
+    return values;
+  }
+
+  void EncodeConstantPayload(Plaintext* plain,
+                             const PHANTOM_CONSTANT_ENTRY& entry,
+                             const char* diagnostic) {
+    const std::vector<std::complex<double>> values = ConstantValues(entry);
+    ProviderCall(diagnostic, [&] {
+      _encoder->encode(*_context, values, entry._raw_scale, *plain,
+                       entry._chain_index);
+    });
+  }
+
+  void ValidateConstantPlain(const Plaintext& plain,
+                             const PHANTOM_CONSTANT_ENTRY& entry,
+                             const ConstantCacheKey& key,
+                             const char* diagnostic) const {
+    ValidatePlainMetadata(plain, diagnostic);
+    if (plain.parms_id() != key._parameter_fingerprint ||
+        plain.chain_index() != key._chain_index ||
+        plain.scale() != key._raw_scale ||
+        key._constant_id != entry._constant_id ||
+        key._element_type != entry._element_type ||
+        key._slot_count != entry._slot_count) {
+      Fail(diagnostic,
+           "constant entry %u does not match its full cache-key tuple",
+           entry._entry_id);
+    }
+  }
+
+  const PHANTOM_CONSTANT_ENTRY& FindConstantEntry(uint32_t entry_id) const {
+    const auto found = _constant_entries.find(entry_id);
+    if (found == _constant_entries.end()) {
+      Fail("CONSTANT_ENTRY_ID", "constant entry id %u is not declared",
+           entry_id);
+    }
+    return *found->second;
+  }
+
+  void BuildConstantCache() {
+    const auto cache_start = std::chrono::steady_clock::now();
+    const size_t cache_free_before = FreeDeviceBytes("CONSTANT_CACHE_MEMORY");
+    ValidateConstantManifest();
+    uint64_t attributed_payload_host_bytes = 0;
+    uint64_t logical_device_bytes = 0;
+
+    for (size_t index = 0; index < _constants->_entry_count; ++index) {
+      const PHANTOM_CONSTANT_ENTRY& entry = _constants->_entries[index];
+      if (index > std::numeric_limits<uint32_t>::max() ||
+          entry._entry_id != static_cast<uint32_t>(index)) {
+        Fail("CONSTANT_ENTRY_ID",
+             "constant entry id %u must equal its manifest index %zu",
+             entry._entry_id, index);
+      }
+      ValidateConstantEntry(entry);
+      if (entry._interleaved_value_count >
+          std::numeric_limits<uint64_t>::max() / sizeof(double)) {
+        Fail("CONSTANT_CACHE_MEMORY",
+             "constant entry %u payload byte count overflowed",
+             entry._entry_id);
+      }
+      const uint64_t payload_bytes =
+          static_cast<uint64_t>(entry._interleaved_value_count) *
+          sizeof(double);
+      if (payload_bytes >
+          std::numeric_limits<uint64_t>::max() -
+              attributed_payload_host_bytes) {
+        Fail("CONSTANT_CACHE_MEMORY",
+             "constant payload host-memory attribution overflowed");
+      }
+      attributed_payload_host_bytes += payload_bytes;
+      if (!_constant_entries.emplace(entry._entry_id, &entry).second) {
+        Fail("CONSTANT_ENTRY_ID", "duplicate constant entry id %u",
+             entry._entry_id);
+      }
+
+      const ConstantCacheKey key = ConstantKey(entry, "CONSTANT_CACHE_KEY");
+      Plaintext cached;
+      EncodeConstantPayload(&cached, entry, "CONSTANT_CACHE_ENCODE");
+      ValidateConstantPlain(cached, entry, key, "CONSTANT_CACHE_ENCODE");
+      const uint64_t poly_degree = cached.poly_modulus_degree();
+      const uint64_t coefficient_moduli = cached.coeff_modulus_size();
+      if (coefficient_moduli == 0 ||
+          poly_degree > std::numeric_limits<uint64_t>::max() /
+                            coefficient_moduli ||
+          poly_degree * coefficient_moduli >
+              std::numeric_limits<uint64_t>::max() / sizeof(uint64_t)) {
+        Fail("CONSTANT_CACHE_MEMORY",
+             "constant entry %u logical device byte count overflowed",
+             entry._entry_id);
+      }
+      const uint64_t entry_device_bytes =
+          poly_degree * coefficient_moduli * sizeof(uint64_t);
+      if (entry_device_bytes >
+          std::numeric_limits<uint64_t>::max() - logical_device_bytes) {
+        Fail("CONSTANT_CACHE_MEMORY",
+             "plaintext-cache logical device byte count overflowed");
+      }
+      if (!_constant_cache.emplace(key, std::move(cached)).second) {
+        Fail("CONSTANT_CACHE_KEY",
+             "constant entry %u duplicates a full cache-key tuple",
+             entry._entry_id);
+      }
+      logical_device_bytes += entry_device_bytes;
+    }
+
+    SynchronizeDevice("CONSTANT_CACHE_SYNC");
+    const size_t cache_free_after = FreeDeviceBytes("CONSTANT_CACHE_MEMORY");
+    _setup_metrics._plaintext_cache_setup_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      cache_start)
+            .count();
+    _setup_metrics._plaintext_cache_device_bytes =
+        DeviceBytesUsed(cache_free_before, cache_free_after);
+    _setup_metrics._plaintext_cache_logical_device_bytes = logical_device_bytes;
+    _setup_metrics._plaintext_cache_entries = _constant_cache.size();
+    // Attribute immutable compiler-owned payload inputs to setup alongside the
+    // context-owned cache/map metadata that consumes them.
+    constexpr uint64_t metadata_bytes_per_entry =
+        sizeof(std::pair<const ConstantCacheKey, Plaintext>) +
+        sizeof(std::pair<const uint32_t, const PHANTOM_CONSTANT_ENTRY*>);
+    if (_constant_cache.size() >
+        std::numeric_limits<uint64_t>::max() / metadata_bytes_per_entry) {
+      Fail("CONSTANT_CACHE_MEMORY",
+           "plaintext-cache host metadata byte count overflowed");
+    }
+    const uint64_t metadata_bytes =
+        static_cast<uint64_t>(_constant_cache.size()) *
+        metadata_bytes_per_entry;
+    if (metadata_bytes > std::numeric_limits<uint64_t>::max() -
+                             attributed_payload_host_bytes) {
+      Fail("CONSTANT_CACHE_MEMORY",
+           "plaintext-cache total host byte count overflowed");
+    }
+    _setup_metrics._plaintext_cache_host_bytes =
+        attributed_payload_host_bytes + metadata_bytes;
   }
 
   void ValidateProgramManifest() const {
     constexpr uint32_t context_schema_version = 1;
-    constexpr uint32_t resource_schema_version = 2;
+    constexpr uint32_t resource_schema_version = 3;
     constexpr uint64_t known_resource_flags =
         PHANTOM_RESOURCE_RELIN_KEY | PHANTOM_RESOURCE_ROTATION_KEYS |
         PHANTOM_RESOURCE_CONJUGATION_KEY | PHANTOM_RESOURCE_ROTATE_BATCH |
-        PHANTOM_RESOURCE_RAISE_MOD | PHANTOM_RESOURCE_MONOMIALS;
+        PHANTOM_RESOURCE_RAISE_MOD | PHANTOM_RESOURCE_MONOMIALS |
+        PHANTOM_RESOURCE_COMPLEX_PLAINTEXT |
+        PHANTOM_RESOURCE_NATIVE_BOOTSTRAP_PRECOMPUTE;
     if (_manifest == nullptr) {
       Fail("CONTEXT_MANIFEST_NULL", "context manifest is null");
     }
@@ -1056,6 +1403,12 @@ private:
       Fail("RESOURCE_FLAGS", "unknown resource bits 0x%llx",
            static_cast<unsigned long long>(_resources->_flags &
                                            ~known_resource_flags));
+    }
+    if ((_resources->_flags &
+         PHANTOM_RESOURCE_NATIVE_BOOTSTRAP_PRECOMPUTE) != 0) {
+      Fail("NATIVE_BOOTSTRAP_FORBIDDEN",
+           "generated primitive bootstrap cannot request native bootstrap "
+           "precomputation");
     }
     const bool has_rotation_flag =
         (_resources->_flags & PHANTOM_RESOURCE_ROTATION_KEYS) != 0;
@@ -1368,18 +1721,24 @@ private:
 
   void ValidatePlain(Plaintext* plain, const char* diagnostic) {
     PlainState(plain, diagnostic, false);
+    ValidatePlainMetadata(*plain, diagnostic);
+  }
+
+  void ValidatePlainMetadata(const Plaintext& plain,
+                             const char* diagnostic) const {
     const size_t q_count = ChainIndexToActiveQ(
-        plain->chain_index(), _manifest->_data_q_count,
+        plain.chain_index(), _manifest->_data_q_count,
         _first_data_chain_index);
-    const auto& context_data = _context->get_context_data(plain->chain_index());
+    const auto& context_data = _context->get_context_data(plain.chain_index());
     if (context_data.parms().coeff_modulus().size() != q_count ||
-        plain->coeff_modulus_size() != q_count ||
-        plain->poly_modulus_degree() != _manifest->_poly_degree ||
-        plain->data() == nullptr || !std::isfinite(plain->scale()) ||
-        plain->scale() <= 0.0) {
+        plain.parms_id() != context_data.parms().parms_id() ||
+        plain.coeff_modulus_size() != q_count ||
+        plain.poly_modulus_degree() != _manifest->_poly_degree ||
+        plain.data() == nullptr || !std::isfinite(plain.scale()) ||
+        plain.scale() <= 0.0) {
       Fail(diagnostic,
            "invalid ordinary Q plaintext metadata: chain=%zu q=%zu scale=%.17g",
-           plain->chain_index(), q_count, plain->scale());
+           plain.chain_index(), q_count, plain.scale());
     }
   }
 
@@ -1445,6 +1804,7 @@ private:
 
   const PHANTOM_CONTEXT_MANIFEST* _manifest = nullptr;
   const PHANTOM_RESOURCE_MANIFEST* _resources = nullptr;
+  const PHANTOM_CONSTANT_MANIFEST* _constants = nullptr;
   size_t _logical_slots = 0;
   size_t _first_data_chain_index = 0;
   uint64_t _resource_flags = 0;
@@ -1455,6 +1815,10 @@ private:
   std::unique_ptr<PhantomRelinKey> _relin_key;
   std::unique_ptr<PhantomGaloisKey> _galois_key;
   std::set<int> _rotation_steps;
+  std::map<ConstantCacheKey, Plaintext> _constant_cache;
+  std::unordered_map<uint32_t, const PHANTOM_CONSTANT_ENTRY*>
+      _constant_entries;
+  PHANTOM_SETUP_METRICS _setup_metrics{};
   std::vector<std::unique_ptr<Ciphertext>> _owned_inputs;
   std::vector<std::unique_ptr<Ciphertext>> _owned_outputs;
   std::mutex _state_mutex;
@@ -1512,6 +1876,18 @@ void Phantom_encode_double(PLAIN plain, const double* input, size_t len,
 void Phantom_encode_dcmplx(PLAIN plain, const DCMPLX* input, size_t len,
                            SCALE_T scale, LEVEL_T level) {
   PHANTOM_CONTEXT::Context()->EncodeComplex(plain, input, len, scale, level);
+}
+
+void Phantom_encode_manifest_constant(PLAIN plain, uint32_t entry_id) {
+  PHANTOM_CONTEXT::Context()->EncodeManifestConstant(plain, entry_id);
+}
+
+void Phantom_load_cached_constant(PLAIN plain, uint32_t entry_id) {
+  PHANTOM_CONTEXT::Context()->LoadCachedConstant(plain, entry_id);
+}
+
+PHANTOM_SETUP_METRICS Phantom_get_setup_metrics() {
+  return PHANTOM_CONTEXT::Context()->SetupMetrics();
 }
 
 void Phantom_encode_float_cst_lvl(PLAIN plain, float* input, size_t len,

@@ -122,6 +122,10 @@ public:
   }
   void Require_raise_mod() { _raise_mod_required = true; }
   bool Raise_mod_required() const { return _raise_mod_required; }
+  void Require_complex_plaintext() { _complex_plaintext_required = true; }
+  bool Complex_plaintext_required() const {
+    return _complex_plaintext_required;
+  }
   void Add_monomial_power(uint32_t power) { _monomial_powers.insert(power); }
   void Add_monomial_powers(const std::set<uint32_t>& powers) {
     _monomial_powers.insert(powers.begin(), powers.end());
@@ -175,6 +179,7 @@ private:
   bool              _conjugation_key_required = false;
   bool              _rotate_batch_required  = false;
   bool              _raise_mod_required     = false;
+  bool              _complex_plaintext_required = false;
   std::set<int32_t> _rotate_index;
   std::vector<std::vector<int32_t>> _rotate_batches;
   std::set<uint32_t> _monomial_powers;

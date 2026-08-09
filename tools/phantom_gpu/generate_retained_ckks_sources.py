@@ -46,6 +46,7 @@ CANONICAL_ARTIFACT_PATHS = {
     "phantom_post_ckks_air": "outputs/retained_ckks_phantom_post.air",
     "phantom_context_manifest": "outputs/compiler_context_manifest.json",
     "phantom_resource_manifest": "outputs/compiler_resource_manifest.json",
+    "phantom_constant_manifest": "outputs/compiler_constant_manifest.json",
     "generation_record": "outputs/retained_ckks_generation.json",
     "interface_header": "outputs/retained_ckks_generated_interface.h",
 }
@@ -76,8 +77,9 @@ def _compile(
     codegen_ir: str,
     context_output: Path | None = None,
     resource_output: Path | None = None,
+    constant_output: Path | None = None,
 ) -> tuple[str, str]:
-    context = _load_context(context_path)
+    _load_context(context_path)
     declare_retained_ckks_conformance_module(context_path, fixture_path)
     module = AceEDSL._get_dsl().current_air_module
     if module is None:
@@ -95,6 +97,7 @@ def _compile(
         codegen_ir=codegen_ir,
         context_manifest_file=str(context_output or ""),
         resource_manifest_file=str(resource_output or ""),
+        constant_manifest_file=str(constant_output or ""),
     )
     pipeline.set_ckks_extended_op_rewrite(False)
     result = pipeline.run(start_domain="fhe::ckks", dump_stages=True, verbose=False)
@@ -178,6 +181,9 @@ def generate(arguments: argparse.Namespace) -> None:
         arguments.interface_header: ".h",
         arguments.ant_post_ckks_air: ".air",
         arguments.phantom_post_ckks_air: ".air",
+        arguments.phantom_context_manifest: ".json",
+        arguments.phantom_resource_manifest: ".json",
+        arguments.phantom_constant_manifest: ".json",
     }
     for path, suffix in expected_suffixes.items():
         if path.suffix != suffix:
@@ -241,12 +247,38 @@ def generate(arguments: argparse.Namespace) -> None:
         codegen_ir="ckks",
         context_output=arguments.phantom_context_manifest,
         resource_output=arguments.phantom_resource_manifest,
+        constant_output=arguments.phantom_constant_manifest,
     )
     if ant_air != phantom_air:
         raise SystemExit("ANT and Phantom terminal paths received different post-CKKS AIR")
     emitted_context = _load_context(arguments.phantom_context_manifest)
     if emitted_context != _load_context(arguments.context_manifest):
         raise SystemExit("emitted Phantom context differs from the generator input")
+    resource_manifest = json.loads(
+        arguments.phantom_resource_manifest.read_text(encoding="utf-8")
+    )
+    if (
+        resource_manifest.get("schema_version") != 3
+        or resource_manifest.get("complex_plaintext") is not False
+        or resource_manifest.get("native_bootstrap_precompute") is not False
+    ):
+        raise SystemExit(
+            "retained Phantom resource manifest has invalid bootstrap fields"
+        )
+    constant_manifest = json.loads(
+        arguments.phantom_constant_manifest.read_text(encoding="utf-8")
+    )
+    emitted_context_sha256 = hashlib.sha256(
+        arguments.phantom_context_manifest.read_bytes()
+    ).hexdigest()
+    if constant_manifest != {
+        "constants": [],
+        "context_manifest_sha256": emitted_context_sha256,
+        "context_schema_version": 1,
+        "resource_schema_version": 3,
+        "schema_version": 1,
+    }:
+        raise SystemExit("retained Phantom constant manifest must be exactly empty")
     _audit_stable_functions(ant_source, "ANT")
     _audit_phantom_source(phantom_source, expected_cipher_array_copy_indices)
     artifacts = (
@@ -287,6 +319,8 @@ CIPHERTEXT retained_ckks_composite(CIPHERTEXT input);
         CANONICAL_ARTIFACT_PATHS["phantom_context_manifest"],
         "--phantom-resource-manifest",
         CANONICAL_ARTIFACT_PATHS["phantom_resource_manifest"],
+        "--phantom-constant-manifest",
+        CANONICAL_ARTIFACT_PATHS["phantom_constant_manifest"],
         "--generation-record", CANONICAL_ARTIFACT_PATHS["generation_record"],
         "--interface-header", CANONICAL_ARTIFACT_PATHS["interface_header"],
         "--polynomial-degree", str(arguments.polynomial_degree),
@@ -319,6 +353,9 @@ CIPHERTEXT retained_ckks_composite(CIPHERTEXT input);
             "resource_manifest_sha256": digest(
                 arguments.phantom_resource_manifest
             ),
+            "constant_manifest_sha256": digest(
+                arguments.phantom_constant_manifest
+            ),
             "generated_functions": list(GENERATED_FUNCTIONS),
             "function_abi": "CIPHERTEXT function(CIPHERTEXT input)",
             "linkage": "C++ (.cxx for ANT/POLY2C; .cu for Phantom/CKKS2C)",
@@ -349,6 +386,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--phantom-post-ckks-air", required=True, type=Path)
     parser.add_argument("--phantom-context-manifest", required=True, type=Path)
     parser.add_argument("--phantom-resource-manifest", required=True, type=Path)
+    parser.add_argument("--phantom-constant-manifest", required=True, type=Path)
     parser.add_argument("--generation-record", required=True, type=Path)
     parser.add_argument("--interface-header", required=True, type=Path)
     parser.add_argument("--polynomial-degree", required=True, type=int)

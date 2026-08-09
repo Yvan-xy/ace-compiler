@@ -29,7 +29,7 @@ def _context(path: Path) -> None:
         "security_level": 0,
         "first_modulus_bits": 60,
         "scaling_modulus_bits": 56,
-        "resource_schema_version": 2,
+        "resource_schema_version": 3,
     }
     path.write_text(json.dumps(value), encoding="utf-8")
 
@@ -238,7 +238,11 @@ def test_binding_inserted_relin_updates_phantom_resource_manifest(
     assert "Relin(" in source
     assert "PHANTOM_RESOURCE_RELIN_KEY" in source
     manifest = json.loads(resources.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 3
+    assert manifest["context_schema_version"] == 1
     assert manifest["relinearization_key"] is True
+    assert manifest["complex_plaintext"] is False
+    assert manifest["native_bootstrap_precompute"] is False
 
 
 def test_binding_driver_keeps_configured_and_default_full_q_counts(
@@ -455,6 +459,7 @@ def test_same_conformance_module_generates_both_terminal_sources(
         "phantom_air": tmp_path / "retained_phantom.air",
         "emitted_context": tmp_path / "emitted_context.json",
         "emitted_resources": tmp_path / "emitted_resources.json",
+        "emitted_constants": tmp_path / "emitted_constants.json",
         "record": tmp_path / "generation.json",
         "interface": tmp_path / "retained_generated.h",
     }
@@ -476,6 +481,7 @@ def test_same_conformance_module_generates_both_terminal_sources(
             "--phantom-post-ckks-air", str(outputs["phantom_air"]),
             "--phantom-context-manifest", str(outputs["emitted_context"]),
             "--phantom-resource-manifest", str(outputs["emitted_resources"]),
+            "--phantom-constant-manifest", str(outputs["emitted_constants"]),
             "--generation-record", str(outputs["record"]),
             "--interface-header", str(outputs["interface"]),
             "--polynomial-degree", str(manifest["polynomial_degree"]),
@@ -576,6 +582,9 @@ def test_same_conformance_module_generates_both_terminal_sources(
     )
     assert raw_array_assignments == []
     resources = json.loads(outputs["emitted_resources"].read_text(encoding="utf-8"))
+    assert resources["schema_version"] == 3
+    assert resources["complex_plaintext"] is False
+    assert resources["native_bootstrap_precompute"] is False
     assert resources["rotation_batches"] == [
         fixture["rotate_batch_steps"],
         *fixture["production_rotation_batches"],

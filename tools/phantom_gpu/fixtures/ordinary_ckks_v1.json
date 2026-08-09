@@ -7,10 +7,10 @@
     "deterministic_seed": 20260807,
     "deterministic_generator": "splitmix64-float53-complex-v1",
     "normalized_compiler_command_sha256": "e966e89fb34bab0c760909b76940cc4d8a6020320bb676705cde30a190097170",
-    "post_ckks_air_sha256": "176eda2e57195873dd1793bd921ccea679750f8b953db4292ac6cbaacc7b46ce"
+    "post_ckks_air_sha256": "f57005746cf5441dd3b029edf73da6675e94bc6ef4f3e4fdf723a1a677568439"
   },
   "compiler_context_manifest": {
-    "sha256": "6635e0582a1e787f7441a806bf4c65dd212013f8bdaf726ccb9d89f62dd2e4b1"
+    "sha256": "43e22e402675bdecfe5a01214c4139ca2fa857f4b99f8c29218a6c980cc44522"
   },
   "coordinate_rules": {
     "input_length": "compiler_context.logical_slot_capacity",

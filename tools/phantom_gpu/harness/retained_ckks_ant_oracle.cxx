@@ -48,7 +48,7 @@ constexpr std::array<std::uint8_t, 8> kDecodedMagic = {'A', 'C', 'E', 'R',
 constexpr char kProviderSchema[] =
     "ace.phantom.retained_ckks.provider-result/3.0.0";
 constexpr char kBinaryFormat[] = "ace.retained_ckks.complex_float64le/1.0.0";
-constexpr std::uint32_t kResourceSchemaVersion = 2;
+constexpr std::uint32_t kResourceSchemaVersion = 3;
 
 [[noreturn]] void Fail(const std::string &message) {
   throw std::runtime_error("ACE_RETAINED_ANT: " + message);
@@ -311,6 +311,12 @@ void ValidateManifest(const Json &context, const Json &resources,
               resources.at("rotate_batch").get<bool>() &&
               resources.at("raise_mod").get<bool>(),
           "retained resource requirements are incomplete");
+  Require(!resources.at("complex_plaintext").get<bool>(),
+          "retained ciphertext-only graph unexpectedly requires complex "
+          "plaintexts");
+  Require(!resources.at("native_bootstrap_precompute").get<bool>(),
+          "retained generated primitives must not authorize native bootstrap "
+          "precomputation");
 
   Json required_batches = Json::array({fixture.at("rotate_batch_steps")});
   for (const auto &batch : fixture.at("production_rotation_batches")) {

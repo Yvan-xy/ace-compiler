@@ -60,6 +60,10 @@ FROZEN_FILES: dict[str, tuple[str, str]] = {
         "outputs/compiler_resource_manifest.json",
         "retained-resource-manifest.json",
     ),
+    "constant_manifest": (
+        "outputs/compiler_constant_manifest.json",
+        "retained-constant-manifest.json",
+    ),
     "ant_post_ckks_air": (
         "outputs/retained_ckks_ant_post.air",
         "retained-ant-post-ckks.air",
@@ -265,12 +269,14 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
     context_path = root / FROZEN_FILES["context_manifest"][0]
     fixture_path = root / FROZEN_FILES["fixture"][0]
     resource_path = root / FROZEN_FILES["resource_manifest"][0]
+    constant_path = root / FROZEN_FILES["constant_manifest"][0]
     generation_path = root / FROZEN_FILES["generation_attestation"][0]
     build_path = root / FROZEN_FILES["build_attestation"][0]
     artifact_path = root / FROZEN_FILES["artifact_manifest"][0]
     expected_host_hashes = {
         "compiler_context_manifest_sha256": sha256_path(context_path),
         "compiler_resource_manifest_sha256": sha256_path(resource_path),
+        "compiler_constant_manifest_sha256": sha256_path(constant_path),
         "fixture_sha256": sha256_path(fixture_path),
         "cpu_reference_sha256": sha256_path(
             root / FROZEN_FILES["ant_reference_json"][0]
@@ -296,6 +302,7 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
         or generation.get("emitted_context_manifest_sha256")
         != sha256_path(root / FROZEN_FILES["emitted_context_manifest"][0])
         or generation.get("resource_manifest_sha256") != sha256_path(resource_path)
+        or generation.get("constant_manifest_sha256") != sha256_path(constant_path)
         or generation.get("ant_post_ckks_air_sha256")
         != sha256_path(root / FROZEN_FILES["ant_post_ckks_air"][0])
         or generation.get("phantom_post_ckks_air_sha256")
@@ -339,6 +346,7 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
         "phantom_source_manifest_sha256": phantom_source_sha,
         "compiler_context_manifest_sha256": sha256_path(context_path),
         "compiler_resource_manifest_sha256": sha256_path(resource_path),
+        "compiler_constant_manifest_sha256": sha256_path(constant_path),
         "fixture_sha256": sha256_path(fixture_path),
         "compiler_invocation_sha256": sha256_path(generation_path),
         "host_ant_oracle_was_run": True,
@@ -370,6 +378,8 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
         != sha256_path(context_path)
         or artifact.get("compiler_resource_manifest_sha256")
         != sha256_path(resource_path)
+        or artifact.get("compiler_constant_manifest_sha256")
+        != sha256_path(constant_path)
         or artifact.get("normalized_compiler_command_sha256")
         != normalized_compiler_command_sha256
         or artifact.get("post_ckks_air_sha256")
@@ -568,6 +578,7 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
         "outputs/retained_ckks_keyless.cu",
         "outputs/retained_ckks_keyless_context.json",
         "outputs/retained_ckks_keyless_resources.json",
+        "outputs/retained_ckks_keyless_constants.json",
         "outputs/retained_ckks_keyless_post.air",
         "build/retained_ckks_conjugation_keyless_sm80",
         "build/retained_ckks_rotation_keyless_sm80",
@@ -614,8 +625,9 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
             raise EvidenceError(f"retained CUDA inspection lacks sm_80: {path}")
     keyless = load_json(root / "outputs/retained_ckks_keyless_resources.json")
     expected_keyless = {
-        "schema_version": 2,
+        "schema_version": 3,
         "context_schema_version": 1,
+        "complex_plaintext": False,
         "relinearization_key": False,
         "rotation_steps": [],
         "conjugation_key": False,
@@ -623,9 +635,23 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
         "rotation_batches": [],
         "raise_mod": False,
         "monomial_powers": [],
+        "native_bootstrap_precompute": False,
     }
     if keyless != expected_keyless:
         raise EvidenceError("retained compiler-emitted keyless resources differ")
+    expected_empty_constants = {
+        "constants": [],
+        "context_manifest_sha256": sha256_path(
+            root / "outputs/retained_ckks_keyless_context.json"
+        ),
+        "context_schema_version": 1,
+        "resource_schema_version": 3,
+        "schema_version": 1,
+    }
+    if load_json(
+        root / "outputs/retained_ckks_keyless_constants.json"
+    ) != expected_empty_constants:
+        raise EvidenceError("retained compiler-emitted keyless constants differ")
     gtest_attestation = load_json(root / "build/gtest-source-attestation.json")
     if (
         set(gtest_attestation)
@@ -987,6 +1013,7 @@ def write_run_attestations(arguments: argparse.Namespace) -> dict[str, Any]:
         "fixture": root / "inputs/retained_ckks_fixture.json",
         "context": root / "inputs/compiler_context_manifest.json",
         "resource": root / "outputs/compiler_resource_manifest.json",
+        "constant": root / "outputs/compiler_constant_manifest.json",
         "phantom_executable": root / "build/retained_ckks_phantom_sm80",
         "ant_json": frozen / FROZEN_FILES["ant_reference_json"][1],
         "ant_binary": frozen / FROZEN_FILES["ant_reference_binary"][1],
@@ -1018,6 +1045,7 @@ def write_run_attestations(arguments: argparse.Namespace) -> dict[str, Any]:
         "phantom_source_manifest_sha256": sha256_path(paths["phantom_source"]),
         "compiler_context_manifest_sha256": sha256_path(paths["context"]),
         "compiler_resource_manifest_sha256": sha256_path(paths["resource"]),
+        "compiler_constant_manifest_sha256": sha256_path(paths["constant"]),
         "fixture_sha256": sha256_path(paths["fixture"]),
         "compiler_invocation_sha256": sha256_path(paths["generation"]),
     }
@@ -1081,6 +1109,7 @@ def write_run_attestations(arguments: argparse.Namespace) -> dict[str, Any]:
         "fixture_sha256": sha256_path(paths["fixture"]),
         "compiler_context_manifest_sha256": sha256_path(paths["context"]),
         "compiler_resource_manifest_sha256": sha256_path(paths["resource"]),
+        "compiler_constant_manifest_sha256": sha256_path(paths["constant"]),
         "executables": {
             "ant_oracle": expected_identifiers["ant"]["executable_sha256"],
             "phantom_sm80": sha256_path(paths["phantom_executable"]),

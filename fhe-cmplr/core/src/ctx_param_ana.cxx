@@ -424,6 +424,9 @@ R_CODE CTX_PARAM_ANA::Run() {
   if (ana_ctx.Raise_mod_required()) {
     ctx_param.Require_raise_mod();
   }
+  if (ana_ctx.Complex_plaintext_required()) {
+    ctx_param.Require_complex_plaintext();
+  }
   ctx_param.Add_monomial_powers(ana_ctx.Get_monomial_powers());
 
   // 4. update CTX_PARAM with Config

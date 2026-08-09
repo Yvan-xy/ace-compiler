@@ -22,7 +22,7 @@ CONTEXT_MANIFEST_TEXT = (
     '{"data_q_bit_sizes":[60,56,56,56],"first_modulus_bits":60,'
     '"hamming_weight":192,"input_level":1,"logical_slot_capacity":8192,'
     '"packing":"full","polynomial_degree":16384,"q_part_count":2,'
-    '"resource_schema_version":2,"scaling_modulus_bits":56,'
+    '"resource_schema_version":3,"scaling_modulus_bits":56,'
     '"schema_version":1,"security_level":0,'
     '"special_p_bit_sizes":[60,60]}'
 )
@@ -32,6 +32,26 @@ def write_context_manifest(tmp_path: Path) -> Path:
     path = tmp_path / "compiler_context_manifest.json"
     path.write_text(CONTEXT_MANIFEST_TEXT, encoding="utf-8")
     return path
+
+
+def test_context_manifest_requires_resource_schema_v3() -> None:
+    manifest = json.loads(CONTEXT_MANIFEST_TEXT)
+    ordinary.validate_context_manifest(manifest)
+    manifest["resource_schema_version"] = 2
+    with pytest.raises(
+        ordinary.OrdinaryCkksError,
+        match="schema is unsupported",
+    ):
+        ordinary.validate_context_manifest(manifest)
+
+
+def test_ant_oracle_requires_keyless_schema_v3_resources() -> None:
+    source = (TOOLS_ROOT / "harness/ordinary_ckks_ant_oracle.cxx").read_text(
+        encoding="utf-8"
+    )
+    assert 'resources.at("schema_version") != 3' in source
+    assert 'resources.at("complex_plaintext") != false' in source
+    assert 'resources.at("native_bootstrap_precompute") != false' in source
 
 
 def write_unbound_fixture(tmp_path: Path) -> Path:
@@ -175,13 +195,13 @@ def test_frozen_fixture_derives_coordinates_and_covers_aliases_and_tolerances(
             "e966e89fb34bab0c760909b76940cc4d8a6020320bb676705cde30a190097170"
         ),
         "post_ckks_air_sha256": (
-            "176eda2e57195873dd1793bd921ccea679750f8b953db4292ac6cbaacc7b46ce"
+            "f57005746cf5441dd3b029edf73da6675e94bc6ef4f3e4fdf723a1a677568439"
         ),
     }
     assert fixture["compiler_context_manifest"]["sha256"] == (
-        "6635e0582a1e787f7441a806bf4c65dd212013f8bdaf726ccb9d89f62dd2e4b1"
+        "43e22e402675bdecfe5a01214c4139ca2fa857f4b99f8c29218a6c980cc44522"
     )
-    assert digest == "e55c8f0c444dac4377ff5722e8061dfaa6370354364a23669d9b82e72a49fe29"
+    assert digest == "d15e23e1930a51a07ab4039ef949578dc56029f0133dbc4ae091bf1dc04fc439"
     assert fixture["coordinate_rules"] == {
         "input_length": "compiler_context.logical_slot_capacity",
         "full_level": "compiler_context.data_q_count",

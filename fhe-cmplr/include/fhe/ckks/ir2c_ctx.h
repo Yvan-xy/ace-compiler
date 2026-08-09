@@ -13,13 +13,17 @@
 #include "air/base/st_decl.h"
 #include "air/util/debug.h"
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include "fhe/core/ir2c_ctx.h"
+#include "fhe/ckks/phantom_constant_manifest.h"
 #include "fhe/ckks/phantom_context_manifest.h"
 #include "fhe/core/rt_context.h"
 #include "fhe/core/rt_data_writer.h"
@@ -33,6 +37,11 @@ namespace ckks {
 
 //! @brief Context for CKKS IR to C in fhe-cmplr
 class IR2C_CTX : public fhe::core::IR2C_CTX {
+  struct PHANTOM_EMITTED_CONSTANT {
+    PHANTOM_CONSTANT_DESCRIPTOR _descriptor;
+    air::base::CONSTANT_PTR      _constant = air::base::Null_ptr;
+  };
+
 public:
   //! @brief Construct a new ir2c ctx object
   IR2C_CTX(std::ostream& os, const fhe::core::LOWER_CTX& lower_ctx,
@@ -45,6 +54,9 @@ public:
           Build_phantom_context_descriptor(lower_ctx.Get_ctx_param());
       _phantom_resources = Build_phantom_resource_descriptor(
           lower_ctx.Get_ctx_param(), _phantom_context);
+      _phantom_context_sha256 =
+          Phantom_sha256(Serialize_phantom_context_descriptor(
+              _phantom_context));
       _has_phantom_manifests = true;
     }
     if (cfg.Emit_data_file()) {
@@ -285,6 +297,53 @@ public:
   }
 
   //! @brief Emit the runtime feature query without introducing BTS calls.
+  void Emit_phantom_constant_manifest() {
+    if (!_has_phantom_manifests) return;
+    if (!_phantom_constants.empty()) {
+      _ir2c_util << "static const PHANTOM_CONSTANT_ENTRY ";
+      _ir2c_util.Emit_identifier(Function_name_prefix());
+      _ir2c_util << "phantom_constant_entries[] = {\n";
+      for (const auto& emitted : _phantom_constants) {
+        const PHANTOM_CONSTANT_DESCRIPTOR& constant = emitted._descriptor;
+        _ir2c_util << "  // ACE_PHANTOM_CONSTANT_ENTRY entry_id="
+                   << constant._entry_id << " constant_id="
+                   << constant._constant_id << "\n";
+        _ir2c_util << "  {" << constant._entry_id << ", "
+                   << constant._constant_id
+                   << ", PHANTOM_CONSTANT_COMPLEX_F64, "
+                   << constant._slot_count << ", " << constant._ace_level
+                   << ", " << constant._chain_index << ", "
+                   << constant._scale_degree << ", "
+                   << constant._raw_scale_text << ", \"" << constant._symbol
+                   << "\", \"" << constant._payload_sha256 << "\", \""
+                   << constant._cache_key_sha256 << "\", "
+                   << constant._slot_count * 2 << ", (const double*)";
+        Emit_constant_name(emitted._constant->Id());
+        _ir2c_util << "},\n";
+      }
+      _ir2c_util << "};\n\n";
+    }
+    _ir2c_util << "extern \"C\" const PHANTOM_CONSTANT_MANIFEST* ";
+    _ir2c_util.Emit_identifier(Function_name_prefix());
+    _ir2c_util << "Get_phantom_constant_manifest() {\n";
+    _ir2c_util << "  static const PHANTOM_CONSTANT_MANIFEST constants = {\n";
+    _ir2c_util << "    " << PHANTOM_CONSTANT_SCHEMA_VERSION << ",\n";
+    _ir2c_util << "    " << _phantom_context._schema_version << ",\n";
+    _ir2c_util << "    " << _phantom_resources._schema_version << ",\n";
+    _ir2c_util << "    \"" << _phantom_context_sha256 << "\",\n";
+    _ir2c_util << "    " << _phantom_constants.size() << ",\n";
+    if (_phantom_constants.empty()) {
+      _ir2c_util << "    nullptr\n";
+    } else {
+      _ir2c_util << "    ";
+      _ir2c_util.Emit_identifier(Function_name_prefix());
+      _ir2c_util << "phantom_constant_entries\n";
+    }
+    _ir2c_util << "  };\n";
+    _ir2c_util << "  return &constants;\n";
+    _ir2c_util << "}\n\n";
+  }
+
   void Emit_need_bts() {
     if (Provider() == core::PROVIDER::PHANTOM) {
       if (_observed_rotation_batches !=
@@ -377,6 +436,18 @@ public:
         if ((_phantom_resources._flags & PHANTOM_RESOURCE_MONOMIALS) != 0) {
           if (separator) _ir2c_util << " | ";
           _ir2c_util << "PHANTOM_RESOURCE_MONOMIALS";
+          separator = true;
+        }
+        if ((_phantom_resources._flags &
+             PHANTOM_RESOURCE_COMPLEX_PLAINTEXT) != 0) {
+          if (separator) _ir2c_util << " | ";
+          _ir2c_util << "PHANTOM_RESOURCE_COMPLEX_PLAINTEXT";
+          separator = true;
+        }
+        if ((_phantom_resources._flags &
+             PHANTOM_RESOURCE_NATIVE_BOOTSTRAP_PRECOMPUTE) != 0) {
+          if (separator) _ir2c_util << " | ";
+          _ir2c_util << "PHANTOM_RESOURCE_NATIVE_BOOTSTRAP_PRECOMPUTE";
         }
       }
       _ir2c_util << ",\n";
@@ -412,6 +483,7 @@ public:
       _ir2c_util << "  };\n";
       _ir2c_util << "  return &resources;\n";
       _ir2c_util << "}\n\n";
+      Emit_phantom_constant_manifest();
     }
     if (Provider() == core::PROVIDER::SEAL) {
       _ir2c_util << "bool Need_bts() {\n";
@@ -440,6 +512,18 @@ public:
   std::string Phantom_resource_json() const {
     AIR_ASSERT(_has_phantom_manifests);
     return Serialize_phantom_resource_descriptor(_phantom_resources);
+  }
+
+  std::string Phantom_constant_json() const {
+    AIR_ASSERT(_has_phantom_manifests);
+    std::vector<PHANTOM_CONSTANT_DESCRIPTOR> descriptors;
+    descriptors.reserve(_phantom_constants.size());
+    for (const auto& constant : _phantom_constants) {
+      descriptors.push_back(constant._descriptor);
+    }
+    return Serialize_phantom_constant_manifest(
+        _phantom_context_sha256, _phantom_context._schema_version,
+        _phantom_resources._schema_version, descriptors);
   }
 
   void Require_phantom_relinearization_key() {
@@ -515,6 +599,16 @@ public:
     }
   }
 
+  void Require_phantom_complex_plaintext() {
+    if (!_has_phantom_manifests) return;
+    if ((_phantom_resources._flags &
+         PHANTOM_RESOURCE_COMPLEX_PLAINTEXT) == 0) {
+      throw std::runtime_error(
+          "Phantom complex-plaintext analysis/codegen requirements "
+          "disagree");
+    }
+  }
+
   uint32_t Require_phantom_monomial_power(int64_t power) {
     const int64_t period =
         static_cast<int64_t>(_phantom_context._poly_degree) * 2;
@@ -565,13 +659,17 @@ public:
         node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::ENCODE_CACHE);
     bool encoding_dcmplx = (complex_attr != nullptr) && (*complex_attr != 0);
     bool encode_cache     = (cache_attr != nullptr) && (*cache_attr != 0);
+    if (encoding_dcmplx && Provider() == core::PROVIDER::PHANTOM) {
+      Require_phantom_complex_plaintext();
+    }
     // NUM_P describes ANT's extended Q+P plaintext encoding.  Phantom
     // constants always use the ordinary Q-level complex encoder and therefore
     // retain the full (length, scale_degree, logical_level) argument list.
     bool use_extended_dcmplx =
         encoding_dcmplx && Provider() != core::PROVIDER::PHANTOM &&
         num_p_attr != nullptr && *num_p_attr != 0;
-    if (!encoding_dcmplx && _rt_data_writer != nullptr &&
+    if (Provider() == core::PROVIDER::ANT && !encoding_dcmplx &&
+        _rt_data_writer != nullptr &&
         node->Child(0)->Opcode() == air::core::OPC_LDC &&
         node->Child(1)->Opcode() == air::core::OPC_INTCONST &&
         node->Child(2)->Opcode() == air::core::OPC_INTCONST &&
@@ -610,7 +708,8 @@ public:
         Emit_st_var<RETV, VISITOR>(visitor, dest);
       }
       _ir2c_util << ", " << idx << " /* " << name << " */";
-    } else if (_rt_data_writer != nullptr &&
+    } else if (Provider() == core::PROVIDER::ANT &&
+               _rt_data_writer != nullptr &&
                node->Child(0)->Opcode() == nn::vector::OPC_SLICE &&
                node->Child(1)->Opcode() == air::core::OPC_INTCONST) {
 #if 0
@@ -836,6 +935,146 @@ public:
     _ir2c_util << " = _pre_plain_" << node_id << "; }";
   }
 
+  static std::string Sanitize_phantom_identifier(const char* input) {
+    std::string result;
+    if (input == nullptr) return result;
+    for (const unsigned char ch : std::string(input)) {
+      result.push_back((std::isalnum(ch) != 0 || ch == '_')
+                           ? static_cast<char>(ch)
+                           : '_');
+    }
+    return result;
+  }
+
+  static uint32_t Static_positive_u32(air::base::NODE_PTR node,
+                                      const char* diagnostic) {
+    if (node->Opcode() != air::core::OPC_INTCONST || node->Intconst() <= 0 ||
+        static_cast<uint64_t>(node->Intconst()) >
+            std::numeric_limits<uint32_t>::max()) {
+      throw std::runtime_error(diagnostic);
+    }
+    return static_cast<uint32_t>(node->Intconst());
+  }
+
+  uint32_t Register_phantom_constant(air::base::NODE_PTR node,
+                                     air::base::CONSTANT_PTR constant) {
+    AIR_ASSERT(Provider() == core::PROVIDER::PHANTOM);
+    if (constant->Kind() != air::base::CONSTANT_KIND::ARRAY ||
+        !constant->Type()->Is_array()) {
+      throw std::runtime_error(
+          "Phantom cached complex plaintext requires an array constant");
+    }
+    air::base::TYPE_PTR element_type = constant->Type();
+    while (element_type->Is_array()) {
+      element_type = element_type->Cast_to_arr()->Elem_type();
+    }
+    if (!element_type->Is_prim() ||
+        element_type->Cast_to_prim()->Encoding() !=
+            air::base::PRIMITIVE_TYPE::FLOAT_64) {
+      throw std::runtime_error(
+          "Phantom cached complex plaintext requires interleaved float64 "
+          "values");
+    }
+
+    const uint32_t slot_count = Static_positive_u32(
+        node->Child(1),
+        "Phantom cached complex plaintext requires a static slot count");
+    if (slot_count > _phantom_context._logical_slots ||
+        slot_count > std::numeric_limits<size_t>::max() / 2 ||
+        static_cast<size_t>(slot_count) * 2 >
+            std::numeric_limits<size_t>::max() / sizeof(double)) {
+      throw std::runtime_error(
+          "Phantom cached complex plaintext slot count is invalid");
+    }
+    const size_t interleaved_count = static_cast<size_t>(slot_count) * 2;
+    const size_t payload_bytes = interleaved_count * sizeof(double);
+    if (constant->Array_byte_len() < payload_bytes) {
+      throw std::runtime_error(
+          "Phantom cached complex plaintext payload is truncated");
+    }
+
+    const uint32_t* scale_attr =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::SCALE);
+    const uint32_t* level_attr =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
+    const uint32_t scale_degree =
+        scale_attr != nullptr
+            ? *scale_attr
+            : Static_positive_u32(
+                  node->Child(2),
+                  "Phantom cached complex plaintext requires a static scale");
+    const uint32_t ace_level =
+        level_attr != nullptr
+            ? *level_attr
+            : Static_positive_u32(
+                  node->Child(3),
+                  "Phantom cached complex plaintext requires a static level");
+    if (scale_degree == 0 ||
+        scale_degree > static_cast<uint32_t>(
+                           std::numeric_limits<int32_t>::max()) ||
+        ace_level == 0 ||
+        ace_level > _phantom_context._data_q_bit_sizes.size()) {
+      throw std::runtime_error(
+          "Phantom cached complex plaintext scale or level is invalid");
+    }
+    const int64_t scale_exponent =
+        static_cast<int64_t>(scale_degree) *
+        static_cast<int64_t>(_phantom_context._scaling_modulus_bits);
+    if (scale_exponent > std::numeric_limits<double>::max_exponent - 1) {
+      throw std::runtime_error(
+          "Phantom cached complex plaintext scale is not finite");
+    }
+    const double raw_scale =
+        std::ldexp(1.0, static_cast<int>(scale_exponent));
+    const uint32_t chain_index =
+        1 + static_cast<uint32_t>(_phantom_context._data_q_bit_sizes.size()) -
+        ace_level;
+    const uint64_t constant_id = constant->Id().Value();
+    const std::string symbol =
+        Sanitize_phantom_identifier(Constant_name_prefix()) + "_cst_" +
+        std::to_string(constant_id);
+    const std::string payload_sha256 =
+        Phantom_sha256(constant->Array_buffer(), payload_bytes);
+    const std::string raw_scale_text = Phantom_raw_scale_text(raw_scale);
+    const std::string cache_key_sha256 = Phantom_sha256(
+        Build_phantom_cache_key_json(constant_id, _phantom_context_sha256,
+                                     chain_index, raw_scale_text,
+                                     "complex_f64", slot_count));
+
+    for (const auto& emitted : _phantom_constants) {
+      const PHANTOM_CONSTANT_DESCRIPTOR& prior = emitted._descriptor;
+      if (prior._constant_id == constant_id &&
+          prior._chain_index == chain_index &&
+          prior._raw_scale_text == raw_scale_text &&
+          prior._element_type == "complex_f64" &&
+          prior._slot_count == slot_count) {
+        if (prior._payload_sha256 != payload_sha256 ||
+            prior._ace_level != ace_level ||
+            prior._scale_degree != static_cast<int32_t>(scale_degree)) {
+          throw std::runtime_error(
+              "Phantom plaintext cache key resolves to conflicting "
+              "constant metadata");
+        }
+        return prior._entry_id;
+      }
+    }
+
+    PHANTOM_CONSTANT_DESCRIPTOR descriptor;
+    descriptor._entry_id = static_cast<uint32_t>(_phantom_constants.size());
+    descriptor._constant_id = constant_id;
+    descriptor._symbol = symbol;
+    descriptor._slot_count = slot_count;
+    descriptor._ace_level = ace_level;
+    descriptor._chain_index = chain_index;
+    descriptor._scale_degree = static_cast<int32_t>(scale_degree);
+    descriptor._raw_scale = raw_scale;
+    descriptor._raw_scale_text = raw_scale_text;
+    descriptor._payload_sha256 = payload_sha256;
+    descriptor._cache_key_sha256 = cache_key_sha256;
+    _phantom_constants.push_back({descriptor, constant});
+    return descriptor._entry_id;
+  }
+
   template <typename RETV, typename VISITOR>
   void Emit_cached_dcmplx_encode(VISITOR* visitor, air::base::NODE_PTR dest,
                                  air::base::NODE_PTR node) {
@@ -851,6 +1090,14 @@ public:
     bool use_extended_dcmplx =
         Provider() != core::PROVIDER::PHANTOM && num_p_attr != nullptr &&
         *num_p_attr != 0;
+
+    if (Provider() == core::PROVIDER::PHANTOM) {
+      const uint32_t entry_id = Register_phantom_constant(node, cst_val);
+      _ir2c_util << "{ Load_cached_plain(&";
+      Emit_st_var<RETV, VISITOR>(visitor, dest);
+      _ir2c_util << ", " << entry_id << "); }";
+      return;
+    }
 
     uint32_t node_id = node->Id().Value();
     _ir2c_util << "{ static PLAINTEXT _pre_plain_" << node_id
@@ -1177,6 +1424,8 @@ public:
   bool                       _has_phantom_manifests = false;
   PHANTOM_CONTEXT_DESCRIPTOR _phantom_context;
   PHANTOM_RESOURCE_DESCRIPTOR _phantom_resources;
+  std::string                  _phantom_context_sha256;
+  std::vector<PHANTOM_EMITTED_CONSTANT> _phantom_constants;
   size_t                       _observed_rotation_batches = 0;
 };  // IR2C_CTX
 

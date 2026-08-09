@@ -76,6 +76,24 @@ inline void Encode_dcmplx(PLAIN plain, DCMPLX* input, size_t len,
   END_TIMER("Encode_dcmplx")
 }
 
+//! @brief Correctness-mode encoding from a compiler-emitted constant entry.
+inline void Encode_manifest_constant(PLAIN plain, uint32_t entry_id) {
+  START_TIMER
+  Phantom_encode_manifest_constant(plain, entry_id);
+  END_TIMER("Encode_manifest_constant")
+}
+
+//! @brief Deep-copy one immutable context-owned cached plaintext.
+inline void Load_cached_plain(PLAIN plain, uint32_t entry_id) {
+  START_TIMER
+  Phantom_load_cached_constant(plain, entry_id);
+  END_TIMER("Load_cached_plain")
+}
+
+inline PHANTOM_SETUP_METRICS Get_phantom_setup_metrics() {
+  return Phantom_get_setup_metrics();
+}
+
 inline void Encode_float_cst_lvl(PLAIN plain, float* input, size_t len,
                                  SCALE_T sc_degree, int level) {
   START_TIMER

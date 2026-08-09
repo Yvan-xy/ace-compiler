@@ -384,6 +384,7 @@ expected_options = {
     "--security-level", "--scaling-factor-bits", "--first-prime-bits",
     "--hamming-weight",
 }
+
 if len(pairs) != len(arguments) // 2 or set(pairs) != expected_options:
     raise SystemExit("packaged compiler invocation options are incomplete or duplicated")
 if pairs["--gate"] != "ordinary":
@@ -493,6 +494,414 @@ PY
         qualification_sha256_manifest_sha256:$qualification_sha256_manifest_sha256}' \
       >"${RESULT_DIR}/host-freeze-candidate.json"
   fi
+}
+validate_packaged_bootstrap_qualification() {
+  python3 - "${INPUT}" <<'PY'
+import hashlib
+import json
+import math
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+
+def reject_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise SystemExit(f"duplicate JSON key in bootstrap package: {key}")
+        value[key] = item
+    return value
+
+def load(name):
+    path = root / name
+    value = json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicates
+    )
+    if not isinstance(value, dict):
+        raise SystemExit(f"bootstrap package record is not an object: {name}")
+    return value
+
+def digest(name):
+    return hashlib.sha256((root / name).read_bytes()).hexdigest()
+
+payload = load("payload.json")
+binding = payload.get("bootstrap_qualification")
+if not isinstance(binding, dict):
+    raise SystemExit("payload lacks its bootstrap qualification binding")
+bound_files = {
+    "qualification_invocation_sha256": "bootstrap-qualification-invocation.json",
+    "generation_invocation_sha256": "bootstrap-generation-invocation.json",
+    "artifact_manifest_sha256": "bootstrap-artifact-manifest.json",
+    "run_manifest_sha256": "bootstrap-run-manifest.json",
+    "context_manifest_sha256": "bootstrap-context-manifest.json",
+    "resource_manifest_sha256": "bootstrap-resource-manifest.json",
+    "constant_manifest_sha256": "bootstrap-constant-manifest.json",
+    "generation_record_sha256": "bootstrap-generation.json",
+    "source_audit_sha256": "bootstrap-source-audit.json",
+    "host_qualification_sha256": "bootstrap-host-qualification.json",
+}
+expected_binding_keys = set(bound_files) | {
+    "normalized_qualification_argv_sha256",
+    "normalized_generation_argv_sha256",
+    "expected_generated_source_sha256",
+    "expected_linked_binary_sha256",
+    "expected_harness_source_sha256",
+    "packaged_build_output",
+}
+if set(binding) != expected_binding_keys:
+    raise SystemExit("payload bootstrap qualification binding has an invalid shape")
+for field, name in bound_files.items():
+    if binding.get(field) != digest(name):
+        raise SystemExit(f"payload bootstrap binding is stale: {field}")
+if binding.get("packaged_build_output") is not False:
+    raise SystemExit("bootstrap payload must not contain packaged build output")
+
+expected_parameters = [
+    "--poly-degree", "16384", "--mul-level", "26",
+    "--input-level", "1", "--security-level", "0",
+    "--scaling-factor-bits", "56", "--first-prime-bits", "60",
+    "--hamming-weight", "192",
+]
+
+def validate_invocation(name, schema, expected):
+    invocation = load(name)
+    if set(invocation) != {"schema_version", "argv", "normalized_argv_sha256"}:
+        raise SystemExit(f"bootstrap invocation has an invalid shape: {name}")
+    encoded = json.dumps(
+        invocation["argv"], ensure_ascii=False, separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if (
+        invocation["schema_version"] != schema
+        or invocation["argv"] != expected
+        or invocation["normalized_argv_sha256"]
+        != hashlib.sha256(encoded).hexdigest()
+    ):
+        raise SystemExit(f"bootstrap invocation is not the exact frozen contract: {name}")
+    return invocation
+
+qualification_invocation = validate_invocation(
+    "bootstrap-qualification-invocation.json",
+    "ace.phantom.qualification-invocation/1.0.0",
+    ["tools/phantom_gpu/compile_only.sh", "--gate", "bootstrap"]
+    + expected_parameters,
+)
+generation_invocation = validate_invocation(
+    "bootstrap-generation-invocation.json",
+    "ace.phantom.bootstrap-qualification-invocation/1.0.0",
+    ["tools/phantom_gpu/generate_bootstrap_qualification.py",
+     "bootstrap_qualification"] + expected_parameters,
+)
+if (
+    binding.get("normalized_qualification_argv_sha256")
+    != qualification_invocation["normalized_argv_sha256"]
+    or binding.get("normalized_generation_argv_sha256")
+    != generation_invocation["normalized_argv_sha256"]
+):
+    raise SystemExit("payload normalized bootstrap invocation binding is stale")
+
+context = load("bootstrap-context-manifest.json")
+context_keys = {
+    "data_q_bit_sizes", "first_modulus_bits", "hamming_weight", "input_level",
+    "logical_slot_capacity", "packing", "polynomial_degree", "q_part_count",
+    "resource_schema_version", "scaling_modulus_bits", "schema_version",
+    "security_level", "special_p_bit_sizes",
+}
+if (
+    set(context) != context_keys
+    or context.get("schema_version") != 1
+    or context.get("resource_schema_version") != 3
+    or context.get("polynomial_degree") != 16384
+    or context.get("logical_slot_capacity") != 8192
+    or context.get("packing") != "full"
+    or not isinstance(context.get("data_q_bit_sizes"), list)
+    or len(context["data_q_bit_sizes"]) != 26
+    or context.get("input_level") != 1
+    or context.get("security_level") != 0
+    or context.get("scaling_modulus_bits") != 56
+    or context.get("first_modulus_bits") != 60
+    or context.get("hamming_weight") != 192
+):
+    raise SystemExit("packaged bootstrap context is not the exact schema-v3 contract")
+resources = load("bootstrap-resource-manifest.json")
+resource_keys = {
+    "schema_version", "context_schema_version", "relinearization_key",
+    "rotation_steps", "conjugation_key", "rotate_batch", "rotation_batches",
+    "raise_mod", "monomial_powers", "complex_plaintext",
+    "native_bootstrap_precompute",
+}
+if (
+    set(resources) != resource_keys
+    or resources.get("schema_version") != 3
+    or resources.get("context_schema_version") != 1
+    or any(resources.get(field) is not True for field in (
+        "relinearization_key", "conjugation_key", "rotate_batch", "raise_mod",
+        "complex_plaintext",
+    ))
+    or resources.get("native_bootstrap_precompute") is not False
+    or not resources.get("rotation_steps")
+    or not resources.get("rotation_batches")
+    or not resources.get("monomial_powers")
+):
+    raise SystemExit("packaged bootstrap resources are not the full primitive set")
+constants = load("bootstrap-constant-manifest.json")
+if (
+    set(constants) != {"constants", "context_manifest_sha256",
+                       "context_schema_version", "resource_schema_version",
+                       "schema_version"}
+    or constants.get("schema_version") != 1
+    or constants.get("context_schema_version") != 1
+    or constants.get("resource_schema_version") != 3
+    or constants.get("context_manifest_sha256")
+       != digest("bootstrap-context-manifest.json")
+    or not isinstance(constants.get("constants"), list)
+    or not constants["constants"]
+):
+    raise SystemExit("packaged bootstrap constants are empty or not context-bound")
+for index, entry in enumerate(constants["constants"]):
+    entry_keys = {
+        "ace_level", "cache_key_sha256", "chain_index", "constant_id",
+        "element_type", "entry_id", "payload_sha256", "raw_scale",
+        "scale_degree", "slot_count", "symbol",
+    }
+    if (
+        not isinstance(entry, dict)
+        or set(entry) != entry_keys
+        or entry.get("entry_id") != index
+        or entry.get("element_type") != "complex_f64"
+        or not isinstance(entry.get("slot_count"), int)
+        or isinstance(entry.get("slot_count"), bool)
+        or entry["slot_count"] <= 0
+        or not isinstance(entry.get("ace_level"), int)
+        or isinstance(entry.get("ace_level"), bool)
+        or entry["ace_level"] <= 0
+        or re.fullmatch(r"[0-9a-f]{64}", str(entry.get("payload_sha256"))) is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(entry.get("cache_key_sha256"))) is None
+    ):
+        raise SystemExit(f"packaged bootstrap constant entry is invalid: {index}")
+
+generation = load("bootstrap-generation.json")
+audit = load("bootstrap-source-audit.json")
+artifact = load("bootstrap-artifact-manifest.json")
+qualification = load("bootstrap-host-qualification.json")
+generated_source_sha = artifact.get("files", {}).get(
+    "bootstrap_qualification/bootstrap_qualification.cu"
+)
+if (
+    generation.get("schema_version") != "ace.phantom.bootstrap-generation/1.0.0"
+    or generation.get("status") != "pass"
+    or generation.get("constant_count") != len(constants["constants"])
+    or audit.get("status") != "pass"
+    or audit.get("counts", {}).get("constants") != len(constants["constants"])
+    or artifact.get("schema_version") != "ace.phantom.bootstrap-artifacts/1.0.0"
+    or artifact.get("status") != "bound"
+    or qualification.get("status") != "pass"
+    or qualification.get("gate") != "bootstrap"
+    or qualification.get("executable_was_run") is not False
+):
+    raise SystemExit("packaged bootstrap generation/audit/host records are invalid")
+for label, name in (
+    ("context", "bootstrap-context-manifest.json"),
+    ("resource", "bootstrap-resource-manifest.json"),
+    ("constant", "bootstrap-constant-manifest.json"),
+):
+    manifest_record = generation.get("manifests", {}).get(label, {})
+    if manifest_record.get("sha256") != digest(name):
+        raise SystemExit(f"packaged bootstrap generation lacks {label} binding")
+audit_inputs = audit.get("inputs", {})
+for label, name in (
+    ("context_manifest", "bootstrap-context-manifest.json"),
+    ("resource_manifest", "bootstrap-resource-manifest.json"),
+    ("constant_manifest", "bootstrap-constant-manifest.json"),
+):
+    if audit_inputs.get(label, {}).get("sha256") != digest(name):
+        raise SystemExit(f"packaged bootstrap audit lacks {label} binding")
+if (
+    generation.get("source", {}).get("sha256") != generated_source_sha
+    or audit_inputs.get("source", {}).get("sha256") != generated_source_sha
+):
+    raise SystemExit("packaged bootstrap generation/audit source binding is stale")
+qualification_hashes = {
+    "generated_source_sha256": generated_source_sha,
+    "linked_binary_sha256": artifact.get("linked_binary_sha256"),
+    "harness_source_sha256": artifact.get("harness_source_sha256"),
+    "compiler_context_manifest_sha256": digest("bootstrap-context-manifest.json"),
+    "compiler_resource_manifest_sha256": digest("bootstrap-resource-manifest.json"),
+    "compiler_constant_manifest_sha256": digest("bootstrap-constant-manifest.json"),
+    "generation_record_sha256": digest("bootstrap-generation.json"),
+    "generated_artifact_audit_sha256": digest("bootstrap-source-audit.json"),
+}
+if any(qualification.get(field) != value for field, value in qualification_hashes.items()):
+    raise SystemExit("packaged bootstrap host qualification hashes are stale")
+if (
+    binding.get("expected_generated_source_sha256") != generated_source_sha
+    or binding.get("expected_linked_binary_sha256")
+       != artifact.get("linked_binary_sha256")
+    or binding.get("expected_harness_source_sha256")
+       != artifact.get("harness_source_sha256")
+    or any(re.fullmatch(r"[0-9a-f]{64}", str(value)) is None for value in (
+        binding.get("expected_generated_source_sha256"),
+        binding.get("expected_linked_binary_sha256"),
+        binding.get("expected_harness_source_sha256"),
+    ))
+):
+    raise SystemExit("packaged bootstrap artifact hashes are incomplete")
+PY
+}
+
+capture_failed_bootstrap_qualification() {
+  local current="$1"
+  local qualification_exit="$2"
+  local run_root run_id current_exit canonical_runs_root canonical_run_root
+  [[ -s "${current}" ]]
+  cp -- "${current}" "${RESULT_DIR}/bootstrap-qualification-current.json"
+  [[ "$(jq -er '.gate + ":" + .status' "${current}")" == "bootstrap:failed" ]]
+  current_exit="$(jq -er .exit_code "${current}")"
+  [[ "${current_exit}" -eq "${qualification_exit}" ]]
+  run_id="$(jq -er .run_id "${current}")"
+  run_root="$(jq -er .run_root "${current}")"
+  canonical_runs_root="$(realpath -- \
+    "${ACE_PHANTOM_STATE_ROOT}/compile_only_results/runs")"
+  canonical_run_root="$(realpath -- "${run_root}")"
+  case "${canonical_run_root}" in
+    "${canonical_runs_root}"/*) ;;
+    *) return 1 ;;
+  esac
+  [[ "${canonical_run_root##*/}" == "${run_id}" ]]
+  cp -a -- "${canonical_run_root}" \
+    "${RESULT_DIR}/bootstrap-qualification"
+  (
+    cd "${RESULT_DIR}"
+    find bootstrap-qualification -type f -print0 |
+      LC_ALL=C sort -z |
+      xargs -0 -r sha256sum >bootstrap-qualification-failure-files.sha256
+  )
+  jq -n --arg status captured --arg run_id "${run_id}" \
+    --arg evidence_path bootstrap-qualification \
+    --arg sha256_manifest bootstrap-qualification-failure-files.sha256 \
+    --argjson qualification_exit_code "${qualification_exit}" \
+    '{schema_version:"ace.phantom.failed-bootstrap-qualification-evidence/1.0.0",
+      status:$status, run_id:$run_id,
+      qualification_exit_code:$qualification_exit_code,
+      evidence_path:$evidence_path, sha256_manifest:$sha256_manifest}' \
+    >"${RESULT_DIR}/bootstrap-qualification-failure-evidence.json"
+}
+
+run_bootstrap_host_qualification() {
+  local arguments_output
+  arguments_output="$(
+    jq -er '.argv[1:][]' "${INPUT}/bootstrap-qualification-invocation.json"
+  )"
+  local -a arguments
+  mapfile -t arguments <<<"${arguments_output}"
+  local -a status
+  local qualification_exit current run_root
+  set +e
+  bash "${ACE_PHANTOM_REPO_ROOT}/tools/phantom_gpu/compile_only.sh" \
+    "${arguments[@]}" 2>&1 | tee "${RESULT_DIR}/bootstrap-qualification.log"
+  status=("${PIPESTATUS[@]}")
+  set -e
+  qualification_exit="${status[0]}"
+  current="${ACE_PHANTOM_STATE_ROOT}/compile_only_results/current-bootstrap.json"
+  if [[ ${qualification_exit} -ne 0 ]]; then
+    capture_failed_bootstrap_qualification "${current}" "${qualification_exit}" ||
+      echo "failed bootstrap qualification evidence capture was incomplete" >&2
+    return "${qualification_exit}"
+  fi
+  [[ "${status[1]}" -eq 0 ]]
+  [[ "$(jq -er '.gate + ":" + .status' "${current}")" == "bootstrap:pass" ]]
+  run_root="$(jq -er .run_root "${current}")"
+  cmp "${run_root}/qualification_invocation.json" \
+    "${INPUT}/bootstrap-qualification-invocation.json"
+  cmp "${run_root}/bootstrap_generation_invocation.json" \
+    "${INPUT}/bootstrap-generation-invocation.json"
+  cp -a -- "${run_root}" "${RESULT_DIR}/bootstrap-qualification"
+  cp -- "${current}" "${RESULT_DIR}/bootstrap-qualification-current.json"
+}
+
+verify_frozen_bootstrap_qualification() {
+  local current run_root output frozen_artifact generated_artifact
+  current="${ACE_PHANTOM_STATE_ROOT}/compile_only_results/current-bootstrap.json"
+  run_root="$(jq -er .run_root "${current}")"
+  output="${run_root}/bootstrap_qualification"
+  frozen_artifact="${INPUT}/bootstrap-artifact-manifest.json"
+  generated_artifact="${run_root}/artifact_manifest.json"
+  cmp "${output}/compiler_context_manifest.json" \
+    "${INPUT}/bootstrap-context-manifest.json"
+  cmp "${output}/compiler_resource_manifest.json" \
+    "${INPUT}/bootstrap-resource-manifest.json"
+  cmp "${output}/compiler_constant_manifest.json" \
+    "${INPUT}/bootstrap-constant-manifest.json"
+  cmp "${output}/generation.json" "${INPUT}/bootstrap-generation.json"
+  python3 - "${INPUT}/payload.json" "${frozen_artifact}" \
+    "${generated_artifact}" "${output}/qualification.json" \
+    "${output}/source-audit.json" \
+    "${RESULT_DIR}/bootstrap-frozen-reference.json" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+payload_path, frozen_path, generated_path, qualification_path, audit_path, output_path = map(
+    Path, sys.argv[1:]
+)
+load = lambda path: json.loads(path.read_text(encoding="utf-8"))
+digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+binding = load(payload_path)["bootstrap_qualification"]
+frozen = load(frozen_path)
+generated = load(generated_path)
+qualification = load(qualification_path)
+audit = load(audit_path)
+paths = (
+    "bootstrap_qualification/bootstrap_qualification.cu",
+    "bootstrap_qualification/bootstrap_phantom_constants.cu",
+    "bootstrap_qualification/bootstrap_phantom_constants_sm80",
+    "bootstrap_qualification/compiler_context_manifest.json",
+    "bootstrap_qualification/compiler_resource_manifest.json",
+    "bootstrap_qualification/compiler_constant_manifest.json",
+    "bootstrap_qualification/generation.json",
+)
+for relative in paths:
+    if generated["files"].get(relative) != frozen["files"].get(relative):
+        raise SystemExit(f"regenerated bootstrap artifact differs: {relative}")
+expected = {
+    "expected_generated_source_sha256": generated["files"][paths[0]],
+    "expected_harness_source_sha256": generated["files"][paths[1]],
+    "expected_linked_binary_sha256": generated["files"][paths[2]],
+}
+if any(binding.get(field) != value for field, value in expected.items()):
+    raise SystemExit("regenerated bootstrap hashes differ from the packaged host freeze")
+qualification_expected = {
+    "generated_source_sha256": expected["expected_generated_source_sha256"],
+    "linked_binary_sha256": expected["expected_linked_binary_sha256"],
+    "harness_source_sha256": expected["expected_harness_source_sha256"],
+    "compiler_context_manifest_sha256": generated["files"][paths[3]],
+    "compiler_resource_manifest_sha256": generated["files"][paths[4]],
+    "compiler_constant_manifest_sha256": generated["files"][paths[5]],
+    "generation_record_sha256": generated["files"][paths[6]],
+}
+if any(qualification.get(field) != value for field, value in qualification_expected.items()):
+    raise SystemExit("regenerated bootstrap qualification hash binding is stale")
+if audit.get("status") != "pass" or not audit.get("counts", {}).get("constants"):
+    raise SystemExit("regenerated bootstrap source audit did not pass")
+record = {
+    "schema_version": "ace.phantom.bootstrap-frozen-reference/1.0.0",
+    "status": "pass",
+    "comparison": "deterministic-host-artifact-hashes",
+    "packaged_artifact_manifest_sha256": digest(frozen_path),
+    "packaged_host_qualification_sha256": binding["host_qualification_sha256"],
+    "packaged_source_audit_sha256": binding["source_audit_sha256"],
+    "regenerated_artifact_manifest_sha256": digest(generated_path),
+    "regenerated_host_qualification_sha256": digest(qualification_path),
+    "regenerated_source_audit_sha256": digest(audit_path),
+    **expected,
+}
+output_path.write_text(
+    json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
 }
 
 verify_frozen_ordinary_reference() {
@@ -1087,6 +1496,8 @@ PY
       "${RETAINED_HOST_ROOT}/outputs/compiler_context_manifest.json" \
     --resource-manifest \
       "${RETAINED_HOST_ROOT}/outputs/compiler_resource_manifest.json" \
+    --constant-manifest \
+      "${RETAINED_HOST_ROOT}/outputs/compiler_constant_manifest.json" \
     --ant-post-ckks-air \
       "${RETAINED_HOST_ROOT}/outputs/retained_ckks_ant_post.air" \
     --post-ckks-air \
@@ -1233,6 +1644,8 @@ PY
   cp -- "${context}" "${RESULT_DIR}/retained_compiler_context_manifest.json"
   cp -- "${RETAINED_HOST_ROOT}/outputs/compiler_resource_manifest.json" \
     "${RESULT_DIR}/retained_compiler_resource_manifest.json"
+  cp -- "${RETAINED_HOST_ROOT}/outputs/compiler_constant_manifest.json" \
+    "${RESULT_DIR}/retained_compiler_constant_manifest.json"
   cp -- "${fixture}" "${RESULT_DIR}/retained_ckks_v1.json"
   cp -- "${ant_json}" "${RESULT_DIR}/retained_ckks_cpu_reference.json"
   cp -- "${ant_bin}" "${RESULT_DIR}/retained_ckks_cpu_values.bin"
@@ -1249,6 +1662,207 @@ PY
     "${RESULT_DIR}/retained_generated_source_audit.json"
   cp -- "${RETAINED_HOST_ROOT}/build/gtest-source-attestation.json" \
     "${RESULT_DIR}/retained_gtest_source_attestation.json"
+}
+
+run_bootstrap_constant_cache_qualification() {
+  local expected_gpu current run_root bootstrap_dir binary context constants
+  local raw stdout_file stderr_file execution metrics execution_exit
+  expected_gpu="${ACE_RUNPOD_EXPECTED_GPU_NAME:-}"
+  case "${expected_gpu}" in
+    "NVIDIA A100 80GB PCIe"|"NVIDIA A100-SXM4-80GB") ;;
+    *)
+      echo "an exact supported A100 GPU identity is required" >&2
+      return 1
+      ;;
+  esac
+  current="${ACE_PHANTOM_STATE_ROOT}/compile_only_results/current-bootstrap.json"
+  [[ "$(jq -er '.gate + ":" + .status' "${current}")" == "bootstrap:pass" ]]
+  run_root="$(jq -er .run_root "${current}")"
+  bootstrap_dir="${run_root}/bootstrap_qualification"
+  binary="${bootstrap_dir}/bootstrap_phantom_constants_sm80"
+  context="${bootstrap_dir}/compiler_context_manifest.json"
+  constants="${bootstrap_dir}/compiler_constant_manifest.json"
+  [[ -x "${binary}" && -s "${context}" && -s "${constants}" ]]
+  raw="${RESULT_DIR}/bootstrap-constant-cache.raw.json"
+  stdout_file="${RESULT_DIR}/bootstrap-constant-cache.stdout.txt"
+  stderr_file="${RESULT_DIR}/bootstrap-constant-cache.stderr.txt"
+  execution="${RESULT_DIR}/bootstrap-constant-cache-execution.json"
+  metrics="${RESULT_DIR}/bootstrap-setup-metrics.json"
+  set +e
+  timeout 1800 "${binary}" "${raw}" >"${stdout_file}" 2>"${stderr_file}"
+  execution_exit=$?
+  set -e
+  [[ ${execution_exit} -eq 0 ]]
+  python3 - "${raw}" "${context}" "${constants}" "${binary}" \
+    "${stdout_file}" "${stderr_file}" "${expected_gpu}" \
+    "${RESULT_DIR}/bootstrap-constant-cache.json" "${metrics}" \
+    "${execution}" <<'PY'
+import hashlib
+import json
+import math
+from pathlib import Path
+import re
+import sys
+
+(raw_path, context_path, constants_path, binary_path, stdout_path, stderr_path,
+ expected_gpu, output_path, metrics_path, execution_path) = sys.argv[1:]
+raw_path, context_path, constants_path, binary_path = map(
+    Path, (raw_path, context_path, constants_path, binary_path)
+)
+stdout_path, stderr_path, output_path, metrics_path, execution_path = map(
+    Path, (stdout_path, stderr_path, output_path, metrics_path, execution_path)
+)
+def reject_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise SystemExit(f"duplicate JSON key in bootstrap runtime result: {key}")
+        value[key] = item
+    return value
+
+load = lambda path: json.loads(
+    path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicates
+)
+digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+result = load(raw_path)
+context = load(context_path)
+constants = load(constants_path)
+top_keys = {
+    "status", "gpu", "context_manifest_sha256", "resource_flags", "counts",
+    "tolerance", "maximum_correctness_error", "maximum_cached_error",
+    "maximum_mode_error", "setup_metrics", "entries",
+}
+if set(result) != top_keys or result.get("status") != "pass":
+    raise SystemExit("bootstrap constant-cache result has an invalid shape/status")
+context_sha = digest(context_path)
+if (
+    result.get("gpu") != expected_gpu
+    or "A100" not in result["gpu"]
+    or result.get("context_manifest_sha256") != context_sha
+    or result.get("resource_flags") != 127
+):
+    raise SystemExit("bootstrap result GPU/context/resource binding is invalid")
+count = len(constants["constants"])
+counts = result.get("counts")
+if counts != {
+    "constants_declared": count,
+    "correctness_encodes": count,
+    "cached_loads": count,
+} or count <= 0:
+    raise SystemExit("bootstrap constant-cache operation counts are invalid")
+if result.get("tolerance") != {"absolute": 1.0e-7, "relative": 1.0e-10}:
+    raise SystemExit("bootstrap constant-cache tolerance is invalid")
+for field in (
+    "maximum_correctness_error", "maximum_cached_error", "maximum_mode_error"
+):
+    value = result.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value) or value < 0:
+        raise SystemExit(f"bootstrap result has an invalid error metric: {field}")
+
+setup = result.get("setup_metrics")
+if not isinstance(setup, dict) or set(setup) != {"context_and_keys", "plaintext_cache"}:
+    raise SystemExit("bootstrap setup metrics have an invalid shape")
+context_setup = setup["context_and_keys"]
+cache_setup = setup["plaintext_cache"]
+if set(context_setup) != {"seconds", "device_bytes"} or set(cache_setup) != {
+    "seconds", "device_bytes", "logical_device_bytes", "host_bytes", "entries"
+}:
+    raise SystemExit("bootstrap setup/cache metric fields are incomplete")
+for value in (context_setup["seconds"], cache_setup["seconds"]):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value) or value <= 0:
+        raise SystemExit("bootstrap setup duration is not positive and finite")
+for field, value in (
+    ("context device bytes", context_setup["device_bytes"]),
+    ("cache device bytes", cache_setup["device_bytes"]),
+    ("cache logical device bytes", cache_setup["logical_device_bytes"]),
+    ("cache host bytes", cache_setup["host_bytes"]),
+    ("cache entries", cache_setup["entries"]),
+):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SystemExit(f"bootstrap {field} is not a nonnegative integer")
+expected_logical_bytes = sum(
+    context["polynomial_degree"] * entry["ace_level"] * 8
+    for entry in constants["constants"]
+)
+emitted_payload_bytes = sum(
+    entry["slot_count"] * 2 * 8 for entry in constants["constants"]
+)
+if (
+    expected_logical_bytes <= 0
+    or cache_setup["logical_device_bytes"] != expected_logical_bytes
+    or cache_setup["host_bytes"] < emitted_payload_bytes
+    or cache_setup["entries"] != count
+):
+    raise SystemExit("bootstrap logical cache-byte/accounting metrics are invalid")
+
+entries = result.get("entries")
+if not isinstance(entries, list) or len(entries) != count:
+    raise SystemExit("bootstrap entry result count is invalid")
+entry_keys = {
+    "entry_id", "constant_id", "symbol", "slot_count", "ace_level",
+    "chain_index", "raw_scale", "parameter_fingerprint",
+    "maximum_correctness_error", "maximum_cached_error", "maximum_mode_error",
+}
+for index, (entry, manifest) in enumerate(zip(entries, constants["constants"])):
+    if set(entry) != entry_keys:
+        raise SystemExit(f"bootstrap entry result shape is invalid: {index}")
+    for field in (
+        "entry_id", "constant_id", "slot_count", "ace_level", "chain_index"
+    ):
+        if isinstance(entry[field], bool) or not isinstance(entry[field], int) \
+                or entry[field] < 0:
+            raise SystemExit(f"bootstrap entry integer field is invalid: {index}/{field}")
+    if (
+        entry["entry_id"] != index
+        or entry["constant_id"] != manifest["constant_id"]
+        or entry["symbol"] != manifest["symbol"]
+        or entry["slot_count"] != manifest["slot_count"]
+        or entry["ace_level"] != manifest["ace_level"]
+        or entry["chain_index"] != manifest["chain_index"]
+        or entry["raw_scale"] != float.fromhex(manifest["raw_scale"])
+        or re.fullmatch(r"[0-9a-f]{64}", entry["parameter_fingerprint"]) is None
+    ):
+        raise SystemExit(f"bootstrap entry differs from its manifest: {index}")
+    for field in (
+        "maximum_correctness_error", "maximum_cached_error", "maximum_mode_error"
+    ):
+        value = entry[field]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(value) or value < 0:
+            raise SystemExit(f"bootstrap entry error metric is invalid: {index}/{field}")
+
+output_path.write_text(
+    json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+metrics_record = {
+    "schema_version": "ace.phantom.bootstrap-setup-metrics/1.0.0",
+    "status": "pass",
+    "context_manifest_sha256": context_sha,
+    "constant_count": count,
+    "emitted_payload_bytes": emitted_payload_bytes,
+    "expected_logical_device_bytes": expected_logical_bytes,
+    "context_and_keys": context_setup,
+    "plaintext_cache": cache_setup,
+}
+metrics_path.write_text(
+    json.dumps(metrics_record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+execution_record = {
+    "schema_version": "ace.phantom.bootstrap-constant-cache-execution/1.0.0",
+    "status": "pass",
+    "invocation_count": 1,
+    "binary_sha256": digest(binary_path),
+    "raw_result_sha256": digest(raw_path),
+    "stdout_sha256": digest(stdout_path),
+    "stderr_sha256": digest(stderr_path),
+}
+execution_path.write_text(
+    json.dumps(execution_record, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
 }
 
 run_native_health() {
@@ -1326,6 +1940,28 @@ verify_success_evidence() {
       require_terminal_record ordinary-frozen-reference.json \
         '.status == "pass"'
       require_terminal_record native-health.json '.status == "skipped"'
+      require_terminal_record bootstrap-qualification-current.json '
+        .gate == "bootstrap" and .status == "pass" and .exit_code == 0
+      '
+      require_terminal_record bootstrap-frozen-reference.json '
+        .schema_version == "ace.phantom.bootstrap-frozen-reference/1.0.0"
+        and .status == "pass"
+        and .comparison == "deterministic-host-artifact-hashes"
+        and ([.packaged_artifact_manifest_sha256,
+              .packaged_host_qualification_sha256,
+              .packaged_source_audit_sha256,
+              .regenerated_artifact_manifest_sha256,
+              .regenerated_host_qualification_sha256,
+              .regenerated_source_audit_sha256] |
+             all(test("^[0-9a-f]{64}$")))
+      '
+      require_terminal_record bootstrap-constant-cache.json \
+        '.status == "skipped"'
+      require_terminal_record bootstrap-setup-metrics.json \
+        '.status == "skipped"'
+      require_terminal_record bootstrap-constant-cache-execution.json '
+        .status == "skipped" and .invocation_count == 0
+      '
       require_terminal_record retained-frozen-reference.json '
         .status == "pass"
         and .provider_neutral_ant_reference_matches == true
@@ -1335,6 +1971,50 @@ verify_success_evidence() {
     runpod)
       require_terminal_record native-health.json \
         '.status == "pass" and .device_count == 1'
+      require_terminal_record bootstrap-qualification-current.json '
+        .gate == "bootstrap" and .status == "pass" and .exit_code == 0
+      '
+      require_terminal_record bootstrap-frozen-reference.json '
+        .schema_version == "ace.phantom.bootstrap-frozen-reference/1.0.0"
+        and .status == "pass"
+        and .comparison == "deterministic-host-artifact-hashes"
+        and ([.packaged_artifact_manifest_sha256,
+              .packaged_host_qualification_sha256,
+              .packaged_source_audit_sha256,
+              .regenerated_artifact_manifest_sha256,
+              .regenerated_host_qualification_sha256,
+              .regenerated_source_audit_sha256] |
+             all(test("^[0-9a-f]{64}$")))
+      '
+      require_terminal_record bootstrap-constant-cache.json '
+        .status == "pass" and (.gpu | contains("A100"))
+        and .resource_flags == 127
+        and .counts.constants_declared > 0
+        and .counts.correctness_encodes == .counts.constants_declared
+        and .counts.cached_loads == .counts.constants_declared
+        and (.entries | length) == .counts.constants_declared
+      '
+      require_terminal_record bootstrap-setup-metrics.json '
+        .schema_version == "ace.phantom.bootstrap-setup-metrics/1.0.0"
+        and .status == "pass" and .constant_count > 0
+        and .plaintext_cache.entries == .constant_count
+        and .plaintext_cache.logical_device_bytes ==
+          .expected_logical_device_bytes
+        and .expected_logical_device_bytes > 0
+        and .plaintext_cache.host_bytes >= .emitted_payload_bytes
+        and .context_and_keys.seconds > 0
+        and .plaintext_cache.seconds > 0
+      '
+      require_terminal_record bootstrap-constant-cache-execution.json \
+        --slurpfile artifact \
+          "${RESULT_DIR}/bootstrap-qualification/artifact_manifest.json" '
+        .schema_version ==
+          "ace.phantom.bootstrap-constant-cache-execution/1.0.0"
+        and .status == "pass" and .invocation_count == 1
+        and .binary_sha256 ==
+          $artifact[0].files[
+            "bootstrap_qualification/bootstrap_phantom_constants_sm80"]
+      '
       require_terminal_record ordinary_ckks_compare.json '
         .status == "pass" and .case_count > 0
         and .passing_case_count == .case_count
@@ -1503,8 +2183,13 @@ CURRENT_PHASE=""
 phase qualification run_qualification
 if [[ "${MODE}" != "freeze-host" ]]; then
   phase frozen_ordinary_reference verify_frozen_ordinary_reference
+  phase bootstrap_payload_validation validate_packaged_bootstrap_qualification
+  phase bootstrap_host_qualification run_bootstrap_host_qualification
+  phase frozen_bootstrap_qualification verify_frozen_bootstrap_qualification
   if [[ "${MODE}" == "runpod" ]]; then
     phase native_a100_health run_native_health
+    phase bootstrap_constant_cache_qualification \
+      run_bootstrap_constant_cache_qualification
     phase ordinary_gpu_qualification run_ordinary_gpu_qualification
     # The retained build and all retained execution deliberately begin only
     # after the complete ordinary GPU prerequisite has passed.
@@ -1514,6 +2199,12 @@ if [[ "${MODE}" != "freeze-host" ]]; then
   else
     printf '{"status":"skipped","reason":"local host has no GPU"}\n' \
       >"${RESULT_DIR}/native-health.json"
+    printf '{"status":"skipped","reason":"local host has no GPU"}\n' \
+      >"${RESULT_DIR}/bootstrap-constant-cache.json"
+    printf '{"status":"skipped","reason":"local host has no GPU"}\n' \
+      >"${RESULT_DIR}/bootstrap-setup-metrics.json"
+    printf '{"status":"skipped","reason":"local host has no GPU","invocation_count":0}\n' \
+      >"${RESULT_DIR}/bootstrap-constant-cache-execution.json"
     phase retained_host_qualification run_retained_host_qualification
     phase frozen_retained_reference verify_frozen_retained_reference
   fi

@@ -19,6 +19,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--context-manifest", required=True, type=Path)
     parser.add_argument("--resource-manifest", required=True, type=Path)
+    parser.add_argument("--constant-manifest", type=Path)
     parser.add_argument("--post-ckks-air", type=Path)
     parser.add_argument("--poly-degree", required=True, type=int)
     parser.add_argument("--mul-level", required=True, type=int)
@@ -35,12 +36,22 @@ def parse_arguments() -> argparse.Namespace:
 
 def main() -> int:
     arguments = parse_arguments()
+    if arguments.constant_manifest is None:
+        derived_name = arguments.resource_manifest.name.replace(
+            "resources", "constants"
+        ).replace("resource", "constant")
+        if derived_name == arguments.resource_manifest.name:
+            derived_name = arguments.resource_manifest.stem + "_constants.json"
+        arguments.constant_manifest = arguments.resource_manifest.with_name(
+            derived_name
+        )
     if arguments.output.suffix != ".cu":
         raise SystemExit("output must use the .cu suffix")
 
     for manifest_path in (
         arguments.context_manifest,
         arguments.resource_manifest,
+        arguments.constant_manifest,
     ):
         if manifest_path.suffix != ".json":
             raise SystemExit("manifest outputs must use the .json suffix")
@@ -49,6 +60,7 @@ def main() -> int:
         arguments.output,
         arguments.context_manifest,
         arguments.resource_manifest,
+        arguments.constant_manifest,
         arguments.post_ckks_air,
     ):
         if output_path is None:
@@ -95,6 +107,7 @@ def main() -> int:
         codegen_ir="ckks",
         context_manifest_file=str(arguments.context_manifest),
         resource_manifest_file=str(arguments.resource_manifest),
+        constant_manifest_file=str(arguments.constant_manifest),
     )
     result = pipeline.run(
         start_domain="fhe::ckks", dump_stages=True, verbose=False

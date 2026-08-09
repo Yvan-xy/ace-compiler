@@ -30,8 +30,8 @@ COMPILER_HAMMING_WEIGHT=""
 ORDINARY_RESULTS=""
 
 usage() {
-  echo "usage: $0 --gate <toolchain|ckks2c|ordinary|all> [compiler context options]"
-  echo "CKKS2C/ordinary/all requires --poly-degree N --mul-level Q --input-level L"
+  echo "usage: $0 --gate <toolchain|ckks2c|ordinary|bootstrap|all> [compiler context options]"
+  echo "CKKS2C/ordinary/bootstrap/all requires --poly-degree N --mul-level Q --input-level L"
   echo "  --security-level B --scaling-factor-bits B --first-prime-bits B"
   echo "  --hamming-weight W"
 }
@@ -83,7 +83,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${GATE}" in
-  toolchain|ckks2c|ordinary|all)
+  toolchain|ckks2c|ordinary|bootstrap|all)
     ;;
   *)
     usage >&2
@@ -102,6 +102,19 @@ if [[ "${GATE}" != "toolchain" ]]; then
       exit 2
     fi
   done
+fi
+
+if [[ "${GATE}" == "bootstrap" ]]; then
+  if [[ "${COMPILER_POLY_DEGREE}" != "16384" ||
+        "${COMPILER_MUL_LEVEL}" != "26" ||
+        "${COMPILER_INPUT_LEVEL}" != "1" ||
+        "${COMPILER_SECURITY_LEVEL}" != "0" ||
+        "${COMPILER_SCALING_BITS}" != "56" ||
+        "${COMPILER_FIRST_PRIME_BITS}" != "60" ||
+        "${COMPILER_HAMMING_WEIGHT}" != "192" ]]; then
+    echo "bootstrap gate requires the exact bootstrap qualification context 16384/26/1/0/56/60/192" >&2
+    exit 2
+  fi
 fi
 
 python3 - "${GATE}" "${ORIGINAL_ARGUMENTS[@]}" <<'PY'
@@ -161,6 +174,7 @@ RUN_ID="${RUN_ROOT##*/}"
 TOOLCHAIN_RESULTS="${RUN_ROOT}/toolchain"
 CKKS2C_RESULTS="${RUN_ROOT}/ckks2c"
 ORDINARY_RESULTS="${RUN_ROOT}/ordinary_ckks"
+BOOTSTRAP_RESULTS="${RUN_ROOT}/bootstrap_qualification"
 CURRENT_RECORD="${RESULTS_ROOT}/current-${GATE}.json"
 LATEST_SUCCESS_RECORD="${RESULTS_ROOT}/latest-success-${GATE}.json"
 STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -258,6 +272,135 @@ write_run_state() {
 }
 
 write_artifact_manifest() {
+  if [[ "${GATE}" == "bootstrap" ]]; then
+    local bootstrap_ace_commit
+    if [[ "${SOURCE_MODE}" == "snapshot" ]]; then
+      bootstrap_ace_commit="${ACE_PHANTOM_ACE_COMMIT}"
+    else
+      bootstrap_ace_commit="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+    fi
+    python3 - "${RUN_ROOT}" "${SCRIPT_DIR}" "${bootstrap_ace_commit}" \
+      "${PHANTOM_COMMIT}" "${SOURCE_MODE}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+run_root = Path(sys.argv[1])
+script_dir = Path(sys.argv[2])
+ace_commit, phantom_commit, source_mode = sys.argv[3:6]
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+excluded = {"artifact_manifest.json", "manifest.json", "SHA256SUMS"}
+files = {
+    str(path.relative_to(run_root)): digest(path)
+    for path in sorted(run_root.rglob("*"))
+    if path.is_file() and str(path.relative_to(run_root)) not in excluded
+}
+required = {
+    "qualification_invocation.json",
+    "bootstrap_generation_invocation.json",
+    "bootstrap_qualification/bootstrap_qualification.cu",
+    "bootstrap_qualification/bootstrap_phantom_constants.cu",
+    "bootstrap_qualification/compiler_context_manifest.json",
+    "bootstrap_qualification/compiler_resource_manifest.json",
+    "bootstrap_qualification/compiler_constant_manifest.json",
+    "bootstrap_qualification/generation.json",
+    "bootstrap_qualification/source-audit.json",
+    "bootstrap_qualification/configuration.json",
+    "bootstrap_qualification/environment.txt",
+    "bootstrap_qualification/link-commands.txt",
+    "bootstrap_qualification/bootstrap_qualification.o",
+    "bootstrap_qualification/bootstrap_phantom_constants.o",
+    "bootstrap_qualification/bootstrap_qualification.dlink.o",
+    "bootstrap_qualification/bootstrap_phantom_constants_sm80",
+    "bootstrap_qualification/cuda_elf.txt",
+    "bootstrap_qualification/cuda_resources.txt",
+    "bootstrap_qualification/file.txt",
+    "bootstrap_qualification/readelf.txt",
+    "bootstrap_qualification/undefined_symbols.txt",
+    "bootstrap_qualification/adapter_archive_members.txt",
+    "bootstrap_qualification/provider_archive_members.txt",
+    "bootstrap_qualification/common_archive_members.txt",
+    "bootstrap_qualification/adapter_archive_symbols.txt",
+    "bootstrap_qualification/provider_archive_symbols.txt",
+    "bootstrap_qualification/common_archive_symbols.txt",
+    "bootstrap_qualification/generated_object_symbols.txt",
+    "bootstrap_qualification/harness_object_symbols.txt",
+    "bootstrap_qualification/io-helper-closure.json",
+    "bootstrap_qualification/linked_binary_symbols.txt",
+    "bootstrap_qualification/native_bootstrap_symbols.txt",
+    "bootstrap_qualification/archive-member-audit.json",
+    "bootstrap_qualification/symbol-closure.json",
+    "bootstrap_qualification/qualification.json",
+}
+required.add(
+    "ace_source_manifest.json"
+    if source_mode == "snapshot"
+    else "ace_tracked_sources.sha256"
+)
+if source_mode == "snapshot":
+    required.add("phantom_source_manifest.json")
+missing = sorted(required - files.keys())
+if missing:
+    raise SystemExit("bootstrap artifact inputs are missing: " + ", ".join(missing))
+
+qualification = json.loads(
+    (run_root / "bootstrap_qualification/qualification.json").read_text(encoding="utf-8")
+)
+generation = json.loads(
+    (run_root / "bootstrap_qualification/generation.json").read_text(encoding="utf-8")
+)
+audit = json.loads(
+    (run_root / "bootstrap_qualification/source-audit.json").read_text(encoding="utf-8")
+)
+if qualification.get("status") != "pass" or generation.get("status") != "pass":
+    raise SystemExit("bootstrap qualification/generation status is not pass")
+if audit.get("status") != "pass":
+    raise SystemExit("bootstrap generated-artifact audit status is not pass")
+record = {
+    "schema_version": "ace.phantom.bootstrap-artifacts/1.0.0",
+    "status": "bound",
+    "ace_commit": ace_commit,
+    "phantom_commit": phantom_commit,
+    "source_mode": source_mode,
+    "normalized_qualification_argv_sha256": json.loads(
+        (run_root / "qualification_invocation.json").read_text(encoding="utf-8")
+    )["normalized_argv_sha256"],
+    "normalized_generation_argv_sha256": json.loads(
+        (run_root / "bootstrap_generation_invocation.json").read_text(
+            encoding="utf-8"
+        )
+    )["normalized_argv_sha256"],
+    "compiler_context_manifest_sha256": files[
+        "bootstrap_qualification/compiler_context_manifest.json"
+    ],
+    "compiler_resource_manifest_sha256": files[
+        "bootstrap_qualification/compiler_resource_manifest.json"
+    ],
+    "compiler_constant_manifest_sha256": files[
+        "bootstrap_qualification/compiler_constant_manifest.json"
+    ],
+    "generation_record_sha256": files["bootstrap_qualification/generation.json"],
+    "generated_artifact_audit_sha256": files[
+        "bootstrap_qualification/source-audit.json"
+    ],
+    "linked_binary_sha256": files[
+        "bootstrap_qualification/bootstrap_phantom_constants_sm80"
+    ],
+    "harness_source_sha256": files[
+        "bootstrap_qualification/bootstrap_phantom_constants.cu"
+    ],
+    "files": files,
+}
+(run_root / "artifact_manifest.json").write_text(
+    json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+    return 0
+  fi
   [[ "${GATE}" == "ordinary" ]] || return 0
   local ace_commit
   if [[ "${SOURCE_MODE}" == "snapshot" ]]; then
@@ -290,6 +433,7 @@ required_paths = {
     "ckks2c/add_mul_rotate.cu",
     "ckks2c/compiler_context_manifest.json",
     "ckks2c/compiler_resource_manifest.json",
+    "ckks2c/compiler_constant_manifest.json",
     "ckks2c/ordinary_ckks_post_ckks.air",
     "ckks2c/source_audit.json",
     "ckks2c/configuration.json",
@@ -312,6 +456,7 @@ required_paths = {
     "ordinary_ckks/fixture-validation.json",
     "ordinary_ckks/static-rejection-coverage.json",
     "ordinary_ckks/keyless-source-audit.json",
+    "ordinary_ckks/ordinary_ckks_keyless_constants.json",
     "ordinary_ckks/link-commands.txt",
     "ordinary_ckks/ordinary_ckks_analytic_reference.json",
     "ordinary_ckks/ordinary_ckks_analytic_values.bin",
@@ -373,6 +518,9 @@ record = {
     ],
     "post_ckks_air_sha256": files[
         "ckks2c/ordinary_ckks_post_ckks.air"
+    ],
+    "compiler_constant_manifest_sha256": files[
+        "ckks2c/compiler_constant_manifest.json"
     ],
     "production_sources": {
         path: files[path]
@@ -447,6 +595,12 @@ write_manifest() {
   local sums_sha256
   local context_manifest_sha256=""
   local resource_manifest_sha256=""
+  local constant_manifest_sha256=""
+  local bootstrap_generation_sha256=""
+  local bootstrap_audit_sha256=""
+  local bootstrap_binary_sha256=""
+  local bootstrap_harness_sha256=""
+  local bootstrap_qualification_sha256=""
   local qualification_invocation_sha256=""
   local qualification_argv_sha256=""
   local compiler_invocation_sha256=""
@@ -465,13 +619,26 @@ write_manifest() {
   local ace_commit
   local source_manifest_name
   sums_sha256="$(sha256sum "${RUN_ROOT}/SHA256SUMS" | awk '{print $1}')"
-  if [[ -s "${CKKS2C_RESULTS}/compiler_context_manifest.json" ]]; then
+  if [[ "${GATE}" == "bootstrap" &&
+        -s "${BOOTSTRAP_RESULTS}/compiler_context_manifest.json" ]]; then
+    context_manifest_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/compiler_context_manifest.json" | awk '{print $1}')"
+    resource_manifest_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/compiler_resource_manifest.json" | awk '{print $1}')"
+    constant_manifest_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/compiler_constant_manifest.json" | awk '{print $1}')"
+    bootstrap_generation_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/generation.json" | awk '{print $1}')"
+    bootstrap_audit_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/source-audit.json" | awk '{print $1}')"
+    bootstrap_binary_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/bootstrap_phantom_constants_sm80" | awk '{print $1}')"
+    bootstrap_harness_sha256="$(sha256sum "${SCRIPT_DIR}/harness/bootstrap_phantom_constants.cu" | awk '{print $1}')"
+    bootstrap_qualification_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/qualification.json" | awk '{print $1}')"
+  elif [[ -s "${CKKS2C_RESULTS}/compiler_context_manifest.json" ]]; then
     context_manifest_sha256="$(
       sha256sum "${CKKS2C_RESULTS}/compiler_context_manifest.json" | awk '{print $1}'
     )"
-  fi
-  if [[ -s "${CKKS2C_RESULTS}/compiler_resource_manifest.json" ]]; then
-    resource_manifest_sha256="$(sha256sum "${CKKS2C_RESULTS}/compiler_resource_manifest.json" | awk '{print $1}')"
+    if [[ -s "${CKKS2C_RESULTS}/compiler_resource_manifest.json" ]]; then
+      resource_manifest_sha256="$(sha256sum "${CKKS2C_RESULTS}/compiler_resource_manifest.json" | awk '{print $1}')"
+    fi
+    if [[ -s "${CKKS2C_RESULTS}/compiler_constant_manifest.json" ]]; then
+      constant_manifest_sha256="$(sha256sum "${CKKS2C_RESULTS}/compiler_constant_manifest.json" | awk '{print $1}')"
+    fi
   fi
   if [[ -s "${RUN_ROOT}/qualification_invocation.json" ]]; then
     qualification_invocation_sha256="$(sha256sum "${RUN_ROOT}/qualification_invocation.json" | awk '{print $1}')"
@@ -541,6 +708,12 @@ write_manifest() {
     --arg definition_sha256 "${ACE_PHANTOM_DEFINITION_SHA256}" \
     --arg context_manifest_sha256 "${context_manifest_sha256}" \
     --arg resource_manifest_sha256 "${resource_manifest_sha256}" \
+    --arg constant_manifest_sha256 "${constant_manifest_sha256}" \
+    --arg bootstrap_generation_sha256 "${bootstrap_generation_sha256}" \
+    --arg bootstrap_audit_sha256 "${bootstrap_audit_sha256}" \
+    --arg bootstrap_binary_sha256 "${bootstrap_binary_sha256}" \
+    --arg bootstrap_harness_sha256 "${bootstrap_harness_sha256}" \
+    --arg bootstrap_qualification_sha256 "${bootstrap_qualification_sha256}" \
     --arg qualification_invocation_sha256 "${qualification_invocation_sha256}" \
     --arg qualification_argv_sha256 "${qualification_argv_sha256}" \
     --arg compiler_invocation_sha256 "${compiler_invocation_sha256}" \
@@ -573,6 +746,18 @@ write_manifest() {
         (if $context_manifest_sha256 == "" then null else $context_manifest_sha256 end),
       compiler_resource_manifest_sha256:
         (if $resource_manifest_sha256 == "" then null else $resource_manifest_sha256 end),
+      compiler_constant_manifest_sha256:
+        (if $constant_manifest_sha256 == "" then null else $constant_manifest_sha256 end),
+      bootstrap_generation_record_sha256:
+        (if $bootstrap_generation_sha256 == "" then null else $bootstrap_generation_sha256 end),
+      bootstrap_generated_artifact_audit_sha256:
+        (if $bootstrap_audit_sha256 == "" then null else $bootstrap_audit_sha256 end),
+      bootstrap_linked_binary_sha256:
+        (if $bootstrap_binary_sha256 == "" then null else $bootstrap_binary_sha256 end),
+      bootstrap_harness_source_sha256:
+        (if $bootstrap_harness_sha256 == "" then null else $bootstrap_harness_sha256 end),
+      bootstrap_host_qualification_sha256:
+        (if $bootstrap_qualification_sha256 == "" then null else $bootstrap_qualification_sha256 end),
       qualification_invocation_sha256:
         (if $qualification_invocation_sha256 == "" then null else $qualification_invocation_sha256 end),
       normalized_qualification_argv_sha256:
@@ -957,8 +1142,10 @@ run_compiler_tests() {
     ace_edsl/tests/test_ckks2c_codegen.py
     tools/phantom_gpu/tests/test_a100_evidence_archives.py
     tools/phantom_gpu/tests/test_codegen_tools.py
+    tools/phantom_gpu/tests/test_bootstrap_generated_artifact_audit.py
     tools/phantom_gpu/tests/test_ordinary_ckks_fixture.py
     tools/phantom_gpu/tests/test_ordinary_runtime_source.py
+    tools/phantom_gpu/tests/test_phantom_constant_cache_source.py
     tools/phantom_gpu/tests/test_runpod_pipeline.py
   )
   (
@@ -1244,6 +1431,7 @@ link_generated_probe() {
   local post_ckks_air="${CKKS2C_RESULTS}/ordinary_ckks_post_ckks.air"
   local context_manifest="${CKKS2C_RESULTS}/compiler_context_manifest.json"
   local resource_manifest="${CKKS2C_RESULTS}/compiler_resource_manifest.json"
+  local constant_manifest="${CKKS2C_RESULTS}/compiler_constant_manifest.json"
   local object="${CKKS2C_RESULTS}/add_mul_rotate.o"
   local symbol_source="${CKKS2C_RESULTS}/ordinary_runtime_symbols.cu"
   local symbol_object="${CKKS2C_RESULTS}/ordinary_runtime_symbols.o"
@@ -1298,6 +1486,13 @@ link_generated_probe() {
   record_common_configuration "${CKKS2C_RESULTS}" "${context_manifest}"
   local context_manifest_sha
   context_manifest_sha="$(sha256sum "${context_manifest}" | awk '{print $1}')"
+  jq -e --arg context_sha256 "${context_manifest_sha}" '
+    .schema_version == 1 and
+    .context_schema_version == 1 and
+    .resource_schema_version == 3 and
+    .context_manifest_sha256 == $context_sha256 and
+    .constants == []
+  ' "${constant_manifest}" >/dev/null
 
   local contract_binary="${CKKS2C_RESULTS}/ordinary_contract_test"
   local -a contract_context_arguments
@@ -1493,12 +1688,14 @@ link_generated_probe() {
   local source_sha
   local binary_sha
   local resource_manifest_sha
+  local constant_manifest_sha
   local health_binary_sha
   local terminal_selection_sha
   local adapter_archive_sha provider_archive_sha common_archive_sha
   source_sha="$(sha256sum "${source}" | awk '{print $1}')"
   binary_sha="$(sha256sum "${binary}" | awk '{print $1}')"
   resource_manifest_sha="$(sha256sum "${resource_manifest}" | awk '{print $1}')"
+  constant_manifest_sha="$(sha256sum "${constant_manifest}" | awk '{print $1}')"
   health_binary_sha="$(sha256sum "${health_binary}" | awk '{print $1}')"
   terminal_selection_sha="$(
     sha256sum "${CKKS2C_RESULTS}/terminal_selection.json" | awk '{print $1}'
@@ -1517,6 +1714,7 @@ link_generated_probe() {
     --arg health_binary_sha256 "${health_binary_sha}"
     --arg context_manifest_sha256 "${context_manifest_sha}"
     --arg resource_manifest_sha256 "${resource_manifest_sha}"
+    --arg constant_manifest_sha256 "${constant_manifest_sha}"
     --arg terminal_selection_sha256 "${terminal_selection_sha}"
     --arg adapter_archive_sha256 "${adapter_archive_sha}"
     --arg provider_archive_sha256 "${provider_archive_sha}"
@@ -1536,6 +1734,7 @@ link_generated_probe() {
       health_binary_sha256: $health_binary_sha256,
       compiler_context_manifest_sha256: $context_manifest_sha256,
       compiler_resource_manifest_sha256: $resource_manifest_sha256,
+      compiler_constant_manifest_sha256: $constant_manifest_sha256,
       terminal_selection_sha256: $terminal_selection_sha256,
       adapter_archive_sha256: $adapter_archive_sha256,
       provider_archive_sha256: $provider_archive_sha256,
@@ -1554,6 +1753,332 @@ link_generated_probe() {
   echo "generated CKKS2C source compile, device-link, host-link, and inspection passed"
 }
 
+build_bootstrap_host_qualification() {
+  test ! -e "${BOOTSTRAP_RESULTS}"
+  local runtime_build="${ACE_BUILD}/rtlib/build"
+  local adapter_archive="${runtime_build}/phantom/libFHErt_phantom.a"
+  local common_archive="${runtime_build}/common/libFHErt_common.a"
+  local external_source="${runtime_build}/external/src/phantom_external"
+  local provider_archive="${runtime_build}/external/src/phantom_external-build/lib/libphantom_ordinary.a"
+  local source="${BOOTSTRAP_RESULTS}/bootstrap_qualification.cu"
+  local context_manifest="${BOOTSTRAP_RESULTS}/compiler_context_manifest.json"
+  local resource_manifest="${BOOTSTRAP_RESULTS}/compiler_resource_manifest.json"
+  local constant_manifest="${BOOTSTRAP_RESULTS}/compiler_constant_manifest.json"
+  local generation="${BOOTSTRAP_RESULTS}/generation.json"
+  local source_audit="${BOOTSTRAP_RESULTS}/source-audit.json"
+  local source_object="${BOOTSTRAP_RESULTS}/bootstrap_qualification.o"
+  local checked_harness_source="${SCRIPT_DIR}/harness/bootstrap_phantom_constants.cu"
+  local harness_source="${BOOTSTRAP_RESULTS}/bootstrap_phantom_constants.cu"
+  local harness_object="${BOOTSTRAP_RESULTS}/bootstrap_phantom_constants.o"
+  local device_link="${BOOTSTRAP_RESULTS}/bootstrap_qualification.dlink.o"
+  local binary="${BOOTSTRAP_RESULTS}/bootstrap_phantom_constants_sm80"
+  local nvcc_common=(-std=c++17 -arch=sm_80 -rdc=true)
+
+  test -s "${adapter_archive}"
+  test -s "${common_archive}"
+  test -s "${provider_archive}"
+  test -s "${checked_harness_source}"
+  if [[ "${SOURCE_MODE}" == "snapshot" ]]; then
+    external_source="${PINNED_SOURCE}"
+    test ! -e "${external_source}/.git"
+  else
+    test "$(git -C "${external_source}" rev-parse HEAD)" = "${PHANTOM_COMMIT}"
+  fi
+
+  local generator_arguments=(
+    bootstrap_qualification
+    --poly-degree "${COMPILER_POLY_DEGREE}"
+    --mul-level "${COMPILER_MUL_LEVEL}"
+    --input-level "${COMPILER_INPUT_LEVEL}"
+    --security-level "${COMPILER_SECURITY_LEVEL}"
+    --scaling-factor-bits "${COMPILER_SCALING_BITS}"
+    --first-prime-bits "${COMPILER_FIRST_PRIME_BITS}"
+    --hamming-weight "${COMPILER_HAMMING_WEIGHT}"
+  )
+  write_invocation "${RUN_ROOT}/bootstrap_generation_invocation.json" \
+    "ace.phantom.bootstrap-qualification-invocation/1.0.0" \
+    tools/phantom_gpu/generate_bootstrap_qualification.py "${generator_arguments[@]}"
+  (
+    cd "${RUN_ROOT}"
+    python3 "${SCRIPT_DIR}/generate_bootstrap_qualification.py" \
+      "${generator_arguments[@]}"
+  )
+  test -s "${source}"
+  test -s "${context_manifest}"
+  test -s "${resource_manifest}"
+  test -s "${constant_manifest}"
+  test -s "${generation}"
+  cp -- "${checked_harness_source}" "${harness_source}"
+  jq -e '
+    .schema_version == 1 and
+    .resource_schema_version == 3 and
+    .polynomial_degree == 16384 and
+    (.data_q_bit_sizes | length) == 26 and
+    .input_level == 1 and
+    .security_level == 0 and
+    .scaling_modulus_bits == 56 and
+    .first_modulus_bits == 60 and
+    .hamming_weight == 192
+  ' "${context_manifest}" >/dev/null
+  python3 "${SCRIPT_DIR}/check_bootstrap_generated_artifacts.py" \
+    --context-manifest "${context_manifest}" \
+    --resource-manifest "${resource_manifest}" \
+    --constant-manifest "${constant_manifest}" \
+    --source "${source}" \
+    --report "${source_audit}"
+  record_common_configuration "${BOOTSTRAP_RESULTS}" "${context_manifest}"
+
+  local context_manifest_sha
+  context_manifest_sha="$(sha256sum "${context_manifest}" | awk '{print $1}')"
+  local source_compile_arguments=(
+    "${nvcc_common[@]}"
+    -dc
+    -I"${REPO_ROOT}/fhe-cmplr/rtlib/include"
+    -I"${external_source}/include"
+    "${source}"
+    -o "${source_object}"
+  )
+  record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" \
+    "${NVCC}" "${source_compile_arguments[@]}"
+  "${NVCC}" "${source_compile_arguments[@]}"
+  local harness_compile_arguments=(
+    "${nvcc_common[@]}"
+    -dc
+    -I"${REPO_ROOT}/fhe-cmplr/rtlib/include"
+    -I"${external_source}/include"
+    "-DACE_CONTEXT_MANIFEST_SHA256=\"${context_manifest_sha}\""
+    "${harness_source}"
+    -o "${harness_object}"
+  )
+  record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" \
+    "${NVCC}" "${harness_compile_arguments[@]}"
+  "${NVCC}" "${harness_compile_arguments[@]}"
+  nm -A -C --defined-only "${source_object}" \
+    >"${BOOTSTRAP_RESULTS}/generated_object_symbols.txt"
+  nm -A -C --defined-only "${harness_object}" \
+    >"${BOOTSTRAP_RESULTS}/harness_object_symbols.txt"
+  python3 - "${source}" "${harness_source}" \
+    "${BOOTSTRAP_RESULTS}/generated_object_symbols.txt" \
+    "${BOOTSTRAP_RESULTS}/harness_object_symbols.txt" \
+    "${BOOTSTRAP_RESULTS}/io-helper-closure.json" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+generated_source, harness_source, generated_symbols, harness_symbols, output = map(
+    Path, sys.argv[1:]
+)
+helpers = (
+    "Get_input_count",
+    "Get_output_count",
+    "Get_encode_scheme",
+    "Get_decode_scheme",
+)
+
+def source_counts(path):
+    source = path.read_text(encoding="utf-8")
+    return {
+        helper: len(re.findall(r"\b" + re.escape(helper) + r"\s*\(", source))
+        for helper in helpers
+    }
+
+def symbol_counts(path):
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return {
+        helper: sum(
+            re.search(r"\b" + re.escape(helper) + r"(?:\(.*\))?$", line) is not None
+            for line in lines
+        )
+        for helper in helpers
+    }
+
+counts = {
+    "generated_source": source_counts(generated_source),
+    "harness_source": source_counts(harness_source),
+    "generated_object": symbol_counts(generated_symbols),
+    "harness_object": symbol_counts(harness_symbols),
+}
+valid = all(
+    counts["generated_source"][helper] == 0
+    and counts["generated_object"][helper] == 0
+    and counts["harness_source"][helper] == 1
+    and counts["harness_object"][helper] == 1
+    for helper in helpers
+)
+record = {
+    "schema_version": "ace.phantom.bootstrap-io-helper-closure/1.0.0",
+    "status": "pass" if valid else "fail",
+    "helpers": list(helpers),
+    "counts": counts,
+    "generated_source_sha256": hashlib.sha256(generated_source.read_bytes()).hexdigest(),
+    "harness_source_sha256": hashlib.sha256(harness_source.read_bytes()).hexdigest(),
+    "generated_object_symbols_sha256": hashlib.sha256(
+        generated_symbols.read_bytes()
+    ).hexdigest(),
+    "harness_object_symbols_sha256": hashlib.sha256(
+        harness_symbols.read_bytes()
+    ).hexdigest(),
+}
+output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+if not valid:
+    raise SystemExit("bootstrap qualification generated/harness I/O helper ownership is not exact")
+PY
+  local device_link_arguments=(
+    "${nvcc_common[@]}"
+    -dlink
+    "${source_object}"
+    "${harness_object}"
+    "${adapter_archive}"
+    "${provider_archive}"
+    "${common_archive}"
+    -L"${CUDA_ROOT}/lib64"
+    -lcudadevrt
+    -o "${device_link}"
+  )
+  record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" \
+    "${NVCC}" "${device_link_arguments[@]}"
+  "${NVCC}" "${device_link_arguments[@]}"
+  local host_link_arguments=(
+    -std=c++17
+    "${source_object}"
+    "${harness_object}"
+    "${device_link}"
+    -Wl,--start-group
+    "${adapter_archive}"
+    "${provider_archive}"
+    "${common_archive}"
+    -lntl -lgmpxx -lgmp
+    -Wl,--end-group
+    -L"${CUDA_ROOT}/lib64"
+    -Wl,-rpath,"${CUDA_ROOT}/lib64"
+    -lcudadevrt -lcudart -pthread -fopenmp -ldl -lrt -lm
+    -o "${binary}"
+  )
+  record_command "${BOOTSTRAP_RESULTS}/link-commands.txt" \
+    c++ "${host_link_arguments[@]}"
+  c++ "${host_link_arguments[@]}"
+  inspect_binary "${binary}" "${BOOTSTRAP_RESULTS}"
+
+  nm -A -C --defined-only "${adapter_archive}" \
+    >"${BOOTSTRAP_RESULTS}/adapter_archive_symbols.txt"
+  nm -A -C --defined-only "${provider_archive}" \
+    >"${BOOTSTRAP_RESULTS}/provider_archive_symbols.txt"
+  nm -A -C --defined-only "${common_archive}" \
+    >"${BOOTSTRAP_RESULTS}/common_archive_symbols.txt"
+  ar t "${adapter_archive}" >"${BOOTSTRAP_RESULTS}/adapter_archive_members.txt"
+  ar t "${provider_archive}" >"${BOOTSTRAP_RESULTS}/provider_archive_members.txt"
+  ar t "${common_archive}" >"${BOOTSTRAP_RESULTS}/common_archive_members.txt"
+  audit_production_archive_members \
+    "${BOOTSTRAP_RESULTS}/archive-member-audit.json" \
+    "${BOOTSTRAP_RESULTS}/adapter_archive_members.txt" \
+    "${BOOTSTRAP_RESULTS}/provider_archive_members.txt" \
+    "${BOOTSTRAP_RESULTS}/common_archive_members.txt"
+  nm -A -C --defined-only "${binary}" \
+    >"${BOOTSTRAP_RESULTS}/linked_binary_symbols.txt"
+  if rg 'Bootstrapper|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|cnn_phantom|conv_eval|FHErt_(ant|poly)|fhe::(ant|poly)|CoeffToSlot|SlotToCoeff|EvalMod|Native.*[Pp]recom|[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap' \
+      "${BOOTSTRAP_RESULTS}/adapter_archive_symbols.txt" \
+      "${BOOTSTRAP_RESULTS}/provider_archive_symbols.txt" \
+      "${BOOTSTRAP_RESULTS}/common_archive_symbols.txt" \
+      "${BOOTSTRAP_RESULTS}/generated_object_symbols.txt" \
+      "${BOOTSTRAP_RESULTS}/harness_object_symbols.txt" \
+      "${BOOTSTRAP_RESULTS}/linked_binary_symbols.txt" \
+      >"${BOOTSTRAP_RESULTS}/native_bootstrap_symbols.txt"; then
+    echo "bootstrap qualification production closure contains native-bootstrap or ANT symbols" >&2
+    exit 1
+  fi
+  python3 - "${BOOTSTRAP_RESULTS}/linked_binary_symbols.txt" \
+    "${BOOTSTRAP_RESULTS}/symbol-closure.json" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+symbols_path = Path(sys.argv[1])
+output = Path(sys.argv[2])
+symbols = symbols_path.read_text(encoding="utf-8")
+required = (
+    "Get_phantom_context_manifest",
+    "Get_phantom_resource_manifest",
+    "Get_phantom_constant_manifest",
+    "Load_cached_plain",
+    "main",
+)
+missing = [symbol for symbol in required if symbol not in symbols]
+record = {
+    "schema_version": "ace.phantom.bootstrap-symbol-closure/1.0.0",
+    "status": "fail" if missing else "pass",
+    "linked_binary_symbols_sha256": hashlib.sha256(
+        symbols_path.read_bytes()
+    ).hexdigest(),
+    "required_symbols": list(required),
+    "missing_symbols": missing,
+    "native_bootstrap_symbol_count": 0,
+}
+output.write_text(
+    json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+if missing:
+    raise SystemExit("bootstrap qualification linked binary is missing required generated/runtime symbols")
+PY
+
+  atomic_json "${BOOTSTRAP_RESULTS}/qualification.json" -n \
+    --arg status pass \
+    --arg gate bootstrap \
+    --arg architecture sm_80 \
+    --arg phantom_commit "${PHANTOM_COMMIT}" \
+    --arg source_sha256 "$(sha256sum "${source}" | awk '{print $1}')" \
+    --arg context_sha256 "${context_manifest_sha}" \
+    --arg resource_sha256 "$(sha256sum "${resource_manifest}" | awk '{print $1}')" \
+    --arg constant_sha256 "$(sha256sum "${constant_manifest}" | awk '{print $1}')" \
+    --arg generation_sha256 "$(sha256sum "${generation}" | awk '{print $1}')" \
+    --arg audit_sha256 "$(sha256sum "${source_audit}" | awk '{print $1}')" \
+    --arg binary_sha256 "$(sha256sum "${binary}" | awk '{print $1}')" \
+    --arg harness_sha256 "$(sha256sum "${harness_source}" | awk '{print $1}')" \
+    --arg symbol_closure_sha256 "$(sha256sum "${BOOTSTRAP_RESULTS}/symbol-closure.json" | awk '{print $1}')" \
+    --arg io_helper_closure_sha256 "$(sha256sum "${BOOTSTRAP_RESULTS}/io-helper-closure.json" | awk '{print $1}')" \
+    --arg archive_audit_sha256 "$(sha256sum "${BOOTSTRAP_RESULTS}/archive-member-audit.json" | awk '{print $1}')" \
+    --arg adapter_archive_sha256 "$(sha256sum "${adapter_archive}" | awk '{print $1}')" \
+    --arg provider_archive_sha256 "$(sha256sum "${provider_archive}" | awk '{print $1}')" \
+    --arg common_archive_sha256 "$(sha256sum "${common_archive}" | awk '{print $1}')" \
+    --arg image_id "${ACE_PHANTOM_IMAGE_ID}" \
+    --arg definition_sha256 "${ACE_PHANTOM_DEFINITION_SHA256}" \
+    '{
+      status: $status,
+      gate: $gate,
+      architecture: $architecture,
+      phantom_commit: $phantom_commit,
+      generated_source_sha256: $source_sha256,
+      compiler_context_manifest_sha256: $context_sha256,
+      compiler_resource_manifest_sha256: $resource_sha256,
+      compiler_constant_manifest_sha256: $constant_sha256,
+      generation_record_sha256: $generation_sha256,
+      generated_artifact_audit_sha256: $audit_sha256,
+      linked_binary_sha256: $binary_sha256,
+      harness_source_sha256: $harness_sha256,
+      symbol_closure_sha256: $symbol_closure_sha256,
+      io_helper_closure_sha256: $io_helper_closure_sha256,
+      archive_member_audit_sha256: $archive_audit_sha256,
+      adapter_archive_sha256: $adapter_archive_sha256,
+      provider_archive_sha256: $provider_archive_sha256,
+      common_archive_sha256: $common_archive_sha256,
+      development_image_id: $image_id,
+      development_definition_sha256: $definition_sha256,
+      context_contract: {
+        polynomial_degree: 16384, mul_level: 26, input_level: 1,
+        security_level: 0, scaling_factor_bits: 56,
+        first_prime_bits: 60, hamming_weight: 192
+      },
+      generated_source_contains_native_bootstrap: false,
+      production_archive_contains_native_bootstrap: false,
+      primitive_only_provider_archive: true,
+      link_mode: "manual_static_closure",
+      executable_was_run: false
+    }'
+  echo "bootstrap qualification bootstrap resource/constant compile and static-link qualification passed"
+}
+
 build_ordinary_conformance() {
   mkdir -p "${ORDINARY_RESULTS}"
   local runtime_build="${ACE_BUILD}/rtlib/build"
@@ -1567,6 +2092,7 @@ build_ordinary_conformance() {
   local source_object="${CKKS2C_RESULTS}/add_mul_rotate.o"
   local context_manifest="${CKKS2C_RESULTS}/compiler_context_manifest.json"
   local resource_manifest="${CKKS2C_RESULTS}/compiler_resource_manifest.json"
+  local constant_manifest="${CKKS2C_RESULTS}/compiler_constant_manifest.json"
   local checked_fixture="${SCRIPT_DIR}/fixtures/ordinary_ckks_v1.json"
   local fixture="${ORDINARY_RESULTS}/ordinary_ckks_v1.json"
   local post_ckks_air="${CKKS2C_RESULTS}/ordinary_ckks_post_ckks.air"
@@ -1576,6 +2102,7 @@ build_ordinary_conformance() {
   local keyless_source="${ORDINARY_RESULTS}/ordinary_ckks_keyless_probe.cu"
   local keyless_context="${ORDINARY_RESULTS}/ordinary_ckks_keyless_context.json"
   local keyless_resources="${ORDINARY_RESULTS}/ordinary_ckks_keyless_resources.json"
+  local keyless_constants="${ORDINARY_RESULTS}/ordinary_ckks_keyless_constants.json"
   local keyless_object="${ORDINARY_RESULTS}/ordinary_ckks_keyless_probe.o"
   local keyless_device_link="${ORDINARY_RESULTS}/ordinary_ckks_keyless_runner.dlink.o"
   local keyless_binary="${ORDINARY_RESULTS}/ordinary_ckks_keyless_runner_sm80"
@@ -1669,18 +2196,29 @@ build_ordinary_conformance() {
     --hamming-weight "${COMPILER_HAMMING_WEIGHT}" \
     --resource-mode keyless
   cmp "${context_manifest}" "${keyless_context}"
+  local keyless_context_sha
+  keyless_context_sha="$(sha256sum "${keyless_context}" | awk '{print $1}')"
   jq -e '
-    .schema_version == 2 and
+    .schema_version == 3 and
     .context_schema_version == 1 and
+    .complex_plaintext == false and
     .relinearization_key == false and
     .rotation_steps == [] and
     .conjugation_key == false and
     .rotate_batch == false and
     .rotation_batches == [] and
     .raise_mod == false and
-    .monomial_powers == []
+    .monomial_powers == [] and
+    .native_bootstrap_precompute == false
   ' \
     "${keyless_resources}" >/dev/null
+  jq -e --arg context_sha256 "${keyless_context_sha}" '
+    .schema_version == 1 and
+    .context_schema_version == 1 and
+    .resource_schema_version == 3 and
+    .context_manifest_sha256 == $context_sha256 and
+    .constants == []
+  ' "${keyless_constants}" >/dev/null
   python3 "${SCRIPT_DIR}/check_primitive_codegen.py" \
     "${keyless_source}" \
     --context-manifest "${keyless_context}" \
@@ -1817,11 +2355,13 @@ build_ordinary_conformance() {
     --arg context_sha256 "${context_sha}" \
     --arg fixture_sha256 "${fixture_sha}" \
     --arg resource_sha256 "$(sha256sum "${resource_manifest}" | awk '{print $1}')" \
+    --arg constant_sha256 "$(sha256sum "${constant_manifest}" | awk '{print $1}')" \
     --arg runner_sha256 "$(sha256sum "${runner_binary}" | awk '{print $1}')" \
     --arg keyless_runner_sha256 "$(sha256sum "${keyless_binary}" | awk '{print $1}')" \
     --arg generated_source_sha256 "$(sha256sum "${source}" | awk '{print $1}')" \
     --arg runner_source_sha256 "$(sha256sum "${SCRIPT_DIR}/harness/ordinary_ckks_gpu_runner.cu" | awk '{print $1}')" \
     --arg keyless_source_sha256 "$(sha256sum "${keyless_source}" | awk '{print $1}')" \
+    --arg keyless_constant_sha256 "$(sha256sum "${keyless_constants}" | awk '{print $1}')" \
     --arg native_health_source_sha256 "$(sha256sum "${SCRIPT_DIR}/harness/native_phantom_health.cu" | awk '{print $1}')" \
     --arg ant_source_sha256 "$(sha256sum "${SCRIPT_DIR}/harness/ordinary_ckks_ant_oracle.cxx" | awk '{print $1}')" \
     --arg ant_binary_sha256 "$(sha256sum "${ant_binary}" | awk '{print $1}')" \
@@ -1841,12 +2381,14 @@ build_ordinary_conformance() {
       status: $status,
       compiler_context_manifest_sha256: $context_sha256,
       compiler_resource_manifest_sha256: $resource_sha256,
+      compiler_constant_manifest_sha256: $constant_sha256,
       fixture_sha256: $fixture_sha256,
       runner_sha256: $runner_sha256,
       keyless_runner_sha256: $keyless_runner_sha256,
       generated_source_sha256: $generated_source_sha256,
       runner_source_sha256: $runner_source_sha256,
       keyless_source_sha256: $keyless_source_sha256,
+      keyless_constant_manifest_sha256: $keyless_constant_sha256,
       native_health_source_sha256: $native_health_source_sha256,
       ant_source_sha256: $ant_source_sha256,
       ant_binary_sha256: $ant_binary_sha256,
@@ -1889,6 +2431,17 @@ run_ordinary_gate() {
   timed_phase ordinary_host_qualification build_ordinary_conformance
 }
 
+run_bootstrap_gate() {
+  timed_phase toolchain_gate run_toolchain_gate
+  mkdir -p "${CKKS2C_RESULTS}"
+  timed_phase ace_build configure_ace
+  timed_phase bindings_build configure_bindings
+  timed_phase tests run_compiler_tests
+  timed_phase removed_profile_path_audit audit_removed_profile_path
+  timed_phase bootstrap_host_qualification \
+    build_bootstrap_host_qualification
+}
+
 case "${GATE}" in
   toolchain)
     run_toolchain_gate
@@ -1896,7 +2449,11 @@ case "${GATE}" in
   ckks2c)
     run_ckks2c_gate
     ;;
+  bootstrap)
+    run_bootstrap_gate
+    ;;
   ordinary|all)
+    # Preserve the pre-bootstrap aggregate: bootstrap qualification is selected explicitly by bootstrap.
     run_ordinary_gate
     ;;
 esac

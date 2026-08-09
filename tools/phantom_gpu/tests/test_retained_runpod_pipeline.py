@@ -36,6 +36,7 @@ def test_frozen_export_contains_no_build_output() -> None:
     assert {
         "retained-context-manifest.json",
         "retained-resource-manifest.json",
+        "retained-constant-manifest.json",
         "retained-fixture.json",
         "retained-analytic-reference.json",
         "retained-ant-reference.json",
@@ -106,6 +107,7 @@ def test_keyless_rejections_use_compiler_emitted_translation_unit() -> None:
     assert "generate_ckks2c_probe.py" in host
     assert "--resource-mode keyless" in host
     assert "retained_ckks_keyless_resources.json" in host
+    assert "retained_ckks_keyless_constants.json" in host
     assert "ACE_REJECTION_ONLY" in harness
     rejections = {item["id"]: item for item in fixture["runtime_rejections"]}
     assert rejections["conjugate_missing_key"]["manifest"] == "keyless-conjugation"

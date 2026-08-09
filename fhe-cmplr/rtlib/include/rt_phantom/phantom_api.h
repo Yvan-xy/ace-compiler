@@ -14,9 +14,10 @@ typedef double SCALE_T;
 typedef int    LEVEL_T;
 typedef std::complex<double> DCMPLX;
 
-//! @brief Sole compiler-generated Phantom context and resource authorities.
+//! @brief Sole compiler-generated Phantom context/resource/constant authorities.
 extern "C" const PHANTOM_CONTEXT_MANIFEST* Get_phantom_context_manifest();
 extern "C" const PHANTOM_RESOURCE_MANIFEST* Get_phantom_resource_manifest();
+extern "C" const PHANTOM_CONSTANT_MANIFEST* Get_phantom_constant_manifest();
 
 //! @brief Phantom API for context management
 
@@ -29,6 +30,9 @@ void Phantom_encode_double(PLAIN plain, const double* input, size_t len,
                            SCALE_T scale, LEVEL_T level);
 void Phantom_encode_dcmplx(PLAIN plain, const DCMPLX* input, size_t len,
                            SCALE_T scale, LEVEL_T level);
+void Phantom_encode_manifest_constant(PLAIN plain, uint32_t entry_id);
+void Phantom_load_cached_constant(PLAIN plain, uint32_t entry_id);
+PHANTOM_SETUP_METRICS Phantom_get_setup_metrics();
 
 void Phantom_encode_float_cst_lvl(PLAIN plain, float* input, size_t len,
                                   SCALE_T scale, int level);

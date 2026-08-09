@@ -624,6 +624,40 @@ def test_native_health_uses_the_exact_current_ordinary_run() -> None:
     assert "find " not in body
 
 
+def test_bootstrap_qualification_is_frozen_rebuilt_and_executed_once() -> None:
+    source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    host_start = source.index("run_bootstrap_host_qualification() {")
+    host_end = source.index("\nverify_frozen_bootstrap_qualification()", host_start)
+    host = source[host_start:host_end]
+    gpu_start = source.index("run_bootstrap_constant_cache_qualification() {")
+    gpu_end = source.index("\nrun_native_health() {", gpu_start)
+    gpu = source[gpu_start:gpu_end]
+
+    assert "bootstrap-qualification-invocation.json" in host
+    assert "jq -er '.argv[1:][]'" in host
+    assert 'mapfile -t arguments <<<"${arguments_output}"' in host
+    assert "current-bootstrap.json" in host
+    assert "bootstrap-generation-invocation.json" in host
+    assert host.count('compile_only.sh"') == 1
+
+    invocation = 'timeout 1800 "${binary}" "${raw}"'
+    assert gpu.count(invocation) == 1
+    assert "while " not in gpu
+    assert "for required" not in gpu
+    assert '"logical_device_bytes"' in gpu
+    assert "expected_logical_bytes" in gpu
+    assert '"invocation_count": 1' in gpu
+    assert "bootstrap-setup-metrics/1.0.0" in gpu
+
+    phases = source[source.index("phase payload_verification") :]
+    assert phases.index("phase bootstrap_payload_validation") < phases.index(
+        "phase bootstrap_host_qualification"
+    ) < phases.index("phase frozen_bootstrap_qualification")
+    assert phases.index("phase native_a100_health") < phases.index(
+        "phase bootstrap_constant_cache_qualification"
+    ) < phases.index("phase ordinary_gpu_qualification")
+
+
 def test_host_freeze_runner_returns_fresh_candidate_without_frozen_checks() -> None:
     source = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
     assert "<freeze-host|local|runpod>" in source
@@ -810,6 +844,22 @@ def test_runpod_success_completeness_requires_every_terminal_record(
         + "\n",
         encoding="utf-8",
     )
+    bootstrap_binary_sha256 = "c" * 64
+    bootstrap_artifact_directory = results / "bootstrap-qualification"
+    bootstrap_artifact_directory.mkdir()
+    (bootstrap_artifact_directory / "artifact_manifest.json").write_text(
+        json.dumps(
+            {
+                "files": {
+                    "bootstrap_qualification/bootstrap_phantom_constants_sm80": (
+                        bootstrap_binary_sha256
+                    )
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     records = {
         "qualification-current.json": {
@@ -818,6 +868,56 @@ def test_runpod_success_completeness_requires_every_terminal_record(
             "exit_code": 0,
         },
         "native-health.json": {"status": "pass", "device_count": 1},
+        "bootstrap-qualification-current.json": {
+            "gate": "bootstrap",
+            "status": "pass",
+            "exit_code": 0,
+        },
+        "bootstrap-frozen-reference.json": {
+            "schema_version": "ace.phantom.bootstrap-frozen-reference/1.0.0",
+            "status": "pass",
+            "comparison": "deterministic-host-artifact-hashes",
+            "packaged_artifact_manifest_sha256": "1" * 64,
+            "packaged_host_qualification_sha256": "2" * 64,
+            "packaged_source_audit_sha256": "3" * 64,
+            "regenerated_artifact_manifest_sha256": "4" * 64,
+            "regenerated_host_qualification_sha256": "5" * 64,
+            "regenerated_source_audit_sha256": "6" * 64,
+        },
+        "bootstrap-constant-cache.json": {
+            "status": "pass",
+            "gpu": "NVIDIA A100-SXM4-80GB",
+            "resource_flags": 127,
+            "counts": {
+                "constants_declared": 2,
+                "correctness_encodes": 2,
+                "cached_loads": 2,
+            },
+            "entries": [{}, {}],
+        },
+        "bootstrap-setup-metrics.json": {
+            "schema_version": "ace.phantom.bootstrap-setup-metrics/1.0.0",
+            "status": "pass",
+            "constant_count": 2,
+            "emitted_payload_bytes": 256,
+            "expected_logical_device_bytes": 4096,
+            "context_and_keys": {"seconds": 0.25, "device_bytes": 1024},
+            "plaintext_cache": {
+                "seconds": 0.5,
+                "device_bytes": 2048,
+                "logical_device_bytes": 4096,
+                "host_bytes": 512,
+                "entries": 2,
+            },
+        },
+        "bootstrap-constant-cache-execution.json": {
+            "schema_version": (
+                "ace.phantom.bootstrap-constant-cache-execution/1.0.0"
+            ),
+            "status": "pass",
+            "invocation_count": 1,
+            "binary_sha256": bootstrap_binary_sha256,
+        },
         "ordinary_ckks_compare.json": {
             "status": "pass",
             "case_count": 43,
@@ -1021,8 +1121,49 @@ def test_runpod_success_completeness_requires_every_terminal_record(
         "mode": "runpod",
     }
 
-    (results / "ordinary_ckks_sanitizer.json").unlink()
+    bootstrap_execution = results / "bootstrap-constant-cache-execution.json"
+    bootstrap_execution.unlink()
     (results / "result-completeness.json").unlink()
+    missing_bootstrap = subprocess.run(
+        ["bash", "-c", script, "completeness-test", str(results)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert missing_bootstrap.returncode != 0
+    assert missing_bootstrap.stderr == (
+        "result completeness: missing or empty terminal record: "
+        "bootstrap-constant-cache-execution.json\n"
+    )
+    bootstrap_execution.write_text(
+        json.dumps(records["bootstrap-constant-cache-execution.json"]) + "\n",
+        encoding="utf-8",
+    )
+
+    invalid_metrics = json.loads(
+        json.dumps(records["bootstrap-setup-metrics.json"])
+    )
+    invalid_metrics["plaintext_cache"]["logical_device_bytes"] += 1
+    (results / "bootstrap-setup-metrics.json").write_text(
+        json.dumps(invalid_metrics) + "\n", encoding="utf-8"
+    )
+    rejected_metrics = subprocess.run(
+        ["bash", "-c", script, "completeness-test", str(results)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected_metrics.returncode != 0
+    assert rejected_metrics.stderr == (
+        "result completeness: terminal record violates its contract: "
+        "bootstrap-setup-metrics.json\n"
+    )
+    (results / "bootstrap-setup-metrics.json").write_text(
+        json.dumps(records["bootstrap-setup-metrics.json"]) + "\n",
+        encoding="utf-8",
+    )
+
+    (results / "ordinary_ckks_sanitizer.json").unlink()
     failed = subprocess.run(
         ["bash", "-c", script, "completeness-test", str(results)],
         check=False,

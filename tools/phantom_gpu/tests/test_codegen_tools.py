@@ -30,13 +30,13 @@ extern "C" const PHANTOM_CONTEXT_MANIFEST* Get_phantom_context_manifest() {
   static const PHANTOM_CONTEXT_MANIFEST context = {
     1, PHANTOM_PACKING_FULL, 16384, 8192, 3,
     phantom_data_q_bit_sizes, 1, phantom_special_p_bit_sizes,
-    1, 1, 192, 0, 60, 56, 2
+    1, 1, 192, 0, 60, 56, 3
   };
   return &context;
 }
 extern "C" const PHANTOM_RESOURCE_MANIFEST* Get_phantom_resource_manifest() {
   static const PHANTOM_RESOURCE_MANIFEST resources = {
-      2, 1, 0, 0, nullptr, 0, nullptr, nullptr, 0, nullptr};
+      3, 1, 0, 0, nullptr, 0, nullptr, nullptr, 0, nullptr};
   return &resources;
 }
 """
@@ -55,7 +55,7 @@ CONTEXT = {
     "security_level": 0,
     "first_modulus_bits": 60,
     "scaling_modulus_bits": 56,
-    "resource_schema_version": 2,
+    "resource_schema_version": 3,
 }
 
 
@@ -92,6 +92,13 @@ def write_context_manifest(tmp_path: Path) -> Path:
 
 def test_compiler_context_manifest_schema_is_checked() -> None:
     verify_context_manifest(CONTEXT)
+
+
+def test_compiler_context_manifest_rejects_resource_schema_v2() -> None:
+    legacy = json.loads(json.dumps(CONTEXT))
+    legacy["resource_schema_version"] = 2
+    with pytest.raises(SystemExit, match="unsupported compiler context manifest schema"):
+        verify_context_manifest(legacy)
 
 
 @pytest.mark.parametrize(

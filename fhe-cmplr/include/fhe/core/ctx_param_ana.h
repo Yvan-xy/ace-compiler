@@ -192,6 +192,10 @@ public:
   }
   void Require_raise_mod() { _raise_mod_required = true; }
   bool Raise_mod_required() const { return _raise_mod_required; }
+  void Require_complex_plaintext() { _complex_plaintext_required = true; }
+  bool Complex_plaintext_required() const {
+    return _complex_plaintext_required;
+  }
   void Add_monomial_power(uint32_t power) { _monomial_powers.insert(power); }
   const std::set<uint32_t>& Get_monomial_powers() const {
     return _monomial_powers;
@@ -293,6 +297,7 @@ private:
   bool     _conjugation_key_required = false;
   bool     _rotate_batch_required = false;
   bool     _raise_mod_required = false;
+  bool     _complex_plaintext_required = false;
   std::set<uint32_t> _rotate_batch_nodes;
   std::vector<std::vector<int32_t>> _rotate_batches;
   std::set<uint32_t> _monomial_powers;
@@ -1348,6 +1353,11 @@ template <typename RETV, typename VISITOR>
 RETV CKKS_ANA_IMPL::Handle_encode(VISITOR* visitor, NODE_PTR encode) {
   // 1. get mul_level of bootstrap result
   CTX_PARAM_ANA_CTX& ana_ctx   = visitor->Context();
+  const uint32_t* complex_attr =
+      encode->Attr<uint32_t>(core::FHE_ATTR_KIND::ENCODE_DCMPLX);
+  if (complex_attr != nullptr && *complex_attr != 0) {
+    ana_ctx.Require_complex_plaintext();
+  }
   uint32_t           mul_level = ana_ctx.Top_mul_level();
   const uint32_t*    level_attr =
       encode->Attr<uint32_t>(core::FHE_ATTR_KIND::LEVEL);

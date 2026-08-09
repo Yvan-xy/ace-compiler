@@ -928,6 +928,29 @@ bool CKKS2C_VERIFIER::Verify_source(const std::string& source,
         "Phantom CKKS2C source is missing the resource manifest",
         diagnostic);
   }
+  if (source.find("Get_phantom_constant_manifest()") == std::string::npos) {
+    return Fail(
+        "Phantom CKKS2C source is missing the constant manifest",
+        diagnostic);
+  }
+  const bool has_complex_plaintext =
+      source.find("Encode_dcmplx(") != std::string::npos ||
+      source.find("Load_cached_plain(") != std::string::npos;
+  const bool requests_complex_plaintext =
+      source.find("PHANTOM_RESOURCE_COMPLEX_PLAINTEXT") !=
+      std::string::npos;
+  if (has_complex_plaintext != requests_complex_plaintext) {
+    return Fail(
+        "Phantom CKKS2C complex plaintext calls and resource flag disagree",
+        diagnostic);
+  }
+  if (source.find("PHANTOM_RESOURCE_NATIVE_BOOTSTRAP_PRECOMPUTE") !=
+      std::string::npos) {
+    return Fail(
+        "Phantom CKKS2C source requests forbidden native bootstrap "
+        "precomputation",
+        diagnostic);
+  }
   bool has_relin_call = source.find("Relin(") != std::string::npos;
   bool requests_relin_key =
       source.find("PHANTOM_RESOURCE_RELIN_KEY") != std::string::npos;
@@ -1024,6 +1047,7 @@ bool CKKS2C_VERIFIER::Verify_source(const std::string& source,
       {"phantom::", "direct Phantom C++ call"},
       {"Get_phantom_ordinary_features", "legacy feature callback"},
       {"PHANTOM_ORDINARY_", "legacy feature flag"},
+      {"_pre_plain_", "function-static plaintext cache"},
       {"CKKS_PARAMS* Get_context_params", "duplicate context callback"},
   };
   for (const auto& item : forbidden) {

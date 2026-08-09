@@ -77,8 +77,10 @@ void WriteJson(const std::string& path, const Json& value) {
 
 void ConfigureContext(const Json& manifest, const Json& resources) {
   if (manifest.at("schema_version") != 1 || manifest.at("packing") != "full" ||
-      resources.at("schema_version") != 2 ||
-      resources.at("context_schema_version") != 1) {
+      resources.at("schema_version") != 3 ||
+      resources.at("context_schema_version") != 1 ||
+      resources.at("complex_plaintext") != false ||
+      resources.at("native_bootstrap_precompute") != false) {
     Fail("compiler manifest schema or packing is unsupported");
   }
   const std::size_t data_q_count = manifest.at("data_q_bit_sizes").size();

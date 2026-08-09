@@ -7941,7 +7941,8 @@ public:
         const std::string& pt_from_msg_name = "Pt_from_msg",
         const std::string& raise_mod_level_func = "",
         const std::string& context_manifest_file = "",
-        const std::string& resource_manifest_file = "") {
+        const std::string& resource_manifest_file = "",
+        const std::string& constant_manifest_file = "") {
         require_no_air_pass_transaction("CKKS-to-source lowering");
         if (!glob) {
             throw std::runtime_error(
@@ -7962,7 +7963,8 @@ public:
                 "CKKS2C output_file must use the .cu suffix");
         }
         for (const std::string* manifest_file :
-             {&context_manifest_file, &resource_manifest_file}) {
+             {&context_manifest_file, &resource_manifest_file,
+              &constant_manifest_file}) {
             if (!manifest_file->empty() &&
                 (manifest_file->size() < 5 ||
                  manifest_file->compare(manifest_file->size() - 5, 5,
@@ -7973,7 +7975,8 @@ public:
         }
         if (provider != "phantom" &&
             (!context_manifest_file.empty() ||
-             !resource_manifest_file.empty())) {
+             !resource_manifest_file.empty() ||
+             !constant_manifest_file.empty())) {
             throw std::invalid_argument(
                 "CKKS2C manifest outputs are supported only for Phantom");
         }
@@ -8041,6 +8044,9 @@ public:
             write_manifest(resource_manifest_file,
                            ckks2c.Ctx().Phantom_resource_json(),
                            "Phantom resource manifest");
+            write_manifest(constant_manifest_file,
+                           ckks2c.Ctx().Phantom_constant_json(),
+                           "Phantom constant manifest");
         }
         return true;
     }
@@ -11181,6 +11187,7 @@ PYBIND11_MODULE(air_builder, m) {
              py::arg("raise_mod_level_func") = "",
              py::arg("context_manifest_file") = "",
              py::arg("resource_manifest_file") = "",
+             py::arg("constant_manifest_file") = "",
              "Emit CUDA C++ directly from post-driver CKKS AIR. Errors are "
              "reported as Python exceptions.")
         .def("list_available_passes", &GlobScope::list_available_passes,

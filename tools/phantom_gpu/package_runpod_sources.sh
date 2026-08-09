@@ -6,7 +6,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 PHANTOM_REPO="${ACE_PHANTOM_REPO:-/home/dyf/code/phantom-ant}"
 
 usage() {
-  echo "usage: $0 --ace-commit COMMIT --phantom-commit COMMIT --ordinary-run-root DIR --retained-run-root DIR OUTPUT_DIRECTORY" >&2
+  echo "usage: $0 --ace-commit COMMIT --phantom-commit COMMIT --ordinary-run-root DIR --retained-run-root DIR --bootstrap-run-root DIR OUTPUT_DIRECTORY" >&2
   exit 2
 }
 
@@ -14,6 +14,7 @@ ACE_COMMIT=""
 PHANTOM_COMMIT=""
 ORDINARY_RUN_ROOT=""
 RETAINED_RUN_ROOT=""
+BOOTSTRAP_RUN_ROOT=""
 OUTPUT_ARGUMENT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,6 +38,11 @@ while [[ $# -gt 0 ]]; do
       RETAINED_RUN_ROOT="$2"
       shift 2
       ;;
+    --bootstrap-run-root)
+      [[ $# -ge 2 ]] || usage
+      BOOTSTRAP_RUN_ROOT="$2"
+      shift 2
+      ;;
     --)
       shift
       [[ $# -eq 1 && -z "${OUTPUT_ARGUMENT}" ]] || usage
@@ -53,6 +59,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "${ACE_COMMIT}" && -n "${PHANTOM_COMMIT}" &&
    -n "${ORDINARY_RUN_ROOT}" && -n "${RETAINED_RUN_ROOT}" &&
+   -n "${BOOTSTRAP_RUN_ROOT}" &&
    -n "${OUTPUT_ARGUMENT}" ]] || usage
 if [[ ! "${ACE_COMMIT}" =~ ^[0-9a-f]{40}$ ||
       ! "${PHANTOM_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -64,6 +71,7 @@ git -C "${PHANTOM_REPO}" cat-file -e "${PHANTOM_COMMIT}^{commit}"
 
 ORDINARY_RUN_ROOT="$(realpath -- "${ORDINARY_RUN_ROOT}")"
 RETAINED_RUN_ROOT="$(realpath -- "${RETAINED_RUN_ROOT}")"
+BOOTSTRAP_RUN_ROOT="$(realpath -- "${BOOTSTRAP_RUN_ROOT}")"
 FROZEN_RUN_MANIFEST="${ORDINARY_RUN_ROOT}/manifest.json"
 FROZEN_ACE_SOURCE_MANIFEST="${ORDINARY_RUN_ROOT}/ace_source_manifest.json"
 FROZEN_PHANTOM_SOURCE_MANIFEST="${ORDINARY_RUN_ROOT}/phantom_source_manifest.json"
@@ -72,6 +80,7 @@ FROZEN_QUALIFICATION_INVOCATION="${ORDINARY_RUN_ROOT}/qualification_invocation.j
 FROZEN_COMPILER_INVOCATION="${ORDINARY_RUN_ROOT}/compiler_invocation.json"
 FROZEN_CONTEXT="${ORDINARY_RUN_ROOT}/ckks2c/compiler_context_manifest.json"
 FROZEN_RESOURCES="${ORDINARY_RUN_ROOT}/ckks2c/compiler_resource_manifest.json"
+FROZEN_CONSTANTS="${ORDINARY_RUN_ROOT}/ckks2c/compiler_constant_manifest.json"
 FROZEN_POST_CKKS_AIR="${ORDINARY_RUN_ROOT}/ckks2c/ordinary_ckks_post_ckks.air"
 FROZEN_FIXTURE="${ORDINARY_RUN_ROOT}/ordinary_ckks/ordinary_ckks_v1.json"
 FROZEN_CPU_REFERENCE="${ORDINARY_RUN_ROOT}/ordinary_ckks/ordinary_ckks_cpu_reference.json"
@@ -83,7 +92,7 @@ for required in \
   "${FROZEN_RUN_MANIFEST}" "${FROZEN_ARTIFACT_MANIFEST}" \
   "${FROZEN_ACE_SOURCE_MANIFEST}" "${FROZEN_PHANTOM_SOURCE_MANIFEST}" \
   "${FROZEN_QUALIFICATION_INVOCATION}" "${FROZEN_COMPILER_INVOCATION}" \
-  "${FROZEN_CONTEXT}" "${FROZEN_RESOURCES}" \
+  "${FROZEN_CONTEXT}" "${FROZEN_RESOURCES}" "${FROZEN_CONSTANTS}" \
   "${FROZEN_POST_CKKS_AIR}" "${FROZEN_FIXTURE}" \
   "${FROZEN_CPU_REFERENCE}" "${FROZEN_CPU_VALUES}" \
   "${FROZEN_ANT_VERIFICATION}" "${FROZEN_HOST_QUALIFICATION}"; do
@@ -132,7 +141,8 @@ EXPECTED_HEALTH_SOURCE_SHA256="$(
 python3 - "${FROZEN_QUALIFICATION_INVOCATION}" \
   "${FROZEN_COMPILER_INVOCATION}" "${FROZEN_RUN_MANIFEST}" \
   "${FROZEN_ARTIFACT_MANIFEST}" "${FROZEN_CONTEXT}" \
-  "${FROZEN_RESOURCES}" "${FROZEN_POST_CKKS_AIR}" "${FROZEN_FIXTURE}" \
+  "${FROZEN_RESOURCES}" "${FROZEN_CONSTANTS}" \
+  "${FROZEN_POST_CKKS_AIR}" "${FROZEN_FIXTURE}" \
   "${FROZEN_CPU_REFERENCE}" "${FROZEN_CPU_VALUES}" \
   "${FROZEN_ANT_VERIFICATION}" "${FROZEN_HOST_QUALIFICATION}" \
   "${ORDINARY_RUN_ROOT}/SHA256SUMS" "${ACE_COMMIT}" \
@@ -148,13 +158,14 @@ import sys
 (
     qualification_invocation_path, compiler_invocation_path,
     run_manifest_path, artifact_manifest_path, context_path, resources_path,
-    post_ckks_air_path, fixture_path, cpu_reference_path, cpu_values_path,
+    constants_path, post_ckks_air_path, fixture_path, cpu_reference_path,
+    cpu_values_path,
     ant_verification_path, host_qualification_path, sums_path,
-) = map(Path, sys.argv[1:14])
+) = map(Path, sys.argv[1:15])
 (
     ace_commit, phantom_commit, expected_ant_source_sha,
     expected_runner_source_sha, expected_health_source_sha,
-) = sys.argv[14:19]
+) = sys.argv[15:20]
 
 def reject_duplicates(pairs):
     value = {}
@@ -284,7 +295,7 @@ degree = context["polynomial_degree"]
 data_q = context["data_q_bit_sizes"]
 if (
     context["schema_version"] != 1
-    or context["resource_schema_version"] != 2
+    or context["resource_schema_version"] != 3
     or context["packing"] != "full"
     or isinstance(degree, bool)
     or not isinstance(degree, int)
@@ -327,6 +338,33 @@ if any(
 ):
     raise SystemExit("frozen special-P list is invalid")
 
+resources = load(resources_path)
+required_resources = {
+    "schema_version", "context_schema_version", "relinearization_key",
+    "rotation_steps", "conjugation_key", "rotate_batch",
+    "rotation_batches", "raise_mod", "monomial_powers",
+    "complex_plaintext", "native_bootstrap_precompute",
+}
+if (
+    set(resources) != required_resources
+    or resources["schema_version"] != 3
+    or resources["context_schema_version"] != 1
+    or resources["complex_plaintext"] is not False
+    or resources["native_bootstrap_precompute"] is not False
+):
+    raise SystemExit("frozen ordinary resource manifest is not schema-v3 key-safe")
+
+context_sha = hashlib.sha256(context_path.read_bytes()).hexdigest()
+constants = load(constants_path)
+if constants != {
+    "constants": [],
+    "context_manifest_sha256": context_sha,
+    "context_schema_version": 1,
+    "resource_schema_version": 3,
+    "schema_version": 1,
+}:
+    raise SystemExit("frozen ordinary constant manifest is not the derived empty manifest")
+
 run_manifest = load(run_manifest_path)
 if (run_manifest.get("status"), run_manifest.get("gate")) != ("pass", "ordinary"):
     raise SystemExit("frozen evidence is not a passing ordinary qualification")
@@ -367,8 +405,8 @@ artifact_manifest_sha = hashlib.sha256(artifact_manifest_path.read_bytes()).hexd
 if run_manifest.get("artifact_manifest_sha256") != artifact_manifest_sha:
     raise SystemExit("frozen artifact manifest is not bound by the run manifest")
 
-context_sha = hashlib.sha256(context_path.read_bytes()).hexdigest()
 resources_sha = hashlib.sha256(resources_path.read_bytes()).hexdigest()
+constants_sha = hashlib.sha256(constants_path.read_bytes()).hexdigest()
 post_ckks_air_sha = hashlib.sha256(post_ckks_air_path.read_bytes()).hexdigest()
 fixture_sha = hashlib.sha256(fixture_path.read_bytes()).hexdigest()
 cpu_reference_sha = hashlib.sha256(cpu_reference_path.read_bytes()).hexdigest()
@@ -386,6 +424,7 @@ host_qualification_sha = hashlib.sha256(
 expected_run = {
     "compiler_context_manifest_sha256": context_sha,
     "compiler_resource_manifest_sha256": resources_sha,
+    "compiler_constant_manifest_sha256": constants_sha,
     "qualification_invocation_sha256": qualification_invocation_sha,
     "normalized_qualification_argv_sha256": qualification_invocation[
         "normalized_argv_sha256"
@@ -405,6 +444,10 @@ if any(run_manifest.get(key) != value for key, value in expected_run.items()):
 expected_host = {
     "compiler_context_manifest_sha256": context_sha,
     "compiler_resource_manifest_sha256": resources_sha,
+    "compiler_constant_manifest_sha256": constants_sha,
+    "keyless_constant_manifest_sha256": listed_hashes[
+        "ordinary_ckks/ordinary_ckks_keyless_constants.json"
+    ],
     "fixture_sha256": fixture_sha,
     "cpu_reference_sha256": cpu_reference_sha,
     "cpu_values_sha256": cpu_values_sha,
@@ -506,6 +549,8 @@ if artifact.get("normalized_compiler_command_sha256") != compiler_invocation["no
     raise SystemExit("frozen artifact manifest invocation binding is stale")
 if artifact.get("post_ckks_air_sha256") != post_ckks_air_sha:
     raise SystemExit("frozen artifact manifest post-CKKS AIR binding is stale")
+if artifact.get("compiler_constant_manifest_sha256") != constants_sha:
+    raise SystemExit("frozen artifact manifest constant binding is stale")
 expected_harness_sources = {
     "tools/phantom_gpu/harness/native_phantom_health.cu":
         expected_health_source_sha,
@@ -597,6 +642,8 @@ if (
     != expected_files["ckks2c/add_mul_rotate_sm80"]
     or ckks_qualification.get("health_binary_sha256")
     != expected_files["ckks2c/native_phantom_health_sm80"]
+    or ckks_qualification.get("compiler_constant_manifest_sha256")
+    != constants_sha
 ):
     raise SystemExit("frozen CKKS2C qualification bindings are incomplete or stale")
 for archive_field in (
@@ -606,6 +653,409 @@ for archive_field in (
 ):
     if re.fullmatch(r"[0-9a-f]{64}", ckks_qualification.get(archive_field, "")) is None:
         raise SystemExit(f"frozen CKKS2C qualification lacks {archive_field}")
+PY
+
+BOOTSTRAP_RUN_MANIFEST="${BOOTSTRAP_RUN_ROOT}/manifest.json"
+BOOTSTRAP_ARTIFACT_MANIFEST="${BOOTSTRAP_RUN_ROOT}/artifact_manifest.json"
+BOOTSTRAP_QUALIFICATION_INVOCATION="${BOOTSTRAP_RUN_ROOT}/qualification_invocation.json"
+BOOTSTRAP_GENERATION_INVOCATION="${BOOTSTRAP_RUN_ROOT}/bootstrap_generation_invocation.json"
+BOOTSTRAP_CONTEXT="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/compiler_context_manifest.json"
+BOOTSTRAP_RESOURCES="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/compiler_resource_manifest.json"
+BOOTSTRAP_CONSTANTS="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/compiler_constant_manifest.json"
+BOOTSTRAP_GENERATION="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/generation.json"
+BOOTSTRAP_SOURCE_AUDIT="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/source-audit.json"
+BOOTSTRAP_HOST_QUALIFICATION="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/qualification.json"
+BOOTSTRAP_HARNESS="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/bootstrap_phantom_constants.cu"
+for required in \
+  "${BOOTSTRAP_RUN_ROOT}/SHA256SUMS" \
+  "${BOOTSTRAP_RUN_MANIFEST}" "${BOOTSTRAP_ARTIFACT_MANIFEST}" \
+  "${BOOTSTRAP_QUALIFICATION_INVOCATION}" \
+  "${BOOTSTRAP_GENERATION_INVOCATION}" \
+  "${BOOTSTRAP_CONTEXT}" "${BOOTSTRAP_RESOURCES}" \
+  "${BOOTSTRAP_CONSTANTS}" "${BOOTSTRAP_GENERATION}" \
+  "${BOOTSTRAP_SOURCE_AUDIT}" "${BOOTSTRAP_HOST_QUALIFICATION}" \
+  "${BOOTSTRAP_HARNESS}" \
+  "${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/bootstrap_qualification.cu" \
+  "${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/bootstrap_phantom_constants_sm80" \
+  "${BOOTSTRAP_RUN_ROOT}/ace_source_manifest.json" \
+  "${BOOTSTRAP_RUN_ROOT}/phantom_source_manifest.json"; do
+  if [[ ! -s "${required}" ]]; then
+    echo "missing frozen bootstrap qualification evidence: ${required}" >&2
+    exit 1
+  fi
+done
+python3 - "${BOOTSTRAP_RUN_ROOT}/SHA256SUMS" <<'PY'
+from pathlib import Path, PurePosixPath
+import re
+import sys
+
+sums = Path(sys.argv[1])
+for line in sums.read_text(encoding="utf-8").splitlines():
+    fields = line.split(maxsplit=1)
+    if len(fields) != 2 or re.fullmatch(r"[0-9a-f]{64}", fields[0]) is None:
+        raise SystemExit("bootstrap SHA256SUMS contains a malformed entry")
+    name = fields[1].removeprefix("*").removeprefix("./")
+    path = PurePosixPath(name)
+    if not name or path.is_absolute() or ".." in path.parts:
+        raise SystemExit("bootstrap SHA256SUMS contains an unsafe path")
+PY
+(
+  cd "${BOOTSTRAP_RUN_ROOT}"
+  sha256sum -c SHA256SUMS
+)
+EXPECTED_BOOTSTRAP_HARNESS_SHA256="$(
+  git -C "${REPO_ROOT}" show \
+    "${ACE_COMMIT}:tools/phantom_gpu/harness/bootstrap_phantom_constants.cu" |
+    sha256sum | awk '{print $1}'
+)"
+python3 - "${BOOTSTRAP_RUN_ROOT}" "${ACE_COMMIT}" "${PHANTOM_COMMIT}" \
+  "${EXPECTED_BOOTSTRAP_HARNESS_SHA256}" \
+  "${FROZEN_ACE_SOURCE_MANIFEST}" "${FROZEN_PHANTOM_SOURCE_MANIFEST}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+ace_commit, phantom_commit, expected_harness_sha = sys.argv[2:5]
+ordinary_ace_source, ordinary_phantom_source = map(Path, sys.argv[5:7])
+
+def reject_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise SystemExit(f"duplicate JSON key in bootstrap evidence: {key}")
+        value[key] = item
+    return value
+
+def load(relative):
+    path = root / relative
+    return json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicates
+    )
+
+def digest(relative):
+    return hashlib.sha256((root / relative).read_bytes()).hexdigest()
+
+def normalized_invocation(relative, schema):
+    invocation = load(relative)
+    if set(invocation) != {"schema_version", "argv", "normalized_argv_sha256"}:
+        raise SystemExit(f"bootstrap invocation has an invalid shape: {relative}")
+    if invocation["schema_version"] != schema:
+        raise SystemExit(f"bootstrap invocation has an invalid schema: {relative}")
+    argv = invocation["argv"]
+    if not isinstance(argv, list) or not all(isinstance(item, str) and item for item in argv):
+        raise SystemExit(f"bootstrap invocation argv is invalid: {relative}")
+    encoded = json.dumps(
+        argv, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    if hashlib.sha256(encoded).hexdigest() != invocation["normalized_argv_sha256"]:
+        raise SystemExit(f"bootstrap invocation normalized hash mismatch: {relative}")
+    return invocation, argv
+
+listed = {}
+for line in (root / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+    checksum, name = line.split(maxsplit=1)
+    relative = name.removeprefix("*").removeprefix("./")
+    if relative in listed:
+        raise SystemExit("bootstrap SHA256SUMS contains a duplicate path")
+    listed[relative] = checksum
+actual = sorted(
+    str(path.relative_to(root))
+    for path in root.rglob("*")
+    if path.is_file()
+    and str(path.relative_to(root)) not in {"manifest.json", "SHA256SUMS"}
+)
+if sorted(listed) != actual:
+    raise SystemExit("bootstrap SHA256SUMS does not enumerate the complete run root")
+
+qualification_invocation, qualification_argv = normalized_invocation(
+    "qualification_invocation.json",
+    "ace.phantom.qualification-invocation/1.0.0",
+)
+if qualification_argv[0] != "tools/phantom_gpu/compile_only.sh":
+    raise SystemExit("bootstrap qualification invocation executable is invalid")
+qualification_arguments = qualification_argv[1:]
+if len(qualification_arguments) % 2:
+    raise SystemExit("bootstrap qualification invocation has an unpaired argument")
+qualification_options = dict(
+    zip(qualification_arguments[0::2], qualification_arguments[1::2])
+)
+expected_options = {
+    "--gate": "bootstrap",
+    "--poly-degree": "16384",
+    "--mul-level": "26",
+    "--input-level": "1",
+    "--security-level": "0",
+    "--scaling-factor-bits": "56",
+    "--first-prime-bits": "60",
+    "--hamming-weight": "192",
+}
+if (
+    qualification_options != expected_options
+    or len(qualification_options) != len(qualification_arguments) // 2
+):
+    raise SystemExit("bootstrap qualification invocation is not the exact approved contract")
+
+generation_invocation, generation_argv = normalized_invocation(
+    "bootstrap_generation_invocation.json",
+    "ace.phantom.bootstrap-qualification-invocation/1.0.0",
+)
+if generation_argv[:2] != [
+    "tools/phantom_gpu/generate_bootstrap_qualification.py",
+    "bootstrap_qualification",
+]:
+    raise SystemExit("bootstrap generation invocation executable/output is invalid")
+generation_arguments = generation_argv[2:]
+if len(generation_arguments) % 2:
+    raise SystemExit("bootstrap generation invocation has an unpaired argument")
+generation_options = dict(zip(generation_arguments[0::2], generation_arguments[1::2]))
+if (
+    generation_options != {key: value for key, value in expected_options.items() if key != "--gate"}
+    or len(generation_options) != len(generation_arguments) // 2
+):
+    raise SystemExit("bootstrap generation invocation is not the exact approved contract")
+
+context = load("bootstrap_qualification/compiler_context_manifest.json")
+if (
+    context.get("schema_version") != 1
+    or context.get("resource_schema_version") != 3
+    or context.get("packing") != "full"
+    or context.get("polynomial_degree") != 16384
+    or context.get("logical_slot_capacity") != 8192
+    or len(context.get("data_q_bit_sizes", [])) != 26
+    or context.get("input_level") != 1
+    or context.get("security_level") != 0
+    or context.get("scaling_modulus_bits") != 56
+    or context.get("first_modulus_bits") != 60
+    or context.get("hamming_weight") != 192
+):
+    raise SystemExit("bootstrap context manifest is not the exact schema-v3 qualification context")
+resources = load("bootstrap_qualification/compiler_resource_manifest.json")
+required_true = {
+    "relinearization_key", "conjugation_key", "rotate_batch", "raise_mod",
+    "complex_plaintext",
+}
+if (
+    resources.get("schema_version") != 3
+    or resources.get("context_schema_version") != 1
+    or any(resources.get(field) is not True for field in required_true)
+    or resources.get("native_bootstrap_precompute") is not False
+    or not resources.get("rotation_steps")
+    or not resources.get("rotation_batches")
+    or not resources.get("monomial_powers")
+):
+    raise SystemExit("bootstrap resource manifest is not the full primitive qualification set")
+context_sha = digest("bootstrap_qualification/compiler_context_manifest.json")
+constants = load("bootstrap_qualification/compiler_constant_manifest.json")
+if (
+    constants.get("schema_version") != 1
+    or constants.get("context_schema_version") != 1
+    or constants.get("resource_schema_version") != 3
+    or constants.get("context_manifest_sha256") != context_sha
+    or not constants.get("constants")
+):
+    raise SystemExit("bootstrap constant manifest is empty or not context-bound")
+for relative in (
+    "bootstrap_qualification/compiler_context_manifest.json",
+    "bootstrap_qualification/compiler_resource_manifest.json",
+    "bootstrap_qualification/compiler_constant_manifest.json",
+):
+    if (root / relative).read_bytes().endswith(b"\n"):
+        raise SystemExit("bootstrap compiler manifests are not canonical no-newline JSON")
+
+generation = load("bootstrap_qualification/generation.json")
+expected_compiler_parameters = {
+    "poly_degree": 16384,
+    "mul_level": 26,
+    "input_level": 1,
+    "security_level": 0,
+    "scaling_factor_bits": 56,
+    "first_prime_bits": 60,
+    "hamming_weight": 192,
+}
+generation_manifest_paths = {
+    "context": "bootstrap_qualification/compiler_context_manifest.json",
+    "resource": "bootstrap_qualification/compiler_resource_manifest.json",
+    "constant": "bootstrap_qualification/compiler_constant_manifest.json",
+}
+if (
+    generation.get("schema_version") != "ace.phantom.bootstrap-generation/1.0.0"
+    or generation.get("status") != "pass"
+    or generation.get("generated_program_executed") is not False
+    or generation.get("compiler_parameters") != expected_compiler_parameters
+    or generation.get("source", {}).get("sha256")
+       != digest("bootstrap_qualification/bootstrap_qualification.cu")
+    or generation.get("constant_count") != len(constants["constants"])
+):
+    raise SystemExit("bootstrap generation record is incomplete or stale")
+for name, relative in generation_manifest_paths.items():
+    entry = generation.get("manifests", {}).get(name, {})
+    if (
+        entry.get("path") != Path(relative).name
+        or entry.get("sha256") != digest(relative)
+        or entry.get("bytes") != (root / relative).stat().st_size
+    ):
+        raise SystemExit(f"bootstrap generation record does not bind {name}")
+
+audit = load("bootstrap_qualification/source-audit.json")
+audit_inputs = {
+    "context_manifest": "bootstrap_qualification/compiler_context_manifest.json",
+    "resource_manifest": "bootstrap_qualification/compiler_resource_manifest.json",
+    "constant_manifest": "bootstrap_qualification/compiler_constant_manifest.json",
+    "source": "bootstrap_qualification/bootstrap_qualification.cu",
+}
+if audit.get("status") != "pass" or audit.get("forbidden_native_bts_matches") != []:
+    raise SystemExit("bootstrap generated-artifact audit did not pass")
+for name, relative in audit_inputs.items():
+    entry = audit.get("inputs", {}).get(name, {})
+    if (
+        entry.get("sha256") != digest(relative)
+        or entry.get("size_bytes") != (root / relative).stat().st_size
+    ):
+        raise SystemExit(f"bootstrap source audit does not bind {name}")
+
+qualification = load("bootstrap_qualification/qualification.json")
+expected_qualification = {
+    "status": "pass",
+    "gate": "bootstrap",
+    "architecture": "sm_80",
+    "phantom_commit": phantom_commit,
+    "generated_source_sha256": digest(
+        "bootstrap_qualification/bootstrap_qualification.cu"
+    ),
+    "compiler_context_manifest_sha256": context_sha,
+    "compiler_resource_manifest_sha256": digest(
+        "bootstrap_qualification/compiler_resource_manifest.json"
+    ),
+    "compiler_constant_manifest_sha256": digest(
+        "bootstrap_qualification/compiler_constant_manifest.json"
+    ),
+    "generation_record_sha256": digest(
+        "bootstrap_qualification/generation.json"
+    ),
+    "generated_artifact_audit_sha256": digest(
+        "bootstrap_qualification/source-audit.json"
+    ),
+    "linked_binary_sha256": digest(
+        "bootstrap_qualification/bootstrap_phantom_constants_sm80"
+    ),
+    "harness_source_sha256": digest(
+        "bootstrap_qualification/bootstrap_phantom_constants.cu"
+    ),
+    "symbol_closure_sha256": digest(
+        "bootstrap_qualification/symbol-closure.json"
+    ),
+    "io_helper_closure_sha256": digest(
+        "bootstrap_qualification/io-helper-closure.json"
+    ),
+    "archive_member_audit_sha256": digest(
+        "bootstrap_qualification/archive-member-audit.json"
+    ),
+}
+if any(qualification.get(key) != value for key, value in expected_qualification.items()):
+    raise SystemExit("bootstrap host qualification hashes are incomplete or stale")
+if (
+    qualification.get("generated_source_contains_native_bootstrap") is not False
+    or qualification.get("production_archive_contains_native_bootstrap") is not False
+    or qualification.get("primitive_only_provider_archive") is not True
+    or qualification.get("executable_was_run") is not False
+    or qualification.get("context_contract") != {
+        "polynomial_degree": 16384,
+        "mul_level": 26,
+        "input_level": 1,
+        "security_level": 0,
+        "scaling_factor_bits": 56,
+        "first_prime_bits": 60,
+        "hamming_weight": 192,
+    }
+):
+    raise SystemExit("bootstrap host qualification claims are inconsistent")
+for archive_field in (
+    "adapter_archive_sha256", "provider_archive_sha256", "common_archive_sha256"
+):
+    if re.fullmatch(r"[0-9a-f]{64}", qualification.get(archive_field, "")) is None:
+        raise SystemExit(f"bootstrap host qualification lacks {archive_field}")
+
+artifact = load("artifact_manifest.json")
+artifact_files = artifact.get("files", {})
+expected_artifact_files = {
+    relative: checksum
+    for relative, checksum in listed.items()
+    if relative != "artifact_manifest.json"
+}
+if (
+    artifact.get("schema_version")
+       != "ace.phantom.bootstrap-artifacts/1.0.0"
+    or artifact.get("status") != "bound"
+    or artifact.get("source_mode") != "snapshot"
+    or artifact.get("ace_commit") != ace_commit
+    or artifact.get("phantom_commit") != phantom_commit
+    or artifact.get("normalized_qualification_argv_sha256")
+       != qualification_invocation["normalized_argv_sha256"]
+    or artifact.get("normalized_generation_argv_sha256")
+       != generation_invocation["normalized_argv_sha256"]
+    or artifact.get("compiler_context_manifest_sha256") != context_sha
+    or artifact.get("compiler_resource_manifest_sha256")
+       != digest("bootstrap_qualification/compiler_resource_manifest.json")
+    or artifact.get("compiler_constant_manifest_sha256")
+       != digest("bootstrap_qualification/compiler_constant_manifest.json")
+    or artifact.get("generation_record_sha256")
+       != digest("bootstrap_qualification/generation.json")
+    or artifact.get("generated_artifact_audit_sha256")
+       != digest("bootstrap_qualification/source-audit.json")
+    or artifact.get("linked_binary_sha256")
+       != digest("bootstrap_qualification/bootstrap_phantom_constants_sm80")
+    or artifact.get("harness_source_sha256") != expected_harness_sha
+    or artifact_files != expected_artifact_files
+):
+    raise SystemExit("bootstrap artifact manifest is incomplete or stale")
+
+run_manifest = load("manifest.json")
+if (
+    run_manifest.get("status") != "pass"
+    or run_manifest.get("gate") != "bootstrap"
+    or run_manifest.get("source_mode") != "snapshot"
+    or run_manifest.get("ace_commit") != ace_commit
+    or run_manifest.get("phantom_commit") != phantom_commit
+    or run_manifest.get("ace_worktree_dirty") is not False
+    or run_manifest.get("qualification_invocation_sha256")
+       != digest("qualification_invocation.json")
+    or run_manifest.get("normalized_qualification_argv_sha256")
+       != qualification_invocation["normalized_argv_sha256"]
+    or run_manifest.get("artifact_manifest_sha256") != digest("artifact_manifest.json")
+    or run_manifest.get("evidence_sha256_manifest_sha256") != digest("SHA256SUMS")
+    or run_manifest.get("compiler_context_manifest_sha256") != context_sha
+    or run_manifest.get("compiler_resource_manifest_sha256")
+       != digest("bootstrap_qualification/compiler_resource_manifest.json")
+    or run_manifest.get("compiler_constant_manifest_sha256")
+       != digest("bootstrap_qualification/compiler_constant_manifest.json")
+    or run_manifest.get("bootstrap_generation_record_sha256")
+       != digest("bootstrap_qualification/generation.json")
+    or run_manifest.get("bootstrap_generated_artifact_audit_sha256")
+       != digest("bootstrap_qualification/source-audit.json")
+    or run_manifest.get("bootstrap_linked_binary_sha256")
+       != digest("bootstrap_qualification/bootstrap_phantom_constants_sm80")
+    or run_manifest.get("bootstrap_harness_source_sha256") != expected_harness_sha
+    or run_manifest.get("bootstrap_host_qualification_sha256")
+       != digest("bootstrap_qualification/qualification.json")
+):
+    raise SystemExit("bootstrap run manifest is incomplete or stale")
+
+ace_source = root / "ace_source_manifest.json"
+phantom_source = root / "phantom_source_manifest.json"
+if (
+    ace_source.read_bytes() != ordinary_ace_source.read_bytes()
+    or phantom_source.read_bytes() != ordinary_phantom_source.read_bytes()
+    or run_manifest.get("ace_tracked_source_manifest_sha256")
+       != hashlib.sha256(ace_source.read_bytes()).hexdigest()
+    or run_manifest.get("phantom_source_manifest_sha256")
+       != hashlib.sha256(phantom_source.read_bytes()).hexdigest()
+):
+    raise SystemExit("bootstrap source snapshot manifests differ from ordinary evidence")
+if digest("bootstrap_qualification/bootstrap_phantom_constants.cu") != expected_harness_sha:
+    raise SystemExit("bootstrap harness source differs from the selected ACE commit")
 PY
 
 while IFS= read -r retained_evidence_dependency; do
@@ -720,6 +1170,7 @@ cp "${FROZEN_QUALIFICATION_INVOCATION}" \
   "${OUTPUT}/qualification-invocation.json"
 cp "${FROZEN_COMPILER_INVOCATION}" "${OUTPUT}/compiler-invocation.json"
 cp "${FROZEN_RESOURCES}" "${OUTPUT}/ordinary-resource-manifest.json"
+cp "${FROZEN_CONSTANTS}" "${OUTPUT}/ordinary-constant-manifest.json"
 cp "${FROZEN_POST_CKKS_AIR}" "${OUTPUT}/ordinary-post-ckks.air"
 cp "${FROZEN_ARTIFACT_MANIFEST}" "${OUTPUT}/ordinary-artifact-manifest.json"
 cp "${FROZEN_RUN_MANIFEST}" "${OUTPUT}/ordinary-run-manifest.json"
@@ -729,6 +1180,20 @@ cp "${FROZEN_FIXTURE}" "${OUTPUT}/ordinary-fixture.json"
 cp "${FROZEN_CPU_REFERENCE}" "${OUTPUT}/ordinary-cpu-reference.json"
 cp "${FROZEN_CPU_VALUES}" "${OUTPUT}/ordinary-cpu-values.bin"
 cp "${FROZEN_ANT_VERIFICATION}" "${OUTPUT}/ordinary-ant-verification.json"
+cp "${BOOTSTRAP_QUALIFICATION_INVOCATION}" \
+  "${OUTPUT}/bootstrap-qualification-invocation.json"
+cp "${BOOTSTRAP_GENERATION_INVOCATION}" \
+  "${OUTPUT}/bootstrap-generation-invocation.json"
+cp "${BOOTSTRAP_ARTIFACT_MANIFEST}" \
+  "${OUTPUT}/bootstrap-artifact-manifest.json"
+cp "${BOOTSTRAP_RUN_MANIFEST}" "${OUTPUT}/bootstrap-run-manifest.json"
+cp "${BOOTSTRAP_CONTEXT}" "${OUTPUT}/bootstrap-context-manifest.json"
+cp "${BOOTSTRAP_RESOURCES}" "${OUTPUT}/bootstrap-resource-manifest.json"
+cp "${BOOTSTRAP_CONSTANTS}" "${OUTPUT}/bootstrap-constant-manifest.json"
+cp "${BOOTSTRAP_GENERATION}" "${OUTPUT}/bootstrap-generation.json"
+cp "${BOOTSTRAP_SOURCE_AUDIT}" "${OUTPUT}/bootstrap-source-audit.json"
+cp "${BOOTSTRAP_HOST_QUALIFICATION}" \
+  "${OUTPUT}/bootstrap-host-qualification.json"
 python3 "${SCRIPT_DIR}/retained_runpod_evidence.py" export-frozen \
   --root "${RETAINED_RUN_ROOT}" \
   --output "${OUTPUT}" \
@@ -750,10 +1215,10 @@ import sys
 
 output = Path(sys.argv[1])
 payload = {
-    "schema_version": "1.0.0",
+    "schema_version": "1.1.0",
     "contents": (
         "audited-source-snapshots-and-frozen-provider-neutral-references-"
-        "without-build-output"
+        "with-bootstrap-qualification-regeneration-attestations-without-build-output"
     ),
     "ace_commit": sys.argv[2],
     "phantom_commit": sys.argv[3],
@@ -788,6 +1253,9 @@ payload = {
         "resource_manifest_sha256": hashlib.sha256(
             (output / "ordinary-resource-manifest.json").read_bytes()
         ).hexdigest(),
+        "constant_manifest_sha256": hashlib.sha256(
+            (output / "ordinary-constant-manifest.json").read_bytes()
+        ).hexdigest(),
         "post_ckks_air_sha256": hashlib.sha256(
             (output / "ordinary-post-ckks.air").read_bytes()
         ).hexdigest(),
@@ -812,6 +1280,64 @@ payload = {
         "ant_verification_sha256": hashlib.sha256(
             (output / "ordinary-ant-verification.json").read_bytes()
         ).hexdigest(),
+    },
+    "bootstrap_qualification": {
+        "qualification_invocation_sha256": hashlib.sha256(
+            (output / "bootstrap-qualification-invocation.json").read_bytes()
+        ).hexdigest(),
+        "normalized_qualification_argv_sha256": json.loads(
+            (output / "bootstrap-qualification-invocation.json").read_text(
+                encoding="utf-8"
+            )
+        )["normalized_argv_sha256"],
+        "generation_invocation_sha256": hashlib.sha256(
+            (output / "bootstrap-generation-invocation.json").read_bytes()
+        ).hexdigest(),
+        "normalized_generation_argv_sha256": json.loads(
+            (output / "bootstrap-generation-invocation.json").read_text(
+                encoding="utf-8"
+            )
+        )["normalized_argv_sha256"],
+        "artifact_manifest_sha256": hashlib.sha256(
+            (output / "bootstrap-artifact-manifest.json").read_bytes()
+        ).hexdigest(),
+        "run_manifest_sha256": hashlib.sha256(
+            (output / "bootstrap-run-manifest.json").read_bytes()
+        ).hexdigest(),
+        "context_manifest_sha256": hashlib.sha256(
+            (output / "bootstrap-context-manifest.json").read_bytes()
+        ).hexdigest(),
+        "resource_manifest_sha256": hashlib.sha256(
+            (output / "bootstrap-resource-manifest.json").read_bytes()
+        ).hexdigest(),
+        "constant_manifest_sha256": hashlib.sha256(
+            (output / "bootstrap-constant-manifest.json").read_bytes()
+        ).hexdigest(),
+        "generation_record_sha256": hashlib.sha256(
+            (output / "bootstrap-generation.json").read_bytes()
+        ).hexdigest(),
+        "source_audit_sha256": hashlib.sha256(
+            (output / "bootstrap-source-audit.json").read_bytes()
+        ).hexdigest(),
+        "host_qualification_sha256": hashlib.sha256(
+            (output / "bootstrap-host-qualification.json").read_bytes()
+        ).hexdigest(),
+        "expected_generated_source_sha256": json.loads(
+            (output / "bootstrap-artifact-manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )["files"]["bootstrap_qualification/bootstrap_qualification.cu"],
+        "expected_linked_binary_sha256": json.loads(
+            (output / "bootstrap-artifact-manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )["linked_binary_sha256"],
+        "expected_harness_source_sha256": json.loads(
+            (output / "bootstrap-artifact-manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )["harness_source_sha256"],
+        "packaged_build_output": False,
     },
     "frozen_retained_reference": json.loads(
         (output / "retained-frozen-export.json").read_text(encoding="utf-8")

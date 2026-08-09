@@ -46,7 +46,7 @@ def _context() -> dict:
         "security_level": 0,
         "first_modulus_bits": 5,
         "scaling_modulus_bits": 5,
-        "resource_schema_version": 2,
+        "resource_schema_version": 3,
     }
 
 
@@ -61,6 +61,7 @@ def _invocation(context_path: Path, fixture_path: Path, air_path: Path) -> dict:
         "--phantom-post-ckks-air", "outputs/retained_ckks_phantom_post.air",
         "--phantom-context-manifest", "outputs/compiler_context_manifest.json",
         "--phantom-resource-manifest", "outputs/compiler_resource_manifest.json",
+        "--phantom-constant-manifest", "outputs/compiler_constant_manifest.json",
         "--generation-record", "outputs/retained_ckks_generation.json",
         "--interface-header", "outputs/retained_ckks_generated_interface.h",
         "--polynomial-degree", "8",
@@ -86,6 +87,7 @@ def _invocation(context_path: Path, fixture_path: Path, air_path: Path) -> dict:
         "input_context_manifest_sha256": context_sha,
         "emitted_context_manifest_sha256": "2" * 64,
         "resource_manifest_sha256": "3" * 64,
+        "constant_manifest_sha256": "6" * 64,
         "generated_functions": [
             "retained_ckks_conjugate", "retained_ckks_rotate_batches",
             "retained_ckks_raise_mod", "retained_ckks_mul_monomials",
@@ -135,6 +137,17 @@ def _qualification_files(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     )
     _write_json(invocation_path, _invocation(context_path, template_path, air_path))
     return template_path, context_path, invocation_path, air_path
+
+
+def test_retained_context_requires_resource_schema_v3() -> None:
+    fixture_tool.validate_context_manifest(_context())
+    legacy = _context()
+    legacy["resource_schema_version"] = 2
+    with pytest.raises(
+        fixture_tool.RetainedFixtureError,
+        match="retained resource ABI version 3",
+    ):
+        fixture_tool.validate_context_manifest(legacy)
 
 
 def test_binding_derives_context_and_production_batches(tmp_path: Path) -> None:
@@ -606,6 +619,7 @@ def test_identity_chain_hashes_sources_generation_build_run_and_artifacts(
     emitted_context = tmp_path / "emitted-context.json"
     emitted_context.write_bytes(context.read_bytes())
     resource = tmp_path / "resource.json"
+    constant = tmp_path / "constant.json"
     generated_ant = tmp_path / "generated.cxx"
     generated_phantom = tmp_path / "generated.cu"
     ant_executable = tmp_path / "ant-executable"
@@ -615,6 +629,7 @@ def test_identity_chain_hashes_sources_generation_build_run_and_artifacts(
     exact_json, exact_bin = tmp_path / "exact.json", tmp_path / "exact.bin"
     for path, contents in (
         (resource, b"{}\n"),
+        (constant, b"{}\n"),
         (generated_ant, b"generated ant\n"),
         (generated_phantom, b"generated phantom\n"),
         (ant_executable, b"ant executable\n"),
@@ -642,6 +657,7 @@ def test_identity_chain_hashes_sources_generation_build_run_and_artifacts(
                 emitted_context
             ),
             "resource_manifest_sha256": fixture_tool.sha256_path(resource),
+            "constant_manifest_sha256": fixture_tool.sha256_path(constant),
             "ant_source_sha256": fixture_tool.sha256_path(generated_ant),
             "phantom_source_sha256": fixture_tool.sha256_path(generated_phantom),
         }
@@ -660,6 +676,7 @@ def test_identity_chain_hashes_sources_generation_build_run_and_artifacts(
         "phantom_source_manifest_sha256": fixture_tool.sha256_path(phantom_source),
         "compiler_context_manifest_sha256": fixture_tool.sha256_path(context),
         "compiler_resource_manifest_sha256": fixture_tool.sha256_path(resource),
+        "compiler_constant_manifest_sha256": fixture_tool.sha256_path(constant),
         "fixture_sha256": fixture_tool.sha256_path(fixture),
         "compiler_invocation_sha256": fixture_tool.sha256_path(generation_path),
         "generated_ant_source_sha256": fixture_tool.sha256_path(generated_ant),
@@ -713,6 +730,7 @@ def test_identity_chain_hashes_sources_generation_build_run_and_artifacts(
         "fixture_sha256": fixture_tool.sha256_path(fixture),
         "compiler_context_manifest_sha256": fixture_tool.sha256_path(context),
         "compiler_resource_manifest_sha256": fixture_tool.sha256_path(resource),
+        "compiler_constant_manifest_sha256": fixture_tool.sha256_path(constant),
         "executables": {
             "ant_oracle": build["executables"]["ant_oracle"],
             "phantom_sm80": remote_build["executables"]["phantom_sm80"],
@@ -744,6 +762,7 @@ def test_identity_chain_hashes_sources_generation_build_run_and_artifacts(
         ant_post_ckks_air=air,
         emitted_context_manifest=emitted_context,
         resource_manifest=resource,
+        constant_manifest=constant,
         fixture=fixture,
         generated_ant_source=generated_ant,
         generated_phantom_source=generated_phantom,

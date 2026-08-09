@@ -6,7 +6,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 source "${SCRIPT_DIR}/transport_helpers.sh"
 
 usage() {
-  echo "usage: $0 --ace-commit COMMIT --phantom-commit COMMIT --ordinary-run-root DIR --retained-run-root DIR OUTPUT_DIRECTORY" >&2
+  echo "usage: $0 --ace-commit COMMIT --phantom-commit COMMIT --ordinary-run-root DIR --retained-run-root DIR --bootstrap-run-root DIR OUTPUT_DIRECTORY" >&2
   exit 2
 }
 
@@ -14,6 +14,7 @@ ACE_COMMIT=""
 PHANTOM_COMMIT=""
 ORDINARY_RUN_ROOT=""
 RETAINED_RUN_ROOT=""
+BOOTSTRAP_RUN_ROOT=""
 OUTPUT_ARGUMENT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,6 +38,11 @@ while [[ $# -gt 0 ]]; do
       RETAINED_RUN_ROOT="$2"
       shift 2
       ;;
+    --bootstrap-run-root)
+      [[ $# -ge 2 ]] || usage
+      BOOTSTRAP_RUN_ROOT="$2"
+      shift 2
+      ;;
     --)
       shift
       [[ $# -eq 1 && -z "${OUTPUT_ARGUMENT}" ]] || usage
@@ -53,6 +59,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "${ACE_COMMIT}" && -n "${PHANTOM_COMMIT}" &&
    -n "${ORDINARY_RUN_ROOT}" && -n "${RETAINED_RUN_ROOT}" &&
+   -n "${BOOTSTRAP_RUN_ROOT}" &&
    -n "${OUTPUT_ARGUMENT}" ]] || usage
 if [[ ! "${ACE_COMMIT}" =~ ^[0-9a-f]{40}$ ||
       ! "${PHANTOM_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -144,6 +151,7 @@ bash "${SCRIPT_DIR}/package_runpod_sources.sh" \
   --phantom-commit "${PHANTOM_COMMIT}" \
   --ordinary-run-root "${ORDINARY_RUN_ROOT}" \
   --retained-run-root "${RETAINED_RUN_ROOT}" \
+  --bootstrap-run-root "${BOOTSTRAP_RUN_ROOT}" \
   "${PAYLOAD}"
 docker pull --platform linux/amd64 "${BASE_IMAGE}" | tee "${DOCKER_EVIDENCE}/pull.txt"
 ACTUAL_BASE_ID="$(docker image inspect -f '{{.Id}}' "${BASE_IMAGE}")"

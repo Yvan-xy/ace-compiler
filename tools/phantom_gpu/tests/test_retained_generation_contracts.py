@@ -31,7 +31,7 @@ air_tools = _load("retained_air_generation_contract", TOOLS / "retained_air_tool
 
 def test_unbound_fixture_retains_reviewed_batches_but_has_no_air_hash() -> None:
     fixture = fixture_tool.load_json(TOOLS / "fixtures/retained_ckks_v1.json")
-    fixture["qualification_bindings"] = {
+    assert fixture["qualification_bindings"] == {
         "status": "unbound",
         "required": [
             "compiler_context_manifest_sha256",
@@ -39,9 +39,7 @@ def test_unbound_fixture_retains_reviewed_batches_but_has_no_air_hash() -> None:
             "post_ckks_air_sha256",
         ],
     }
-    fixture["production_rotation_source"]["post_ckks_air_sha256"] = None
     fixture_tool.validate_template(fixture, require_bound=False)
-    assert fixture["qualification_bindings"]["status"] == "unbound"
     assert fixture["production_rotation_batches"]
     assert fixture["production_rotation_source"]["post_ckks_air_sha256"] is None
 
@@ -54,11 +52,10 @@ def test_unbound_fixture_retains_reviewed_batches_but_has_no_air_hash() -> None:
         fixture_tool.validate_template(invalid, require_bound=False)
 
 
-def test_checked_fixture_lifecycle_is_accepted_only_when_explicit() -> None:
+def test_checked_fixture_is_an_explicit_unbound_freeze_template() -> None:
     fixture = fixture_tool.load_json(TOOLS / "fixtures/retained_ckks_v1.json")
-    status = fixture["qualification_bindings"]["status"]
-    assert status in {"unbound", "bound"}
-    fixture_tool.validate_template(fixture, require_bound=status == "bound")
+    assert fixture["qualification_bindings"]["status"] == "unbound"
+    fixture_tool.validate_template(fixture, require_bound=False)
 
     formal_gate = (TOOLS / "retained_runpod_evidence.py").read_text(
         encoding="utf-8"

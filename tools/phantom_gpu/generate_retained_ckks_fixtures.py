@@ -23,7 +23,7 @@ DECODED_MAGIC = b"ACERCK01"
 EXACT_SOURCE_MAGIC = b"ACESRC01"
 EXACT_MAGIC = b"ACERNS01"
 MASK64 = (1 << 64) - 1
-RETAINED_RESOURCE_SCHEMA_VERSION = 2
+RETAINED_RESOURCE_SCHEMA_VERSION = 3
 
 
 class RetainedFixtureError(ValueError):
@@ -489,7 +489,8 @@ def _load_invocation(path: Path) -> tuple[dict[str, Any], str, dict[str, str]]:
             "schema_version", "argv", "normalized_argv_sha256",
             "canonical_module", "ace_commit", "fixture_sha256",
             "input_context_manifest_sha256", "emitted_context_manifest_sha256",
-            "resource_manifest_sha256", "generated_functions", "function_abi",
+            "resource_manifest_sha256", "constant_manifest_sha256",
+            "generated_functions", "function_abi",
             "linkage", "invocation", "retained_runtime_calls",
             "post_ckks_air_sha256", "ant_post_ckks_air_sha256",
             "phantom_post_ckks_air_sha256", "ant_source_sha256",
@@ -522,6 +523,7 @@ def _load_invocation(path: Path) -> tuple[dict[str, Any], str, dict[str, str]]:
         "--context-manifest", "--fixture", "--ant-source", "--phantom-source",
         "--ant-post-ckks-air", "--phantom-post-ckks-air",
         "--phantom-context-manifest", "--phantom-resource-manifest",
+        "--phantom-constant-manifest",
         "--generation-record", "--interface-header",
     }
     compiler_options = {
@@ -544,6 +546,7 @@ def _load_invocation(path: Path) -> tuple[dict[str, Any], str, dict[str, str]]:
         "--ant-post-ckks-air": ".air", "--phantom-post-ckks-air": ".air",
         "--phantom-context-manifest": ".json",
         "--phantom-resource-manifest": ".json",
+        "--phantom-constant-manifest": ".json",
         "--generation-record": ".json", "--interface-header": ".h",
     }
     for option, suffix in expected_suffixes.items():

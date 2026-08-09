@@ -173,7 +173,7 @@ def verify_context_manifest(manifest: dict[str, Any]) -> None:
     }
     if set(manifest) != required:
         fail("compiler context manifest keys do not match schema")
-    if manifest["schema_version"] != 1 or manifest["resource_schema_version"] != 2:
+    if manifest["schema_version"] != 1 or manifest["resource_schema_version"] != 3:
         fail("unsupported compiler context manifest schema")
     degree = manifest["polynomial_degree"]
     slots = manifest["logical_slot_capacity"]

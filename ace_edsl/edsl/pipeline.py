@@ -81,6 +81,7 @@ class FHEConfig:
     raise_mod_level_func: str = ""
     context_manifest_file: str = ""
     resource_manifest_file: str = ""
+    constant_manifest_file: str = ""
 
     def __post_init__(self):
         self.provider = self.provider.strip().lower()
@@ -230,6 +231,7 @@ class AcePipeline:
         raise_mod_level_func: str = "",
         context_manifest_file: str = "",
         resource_manifest_file: str = "",
+        constant_manifest_file: str = "",
     ) -> "AcePipeline":
         """
         Configure FHE parameters.
@@ -252,6 +254,7 @@ class AcePipeline:
             raise_mod_level_func: Runtime helper name for attributed raise_mod
             context_manifest_file: Optional generated context attestation path
             resource_manifest_file: Optional generated resource attestation path
+            constant_manifest_file: Optional generated constant attestation path
             
         Returns:
             self (for method chaining)
@@ -276,6 +279,7 @@ class AcePipeline:
             raise_mod_level_func=raise_mod_level_func,
             context_manifest_file=context_manifest_file,
             resource_manifest_file=resource_manifest_file,
+            constant_manifest_file=constant_manifest_file,
         )
         return self
 
@@ -488,6 +492,7 @@ class AcePipeline:
             raise_mod_level_func=self.fhe_config.raise_mod_level_func,
             context_manifest_file=self.fhe_config.context_manifest_file,
             resource_manifest_file=self.fhe_config.resource_manifest_file,
+            constant_manifest_file=self.fhe_config.constant_manifest_file,
         )
         if ok and hasattr(self.glob_scope, "get_c_code"):
             return self.glob_scope.get_c_code()
@@ -900,6 +905,7 @@ class Pipeline:
         enable_poly: Optional[bool] = None,
         context_manifest_file: str = "",
         resource_manifest_file: str = "",
+        constant_manifest_file: str = "",
     ) -> "Pipeline":
         """
         Configure FHE parameters.
@@ -940,6 +946,7 @@ class Pipeline:
             enable_poly=enable_poly,
             context_manifest_file=context_manifest_file,
             resource_manifest_file=resource_manifest_file,
+            constant_manifest_file=constant_manifest_file,
         )
         return self
     
@@ -1138,6 +1145,7 @@ class Pipeline:
                     raise_mod_level_func=self.config.raise_mod_level_func,
                     context_manifest_file=self.config.context_manifest_file,
                     resource_manifest_file=self.config.resource_manifest_file,
+                    constant_manifest_file=self.config.constant_manifest_file,
                 )
             return False
         

@@ -23,7 +23,7 @@ namespace fhe {
 namespace ckks {
 
 inline constexpr uint32_t PHANTOM_CONTEXT_SCHEMA_VERSION  = 1;
-inline constexpr uint32_t PHANTOM_RESOURCE_SCHEMA_VERSION = 2;
+inline constexpr uint32_t PHANTOM_RESOURCE_SCHEMA_VERSION = 3;
 inline constexpr uint32_t PHANTOM_PACKING_FULL             = 1;
 inline constexpr uint32_t PHANTOM_POLY_DEGREE_MAX          = 131072;
 inline constexpr uint32_t PHANTOM_USER_MODULUS_BITS_MIN    = 2;
@@ -36,6 +36,10 @@ inline constexpr uint64_t PHANTOM_RESOURCE_CONJUGATION_KEY = uint64_t{1} << 2;
 inline constexpr uint64_t PHANTOM_RESOURCE_ROTATE_BATCH = uint64_t{1} << 3;
 inline constexpr uint64_t PHANTOM_RESOURCE_RAISE_MOD = uint64_t{1} << 4;
 inline constexpr uint64_t PHANTOM_RESOURCE_MONOMIALS = uint64_t{1} << 5;
+inline constexpr uint64_t PHANTOM_RESOURCE_COMPLEX_PLAINTEXT =
+    uint64_t{1} << 6;
+inline constexpr uint64_t PHANTOM_RESOURCE_NATIVE_BOOTSTRAP_PRECOMPUTE =
+    uint64_t{1} << 7;
 
 struct PHANTOM_CONTEXT_DESCRIPTOR {
   uint32_t              _schema_version = PHANTOM_CONTEXT_SCHEMA_VERSION;
@@ -193,6 +197,9 @@ inline PHANTOM_RESOURCE_DESCRIPTOR Build_phantom_resource_descriptor(
   if (parameters.Raise_mod_required()) {
     result._flags |= PHANTOM_RESOURCE_RAISE_MOD;
   }
+  if (parameters.Complex_plaintext_required()) {
+    result._flags |= PHANTOM_RESOURCE_COMPLEX_PLAINTEXT;
+  }
   const uint64_t monomial_period =
       static_cast<uint64_t>(context._poly_degree) * 2;
   for (uint32_t power : parameters.Get_monomial_powers()) {
@@ -264,12 +271,21 @@ inline std::string Serialize_phantom_resource_descriptor(
   std::ostringstream output;
   output << "{\"context_schema_version\":"
          << resources._context_schema_version;
+  output << ",\"complex_plaintext\":"
+         << ((resources._flags & PHANTOM_RESOURCE_COMPLEX_PLAINTEXT) != 0
+                 ? "true"
+                 : "false");
   output << ",\"conjugation_key\":"
          << ((resources._flags & PHANTOM_RESOURCE_CONJUGATION_KEY) != 0
                  ? "true"
                  : "false");
   output << ",\"monomial_powers\":";
   Emit_json_array(output, resources._monomial_powers);
+  output << ",\"native_bootstrap_precompute\":"
+         << ((resources._flags &
+              PHANTOM_RESOURCE_NATIVE_BOOTSTRAP_PRECOMPUTE) != 0
+                 ? "true"
+                 : "false");
   output << ",\"raise_mod\":"
          << ((resources._flags & PHANTOM_RESOURCE_RAISE_MOD) != 0 ? "true"
                                                                    : "false");

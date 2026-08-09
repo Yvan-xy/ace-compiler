@@ -279,6 +279,7 @@ def load_build_attestation(
             "phantom_source_manifest_sha256",
             "compiler_context_manifest_sha256",
             "compiler_resource_manifest_sha256",
+            "compiler_constant_manifest_sha256",
             "fixture_sha256",
             "compiler_invocation_sha256",
             "generated_ant_source_sha256",
@@ -365,6 +366,7 @@ def load_run_attestation(path: Path, *, expected: dict[str, Any]) -> dict[str, A
             "fixture_sha256",
             "compiler_context_manifest_sha256",
             "compiler_resource_manifest_sha256",
+            "compiler_constant_manifest_sha256",
             "executables",
             "provider_results",
             "exact_observed",
@@ -965,6 +967,7 @@ def load_identity_chain(arguments: argparse.Namespace) -> dict[str, Any]:
             arguments.emitted_context_manifest
         ),
         "resource_manifest_sha256": sha256_path(arguments.resource_manifest),
+        "constant_manifest_sha256": sha256_path(arguments.constant_manifest),
         "post_ckks_air_sha256": sha256_path(arguments.post_ckks_air),
         "ant_post_ckks_air_sha256": sha256_path(arguments.ant_post_ckks_air),
         "phantom_post_ckks_air_sha256": sha256_path(arguments.post_ckks_air),
@@ -984,6 +987,7 @@ def load_identity_chain(arguments: argparse.Namespace) -> dict[str, Any]:
     fixture_sha256 = sha256_path(arguments.fixture)
     context_sha256 = sha256_path(arguments.context_manifest)
     resource_sha256 = sha256_path(arguments.resource_manifest)
+    constant_sha256 = sha256_path(arguments.constant_manifest)
     phantom_executable_sha256 = sha256_path(arguments.phantom_executable)
     build_expected = {
         "ace_commit": ace_source["commit"],
@@ -992,6 +996,7 @@ def load_identity_chain(arguments: argparse.Namespace) -> dict[str, Any]:
         "phantom_source_manifest_sha256": phantom_source_sha256,
         "compiler_context_manifest_sha256": context_sha256,
         "compiler_resource_manifest_sha256": resource_sha256,
+        "compiler_constant_manifest_sha256": constant_sha256,
         "fixture_sha256": fixture_sha256,
         "compiler_invocation_sha256": generation_sha256,
         "generated_ant_source_sha256": sha256_path(arguments.generated_ant_source),
@@ -1022,6 +1027,7 @@ def load_identity_chain(arguments: argparse.Namespace) -> dict[str, Any]:
         "fixture_sha256": fixture_sha256,
         "compiler_context_manifest_sha256": context_sha256,
         "compiler_resource_manifest_sha256": resource_sha256,
+        "compiler_constant_manifest_sha256": constant_sha256,
     }
     run = load_run_attestation(arguments.run_attestation, expected=run_expected)
     expected_run_executables = {
@@ -1942,7 +1948,7 @@ def parse_arguments() -> argparse.Namespace:
         "production-post-ckks-air",
         "ace-source-manifest", "phantom-source-manifest",
         "generation-attestation", "generation-fixture",
-        "emitted-context-manifest", "resource-manifest",
+        "emitted-context-manifest", "resource-manifest", "constant-manifest",
         "generated-ant-source", "generated-phantom-source",
         "phantom-executable", "frozen-build-attestation",
         "remote-build-attestation", "run-attestation",

@@ -308,6 +308,7 @@ generate_context_authority() {
     --output "${RESULT_ROOT}/source/context_authority_probe.cu"
     --context-manifest "${RESULT_ROOT}/inputs/compiler_context_manifest.json"
     --resource-manifest "${RESULT_ROOT}/source/context_authority_resources.json"
+    --constant-manifest "${RESULT_ROOT}/source/context_authority_constants.json"
     --post-ckks-air "${RESULT_ROOT}/source/context_authority_post.air"
     --poly-degree "${POLYNOMIAL_DEGREE}"
     --mul-level "${MUL_LEVEL}"
@@ -334,6 +335,7 @@ generate_retained_artifacts() {
     --phantom-post-ckks-air "${RESULT_ROOT}/outputs/retained_ckks_phantom_post.air" \
     --phantom-context-manifest "${RESULT_ROOT}/outputs/compiler_context_manifest.json" \
     --phantom-resource-manifest "${RESULT_ROOT}/outputs/compiler_resource_manifest.json" \
+    --phantom-constant-manifest "${RESULT_ROOT}/outputs/compiler_constant_manifest.json" \
     --generation-record "${RESULT_ROOT}/outputs/retained_ckks_generation.json" \
     --interface-header "${RESULT_ROOT}/outputs/retained_ckks_generated_interface.h" \
     --polynomial-degree "${POLYNOMIAL_DEGREE}" \
@@ -361,6 +363,8 @@ generate_retained_artifacts() {
       "${RESULT_ROOT}/outputs/retained_ckks_keyless_context.json" \
     --resource-manifest \
       "${RESULT_ROOT}/outputs/retained_ckks_keyless_resources.json" \
+    --constant-manifest \
+      "${RESULT_ROOT}/outputs/retained_ckks_keyless_constants.json" \
     --post-ckks-air \
       "${RESULT_ROOT}/outputs/retained_ckks_keyless_post.air" \
     --poly-degree "${POLYNOMIAL_DEGREE}" \
@@ -375,7 +379,7 @@ generate_retained_artifacts() {
   cmp "${RESULT_ROOT}/inputs/compiler_context_manifest.json" \
     "${RESULT_ROOT}/outputs/retained_ckks_keyless_context.json"
   jq -e '
-    .schema_version == 2 and
+    .schema_version == 3 and
     .context_schema_version == 1 and
     .relinearization_key == false and
     .rotation_steps == [] and
@@ -383,8 +387,17 @@ generate_retained_artifacts() {
     .rotate_batch == false and
     .rotation_batches == [] and
     .raise_mod == false and
-    .monomial_powers == []
+    .monomial_powers == [] and
+    .complex_plaintext == false and
+    .native_bootstrap_precompute == false
   ' "${RESULT_ROOT}/outputs/retained_ckks_keyless_resources.json" >/dev/null
+  jq -e '
+    .schema_version == 1 and
+    .context_schema_version == 1 and
+    .resource_schema_version == 3 and
+    .constants == [] and
+    (.context_manifest_sha256 | test("^[0-9a-f]{64}$"))
+  ' "${RESULT_ROOT}/outputs/retained_ckks_keyless_constants.json" >/dev/null
 
   local fixture_tool="${SCRIPT_DIR}/generate_retained_ckks_fixtures.py"
   local common=(
@@ -953,6 +966,7 @@ def write(path, value):
 
 context = root / "inputs/compiler_context_manifest.json"
 resource = root / "outputs/compiler_resource_manifest.json"
+constant = root / "outputs/compiler_constant_manifest.json"
 fixture = root / "inputs/retained_ckks_fixture.json"
 generation = root / "outputs/retained_ckks_generation.json"
 build = {
@@ -970,6 +984,7 @@ build = {
     ),
     "compiler_context_manifest_sha256": digest(context),
     "compiler_resource_manifest_sha256": digest(resource),
+    "compiler_constant_manifest_sha256": digest(constant),
     "fixture_sha256": digest(fixture),
     "compiler_invocation_sha256": digest(generation),
     "generated_ant_source_sha256": digest(
@@ -1015,6 +1030,7 @@ required = {
     "inputs/retained_ckks_fixture.json",
     "outputs/compiler_context_manifest.json",
     "outputs/compiler_resource_manifest.json",
+    "outputs/compiler_constant_manifest.json",
     "outputs/retained_ckks_ant.cxx",
     "outputs/retained_ckks_phantom.cu",
     "outputs/retained_ckks_ant_post.air",
@@ -1029,6 +1045,7 @@ required = {
     "outputs/retained_ckks_keyless.cu",
     "outputs/retained_ckks_keyless_context.json",
     "outputs/retained_ckks_keyless_resources.json",
+    "outputs/retained_ckks_keyless_constants.json",
     "outputs/retained_ckks_keyless_post.air",
     "outputs/retained_ckks_cpu_reference.json",
     "outputs/retained_ckks_cpu_values.bin",
@@ -1080,6 +1097,7 @@ artifact = {
     ),
     "compiler_context_manifest_sha256": digest(context),
     "compiler_resource_manifest_sha256": digest(resource),
+    "compiler_constant_manifest_sha256": digest(constant),
     "normalized_compiler_command_sha256": json.loads(
         generation.read_text(encoding="utf-8")
     )["normalized_argv_sha256"],
@@ -1140,6 +1158,9 @@ value = {
     ),
     "compiler_resource_manifest_sha256": digest(
         root / "outputs/compiler_resource_manifest.json"
+    ),
+    "compiler_constant_manifest_sha256": digest(
+        root / "outputs/compiler_constant_manifest.json"
     ),
     "fixture_sha256": digest(root / "inputs/retained_ckks_fixture.json"),
     "cpu_reference_sha256": digest(
