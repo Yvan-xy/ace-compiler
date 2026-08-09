@@ -26,6 +26,26 @@ PHANTOM_REQUIRED_TEST_PATHS = {
     "tests/compiler_context_manifest.h",
     "tests/native_bts_oracle_link.cu",
 }
+BOOTSTRAP_REQUIRED_SYMBOLS = [
+    "bootstrap_full",
+    "Conjugate_ciph",
+    "Rotate_batch_ciph",
+    "Raise_mod",
+    "Mul_mono_ciph",
+    "Phantom_conjugate",
+    "Phantom_rotate_batch",
+    "Phantom_raise_mod",
+    "Phantom_mul_mono",
+    "complex_conjugate_inplace",
+    "rotate_batch",
+    "raise_modulus",
+    "multiply_by_monomial",
+    "Get_phantom_context_manifest",
+    "Get_phantom_resource_manifest",
+    "Get_phantom_constant_manifest",
+    "Load_cached_plain",
+    "main",
+]
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -588,7 +608,7 @@ def test_retained_replay_payload_descriptor_matches_packager_and_rejects_tamper(
     )
     expected_descriptor = (
         "audited-source-snapshots-and-frozen-provider-neutral-references-"
-        "with-bootstrap-qualification-regeneration-attestations-without-build-output"
+        "with-exact-bootstrap-compile-handoff-and-regeneration-attestations"
     )
     assert package_descriptor == expected_descriptor
 
@@ -650,6 +670,35 @@ def test_retained_replay_payload_descriptor_matches_packager_and_rejects_tamper(
     payload_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     rejected = subprocess.run(arguments, check=False)
     assert rejected.returncode != 0
+
+
+def test_bootstrap_compile_handoff_is_complete_and_checksum_bound() -> None:
+    package = (TOOLS / "package_runpod_sources.sh").read_text(encoding="utf-8")
+    pipeline = (TOOLS / "run_build_and_health.sh").read_text(encoding="utf-8")
+    handoff_files = (
+        "bootstrap-raw.air",
+        "bootstrap-post-ckks.air",
+        "bootstrap-generated.cu",
+        "bootstrap-host-linked-sm80",
+        "bootstrap-link-commands.txt",
+        "bootstrap-cuda-elf.txt",
+        "bootstrap-cuda-resources.txt",
+        "bootstrap-file-report.txt",
+        "bootstrap-readelf.txt",
+        "bootstrap-linked-symbols.txt",
+        "bootstrap-symbol-closure.json",
+    )
+    for name in handoff_files:
+        assert name in package
+        assert name in pipeline
+    assert '"schema_version": "2.0.0"' in package
+    assert '"architecture": "sm_80"' in package
+    assert '"packaged_compile_handoff": True' in package
+    assert '"linked_binary_byte_identity_required": False' in package
+    assert '"${output}/link-commands.txt"' not in pipeline[
+        pipeline.index("verify_frozen_bootstrap_qualification() {") :
+        pipeline.index("verify_frozen_ordinary_reference() {")
+    ]
 
 
 def test_local_reproduction_does_not_restate_compiler_context() -> None:
@@ -761,12 +810,15 @@ def test_bootstrap_freeze_requires_exact_source_but_allows_fresh_cuda_bytes(
     verifier = source[heredoc_start:heredoc_end]
 
     stable_paths = (
+        "bootstrap_qualification/bootstrap_raw.air",
+        "bootstrap_qualification/bootstrap_post_ckks.air",
         "bootstrap_qualification/bootstrap_qualification.cu",
         "bootstrap_qualification/bootstrap_phantom_constants.cu",
         "bootstrap_qualification/compiler_context_manifest.json",
         "bootstrap_qualification/compiler_resource_manifest.json",
         "bootstrap_qualification/compiler_constant_manifest.json",
         "bootstrap_qualification/generation.json",
+        "bootstrap_qualification/source-audit.json",
     )
     binary_path = "bootstrap_qualification/bootstrap_phantom_constants_sm80"
     stable_hashes = {
@@ -780,9 +832,11 @@ def test_bootstrap_freeze_requires_exact_source_but_allows_fresh_cuda_bytes(
     ).hexdigest()
     payload = {
         "bootstrap_qualification": {
-            "expected_generated_source_sha256": stable_hashes[stable_paths[0]],
-            "expected_harness_source_sha256": stable_hashes[stable_paths[1]],
-            "expected_linked_binary_sha256": packaged_binary,
+            "raw_air_sha256": stable_hashes[stable_paths[0]],
+            "post_ckks_air_sha256": stable_hashes[stable_paths[1]],
+            "generated_source_sha256": stable_hashes[stable_paths[2]],
+            "harness_source_sha256": stable_hashes[stable_paths[3]],
+            "host_linked_binary_sha256": packaged_binary,
             "host_qualification_sha256": "c" * 64,
             "source_audit_sha256": "d" * 64,
         }
@@ -792,17 +846,53 @@ def test_bootstrap_freeze_requires_exact_source_but_allows_fresh_cuda_bytes(
         "files": dict(stable_hashes) | {binary_path: regenerated_binary}
     }
     qualification = {
-        "generated_source_sha256": stable_hashes[stable_paths[0]],
+        "architecture": "sm_80",
+        "raw_air_sha256": stable_hashes[stable_paths[0]],
+        "post_ckks_air_sha256": stable_hashes[stable_paths[1]],
+        "generated_source_sha256": stable_hashes[stable_paths[2]],
         "linked_binary_sha256": regenerated_binary,
-        "harness_source_sha256": stable_hashes[stable_paths[1]],
-        "compiler_context_manifest_sha256": stable_hashes[stable_paths[2]],
-        "compiler_resource_manifest_sha256": stable_hashes[stable_paths[3]],
-        "compiler_constant_manifest_sha256": stable_hashes[stable_paths[4]],
-        "generation_record_sha256": stable_hashes[stable_paths[5]],
+        "harness_source_sha256": stable_hashes[stable_paths[3]],
+        "compiler_context_manifest_sha256": stable_hashes[stable_paths[4]],
+        "compiler_resource_manifest_sha256": stable_hashes[stable_paths[5]],
+        "compiler_constant_manifest_sha256": stable_hashes[stable_paths[6]],
+        "generation_record_sha256": stable_hashes[stable_paths[7]],
+        "generated_artifact_audit_sha256": stable_hashes[stable_paths[8]],
     }
-    audit = {"status": "pass", "counts": {"constants": 1}}
+    audit = {
+        "schema_version": (
+            "ace.phantom.bootstrap-generated-artifact-audit/2.0.0"
+        ),
+        "status": "pass",
+        "counts": {"constants": 1},
+    }
+    symbol_closure = {
+        "schema_version": "ace.phantom.bootstrap-symbol-closure/2.0.0",
+        "status": "pass",
+        "required_symbols": BOOTSTRAP_REQUIRED_SYMBOLS,
+        "missing_symbols": [],
+        "native_bootstrap_symbol_count": 0,
+    }
+    input_root = tmp_path / "input"
+    regenerated_root = tmp_path / "regenerated"
+    input_root.mkdir()
+    regenerated_root.mkdir()
+    (input_root / "payload.json").write_text(
+        json.dumps(payload) + "\n", encoding="utf-8"
+    )
+    (input_root / "bootstrap-symbol-closure.json").write_text(
+        json.dumps(symbol_closure) + "\n", encoding="utf-8"
+    )
+    (input_root / "bootstrap-cuda-elf.txt").write_text(
+        "arch = sm_80\n", encoding="utf-8"
+    )
+    regenerated_symbol_path = regenerated_root / "symbol-closure.json"
+    regenerated_symbol_path.write_text(
+        json.dumps(symbol_closure) + "\n", encoding="utf-8"
+    )
+    (regenerated_root / "cuda_elf.txt").write_text(
+        "arch = sm_80\n", encoding="utf-8"
+    )
     inputs = {
-        "payload.json": payload,
         "frozen.json": frozen,
         "generated.json": generated,
         "qualification.json": qualification,
@@ -817,6 +907,8 @@ def test_bootstrap_freeze_requires_exact_source_but_allows_fresh_cuda_bytes(
         "python3",
         "-c",
         verifier,
+        str(input_root),
+        str(regenerated_root),
         *(str(tmp_path / name) for name in inputs),
         str(regenerated_binary_path),
         str(output),
@@ -825,6 +917,11 @@ def test_bootstrap_freeze_requires_exact_source_but_allows_fresh_cuda_bytes(
     subprocess.run(arguments, check=True)
     reference = json.loads(output.read_text(encoding="utf-8"))
     assert reference["source_and_setup_match"] is True
+    assert reference["raw_air_matches"] is True
+    assert reference["post_ckks_air_matches"] is True
+    assert reference["generated_source_matches"] is True
+    assert reference["architecture"] == "sm_80"
+    assert reference["semantic_symbol_closure"] == symbol_closure
     assert reference["linked_binary_byte_identity_required"] is False
     assert reference["packaged_linked_binary_sha256"] == packaged_binary
     assert reference["regenerated_linked_binary_sha256"] == regenerated_binary
@@ -842,6 +939,19 @@ def test_bootstrap_freeze_requires_exact_source_but_allows_fresh_cuda_bytes(
     rejected = subprocess.run(arguments, check=False, capture_output=True, text=True)
     assert rejected.returncode != 0
     assert "regenerated bootstrap artifact differs" in rejected.stderr
+
+    frozen["files"][stable_paths[0]] = stable_hashes[stable_paths[0]]
+    (tmp_path / "frozen.json").write_text(
+        json.dumps(frozen) + "\n", encoding="utf-8"
+    )
+    tampered_symbol_closure = dict(symbol_closure)
+    tampered_symbol_closure["missing_symbols"] = ["Conjugate_ciph"]
+    regenerated_symbol_path.write_text(
+        json.dumps(tampered_symbol_closure) + "\n", encoding="utf-8"
+    )
+    rejected = subprocess.run(arguments, check=False, capture_output=True, text=True)
+    assert rejected.returncode != 0
+    assert "semantic symbol closure differs" in rejected.stderr
 
 
 def test_bootstrap_stable_symbol_inventories_are_root_independent(
@@ -1102,17 +1212,34 @@ def test_runpod_success_completeness_requires_every_terminal_record(
             "exit_code": 0,
         },
         "bootstrap-frozen-reference.json": {
-            "schema_version": "ace.phantom.bootstrap-frozen-reference/1.1.0",
+            "schema_version": "ace.phantom.bootstrap-frozen-reference/2.0.0",
             "status": "pass",
             "comparison": "exact-source-and-setup-with-per-run-cuda-artifacts",
             "source_and_setup_match": True,
             "linked_binary_byte_identity_required": False,
+            "raw_air_matches": True,
+            "post_ckks_air_matches": True,
+            "generated_source_matches": True,
+            "architecture": "sm_80",
+            "semantic_symbol_closure": {
+                "schema_version": (
+                    "ace.phantom.bootstrap-symbol-closure/2.0.0"
+                ),
+                "status": "pass",
+                "required_symbols": BOOTSTRAP_REQUIRED_SYMBOLS,
+                "missing_symbols": [],
+                "native_bootstrap_symbol_count": 0,
+            },
             "packaged_artifact_manifest_sha256": "1" * 64,
             "packaged_host_qualification_sha256": "2" * 64,
             "packaged_source_audit_sha256": "3" * 64,
             "regenerated_artifact_manifest_sha256": "4" * 64,
             "regenerated_host_qualification_sha256": "5" * 64,
             "regenerated_source_audit_sha256": "6" * 64,
+            "packaged_raw_air_sha256": "a" * 64,
+            "regenerated_raw_air_sha256": "a" * 64,
+            "packaged_post_ckks_air_sha256": "d" * 64,
+            "regenerated_post_ckks_air_sha256": "d" * 64,
             "packaged_generated_source_sha256": "7" * 64,
             "regenerated_generated_source_sha256": "7" * 64,
             "packaged_harness_source_sha256": "8" * 64,

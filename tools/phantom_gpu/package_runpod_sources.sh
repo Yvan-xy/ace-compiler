@@ -666,6 +666,17 @@ BOOTSTRAP_GENERATION="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/generation.j
 BOOTSTRAP_SOURCE_AUDIT="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/source-audit.json"
 BOOTSTRAP_HOST_QUALIFICATION="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/qualification.json"
 BOOTSTRAP_HARNESS="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/bootstrap_phantom_constants.cu"
+BOOTSTRAP_RAW_AIR="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/bootstrap_raw.air"
+BOOTSTRAP_POST_CKKS_AIR="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/bootstrap_post_ckks.air"
+BOOTSTRAP_GENERATED_SOURCE="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/bootstrap_qualification.cu"
+BOOTSTRAP_HOST_BINARY="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/bootstrap_phantom_constants_sm80"
+BOOTSTRAP_LINK_COMMANDS="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/link-commands.txt"
+BOOTSTRAP_CUDA_ELF="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/cuda_elf.txt"
+BOOTSTRAP_CUDA_RESOURCES="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/cuda_resources.txt"
+BOOTSTRAP_FILE_REPORT="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/file.txt"
+BOOTSTRAP_READELF="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/readelf.txt"
+BOOTSTRAP_LINKED_SYMBOLS="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/linked_binary_symbols.txt"
+BOOTSTRAP_SYMBOL_CLOSURE="${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/symbol-closure.json"
 for required in \
   "${BOOTSTRAP_RUN_ROOT}/SHA256SUMS" \
   "${BOOTSTRAP_RUN_MANIFEST}" "${BOOTSTRAP_ARTIFACT_MANIFEST}" \
@@ -674,9 +685,12 @@ for required in \
   "${BOOTSTRAP_CONTEXT}" "${BOOTSTRAP_RESOURCES}" \
   "${BOOTSTRAP_CONSTANTS}" "${BOOTSTRAP_GENERATION}" \
   "${BOOTSTRAP_SOURCE_AUDIT}" "${BOOTSTRAP_HOST_QUALIFICATION}" \
-  "${BOOTSTRAP_HARNESS}" \
-  "${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/bootstrap_qualification.cu" \
-  "${BOOTSTRAP_RUN_ROOT}/bootstrap_qualification/bootstrap_phantom_constants_sm80" \
+  "${BOOTSTRAP_HARNESS}" "${BOOTSTRAP_RAW_AIR}" \
+  "${BOOTSTRAP_POST_CKKS_AIR}" "${BOOTSTRAP_GENERATED_SOURCE}" \
+  "${BOOTSTRAP_HOST_BINARY}" "${BOOTSTRAP_LINK_COMMANDS}" \
+  "${BOOTSTRAP_CUDA_ELF}" "${BOOTSTRAP_CUDA_RESOURCES}" \
+  "${BOOTSTRAP_FILE_REPORT}" "${BOOTSTRAP_READELF}" \
+  "${BOOTSTRAP_LINKED_SYMBOLS}" "${BOOTSTRAP_SYMBOL_CLOSURE}" \
   "${BOOTSTRAP_RUN_ROOT}/ace_source_manifest.json" \
   "${BOOTSTRAP_RUN_ROOT}/phantom_source_manifest.json"; do
   if [[ ! -s "${required}" ]]; then
@@ -880,16 +894,53 @@ generation_manifest_paths = {
     "resource": "bootstrap_qualification/compiler_resource_manifest.json",
     "constant": "bootstrap_qualification/compiler_constant_manifest.json",
 }
+expected_generation_keys = {
+    "schema_version", "status", "qualification_scope", "compiler_parameters",
+    "bootstrap_parameters", "stages_completed", "source", "air", "manifests",
+    "constant_count", "rotation_count", "rotation_batch_count", "monomial_count",
+    "native_bootstrap_precompute", "generated_program_executed",
+}
+generated_source_path = root / "bootstrap_qualification/bootstrap_qualification.cu"
 if (
-    generation.get("schema_version") != "ace.phantom.bootstrap-generation/1.0.0"
+    set(generation) != expected_generation_keys
+    or generation.get("schema_version") != "ace.phantom.bootstrap-generation/2.0.0"
     or generation.get("status") != "pass"
+    or generation.get("qualification_scope")
+       != "full-generated-bootstrap-compile-only"
     or generation.get("generated_program_executed") is not False
+    or generation.get("native_bootstrap_precompute") is not False
     or generation.get("compiler_parameters") != expected_compiler_parameters
-    or generation.get("source", {}).get("sha256")
-       != digest("bootstrap_qualification/bootstrap_qualification.cu")
+    or generation.get("bootstrap_parameters") != {
+        "q_parts": 3, "enc_budget": 3, "dec_budget": 3, "ct_encode": False,
+    }
+    or generation.get("stages_completed") != ["ckks_driver", "ckks2c"]
+    or generation.get("source") != {
+        "path": "bootstrap_qualification.cu",
+        "sha256": digest("bootstrap_qualification/bootstrap_qualification.cu"),
+        "bytes": generated_source_path.stat().st_size,
+    }
     or generation.get("constant_count") != len(constants["constants"])
+    or generation.get("rotation_count") != len(resources["rotation_steps"])
+    or generation.get("rotation_batch_count") != len(resources["rotation_batches"])
+    or generation.get("monomial_count") != len(resources["monomial_powers"])
 ):
     raise SystemExit("bootstrap generation record is incomplete or stale")
+generation_air_paths = {
+    "raw": "bootstrap_qualification/bootstrap_raw.air",
+    "post_ckks": "bootstrap_qualification/bootstrap_post_ckks.air",
+}
+if set(generation.get("air", {})) != set(generation_air_paths):
+    raise SystemExit("bootstrap generation AIR binding has an invalid shape")
+for name, relative in generation_air_paths.items():
+    entry = generation.get("air", {}).get(name, {})
+    if (
+        entry.get("path") != Path(relative).name
+        or entry.get("sha256") != digest(relative)
+        or entry.get("bytes") != (root / relative).stat().st_size
+    ):
+        raise SystemExit(f"bootstrap generation record does not bind {name} AIR")
+if set(generation.get("manifests", {})) != set(generation_manifest_paths):
+    raise SystemExit("bootstrap generation manifest binding has an invalid shape")
 for name, relative in generation_manifest_paths.items():
     entry = generation.get("manifests", {}).get(name, {})
     if (
@@ -901,19 +952,92 @@ for name, relative in generation_manifest_paths.items():
 
 audit = load("bootstrap_qualification/source-audit.json")
 audit_inputs = {
+    "raw_air": "bootstrap_qualification/bootstrap_raw.air",
+    "post_ckks_air": "bootstrap_qualification/bootstrap_post_ckks.air",
     "context_manifest": "bootstrap_qualification/compiler_context_manifest.json",
     "resource_manifest": "bootstrap_qualification/compiler_resource_manifest.json",
     "constant_manifest": "bootstrap_qualification/compiler_constant_manifest.json",
     "source": "bootstrap_qualification/bootstrap_qualification.cu",
 }
-if audit.get("status") != "pass" or audit.get("forbidden_native_bts_matches") != []:
+if not isinstance(audit.get("inputs"), dict) or set(audit["inputs"]) != set(audit_inputs):
+    raise SystemExit("bootstrap generated-artifact audit inputs have an invalid shape")
+required_opcodes = (
+    "ckks.conjugate", "ckks.rotate_batch", "ckks.raise_mod", "ckks.mul_mono",
+)
+required_calls = (
+    "Conjugate_ciph", "Rotate_batch_ciph", "Raise_mod", "Mul_mono_ciph",
+)
+air_records = {}
+for stage, relative in (
+    ("raw", audit_inputs["raw_air"]),
+    ("post_ckks", audit_inputs["post_ckks_air"]),
+):
+    air_text = (root / relative).read_text(encoding="utf-8")
+    if re.search(
+        r"\bckks\.bootstrap(?:\b|[._])|"
+        r"\b(?:bootstrap_coeffs_to_slots|bootstrap_eval_mod|"
+        r"bootstrap_slots_to_coeffs)\b|"
+        r"(?:\bfhe::(?:poly|hpoly|lpoly)\b|\b(?:poly|hpoly|lpoly)\.[A-Za-z_])",
+        air_text,
+        re.IGNORECASE,
+    ):
+        raise SystemExit(f"bootstrap {stage} AIR contains a forbidden operation")
+    lowered_air = air_text.lower()
+    opcode_counts = {name: lowered_air.count(name) for name in required_opcodes}
+    if any(count <= 0 for count in opcode_counts.values()):
+        raise SystemExit(f"bootstrap {stage} AIR lacks a required primitive opcode")
+    air_records[stage] = {
+        "required_opcode_counts": opcode_counts,
+        "forbidden_matches": [],
+    }
+generated_source = (root / audit_inputs["source"]).read_text(encoding="utf-8")
+source_counts = {
+    name: len(re.findall(r"\b" + re.escape(name) + r"\s*\(", generated_source))
+    for name in required_calls
+}
+if any(count <= 0 for count in source_counts.values()):
+    raise SystemExit("bootstrap generated source lacks a required primitive call")
+if re.search(
+    r"Bootstrapper|Phantom_bootstrap|bootstrap_3|\bBootstrap\s*\(|"
+    r"\bEval_bootstrap[A-Za-z0-9_]*\s*\(|"
+    r"\b(?:bootstrap_coeffs_to_slots|CoeffToSlots?|bootstrap_eval_mod|EvalMod|"
+    r"bootstrap_slots_to_coeffs|SlotToCoeffs?)\b",
+    generated_source,
+):
+    raise SystemExit("bootstrap generated source contains a forbidden operation")
+expected_audit_keys = {
+    "schema_version", "status", "inputs", "errors", "air", "source",
+    "forbidden_matches", "forbidden_native_bts_matches", "counts",
+}
+if (
+    set(audit) != expected_audit_keys
+    or audit.get("schema_version")
+       != "ace.phantom.bootstrap-generated-artifact-audit/2.0.0"
+    or audit.get("status") != "pass"
+    or audit.get("errors") != []
+    or audit.get("air") != air_records
+    or audit.get("source") != {
+        "required_call_counts": source_counts, "forbidden_matches": [],
+    }
+    or audit.get("forbidden_matches") != {
+        "raw_air": [], "post_ckks_air": [], "source": [],
+    }
+    or audit.get("forbidden_native_bts_matches") != []
+    or audit.get("counts") != {
+        "constants": len(constants["constants"]),
+        "monomial_powers": len(resources["monomial_powers"]),
+        "rotation_batches": len(resources["rotation_batches"]),
+        "rotation_steps": len(resources["rotation_steps"]),
+    }
+):
     raise SystemExit("bootstrap generated-artifact audit did not pass")
 for name, relative in audit_inputs.items():
-    entry = audit.get("inputs", {}).get(name, {})
-    if (
-        entry.get("sha256") != digest(relative)
-        or entry.get("size_bytes") != (root / relative).stat().st_size
-    ):
+    entry = audit["inputs"].get(name, {})
+    if entry != {
+        "path": Path(relative).name,
+        "sha256": digest(relative),
+        "size_bytes": (root / relative).stat().st_size,
+    }:
         raise SystemExit(f"bootstrap source audit does not bind {name}")
 
 qualification = load("bootstrap_qualification/qualification.json")
@@ -924,6 +1048,10 @@ expected_qualification = {
     "phantom_commit": phantom_commit,
     "generated_source_sha256": digest(
         "bootstrap_qualification/bootstrap_qualification.cu"
+    ),
+    "raw_air_sha256": digest("bootstrap_qualification/bootstrap_raw.air"),
+    "post_ckks_air_sha256": digest(
+        "bootstrap_qualification/bootstrap_post_ckks.air"
     ),
     "compiler_context_manifest_sha256": context_sha,
     "compiler_resource_manifest_sha256": digest(
@@ -987,7 +1115,7 @@ expected_artifact_files = {
 }
 if (
     artifact.get("schema_version")
-       != "ace.phantom.bootstrap-artifacts/1.0.0"
+       != "ace.phantom.bootstrap-artifacts/2.0.0"
     or artifact.get("status") != "bound"
     or artifact.get("source_mode") != "snapshot"
     or artifact.get("ace_commit") != ace_commit
@@ -996,6 +1124,10 @@ if (
        != qualification_invocation["normalized_argv_sha256"]
     or artifact.get("normalized_generation_argv_sha256")
        != generation_invocation["normalized_argv_sha256"]
+    or artifact.get("raw_air_sha256")
+       != digest("bootstrap_qualification/bootstrap_raw.air")
+    or artifact.get("post_ckks_air_sha256")
+       != digest("bootstrap_qualification/bootstrap_post_ckks.air")
     or artifact.get("compiler_context_manifest_sha256") != context_sha
     or artifact.get("compiler_resource_manifest_sha256")
        != digest("bootstrap_qualification/compiler_resource_manifest.json")
@@ -1011,6 +1143,69 @@ if (
     or artifact_files != expected_artifact_files
 ):
     raise SystemExit("bootstrap artifact manifest is incomplete or stale")
+
+symbol_closure = load("bootstrap_qualification/symbol-closure.json")
+required_symbols = symbol_closure.get("required_symbols")
+expected_required_symbols = [
+    "bootstrap_full",
+    "Conjugate_ciph",
+    "Rotate_batch_ciph",
+    "Raise_mod",
+    "Mul_mono_ciph",
+    "Phantom_conjugate",
+    "Phantom_rotate_batch",
+    "Phantom_raise_mod",
+    "Phantom_mul_mono",
+    "complex_conjugate_inplace",
+    "rotate_batch",
+    "raise_modulus",
+    "multiply_by_monomial",
+    "Get_phantom_context_manifest",
+    "Get_phantom_resource_manifest",
+    "Get_phantom_constant_manifest",
+    "Load_cached_plain",
+    "main",
+]
+linked_symbols = (
+    root / "bootstrap_qualification/linked_binary_symbols.txt"
+).read_text(encoding="utf-8")
+forbidden_symbol_pattern = re.compile(
+    r"Bootstrapper|\bBootstrap\b|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|"
+    r"bootstrap_(?:coeffs_to_slots|eval_mod|slots_to_coeffs)|"
+    r"cnn_phantom|conv_eval|FHErt_(?:ant|poly)|fhe::(?:ant|poly)|"
+    r"CoeffToSlot|SlotToCoeff|EvalMod|Native.*precom|precom.*Native|"
+    r"Bootstrap.*stage|stage.*Bootstrap",
+    re.IGNORECASE,
+)
+if (
+    symbol_closure.get("schema_version")
+       != "ace.phantom.bootstrap-symbol-closure/2.0.0"
+    or symbol_closure.get("status") != "pass"
+    or required_symbols != expected_required_symbols
+    or symbol_closure.get("missing_symbols") != []
+    or symbol_closure.get("native_bootstrap_symbol_count") != 0
+    or symbol_closure.get("linked_binary_symbols_sha256")
+       != digest("bootstrap_qualification/linked_binary_symbols.txt")
+    or any(
+        re.search(
+            r"(?<![A-Za-z0-9_])" + re.escape(symbol) + r"(?![A-Za-z0-9_])",
+            linked_symbols,
+        ) is None
+        for symbol in expected_required_symbols
+    )
+    or forbidden_symbol_pattern.search(linked_symbols) is not None
+):
+    raise SystemExit("bootstrap semantic symbol closure is incomplete or stale")
+if "sm_80" not in (
+    root / "bootstrap_qualification/cuda_elf.txt"
+).read_text(encoding="utf-8"):
+    raise SystemExit("bootstrap CUDA image inventory lacks sm_80")
+link_commands = (
+    root / "bootstrap_qualification/link-commands.txt"
+).read_text(encoding="utf-8")
+for token in ("-arch=sm_80", "-dlink", "bootstrap_phantom_constants_sm80"):
+    if token not in link_commands:
+        raise SystemExit(f"bootstrap link command record lacks {token}")
 
 run_manifest = load("manifest.json")
 if (
@@ -1031,6 +1226,10 @@ if (
        != digest("bootstrap_qualification/compiler_resource_manifest.json")
     or run_manifest.get("compiler_constant_manifest_sha256")
        != digest("bootstrap_qualification/compiler_constant_manifest.json")
+    or run_manifest.get("bootstrap_raw_air_sha256")
+       != digest("bootstrap_qualification/bootstrap_raw.air")
+    or run_manifest.get("bootstrap_post_ckks_air_sha256")
+       != digest("bootstrap_qualification/bootstrap_post_ckks.air")
     or run_manifest.get("bootstrap_generation_record_sha256")
        != digest("bootstrap_qualification/generation.json")
     or run_manifest.get("bootstrap_generated_artifact_audit_sha256")
@@ -1194,6 +1393,17 @@ cp "${BOOTSTRAP_GENERATION}" "${OUTPUT}/bootstrap-generation.json"
 cp "${BOOTSTRAP_SOURCE_AUDIT}" "${OUTPUT}/bootstrap-source-audit.json"
 cp "${BOOTSTRAP_HOST_QUALIFICATION}" \
   "${OUTPUT}/bootstrap-host-qualification.json"
+cp "${BOOTSTRAP_RAW_AIR}" "${OUTPUT}/bootstrap-raw.air"
+cp "${BOOTSTRAP_POST_CKKS_AIR}" "${OUTPUT}/bootstrap-post-ckks.air"
+cp "${BOOTSTRAP_GENERATED_SOURCE}" "${OUTPUT}/bootstrap-generated.cu"
+cp "${BOOTSTRAP_HOST_BINARY}" "${OUTPUT}/bootstrap-host-linked-sm80"
+cp "${BOOTSTRAP_LINK_COMMANDS}" "${OUTPUT}/bootstrap-link-commands.txt"
+cp "${BOOTSTRAP_CUDA_ELF}" "${OUTPUT}/bootstrap-cuda-elf.txt"
+cp "${BOOTSTRAP_CUDA_RESOURCES}" "${OUTPUT}/bootstrap-cuda-resources.txt"
+cp "${BOOTSTRAP_FILE_REPORT}" "${OUTPUT}/bootstrap-file-report.txt"
+cp "${BOOTSTRAP_READELF}" "${OUTPUT}/bootstrap-readelf.txt"
+cp "${BOOTSTRAP_LINKED_SYMBOLS}" "${OUTPUT}/bootstrap-linked-symbols.txt"
+cp "${BOOTSTRAP_SYMBOL_CLOSURE}" "${OUTPUT}/bootstrap-symbol-closure.json"
 python3 "${SCRIPT_DIR}/retained_runpod_evidence.py" export-frozen \
   --root "${RETAINED_RUN_ROOT}" \
   --output "${OUTPUT}" \
@@ -1215,10 +1425,10 @@ import sys
 
 output = Path(sys.argv[1])
 payload = {
-    "schema_version": "1.1.0",
+    "schema_version": "2.0.0",
     "contents": (
         "audited-source-snapshots-and-frozen-provider-neutral-references-"
-        "with-bootstrap-qualification-regeneration-attestations-without-build-output"
+        "with-exact-bootstrap-compile-handoff-and-regeneration-attestations"
     ),
     "ace_commit": sys.argv[2],
     "phantom_commit": sys.argv[3],
@@ -1322,22 +1532,47 @@ payload = {
         "host_qualification_sha256": hashlib.sha256(
             (output / "bootstrap-host-qualification.json").read_bytes()
         ).hexdigest(),
-        "expected_generated_source_sha256": json.loads(
-            (output / "bootstrap-artifact-manifest.json").read_text(
-                encoding="utf-8"
-            )
-        )["files"]["bootstrap_qualification/bootstrap_qualification.cu"],
-        "expected_linked_binary_sha256": json.loads(
-            (output / "bootstrap-artifact-manifest.json").read_text(
-                encoding="utf-8"
-            )
-        )["linked_binary_sha256"],
-        "expected_harness_source_sha256": json.loads(
+        "raw_air_sha256": hashlib.sha256(
+            (output / "bootstrap-raw.air").read_bytes()
+        ).hexdigest(),
+        "post_ckks_air_sha256": hashlib.sha256(
+            (output / "bootstrap-post-ckks.air").read_bytes()
+        ).hexdigest(),
+        "generated_source_sha256": hashlib.sha256(
+            (output / "bootstrap-generated.cu").read_bytes()
+        ).hexdigest(),
+        "host_linked_binary_sha256": hashlib.sha256(
+            (output / "bootstrap-host-linked-sm80").read_bytes()
+        ).hexdigest(),
+        "harness_source_sha256": json.loads(
             (output / "bootstrap-artifact-manifest.json").read_text(
                 encoding="utf-8"
             )
         )["harness_source_sha256"],
-        "packaged_build_output": False,
+        "link_commands_sha256": hashlib.sha256(
+            (output / "bootstrap-link-commands.txt").read_bytes()
+        ).hexdigest(),
+        "cuda_elf_sha256": hashlib.sha256(
+            (output / "bootstrap-cuda-elf.txt").read_bytes()
+        ).hexdigest(),
+        "cuda_resources_sha256": hashlib.sha256(
+            (output / "bootstrap-cuda-resources.txt").read_bytes()
+        ).hexdigest(),
+        "file_report_sha256": hashlib.sha256(
+            (output / "bootstrap-file-report.txt").read_bytes()
+        ).hexdigest(),
+        "readelf_sha256": hashlib.sha256(
+            (output / "bootstrap-readelf.txt").read_bytes()
+        ).hexdigest(),
+        "linked_symbols_sha256": hashlib.sha256(
+            (output / "bootstrap-linked-symbols.txt").read_bytes()
+        ).hexdigest(),
+        "symbol_closure_sha256": hashlib.sha256(
+            (output / "bootstrap-symbol-closure.json").read_bytes()
+        ).hexdigest(),
+        "architecture": "sm_80",
+        "packaged_compile_handoff": True,
+        "linked_binary_byte_identity_required": False,
     },
     "frozen_retained_reference": json.loads(
         (output / "retained-frozen-export.json").read_text(encoding="utf-8")

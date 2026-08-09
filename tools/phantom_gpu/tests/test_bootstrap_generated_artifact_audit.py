@@ -155,8 +155,20 @@ void generated_program() {
   PLAIN second;
   Load_cached_plain(&first, 0);
   Load_cached_plain(&second, 1);
+  Conjugate_ciph(nullptr, nullptr);
+  Rotate_batch_ciph(nullptr, nullptr, nullptr, 0);
+  Raise_mod(nullptr, nullptr, 0);
+  Mul_mono_ciph(nullptr, nullptr, 0);
 }
 '''
+
+RAW_AIR = """\
+ckks.conjugate
+ckks.rotate_batch
+ckks.raise_mod
+ckks.mul_mono
+"""
+POST_CKKS_AIR = RAW_AIR
 
 
 def render_source(constants: dict[str, Any]) -> str:
@@ -182,8 +194,10 @@ def write_inputs(
     context: dict[str, Any] | None = None,
     resource: dict[str, Any] | None = None,
     constants: dict[str, Any] | None = None,
+    raw_air: str | None = None,
+    post_ckks_air: str | None = None,
     source: str | None = None,
-) -> tuple[Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path]:
     context_value = json.loads(json.dumps(context if context is not None else CONTEXT))
     context_path = tmp_path / "compiler_context_manifest.json"
     context_path.write_bytes(canonical_bytes(context_value))
@@ -196,14 +210,28 @@ def write_inputs(
     resource_value = json.loads(json.dumps(resource if resource is not None else RESOURCE))
     resource_path = tmp_path / "compiler_resource_manifest.json"
     constant_path = tmp_path / "compiler_constant_manifest.json"
+    raw_air_path = tmp_path / "bootstrap_raw.air"
+    post_ckks_air_path = tmp_path / "bootstrap_post_ckks.air"
     source_path = tmp_path / "generated.cu"
     resource_path.write_bytes(canonical_bytes(resource_value))
     constant_path.write_bytes(canonical_bytes(constants_value))
+    raw_air_path.write_text(RAW_AIR if raw_air is None else raw_air, encoding="utf-8")
+    post_ckks_air_path.write_text(
+        POST_CKKS_AIR if post_ckks_air is None else post_ckks_air,
+        encoding="utf-8",
+    )
     source_path.write_text(
         render_source(constants_value) if source is None else source,
         encoding="utf-8",
     )
-    return context_path, resource_path, constant_path, source_path
+    return (
+        context_path,
+        resource_path,
+        constant_path,
+        raw_air_path,
+        post_ckks_air_path,
+        source_path,
+    )
 
 
 def run_audit(tmp_path: Path, **changes: Any) -> dict[str, Any]:
@@ -213,6 +241,10 @@ def run_audit(tmp_path: Path, **changes: Any) -> dict[str, Any]:
 def test_complete_generated_artifact_closure_passes(tmp_path: Path) -> None:
     report = run_audit(tmp_path)
     assert report["status"] == "pass", report["errors"]
+    assert (
+        report["schema_version"]
+        == "ace.phantom.bootstrap-generated-artifact-audit/2.0.0"
+    )
     assert report["counts"] == {
         "constants": 2,
         "monomial_powers": 2,
@@ -220,9 +252,31 @@ def test_complete_generated_artifact_closure_passes(tmp_path: Path) -> None:
         "rotation_steps": 2,
     }
     assert report["forbidden_native_bts_matches"] == []
+    assert report["forbidden_matches"] == {
+        "raw_air": [],
+        "post_ckks_air": [],
+        "source": [],
+    }
+    assert report["air"]["raw"]["required_opcode_counts"] == {
+        "ckks.conjugate": 1,
+        "ckks.rotate_batch": 1,
+        "ckks.raise_mod": 1,
+        "ckks.mul_mono": 1,
+    }
+    assert report["air"]["post_ckks"]["required_opcode_counts"] == report[
+        "air"
+    ]["raw"]["required_opcode_counts"]
+    assert report["source"]["required_call_counts"] == {
+        "Conjugate_ciph": 1,
+        "Rotate_batch_ciph": 1,
+        "Raise_mod": 1,
+        "Mul_mono_ciph": 1,
+    }
     assert set(report["inputs"]) == {
         "constant_manifest",
         "context_manifest",
+        "raw_air",
+        "post_ckks_air",
         "resource_manifest",
         "source",
     }
@@ -254,8 +308,12 @@ def test_cli_writes_a_checksum_bound_failure_report(tmp_path: Path) -> None:
             str(paths[1]),
             "--constant-manifest",
             str(paths[2]),
-            "--source",
+            "--raw-air",
             str(paths[3]),
+            "--post-ckks-air",
+            str(paths[4]),
+            "--source",
+            str(paths[5]),
             "--report",
             str(report_path),
         ],
@@ -273,6 +331,82 @@ def test_cli_writes_a_checksum_bound_failure_report(tmp_path: Path) -> None:
 
 
 SHA256_KEYS = {"path", "sha256", "size_bytes"}
+
+
+@pytest.mark.parametrize("air_name", ("raw_air", "post_ckks_air"))
+@pytest.mark.parametrize(
+    "opcode",
+    ("ckks.conjugate", "ckks.rotate_batch", "ckks.raise_mod", "ckks.mul_mono"),
+)
+def test_each_air_requires_every_retained_opcode(
+    tmp_path: Path, air_name: str, opcode: str
+) -> None:
+    report = run_audit(tmp_path, **{air_name: RAW_AIR.replace(opcode + "\n", "")})
+    assert report["status"] == "fail"
+    assert f"{air_name.removesuffix('_air')} AIR is missing" in report["errors"][0]
+    assert opcode in report["errors"][0]
+    assert report["air"][air_name.removesuffix("_air")][
+        "required_opcode_counts"
+    ][opcode] == 0
+
+
+@pytest.mark.parametrize("air_name", ("raw_air", "post_ckks_air"))
+@pytest.mark.parametrize(
+    ("forbidden_opcode", "diagnostic"),
+    (
+        ("ckks.bootstrap", "opaque CKKS bootstrap opcode"),
+        ("ckks.bootstrap_coeffs_to_slots", "coefficient-to-slot stage opcode"),
+        ("ckks.bootstrap_eval_mod", "evaluation stage opcode"),
+        ("ckks.bootstrap_slots_to_coeffs", "slot-to-coefficient stage opcode"),
+        ("poly.add", "POLY/HPOLY/LPOLY opcode"),
+        ("hpoly.mul", "POLY/HPOLY/LPOLY opcode"),
+        ("lpoly.rotate", "POLY/HPOLY/LPOLY opcode"),
+    ),
+)
+def test_each_air_rejects_opaque_stage_and_lower_level_opcodes(
+    tmp_path: Path, air_name: str, forbidden_opcode: str, diagnostic: str
+) -> None:
+    report = run_audit(
+        tmp_path, **{air_name: RAW_AIR + forbidden_opcode + "\n"}
+    )
+    assert report["status"] == "fail"
+    assert diagnostic in report["forbidden_matches"][air_name]
+
+
+@pytest.mark.parametrize(
+    "call", ("Conjugate_ciph", "Rotate_batch_ciph", "Raise_mod", "Mul_mono_ciph")
+)
+def test_generated_source_requires_each_retained_call(
+    tmp_path: Path, call: str
+) -> None:
+    source = re.sub(
+        r"^\s*" + re.escape(call) + r"\([^\n]*\);\n",
+        "",
+        SOURCE,
+        flags=re.MULTILINE,
+    )
+    report = run_audit(tmp_path, source=source)
+    assert report["status"] == "fail"
+    assert call in report["errors"][0]
+    assert report["source"]["required_call_counts"][call] == 0
+
+
+@pytest.mark.parametrize(
+    ("forbidden_call", "diagnostic"),
+    (
+        ("Bootstrap();", "opaque bootstrap call"),
+        ("Eval_bootstrap_ciph();", "opaque ANT bootstrap call"),
+        ("Eval_bootstrap_coeffs_to_slots_ciph();", "opaque ANT bootstrap call"),
+        ("bootstrap_eval_mod();", "native Phantom evaluation stage"),
+        ("bootstrap_slots_to_coeffs();", "native Phantom slot-to-coefficient stage"),
+    ),
+)
+def test_generated_source_rejects_opaque_and_stage_calls(
+    tmp_path: Path, forbidden_call: str, diagnostic: str
+) -> None:
+    report = run_audit(tmp_path, source=SOURCE + "\n" + forbidden_call + "\n")
+    assert report["status"] == "fail"
+    assert diagnostic in report["forbidden_matches"]["source"]
 
 
 @pytest.mark.parametrize(

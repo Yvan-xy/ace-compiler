@@ -20,10 +20,13 @@ RETAINED_BUILD_SCHEMA = "ace.phantom.retained_ckks.build-attestation/1.0.0"
 RETAINED_ARTIFACT_SCHEMA = "ace.phantom.retained_ckks.artifact-manifest/1.0.0"
 RETAINED_SUMMARY_SCHEMA = "ace.phantom.retained_ckks.ant-semantic-summary/1.0.0"
 SEMANTIC_REPLAY_MODE = "semantic-summary-only-no-decoded-byte-comparison"
-BOOTSTRAP_ARTIFACT_SCHEMA = "ace.phantom.bootstrap-artifacts/1.0.0"
-BOOTSTRAP_GENERATION_SCHEMA = "ace.phantom.bootstrap-generation/1.0.0"
+BOOTSTRAP_ARTIFACT_SCHEMA = "ace.phantom.bootstrap-artifacts/2.0.0"
+BOOTSTRAP_GENERATION_SCHEMA = "ace.phantom.bootstrap-generation/2.0.0"
+BOOTSTRAP_GENERATED_ARTIFACT_AUDIT_SCHEMA = (
+    "ace.phantom.bootstrap-generated-artifact-audit/2.0.0"
+)
 BOOTSTRAP_FROZEN_REFERENCE_SCHEMA = (
-    "ace.phantom.bootstrap-frozen-reference/1.1.0"
+    "ace.phantom.bootstrap-frozen-reference/2.0.0"
 )
 BOOTSTRAP_QUALIFICATION_INVOCATION_SCHEMA = (
     "ace.phantom.qualification-invocation/1.0.0"
@@ -32,7 +35,7 @@ BOOTSTRAP_GENERATION_INVOCATION_SCHEMA = (
     "ace.phantom.bootstrap-qualification-invocation/1.0.0"
 )
 BOOTSTRAP_SYMBOL_CLOSURE_SCHEMA = (
-    "ace.phantom.bootstrap-symbol-closure/1.0.0"
+    "ace.phantom.bootstrap-symbol-closure/2.0.0"
 )
 BOOTSTRAP_IO_HELPER_CLOSURE_SCHEMA = (
     "ace.phantom.bootstrap-io-helper-closure/1.0.0"
@@ -41,6 +44,19 @@ ARCHIVE_MEMBER_AUDIT_SCHEMA = (
     "ace.phantom.production-archive-members/1.0.0"
 )
 BOOTSTRAP_REQUIRED_SYMBOLS = (
+    "bootstrap_full",
+    "Conjugate_ciph",
+    "Rotate_batch_ciph",
+    "Raise_mod",
+    "Mul_mono_ciph",
+    "Phantom_conjugate",
+    "Phantom_rotate_batch",
+    "Phantom_raise_mod",
+    "Phantom_mul_mono",
+    "complex_conjugate_inplace",
+    "rotate_batch",
+    "raise_modulus",
+    "multiply_by_monomial",
     "Get_phantom_context_manifest",
     "Get_phantom_resource_manifest",
     "Get_phantom_constant_manifest",
@@ -54,10 +70,12 @@ BOOTSTRAP_IO_HELPERS = (
     "Get_decode_scheme",
 )
 FORBIDDEN_BOOTSTRAP_SYMBOL_PATTERN = re.compile(
-    r"Bootstrapper|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|"
+    r"Bootstrapper|\bBootstrap\b|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|"
+    r"bootstrap_(?:coeffs_to_slots|eval_mod|slots_to_coeffs)|"
     r"cnn_phantom|conv_eval|FHErt_(?:ant|poly)|fhe::(?:ant|poly)|"
     r"CoeffToSlot|SlotToCoeff|EvalMod|Native.*[Pp]recom|"
-    r"[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap"
+    r"[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap",
+    re.IGNORECASE,
 )
 
 
@@ -162,7 +180,15 @@ def bootstrap_symbol_projection(
         "bootstrap symbol closure",
     )
     missing = [
-        symbol for symbol in BOOTSTRAP_REQUIRED_SYMBOLS if symbol not in inventory
+        symbol
+        for symbol in BOOTSTRAP_REQUIRED_SYMBOLS
+        if re.search(
+            r"(?<![A-Za-z0-9_])"
+            + re.escape(symbol)
+            + r"(?![A-Za-z0-9_])",
+            inventory,
+        )
+        is None
     ]
     forbidden_count = len(FORBIDDEN_BOOTSTRAP_SYMBOL_PATTERN.findall(inventory))
     if missing or forbidden_count != 0:
@@ -253,6 +279,236 @@ def bootstrap_io_helper_projection(
     }
 
 
+def bootstrap_generated_artifact_audit_projection(
+    record: dict[str, Any], expected_inputs: dict[str, Path], raw_air_path: Path,
+    post_ckks_air_path: Path, source_path: Path
+) -> dict[str, Any]:
+    required_opcodes = (
+        "ckks.conjugate",
+        "ckks.rotate_batch",
+        "ckks.raise_mod",
+        "ckks.mul_mono",
+    )
+    required_calls = (
+        "Conjugate_ciph",
+        "Rotate_batch_ciph",
+        "Raise_mod",
+        "Mul_mono_ciph",
+    )
+    expected_keys = {
+        "schema_version",
+        "status",
+        "inputs",
+        "errors",
+        "air",
+        "source",
+        "forbidden_matches",
+        "forbidden_native_bts_matches",
+        "counts",
+    }
+    if set(record) != expected_keys:
+        raise SystemExit("bootstrap generated-artifact audit has an invalid shape")
+    require_fields(
+        record,
+        {
+            "schema_version": BOOTSTRAP_GENERATED_ARTIFACT_AUDIT_SCHEMA,
+            "status": "pass",
+            "errors": [],
+            "forbidden_native_bts_matches": [],
+        },
+        "bootstrap generated-artifact audit",
+    )
+    inputs = record.get("inputs")
+    if not isinstance(inputs, dict) or set(inputs) != set(expected_inputs):
+        raise SystemExit("bootstrap generated-artifact audit inputs are invalid")
+    for name, expected_path in expected_inputs.items():
+        entry = inputs.get(name)
+        expected_entry = {
+            "path": expected_path.name,
+            "sha256": sha256(expected_path),
+            "size_bytes": expected_path.stat().st_size,
+        }
+        if not isinstance(entry, dict) or entry != expected_entry:
+            raise SystemExit(
+                f"bootstrap generated-artifact audit {name} hash is inconsistent"
+            )
+
+    air = record.get("air")
+    if not isinstance(air, dict) or set(air) != {"raw", "post_ckks"}:
+        raise SystemExit("bootstrap generated-artifact AIR audit is invalid")
+    air_counts: dict[str, dict[str, int]] = {}
+    for stage in ("raw", "post_ckks"):
+        stage_record = air.get(stage)
+        if not isinstance(stage_record, dict) or set(stage_record) != {
+            "required_opcode_counts",
+            "forbidden_matches",
+        }:
+            raise SystemExit(f"bootstrap {stage} AIR audit has an invalid shape")
+        counts = stage_record.get("required_opcode_counts")
+        if not isinstance(counts, dict) or set(counts) != set(required_opcodes):
+            raise SystemExit(f"bootstrap {stage} AIR opcode counts are invalid")
+        air_text = (
+            raw_air_path if stage == "raw" else post_ckks_air_path
+        ).read_text(encoding="utf-8").lower()
+        observed_counts = {name: air_text.count(name) for name in required_opcodes}
+        if counts != observed_counts or any(
+            type(counts[name]) is not int or counts[name] <= 0
+            for name in required_opcodes
+        ):
+            raise SystemExit(f"bootstrap {stage} AIR lacks required CKKS opcodes")
+        if stage_record.get("forbidden_matches") != []:
+            raise SystemExit(f"bootstrap {stage} AIR contains forbidden operations")
+        air_counts[stage] = counts
+
+    source = record.get("source")
+    if not isinstance(source, dict) or set(source) != {
+        "required_call_counts",
+        "forbidden_matches",
+    }:
+        raise SystemExit("bootstrap generated-source call audit has an invalid shape")
+    source_counts = source.get("required_call_counts")
+    if not isinstance(source_counts, dict) or set(source_counts) != set(required_calls):
+        raise SystemExit("bootstrap generated-source call counts are invalid")
+    source_text = source_path.read_text(encoding="utf-8")
+    observed_source_counts = {
+        name: len(re.findall(r"\b" + re.escape(name) + r"\s*\(", source_text))
+        for name in required_calls
+    }
+    if source_counts != observed_source_counts or any(
+        type(source_counts[name]) is not int or source_counts[name] <= 0
+        for name in required_calls
+    ):
+        raise SystemExit("bootstrap generated source lacks required runtime calls")
+    if source.get("forbidden_matches") != []:
+        raise SystemExit("bootstrap generated source contains forbidden operations")
+
+    forbidden = record.get("forbidden_matches")
+    if not isinstance(forbidden, dict) or set(forbidden) != {
+        "raw_air",
+        "post_ckks_air",
+        "source",
+    }:
+        raise SystemExit("bootstrap forbidden-match audit is invalid")
+    if any(forbidden[name] != [] for name in forbidden):
+        raise SystemExit("bootstrap generated artifacts contain forbidden operations")
+
+    counts = record.get("counts")
+    expected_count_keys = {
+        "constants",
+        "monomial_powers",
+        "rotation_batches",
+        "rotation_steps",
+    }
+    if not isinstance(counts, dict) or set(counts) != expected_count_keys:
+        raise SystemExit("bootstrap generated-artifact summary counts are invalid")
+    if any(type(counts[name]) is not int or counts[name] <= 0 for name in counts):
+        raise SystemExit("bootstrap generated-artifact summary counts are empty")
+    return {
+        "schema_version": record["schema_version"],
+        "status": record["status"],
+        "air": air_counts,
+        "source": source_counts,
+        "forbidden_matches": forbidden,
+        "counts": counts,
+    }
+
+
+def validate_bootstrap_generation(
+    record: dict[str, Any],
+    source_path: Path,
+    raw_air_path: Path,
+    post_ckks_air_path: Path,
+    manifest_paths: dict[str, Path],
+    resource: dict[str, Any],
+    constant_count: int,
+) -> None:
+    expected_keys = {
+        "schema_version",
+        "status",
+        "qualification_scope",
+        "compiler_parameters",
+        "bootstrap_parameters",
+        "stages_completed",
+        "source",
+        "air",
+        "manifests",
+        "constant_count",
+        "rotation_count",
+        "rotation_batch_count",
+        "monomial_count",
+        "native_bootstrap_precompute",
+        "generated_program_executed",
+    }
+    if set(record) != expected_keys:
+        raise SystemExit("bootstrap generation record has an invalid shape")
+    require_fields(
+        record,
+        {
+            "schema_version": BOOTSTRAP_GENERATION_SCHEMA,
+            "status": "pass",
+            "qualification_scope": "full-generated-bootstrap-compile-only",
+            "compiler_parameters": {
+                "poly_degree": 16384,
+                "mul_level": 26,
+                "input_level": 1,
+                "security_level": 0,
+                "scaling_factor_bits": 56,
+                "first_prime_bits": 60,
+                "hamming_weight": 192,
+            },
+            "bootstrap_parameters": {
+                "q_parts": 3,
+                "enc_budget": 3,
+                "dec_budget": 3,
+                "ct_encode": False,
+            },
+            "stages_completed": ["ckks_driver", "ckks2c"],
+            "constant_count": constant_count,
+            "rotation_count": len(resource["rotation_steps"]),
+            "rotation_batch_count": len(resource["rotation_batches"]),
+            "monomial_count": len(resource["monomial_powers"]),
+            "native_bootstrap_precompute": False,
+            "generated_program_executed": False,
+        },
+        "bootstrap generation record",
+    )
+
+    expected_files = {
+        "source": (source_path, "bootstrap_qualification.cu"),
+        "raw": (raw_air_path, "bootstrap_raw.air"),
+        "post_ckks": (post_ckks_air_path, "bootstrap_post_ckks.air"),
+    }
+    source_entry = record.get("source")
+    source_file, source_name = expected_files["source"]
+    if source_entry != {
+        "path": source_name,
+        "sha256": sha256(source_file),
+        "bytes": source_file.stat().st_size,
+    }:
+        raise SystemExit("bootstrap generation source binding is inconsistent")
+    air = record.get("air")
+    if not isinstance(air, dict) or set(air) != {"raw", "post_ckks"}:
+        raise SystemExit("bootstrap generation AIR binding has an invalid shape")
+    for stage in ("raw", "post_ckks"):
+        path, name = expected_files[stage]
+        if air.get(stage) != {
+            "path": name,
+            "sha256": sha256(path),
+            "bytes": path.stat().st_size,
+        }:
+            raise SystemExit(f"bootstrap generation {stage} AIR binding is inconsistent")
+    manifests = record.get("manifests")
+    if not isinstance(manifests, dict) or set(manifests) != set(manifest_paths):
+        raise SystemExit("bootstrap generation manifest bindings have an invalid shape")
+    for name, path in manifest_paths.items():
+        if manifests.get(name) != {
+            "path": path.name,
+            "sha256": sha256(path),
+            "bytes": path.stat().st_size,
+        }:
+            raise SystemExit(f"bootstrap generation {name} binding is inconsistent")
+
+
 def bootstrap_fields(root: Path) -> dict[str, Any]:
     evidence = root / "bootstrap-qualification"
     output = evidence / "bootstrap_qualification"
@@ -282,6 +538,8 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
     resource = read_json(resource_path)
     constant_path = output / "compiler_constant_manifest.json"
     constants = read_json(constant_path)
+    raw_air_path = output / "bootstrap_raw.air"
+    post_ckks_air_path = output / "bootstrap_post_ckks.air"
     source_path = output / "bootstrap_qualification.cu"
     harness_path = output / "bootstrap_phantom_constants.cu"
     binary_path = output / "bootstrap_phantom_constants_sm80"
@@ -437,6 +695,8 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
     if not isinstance(constant_entries, list) or not constant_entries:
         raise SystemExit("bootstrap constant manifest is empty")
 
+    raw_air_sha = sha256(raw_air_path)
+    post_ckks_air_sha = sha256(post_ckks_air_path)
     source_sha = sha256(source_path)
     harness_sha = sha256(harness_path)
     binary_sha = sha256(binary_path)
@@ -449,31 +709,31 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
     ace_source_sha = sha256(ace_source_path)
     phantom_source_sha = sha256(phantom_source_path)
 
-    require_fields(
+    validate_bootstrap_generation(
         generation,
+        source_path,
+        raw_air_path,
+        post_ckks_air_path,
         {
-            "schema_version": BOOTSTRAP_GENERATION_SCHEMA,
-            "status": "pass",
-            "constant_count": len(constant_entries),
+            "context": context_path,
+            "resource": resource_path,
+            "constant": constant_path,
         },
-        "bootstrap generation record",
+        resource,
+        len(constant_entries),
     )
-    if generation.get("source", {}).get("sha256") != source_sha:
-        raise SystemExit("bootstrap generation source hash is inconsistent")
-    for name, value in (
-        ("context", context_sha), ("resource", resource_sha),
-        ("constant", constant_sha),
-    ):
-        if generation.get("manifests", {}).get(name, {}).get("sha256") != value:
-            raise SystemExit(f"bootstrap generation {name} hash is inconsistent")
 
-    require_fields(audit, {"status": "pass"}, "bootstrap source audit")
-    for name, value in (
-        ("context_manifest", context_sha), ("resource_manifest", resource_sha),
-        ("constant_manifest", constant_sha), ("source", source_sha),
-    ):
-        if audit.get("inputs", {}).get(name, {}).get("sha256") != value:
-            raise SystemExit(f"bootstrap source audit {name} hash is inconsistent")
+    audit_inputs = {
+        "raw_air": raw_air_path,
+        "post_ckks_air": post_ckks_air_path,
+        "context_manifest": context_path,
+        "resource_manifest": resource_path,
+        "constant_manifest": constant_path,
+        "source": source_path,
+    }
+    audit_projection = bootstrap_generated_artifact_audit_projection(
+        audit, audit_inputs, raw_air_path, post_ckks_air_path, source_path
+    )
     if audit.get("counts", {}).get("constants") != len(constant_entries):
         raise SystemExit("bootstrap source audit constant count is inconsistent")
 
@@ -499,6 +759,8 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
     )
 
     stable_hashes = {
+        "raw_air_sha256": raw_air_sha,
+        "post_ckks_air_sha256": post_ckks_air_sha,
         "generated_source_sha256": source_sha,
         "compiler_context_manifest_sha256": context_sha,
         "compiler_resource_manifest_sha256": resource_sha,
@@ -544,6 +806,8 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
         "phantom_source_manifest.json": phantom_source_sha,
         "qualification_invocation.json": qualification_invocation_sha,
         "bootstrap_generation_invocation.json": generation_invocation_sha,
+        "bootstrap_qualification/bootstrap_raw.air": raw_air_sha,
+        "bootstrap_qualification/bootstrap_post_ckks.air": post_ckks_air_sha,
         "bootstrap_qualification/compiler_context_manifest.json": context_sha,
         "bootstrap_qualification/compiler_resource_manifest.json": resource_sha,
         "bootstrap_qualification/compiler_constant_manifest.json": constant_sha,
@@ -574,6 +838,8 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
         {
             "normalized_qualification_argv_sha256": normalized_qualification,
             "normalized_generation_argv_sha256": normalized_generation,
+            "raw_air_sha256": raw_air_sha,
+            "post_ckks_air_sha256": post_ckks_air_sha,
             **{
                 name: value
                 for name, value in stable_hashes.items()
@@ -598,6 +864,8 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
             "compiler_constant_manifest_sha256": constant_sha,
             "bootstrap_generation_record_sha256": generation_sha,
             "bootstrap_generated_artifact_audit_sha256": audit_sha,
+            "bootstrap_raw_air_sha256": raw_air_sha,
+            "bootstrap_post_ckks_air_sha256": post_ckks_air_sha,
             "bootstrap_linked_binary_sha256": binary_sha,
             "bootstrap_harness_source_sha256": harness_sha,
             "bootstrap_host_qualification_sha256": qualification_sha,
@@ -609,6 +877,11 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
         "schema_version",
         "status",
         "comparison",
+        "raw_air_matches",
+        "post_ckks_air_matches",
+        "generated_source_matches",
+        "architecture",
+        "semantic_symbol_closure",
         "packaged_artifact_manifest_sha256",
         "packaged_host_qualification_sha256",
         "packaged_source_audit_sha256",
@@ -617,6 +890,10 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
         "regenerated_source_audit_sha256",
         "packaged_generated_source_sha256",
         "regenerated_generated_source_sha256",
+        "packaged_raw_air_sha256",
+        "regenerated_raw_air_sha256",
+        "packaged_post_ckks_air_sha256",
+        "regenerated_post_ckks_air_sha256",
         "packaged_harness_source_sha256",
         "regenerated_harness_source_sha256",
         "packaged_linked_binary_sha256",
@@ -637,11 +914,20 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
             "schema_version": BOOTSTRAP_FROZEN_REFERENCE_SCHEMA,
             "status": "pass",
             "comparison": "exact-source-and-setup-with-per-run-cuda-artifacts",
+            "raw_air_matches": True,
+            "post_ckks_air_matches": True,
+            "generated_source_matches": True,
+            "architecture": "sm_80",
+            "semantic_symbol_closure": symbol_projection,
             "regenerated_artifact_manifest_sha256": sha256(artifact_path),
             "regenerated_host_qualification_sha256": qualification_sha,
             "regenerated_source_audit_sha256": audit_sha,
             "packaged_generated_source_sha256": source_sha,
             "regenerated_generated_source_sha256": source_sha,
+            "packaged_raw_air_sha256": raw_air_sha,
+            "regenerated_raw_air_sha256": raw_air_sha,
+            "packaged_post_ckks_air_sha256": post_ckks_air_sha,
+            "regenerated_post_ckks_air_sha256": post_ckks_air_sha,
             "packaged_harness_source_sha256": harness_sha,
             "regenerated_harness_source_sha256": harness_sha,
             "regenerated_linked_binary_sha256": binary_sha,
@@ -665,6 +951,9 @@ def bootstrap_fields(root: Path) -> dict[str, Any]:
         "bootstrap_constant_manifest_sha256": constant_sha,
         "bootstrap_generation_record_sha256": generation_sha,
         "bootstrap_generated_artifact_audit_sha256": audit_sha,
+        "bootstrap_generated_artifact_audit_projection": audit_projection,
+        "bootstrap_raw_air_sha256": raw_air_sha,
+        "bootstrap_post_ckks_air_sha256": post_ckks_air_sha,
         "bootstrap_generated_source_sha256": source_sha,
         "bootstrap_harness_source_sha256": harness_sha,
         "bootstrap_linked_binary_sha256": binary_sha,
@@ -956,6 +1245,7 @@ def comparison_report(local: dict[str, Any], remote: dict[str, Any]) -> dict[str
         raise SystemExit("local and remote comparison field inventories differ")
     per_run_fields = {
         "bootstrap_adapter_archive_sha256",
+        "bootstrap_common_archive_sha256",
         "bootstrap_frozen_reference_sha256",
         "bootstrap_io_helper_closure_sha256",
         "bootstrap_linked_binary_sha256",

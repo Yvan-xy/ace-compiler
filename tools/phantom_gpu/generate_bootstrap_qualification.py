@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the full primitive-bootstrap source used by the resource gate.
-
-This is intentionally a qualification producer, not the frozen/reproducible
-artifact pipeline reserved for the next milestone.  It expands the checked-in
-DSL bootstrap, runs the existing CKKS driver and Phantom CKKS2C terminal, and
-materializes only the generated translation unit and its three attestations.
-"""
+"""Generate reproducible full primitive-bootstrap compile-only artifacts."""
 
 from __future__ import annotations
 
@@ -27,9 +21,10 @@ from bootstrap_full import (  # noqa: E402
     bootstrap_full,
 )
 from ace_edsl.edsl import AceEDSL, AcePipeline, CkksCiphertext  # noqa: E402
+from retained_air_tools import canonicalize_checkout_paths  # noqa: E402
 
 
-SCHEMA = "ace.phantom.bootstrap-generation/1.0.0"
+SCHEMA = "ace.phantom.bootstrap-generation/2.0.0"
 CONTROL_ENVIRONMENT = (
     "ACE_BOOTSTRAP_POLY_DEGREE",
     "ACE_BOOTSTRAP_MUL_LEVEL",
@@ -102,6 +97,8 @@ def main() -> int:
 
     arguments.output_dir.mkdir(parents=True)
     source_path = arguments.output_dir / "bootstrap_qualification.cu"
+    raw_air_path = arguments.output_dir / "bootstrap_raw.air"
+    post_ckks_air_path = arguments.output_dir / "bootstrap_post_ckks.air"
     context_path = arguments.output_dir / "compiler_context_manifest.json"
     resource_path = arguments.output_dir / "compiler_resource_manifest.json"
     constant_path = arguments.output_dir / "compiler_constant_manifest.json"
@@ -136,6 +133,10 @@ def main() -> int:
     module = AceEDSL._get_dsl().current_air_module
     if module is None:
         raise SystemExit("bootstrap tracing returned no AIR module")
+    raw_air = canonicalize_checkout_paths(module.dump(), REPO_ROOT)
+    if not raw_air:
+        raise SystemExit("bootstrap tracing returned empty raw AIR")
+    raw_air_path.write_text(raw_air, encoding="utf-8")
 
     pipeline = AcePipeline(module).configure_fhe(
         **observed,
@@ -157,6 +158,11 @@ def main() -> int:
     source = result.c_code or ""
     if not source:
         raise SystemExit("bootstrap CKKS2C generation returned empty source")
+    post_ckks_air = result.air_dumps.get("ckks_driver", "")
+    if not post_ckks_air:
+        raise SystemExit("bootstrap CKKS2C generation returned no post-CKKS AIR")
+    post_ckks_air = canonicalize_checkout_paths(post_ckks_air, REPO_ROOT)
+    post_ckks_air_path.write_text(post_ckks_air, encoding="utf-8")
     source_path.write_text(source, encoding="utf-8")
 
     manifests = {}
@@ -197,7 +203,7 @@ def main() -> int:
     record = {
         "schema_version": SCHEMA,
         "status": "pass",
-        "qualification_scope": "bootstrap-resource-and-constant-link-input",
+        "qualification_scope": "full-generated-bootstrap-compile-only",
         "compiler_parameters": observed,
         "bootstrap_parameters": {
             "q_parts": config.q_parts,
@@ -210,6 +216,18 @@ def main() -> int:
             "path": source_path.name,
             "sha256": sha256_path(source_path),
             "bytes": source_path.stat().st_size,
+        },
+        "air": {
+            "raw": {
+                "path": raw_air_path.name,
+                "sha256": sha256_path(raw_air_path),
+                "bytes": raw_air_path.stat().st_size,
+            },
+            "post_ckks": {
+                "path": post_ckks_air_path.name,
+                "sha256": sha256_path(post_ckks_air_path),
+                "bytes": post_ckks_air_path.stat().st_size,
+            },
         },
         "manifests": manifests,
         "constant_count": len(constants),

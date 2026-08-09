@@ -302,6 +302,8 @@ files = {
 required = {
     "qualification_invocation.json",
     "bootstrap_generation_invocation.json",
+    "bootstrap_qualification/bootstrap_raw.air",
+    "bootstrap_qualification/bootstrap_post_ckks.air",
     "bootstrap_qualification/bootstrap_qualification.cu",
     "bootstrap_qualification/bootstrap_phantom_constants.cu",
     "bootstrap_qualification/compiler_context_manifest.json",
@@ -358,10 +360,26 @@ audit = json.loads(
 )
 if qualification.get("status") != "pass" or generation.get("status") != "pass":
     raise SystemExit("bootstrap qualification/generation status is not pass")
-if audit.get("status") != "pass":
+if generation.get("schema_version") != "ace.phantom.bootstrap-generation/2.0.0":
+    raise SystemExit("bootstrap generation schema is not supported")
+if (
+    audit.get("schema_version")
+    != "ace.phantom.bootstrap-generated-artifact-audit/2.0.0"
+    or audit.get("status") != "pass"
+):
     raise SystemExit("bootstrap generated-artifact audit status is not pass")
+for stage, filename, audit_name in (
+    ("raw", "bootstrap_raw.air", "raw_air"),
+    ("post_ckks", "bootstrap_post_ckks.air", "post_ckks_air"),
+):
+    relative = f"bootstrap_qualification/{filename}"
+    generated = generation.get("air", {}).get(stage, {})
+    if generated.get("path") != filename or generated.get("sha256") != files[relative]:
+        raise SystemExit(f"bootstrap generation {stage} AIR binding is inconsistent")
+    if audit.get("inputs", {}).get(audit_name, {}).get("sha256") != files[relative]:
+        raise SystemExit(f"bootstrap audit {stage} AIR binding is inconsistent")
 record = {
-    "schema_version": "ace.phantom.bootstrap-artifacts/1.0.0",
+    "schema_version": "ace.phantom.bootstrap-artifacts/2.0.0",
     "status": "bound",
     "ace_commit": ace_commit,
     "phantom_commit": phantom_commit,
@@ -382,6 +400,10 @@ record = {
     ],
     "compiler_constant_manifest_sha256": files[
         "bootstrap_qualification/compiler_constant_manifest.json"
+    ],
+    "raw_air_sha256": files["bootstrap_qualification/bootstrap_raw.air"],
+    "post_ckks_air_sha256": files[
+        "bootstrap_qualification/bootstrap_post_ckks.air"
     ],
     "generation_record_sha256": files["bootstrap_qualification/generation.json"],
     "generated_artifact_audit_sha256": files[
@@ -598,6 +620,8 @@ write_manifest() {
   local constant_manifest_sha256=""
   local bootstrap_generation_sha256=""
   local bootstrap_audit_sha256=""
+  local bootstrap_raw_air_sha256=""
+  local bootstrap_post_ckks_air_sha256=""
   local bootstrap_binary_sha256=""
   local bootstrap_harness_sha256=""
   local bootstrap_qualification_sha256=""
@@ -626,6 +650,8 @@ write_manifest() {
     constant_manifest_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/compiler_constant_manifest.json" | awk '{print $1}')"
     bootstrap_generation_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/generation.json" | awk '{print $1}')"
     bootstrap_audit_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/source-audit.json" | awk '{print $1}')"
+    bootstrap_raw_air_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/bootstrap_raw.air" | awk '{print $1}')"
+    bootstrap_post_ckks_air_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/bootstrap_post_ckks.air" | awk '{print $1}')"
     bootstrap_binary_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/bootstrap_phantom_constants_sm80" | awk '{print $1}')"
     bootstrap_harness_sha256="$(sha256sum "${SCRIPT_DIR}/harness/bootstrap_phantom_constants.cu" | awk '{print $1}')"
     bootstrap_qualification_sha256="$(sha256sum "${BOOTSTRAP_RESULTS}/qualification.json" | awk '{print $1}')"
@@ -711,6 +737,8 @@ write_manifest() {
     --arg constant_manifest_sha256 "${constant_manifest_sha256}" \
     --arg bootstrap_generation_sha256 "${bootstrap_generation_sha256}" \
     --arg bootstrap_audit_sha256 "${bootstrap_audit_sha256}" \
+    --arg bootstrap_raw_air_sha256 "${bootstrap_raw_air_sha256}" \
+    --arg bootstrap_post_ckks_air_sha256 "${bootstrap_post_ckks_air_sha256}" \
     --arg bootstrap_binary_sha256 "${bootstrap_binary_sha256}" \
     --arg bootstrap_harness_sha256 "${bootstrap_harness_sha256}" \
     --arg bootstrap_qualification_sha256 "${bootstrap_qualification_sha256}" \
@@ -752,6 +780,10 @@ write_manifest() {
         (if $bootstrap_generation_sha256 == "" then null else $bootstrap_generation_sha256 end),
       bootstrap_generated_artifact_audit_sha256:
         (if $bootstrap_audit_sha256 == "" then null else $bootstrap_audit_sha256 end),
+      bootstrap_raw_air_sha256:
+        (if $bootstrap_raw_air_sha256 == "" then null else $bootstrap_raw_air_sha256 end),
+      bootstrap_post_ckks_air_sha256:
+        (if $bootstrap_post_ckks_air_sha256 == "" then null else $bootstrap_post_ckks_air_sha256 end),
       bootstrap_linked_binary_sha256:
         (if $bootstrap_binary_sha256 == "" then null else $bootstrap_binary_sha256 end),
       bootstrap_harness_source_sha256:
@@ -1041,7 +1073,7 @@ run_toolchain_gate() {
     "${TOOLCHAIN_RESULTS}/archive-member-audit.json" \
     "${TOOLCHAIN_RESULTS}/phantom_archive_members.txt"
   rg 'phantom::arith::CoeffModulus::Create' "${TOOLCHAIN_RESULTS}/phantom_archive_symbols.txt"
-  if rg 'Bootstrapper|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|cnn_phantom|conv_eval|FHErt_(ant|poly)|fhe::(ant|poly)|CoeffToSlot|SlotToCoeff|EvalMod|Native.*[Pp]recom|[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap' \
+  if rg --ignore-case 'Bootstrapper|\bBootstrap\b|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|bootstrap_(coeffs_to_slots|eval_mod|slots_to_coeffs)|cnn_phantom|conv_eval|FHErt_(ant|poly)|fhe::(ant|poly)|CoeffToSlot|SlotToCoeff|EvalMod|Native.*[Pp]recom|[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap' \
       "${TOOLCHAIN_RESULTS}/phantom_archive_symbols.txt" \
       >"${TOOLCHAIN_RESULTS}/forbidden_provider_symbols.txt"; then
     echo "primitive-only Phantom archive contains excluded symbols" >&2
@@ -1675,7 +1707,7 @@ link_generated_probe() {
     "${CKKS2C_RESULTS}/common_archive_members.txt"
   nm -A -C --defined-only "${binary}" \
     >"${CKKS2C_RESULTS}/linked_binary_symbols.txt"
-  if rg 'Bootstrapper|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|cnn_phantom|conv_eval|FHErt_(ant|poly)|fhe::(ant|poly)|CoeffToSlot|SlotToCoeff|EvalMod|Native.*[Pp]recom|[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap' \
+  if rg --ignore-case 'Bootstrapper|\bBootstrap\b|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|bootstrap_(coeffs_to_slots|eval_mod|slots_to_coeffs)|cnn_phantom|conv_eval|FHErt_(ant|poly)|fhe::(ant|poly)|CoeffToSlot|SlotToCoeff|EvalMod|Native.*[Pp]recom|[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap' \
       "${CKKS2C_RESULTS}/adapter_archive_symbols.txt" \
       "${CKKS2C_RESULTS}/provider_archive_symbols.txt" \
       "${CKKS2C_RESULTS}/common_archive_symbols.txt" \
@@ -1761,6 +1793,8 @@ build_bootstrap_host_qualification() {
   local external_source="${runtime_build}/external/src/phantom_external"
   local provider_archive="${runtime_build}/external/src/phantom_external-build/lib/libphantom_ordinary.a"
   local source="${BOOTSTRAP_RESULTS}/bootstrap_qualification.cu"
+  local raw_air="${BOOTSTRAP_RESULTS}/bootstrap_raw.air"
+  local post_ckks_air="${BOOTSTRAP_RESULTS}/bootstrap_post_ckks.air"
   local context_manifest="${BOOTSTRAP_RESULTS}/compiler_context_manifest.json"
   local resource_manifest="${BOOTSTRAP_RESULTS}/compiler_resource_manifest.json"
   local constant_manifest="${BOOTSTRAP_RESULTS}/compiler_constant_manifest.json"
@@ -1804,6 +1838,8 @@ build_bootstrap_host_qualification() {
       "${generator_arguments[@]}"
   )
   test -s "${source}"
+  test -s "${raw_air}"
+  test -s "${post_ckks_air}"
   test -s "${context_manifest}"
   test -s "${resource_manifest}"
   test -s "${constant_manifest}"
@@ -1821,6 +1857,8 @@ build_bootstrap_host_qualification() {
     .hamming_weight == 192
   ' "${context_manifest}" >/dev/null
   python3 "${SCRIPT_DIR}/check_bootstrap_generated_artifacts.py" \
+    --raw-air "${raw_air}" \
+    --post-ckks-air "${post_ckks_air}" \
     --context-manifest "${context_manifest}" \
     --resource-manifest "${resource_manifest}" \
     --constant-manifest "${constant_manifest}" \
@@ -1977,7 +2015,7 @@ PY
     "${BOOTSTRAP_RESULTS}/common_archive_members.txt"
   nm -C --defined-only "${binary}" \
     >"${BOOTSTRAP_RESULTS}/linked_binary_symbols.txt"
-  if rg 'Bootstrapper|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|cnn_phantom|conv_eval|FHErt_(ant|poly)|fhe::(ant|poly)|CoeffToSlot|SlotToCoeff|EvalMod|Native.*[Pp]recom|[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap' \
+  if rg --ignore-case 'Bootstrapper|\bBootstrap\b|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|bootstrap_(coeffs_to_slots|eval_mod|slots_to_coeffs)|cnn_phantom|conv_eval|FHErt_(ant|poly)|fhe::(ant|poly)|CoeffToSlot|SlotToCoeff|EvalMod|Native.*[Pp]recom|[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap' \
       "${BOOTSTRAP_RESULTS}/adapter_archive_symbols.txt" \
       "${BOOTSTRAP_RESULTS}/provider_archive_symbols.txt" \
       "${BOOTSTRAP_RESULTS}/common_archive_symbols.txt" \
@@ -1993,21 +2031,43 @@ PY
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 
 symbols_path = Path(sys.argv[1])
 output = Path(sys.argv[2])
 symbols = symbols_path.read_text(encoding="utf-8")
 required = (
+    "bootstrap_full",
+    "Conjugate_ciph",
+    "Rotate_batch_ciph",
+    "Raise_mod",
+    "Mul_mono_ciph",
+    "Phantom_conjugate",
+    "Phantom_rotate_batch",
+    "Phantom_raise_mod",
+    "Phantom_mul_mono",
+    "complex_conjugate_inplace",
+    "rotate_batch",
+    "raise_modulus",
+    "multiply_by_monomial",
     "Get_phantom_context_manifest",
     "Get_phantom_resource_manifest",
     "Get_phantom_constant_manifest",
     "Load_cached_plain",
     "main",
 )
-missing = [symbol for symbol in required if symbol not in symbols]
+missing = [
+    symbol
+    for symbol in required
+    if re.search(
+        r"(?<![A-Za-z0-9_])" + re.escape(symbol) + r"(?![A-Za-z0-9_])",
+        symbols,
+    )
+    is None
+]
 record = {
-    "schema_version": "ace.phantom.bootstrap-symbol-closure/1.0.0",
+    "schema_version": "ace.phantom.bootstrap-symbol-closure/2.0.0",
     "status": "fail" if missing else "pass",
     "linked_binary_symbols_sha256": hashlib.sha256(
         symbols_path.read_bytes()
@@ -2029,6 +2089,8 @@ PY
     --arg architecture sm_80 \
     --arg phantom_commit "${PHANTOM_COMMIT}" \
     --arg source_sha256 "$(sha256sum "${source}" | awk '{print $1}')" \
+    --arg raw_air_sha256 "$(sha256sum "${raw_air}" | awk '{print $1}')" \
+    --arg post_ckks_air_sha256 "$(sha256sum "${post_ckks_air}" | awk '{print $1}')" \
     --arg context_sha256 "${context_manifest_sha}" \
     --arg resource_sha256 "$(sha256sum "${resource_manifest}" | awk '{print $1}')" \
     --arg constant_sha256 "$(sha256sum "${constant_manifest}" | awk '{print $1}')" \
@@ -2050,6 +2112,8 @@ PY
       architecture: $architecture,
       phantom_commit: $phantom_commit,
       generated_source_sha256: $source_sha256,
+      raw_air_sha256: $raw_air_sha256,
+      post_ckks_air_sha256: $post_ckks_air_sha256,
       compiler_context_manifest_sha256: $context_sha256,
       compiler_resource_manifest_sha256: $resource_sha256,
       compiler_constant_manifest_sha256: $constant_sha256,
@@ -2338,7 +2402,7 @@ build_ordinary_conformance() {
 
   nm -A -C --defined-only "${runner_binary}" \
     >"${ORDINARY_RESULTS}/runner-symbols.txt"
-  if rg 'Bootstrapper|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|cnn_phantom|conv_eval|FHErt_(ant|poly)|fhe::(ant|poly)|CoeffToSlot|SlotToCoeff|EvalMod|Native.*[Pp]recom|[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap' \
+  if rg --ignore-case 'Bootstrapper|\bBootstrap\b|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|bootstrap_(coeffs_to_slots|eval_mod|slots_to_coeffs)|cnn_phantom|conv_eval|FHErt_(ant|poly)|fhe::(ant|poly)|CoeffToSlot|SlotToCoeff|EvalMod|Native.*[Pp]recom|[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap' \
       "${ORDINARY_RESULTS}/runner-symbols.txt" \
       >"${ORDINARY_RESULTS}/forbidden-runner-symbols.txt"; then
     echo "ordinary conformance runner contains forbidden provider symbols" >&2

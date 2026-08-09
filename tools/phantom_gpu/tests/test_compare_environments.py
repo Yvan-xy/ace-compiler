@@ -247,8 +247,25 @@ def bootstrap_evidence(root: Path, ace_commit: str, phantom_commit: str) -> tupl
         "constants": [{"entry_id": 0}],
     }
     write_json(output / "compiler_constant_manifest.json", constants)
+    required_opcodes = [
+        "ckks.conjugate",
+        "ckks.rotate_batch",
+        "ckks.raise_mod",
+        "ckks.mul_mono",
+    ]
+    air_text = "\n".join(required_opcodes) + "\n"
+    (output / "bootstrap_raw.air").write_text(air_text, encoding="utf-8")
+    (output / "bootstrap_post_ckks.air").write_text(air_text, encoding="utf-8")
     (output / "bootstrap_qualification.cu").write_text(
-        "int generated_bootstrap_source;\n", encoding="utf-8"
+        """\
+void bootstrap_full() {
+  Conjugate_ciph();
+  Rotate_batch_ciph();
+  Raise_mod();
+  Mul_mono_ciph();
+}
+""",
+        encoding="utf-8",
     )
     (output / "bootstrap_phantom_constants.cu").write_text(
         """\
@@ -262,6 +279,19 @@ int bootstrap_harness;
     )
     (output / "bootstrap_phantom_constants_sm80").write_bytes(b"binary")
     required_symbols = [
+        "bootstrap_full",
+        "Conjugate_ciph",
+        "Rotate_batch_ciph",
+        "Raise_mod",
+        "Mul_mono_ciph",
+        "Phantom_conjugate",
+        "Phantom_rotate_batch",
+        "Phantom_raise_mod",
+        "Phantom_mul_mono",
+        "complex_conjugate_inplace",
+        "rotate_batch",
+        "raise_modulus",
+        "multiply_by_monomial",
         "Get_phantom_context_manifest",
         "Get_phantom_resource_manifest",
         "Get_phantom_constant_manifest",
@@ -294,35 +324,120 @@ int bootstrap_harness;
             "context": "compiler_context_manifest.json",
             "resource": "compiler_resource_manifest.json",
             "constant": "compiler_constant_manifest.json",
+            "raw_air": "bootstrap_raw.air",
+            "post_ckks_air": "bootstrap_post_ckks.air",
             "source": "bootstrap_qualification.cu",
             "harness": "bootstrap_phantom_constants.cu",
             "binary": "bootstrap_phantom_constants_sm80",
         }.items()
     }
     generation = {
-        "schema_version": "ace.phantom.bootstrap-generation/1.0.0",
+        "schema_version": "ace.phantom.bootstrap-generation/2.0.0",
         "status": "pass",
+        "qualification_scope": "full-generated-bootstrap-compile-only",
+        "compiler_parameters": {
+            "poly_degree": 16384,
+            "mul_level": 26,
+            "input_level": 1,
+            "security_level": 0,
+            "scaling_factor_bits": 56,
+            "first_prime_bits": 60,
+            "hamming_weight": 192,
+        },
+        "bootstrap_parameters": {
+            "q_parts": 3,
+            "enc_budget": 3,
+            "dec_budget": 3,
+            "ct_encode": False,
+        },
+        "stages_completed": ["ckks_driver", "ckks2c"],
         "constant_count": 1,
-        "source": {"sha256": hashes["source"]},
+        "rotation_count": 1,
+        "rotation_batch_count": 1,
+        "monomial_count": 1,
+        "native_bootstrap_precompute": False,
+        "generated_program_executed": False,
+        "source": {
+            "path": "bootstrap_qualification.cu",
+            "sha256": hashes["source"],
+            "bytes": (output / "bootstrap_qualification.cu").stat().st_size,
+        },
+        "air": {
+            "raw": {
+                "path": "bootstrap_raw.air",
+                "sha256": hashes["raw_air"],
+                "bytes": (output / "bootstrap_raw.air").stat().st_size,
+            },
+            "post_ckks": {
+                "path": "bootstrap_post_ckks.air",
+                "sha256": hashes["post_ckks_air"],
+                "bytes": (output / "bootstrap_post_ckks.air").stat().st_size,
+            },
+        },
         "manifests": {
-            name: {"sha256": hashes[name]}
+            name: {
+                "path": f"compiler_{name}_manifest.json",
+                "sha256": hashes[name],
+                "bytes": (output / f"compiler_{name}_manifest.json").stat().st_size,
+            }
             for name in ("context", "resource", "constant")
         },
     }
     write_json(output / "generation.json", generation)
     audit = {
+        "schema_version": "ace.phantom.bootstrap-generated-artifact-audit/2.0.0",
         "status": "pass",
-        "counts": {"constants": 1},
+        "counts": {
+            "constants": 1,
+            "monomial_powers": 1,
+            "rotation_batches": 1,
+            "rotation_steps": 1,
+        },
+        "errors": [],
+        "air": {
+            stage: {
+                "required_opcode_counts": {name: 1 for name in required_opcodes},
+                "forbidden_matches": [],
+            }
+            for stage in ("raw", "post_ckks")
+        },
+        "source": {
+            "required_call_counts": {
+                name: 1
+                for name in (
+                    "Conjugate_ciph",
+                    "Rotate_batch_ciph",
+                    "Raise_mod",
+                    "Mul_mono_ciph",
+                )
+            },
+            "forbidden_matches": [],
+        },
+        "forbidden_matches": {
+            "raw_air": [],
+            "post_ckks_air": [],
+            "source": [],
+        },
+        "forbidden_native_bts_matches": [],
         "inputs": {
-            "context_manifest": {"sha256": hashes["context"]},
-            "resource_manifest": {"sha256": hashes["resource"]},
-            "constant_manifest": {"sha256": hashes["constant"]},
-            "source": {"sha256": hashes["source"]},
+            name: {
+                "path": path,
+                "sha256": hashes[hash_name],
+                "size_bytes": (output / path).stat().st_size,
+            }
+            for name, path, hash_name in (
+                ("raw_air", "bootstrap_raw.air", "raw_air"),
+                ("post_ckks_air", "bootstrap_post_ckks.air", "post_ckks_air"),
+                ("context_manifest", "compiler_context_manifest.json", "context"),
+                ("resource_manifest", "compiler_resource_manifest.json", "resource"),
+                ("constant_manifest", "compiler_constant_manifest.json", "constant"),
+                ("source", "bootstrap_qualification.cu", "source"),
+            )
         },
     }
     write_json(output / "source-audit.json", audit)
     symbol_closure = {
-        "schema_version": "ace.phantom.bootstrap-symbol-closure/1.0.0",
+        "schema_version": "ace.phantom.bootstrap-symbol-closure/2.0.0",
         "status": "pass",
         "linked_binary_symbols_sha256": hashlib.sha256(
             (output / "linked_binary_symbols.txt").read_bytes()
@@ -382,6 +497,8 @@ int bootstrap_harness;
         "gate": "bootstrap",
         "architecture": "sm_80",
         "phantom_commit": phantom_commit,
+        "raw_air_sha256": hashes["raw_air"],
+        "post_ckks_air_sha256": hashes["post_ckks_air"],
         "generated_source_sha256": hashes["source"],
         "compiler_context_manifest_sha256": hashes["context"],
         "compiler_resource_manifest_sha256": hashes["resource"],
@@ -424,6 +541,8 @@ int bootstrap_harness;
                 "compiler_context_manifest.json",
                 "compiler_resource_manifest.json",
                 "compiler_constant_manifest.json",
+                "bootstrap_raw.air",
+                "bootstrap_post_ckks.air",
                 "generation.json",
                 "source-audit.json",
                 "bootstrap_qualification.cu",
@@ -440,7 +559,7 @@ int bootstrap_harness;
         },
     }
     artifact = {
-        "schema_version": "ace.phantom.bootstrap-artifacts/1.0.0",
+        "schema_version": "ace.phantom.bootstrap-artifacts/2.0.0",
         "status": "bound",
         "source_mode": "snapshot",
         "ace_commit": ace_commit,
@@ -454,6 +573,8 @@ int bootstrap_harness;
         "compiler_context_manifest_sha256": hashes["context"],
         "compiler_resource_manifest_sha256": hashes["resource"],
         "compiler_constant_manifest_sha256": hashes["constant"],
+        "raw_air_sha256": hashes["raw_air"],
+        "post_ckks_air_sha256": hashes["post_ckks_air"],
         "generation_record_sha256": hashes["generation"],
         "generated_artifact_audit_sha256": hashes["audit"],
         "linked_binary_sha256": hashes["binary"],
@@ -480,6 +601,8 @@ int bootstrap_harness;
         "compiler_constant_manifest_sha256": hashes["constant"],
         "bootstrap_generation_record_sha256": hashes["generation"],
         "bootstrap_generated_artifact_audit_sha256": hashes["audit"],
+        "bootstrap_raw_air_sha256": hashes["raw_air"],
+        "bootstrap_post_ckks_air_sha256": hashes["post_ckks_air"],
         "bootstrap_linked_binary_sha256": hashes["binary"],
         "bootstrap_harness_source_sha256": hashes["harness"],
         "bootstrap_host_qualification_sha256": qualification_sha,
@@ -491,9 +614,22 @@ int bootstrap_harness;
     write_json(
         root / "bootstrap-frozen-reference.json",
         {
-            "schema_version": "ace.phantom.bootstrap-frozen-reference/1.1.0",
+            "schema_version": "ace.phantom.bootstrap-frozen-reference/2.0.0",
             "status": "pass",
             "comparison": "exact-source-and-setup-with-per-run-cuda-artifacts",
+            "raw_air_matches": True,
+            "post_ckks_air_matches": True,
+            "generated_source_matches": True,
+            "architecture": "sm_80",
+            "semantic_symbol_closure": {
+                "schema_version": symbol_closure["schema_version"],
+                "status": symbol_closure["status"],
+                "required_symbols": symbol_closure["required_symbols"],
+                "missing_symbols": symbol_closure["missing_symbols"],
+                "native_bootstrap_symbol_count": symbol_closure[
+                    "native_bootstrap_symbol_count"
+                ],
+            },
             "packaged_artifact_manifest_sha256": hashlib.sha256(
                 (evidence / "artifact_manifest.json").read_bytes()
             ).hexdigest(),
@@ -506,6 +642,10 @@ int bootstrap_harness;
             "regenerated_source_audit_sha256": hashes["audit"],
             "packaged_generated_source_sha256": hashes["source"],
             "regenerated_generated_source_sha256": hashes["source"],
+            "packaged_raw_air_sha256": hashes["raw_air"],
+            "regenerated_raw_air_sha256": hashes["raw_air"],
+            "packaged_post_ckks_air_sha256": hashes["post_ckks_air"],
+            "regenerated_post_ckks_air_sha256": hashes["post_ckks_air"],
             "packaged_harness_source_sha256": hashes["harness"],
             "regenerated_harness_source_sha256": hashes["harness"],
             "packaged_linked_binary_sha256": hashes["binary"],
@@ -690,9 +830,11 @@ def test_retained_stable_fields_match_while_per_run_receipts_differ(
     assert report["comparison_contract"]["bootstrap_field_count"] > 15
     assert "retained_exact_artifacts" in report["matching_fields"]
     assert "retained_ant_semantic_summary_sha256" in report["matching_fields"]
-    assert "bootstrap_common_archive_sha256" in report["matching_fields"]
     assert "bootstrap_symbol_closure_projection" in report["matching_fields"]
     assert "bootstrap_io_helper_closure_projection" in report["matching_fields"]
+    assert "bootstrap_generated_artifact_audit_projection" in report["matching_fields"]
+    assert "bootstrap_raw_air_sha256" in report["matching_fields"]
+    assert "bootstrap_post_ckks_air_sha256" in report["matching_fields"]
     assert (
         "bootstrap_frozen_reference_sha256"
         in report["allowed_differences"]
@@ -702,6 +844,7 @@ def test_retained_stable_fields_match_while_per_run_receipts_differ(
     ]
     assert "bootstrap_linked_binary_sha256" in cuda_provenance
     assert "bootstrap_adapter_archive_sha256" in cuda_provenance
+    assert "bootstrap_common_archive_sha256" in cuda_provenance
     assert "bootstrap_provider_archive_sha256" in cuda_provenance
     assert "bootstrap_symbol_closure_sha256" in cuda_provenance
     assert "bootstrap_io_helper_closure_sha256" in cuda_provenance
@@ -711,7 +854,7 @@ def test_retained_stable_fields_match_while_per_run_receipts_differ(
     assert report["mismatches"] == {}
 
 
-def test_bootstrap_common_archive_hash_tamper_is_reported(tmp_path: Path) -> None:
+def test_bootstrap_common_archive_hash_is_per_run_provenance(tmp_path: Path) -> None:
     module = load_module()
     local = result_root(tmp_path / "local", retained_records("a", "b"))
     remote = result_root(tmp_path / "remote", retained_records("a", "b"))
@@ -726,8 +869,12 @@ def test_bootstrap_common_archive_hash_tamper_is_reported(tmp_path: Path) -> Non
 
     report = module.comparison_report(module.fields(local), module.fields(remote))
 
-    assert report["status"] == "fail"
-    assert set(report["mismatches"]) == {"bootstrap_common_archive_sha256"}
+    assert report["status"] == "pass"
+    assert report["mismatches"] == {}
+    provenance = report["allowed_differences"][
+        "bootstrap_cuda_toolchain_provenance"
+    ]["bootstrap_common_archive_sha256"]
+    assert provenance["local"] != provenance["remote"]
 
 
 def test_bootstrap_per_run_frozen_reference_hash_may_differ(tmp_path: Path) -> None:
@@ -835,6 +982,57 @@ def test_bootstrap_raw_required_symbol_tamper_is_rejected(tmp_path: Path) -> Non
         module.fields(root)
 
 
+@pytest.mark.parametrize(
+    "forbidden_symbol",
+    (
+        "Bootstrap()",
+        "bootstrap_coeffs_to_slots()",
+        "bootstrap_eval_mod()",
+        "bootstrap_slots_to_coeffs()",
+    ),
+)
+def test_bootstrap_raw_forbidden_symbol_tamper_is_rejected(
+    tmp_path: Path, forbidden_symbol: str
+) -> None:
+    module = load_module()
+    root = result_root(tmp_path, retained_records("a", "b"))
+    symbols_path = (
+        root
+        / "bootstrap-qualification/bootstrap_qualification/linked_binary_symbols.txt"
+    )
+    symbols_path.write_text(
+        symbols_path.read_text(encoding="utf-8")
+        + f"0000000000000100 T {forbidden_symbol}\n",
+        encoding="utf-8",
+    )
+    rebind_bootstrap_per_run_provenance(root)
+
+    with pytest.raises(SystemExit, match="raw symbol inventory"):
+        module.fields(root)
+
+
+@pytest.mark.parametrize(
+    "required_symbol",
+    ("bootstrap_full", "Phantom_conjugate", "multiply_by_monomial"),
+)
+def test_bootstrap_semantic_symbol_chain_tamper_is_rejected(
+    tmp_path: Path, required_symbol: str
+) -> None:
+    module = load_module()
+    root = result_root(tmp_path, retained_records("a", "b"))
+    output = root / "bootstrap-qualification/bootstrap_qualification"
+    symbols_path = output / "linked_binary_symbols.txt"
+    lines = symbols_path.read_text(encoding="utf-8").splitlines()
+    symbols_path.write_text(
+        "\n".join(line for line in lines if not line.endswith(required_symbol)) + "\n",
+        encoding="utf-8",
+    )
+    rebind_bootstrap_per_run_provenance(root)
+
+    with pytest.raises(SystemExit, match="raw symbol inventory"):
+        module.fields(root)
+
+
 def test_bootstrap_io_helper_count_tamper_is_rejected(tmp_path: Path) -> None:
     module = load_module()
     root = result_root(tmp_path, retained_records("a", "b"))
@@ -860,7 +1058,48 @@ def test_bootstrap_generated_source_tamper_is_rejected(tmp_path: Path) -> None:
     )
     source_path.write_text("int changed_bootstrap_source;\n", encoding="utf-8")
 
-    with pytest.raises(SystemExit, match="generation source hash"):
+    with pytest.raises(SystemExit, match="generation source binding"):
+        module.fields(root)
+
+
+def test_bootstrap_post_ckks_air_tamper_is_rejected(tmp_path: Path) -> None:
+    module = load_module()
+    root = result_root(tmp_path, retained_records("a", "b"))
+    post_air_path = (
+        root
+        / "bootstrap-qualification/bootstrap_qualification/bootstrap_post_ckks.air"
+    )
+    post_air_path.write_text("ckks.add\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="generation post_ckks AIR binding"):
+        module.fields(root)
+
+
+def test_bootstrap_generation_scope_tamper_is_rejected(tmp_path: Path) -> None:
+    module = load_module()
+    root = result_root(tmp_path, retained_records("a", "b"))
+    generation_path = (
+        root / "bootstrap-qualification/bootstrap_qualification/generation.json"
+    )
+    generation = json.loads(generation_path.read_text(encoding="utf-8"))
+    generation["qualification_scope"] = "partial-bootstrap"
+    write_json(generation_path, generation)
+
+    with pytest.raises(SystemExit, match="qualification_scope"):
+        module.fields(root)
+
+
+def test_bootstrap_air_content_count_tamper_is_rejected(tmp_path: Path) -> None:
+    module = load_module()
+    root = result_root(tmp_path, retained_records("a", "b"))
+    audit_path = (
+        root / "bootstrap-qualification/bootstrap_qualification/source-audit.json"
+    )
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit["air"]["raw"]["required_opcode_counts"]["ckks.conjugate"] = 2
+    write_json(audit_path, audit)
+
+    with pytest.raises(SystemExit, match="raw AIR lacks required CKKS opcodes"):
         module.fields(root)
 
 

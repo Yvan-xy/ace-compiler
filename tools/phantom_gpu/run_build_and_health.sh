@@ -527,6 +527,13 @@ def digest(name):
     return hashlib.sha256((root / name).read_bytes()).hexdigest()
 
 payload = load("payload.json")
+if (
+    payload.get("schema_version") != "2.0.0"
+    or payload.get("contents")
+       != "audited-source-snapshots-and-frozen-provider-neutral-references-"
+          "with-exact-bootstrap-compile-handoff-and-regeneration-attestations"
+):
+    raise SystemExit("payload does not declare the exact bootstrap compile handoff")
 binding = payload.get("bootstrap_qualification")
 if not isinstance(binding, dict):
     raise SystemExit("payload lacks its bootstrap qualification binding")
@@ -541,22 +548,37 @@ bound_files = {
     "generation_record_sha256": "bootstrap-generation.json",
     "source_audit_sha256": "bootstrap-source-audit.json",
     "host_qualification_sha256": "bootstrap-host-qualification.json",
+    "raw_air_sha256": "bootstrap-raw.air",
+    "post_ckks_air_sha256": "bootstrap-post-ckks.air",
+    "generated_source_sha256": "bootstrap-generated.cu",
+    "host_linked_binary_sha256": "bootstrap-host-linked-sm80",
+    "link_commands_sha256": "bootstrap-link-commands.txt",
+    "cuda_elf_sha256": "bootstrap-cuda-elf.txt",
+    "cuda_resources_sha256": "bootstrap-cuda-resources.txt",
+    "file_report_sha256": "bootstrap-file-report.txt",
+    "readelf_sha256": "bootstrap-readelf.txt",
+    "linked_symbols_sha256": "bootstrap-linked-symbols.txt",
+    "symbol_closure_sha256": "bootstrap-symbol-closure.json",
 }
 expected_binding_keys = set(bound_files) | {
     "normalized_qualification_argv_sha256",
     "normalized_generation_argv_sha256",
-    "expected_generated_source_sha256",
-    "expected_linked_binary_sha256",
-    "expected_harness_source_sha256",
-    "packaged_build_output",
+    "harness_source_sha256",
+    "architecture",
+    "packaged_compile_handoff",
+    "linked_binary_byte_identity_required",
 }
 if set(binding) != expected_binding_keys:
     raise SystemExit("payload bootstrap qualification binding has an invalid shape")
 for field, name in bound_files.items():
     if binding.get(field) != digest(name):
         raise SystemExit(f"payload bootstrap binding is stale: {field}")
-if binding.get("packaged_build_output") is not False:
-    raise SystemExit("bootstrap payload must not contain packaged build output")
+if (
+    binding.get("architecture") != "sm_80"
+    or binding.get("packaged_compile_handoff") is not True
+    or binding.get("linked_binary_byte_identity_required") is not False
+):
+    raise SystemExit("bootstrap package compile handoff policy is invalid")
 
 expected_parameters = [
     "--poly-degree", "16384", "--mul-level", "26",
@@ -689,42 +711,192 @@ qualification = load("bootstrap-host-qualification.json")
 generated_source_sha = artifact.get("files", {}).get(
     "bootstrap_qualification/bootstrap_qualification.cu"
 )
+expected_generation_keys = {
+    "schema_version", "status", "qualification_scope", "compiler_parameters",
+    "bootstrap_parameters", "stages_completed", "source", "air", "manifests",
+    "constant_count", "rotation_count", "rotation_batch_count", "monomial_count",
+    "native_bootstrap_precompute", "generated_program_executed",
+}
+expected_compiler_parameters = {
+    "poly_degree": 16384,
+    "mul_level": 26,
+    "input_level": 1,
+    "security_level": 0,
+    "scaling_factor_bits": 56,
+    "first_prime_bits": 60,
+    "hamming_weight": 192,
+}
 if (
-    generation.get("schema_version") != "ace.phantom.bootstrap-generation/1.0.0"
+    set(generation) != expected_generation_keys
+    or generation.get("schema_version") != "ace.phantom.bootstrap-generation/2.0.0"
     or generation.get("status") != "pass"
+    or generation.get("qualification_scope")
+       != "full-generated-bootstrap-compile-only"
+    or generation.get("compiler_parameters") != expected_compiler_parameters
+    or generation.get("bootstrap_parameters") != {
+        "q_parts": 3, "enc_budget": 3, "dec_budget": 3, "ct_encode": False,
+    }
+    or generation.get("stages_completed") != ["ckks_driver", "ckks2c"]
     or generation.get("constant_count") != len(constants["constants"])
+    or generation.get("rotation_count") != len(resources["rotation_steps"])
+    or generation.get("rotation_batch_count") != len(resources["rotation_batches"])
+    or generation.get("monomial_count") != len(resources["monomial_powers"])
+    or generation.get("native_bootstrap_precompute") is not False
+    or generation.get("generated_program_executed") is not False
+    or generation.get("source") != {
+        "path": "bootstrap_qualification.cu",
+        "sha256": digest("bootstrap-generated.cu"),
+        "bytes": (root / "bootstrap-generated.cu").stat().st_size,
+    }
+    or audit.get("schema_version")
+       != "ace.phantom.bootstrap-generated-artifact-audit/2.0.0"
     or audit.get("status") != "pass"
     or audit.get("counts", {}).get("constants") != len(constants["constants"])
-    or artifact.get("schema_version") != "ace.phantom.bootstrap-artifacts/1.0.0"
+    or artifact.get("schema_version") != "ace.phantom.bootstrap-artifacts/2.0.0"
     or artifact.get("status") != "bound"
     or qualification.get("status") != "pass"
     or qualification.get("gate") != "bootstrap"
     or qualification.get("executable_was_run") is not False
 ):
     raise SystemExit("packaged bootstrap generation/audit/host records are invalid")
-for label, name in (
+generation_air = {
+    "raw": "bootstrap-raw.air",
+    "post_ckks": "bootstrap-post-ckks.air",
+}
+if set(generation.get("air", {})) != set(generation_air):
+    raise SystemExit("packaged bootstrap generation AIR binding has an invalid shape")
+for label, name in generation_air.items():
+    entry = generation.get("air", {}).get(label, {})
+    if (
+        entry.get("path") != {
+            "raw": "bootstrap_raw.air",
+            "post_ckks": "bootstrap_post_ckks.air",
+        }[label]
+        or entry.get("sha256") != digest(name)
+        or entry.get("bytes") != (root / name).stat().st_size
+    ):
+        raise SystemExit(f"packaged bootstrap generation lacks {label} AIR binding")
+generation_manifest_names = (
     ("context", "bootstrap-context-manifest.json"),
     ("resource", "bootstrap-resource-manifest.json"),
     ("constant", "bootstrap-constant-manifest.json"),
-):
+)
+if set(generation.get("manifests", {})) != {
+    label for label, _ in generation_manifest_names
+}:
+    raise SystemExit("packaged bootstrap generation manifest binding has an invalid shape")
+for label, name in generation_manifest_names:
     manifest_record = generation.get("manifests", {}).get(label, {})
-    if manifest_record.get("sha256") != digest(name):
+    if manifest_record != {
+        "path": {
+            "context": "compiler_context_manifest.json",
+            "resource": "compiler_resource_manifest.json",
+            "constant": "compiler_constant_manifest.json",
+        }[label],
+        "sha256": digest(name),
+        "bytes": (root / name).stat().st_size,
+    }:
         raise SystemExit(f"packaged bootstrap generation lacks {label} binding")
 audit_inputs = audit.get("inputs", {})
-for label, name in (
+audit_input_paths = (
+    ("raw_air", "bootstrap-raw.air"),
+    ("post_ckks_air", "bootstrap-post-ckks.air"),
     ("context_manifest", "bootstrap-context-manifest.json"),
     ("resource_manifest", "bootstrap-resource-manifest.json"),
     ("constant_manifest", "bootstrap-constant-manifest.json"),
-):
-    if audit_inputs.get(label, {}).get("sha256") != digest(name):
+    ("source", "bootstrap-generated.cu"),
+)
+if not isinstance(audit_inputs, dict) or set(audit_inputs) != {
+    label for label, _ in audit_input_paths
+}:
+    raise SystemExit("packaged bootstrap audit inputs have an invalid shape")
+for label, name in audit_input_paths:
+    expected_path = {
+        "raw_air": "bootstrap_raw.air",
+        "post_ckks_air": "bootstrap_post_ckks.air",
+        "context_manifest": "compiler_context_manifest.json",
+        "resource_manifest": "compiler_resource_manifest.json",
+        "constant_manifest": "compiler_constant_manifest.json",
+        "source": "bootstrap_qualification.cu",
+    }[label]
+    if audit_inputs.get(label) != {
+        "path": expected_path,
+        "sha256": digest(name),
+        "size_bytes": (root / name).stat().st_size,
+    }:
         raise SystemExit(f"packaged bootstrap audit lacks {label} binding")
-if (
-    generation.get("source", {}).get("sha256") != generated_source_sha
-    or audit_inputs.get("source", {}).get("sha256") != generated_source_sha
-):
+if generation.get("source", {}).get("sha256") != generated_source_sha:
     raise SystemExit("packaged bootstrap generation/audit source binding is stale")
+
+required_opcodes = (
+    "ckks.conjugate", "ckks.rotate_batch", "ckks.raise_mod", "ckks.mul_mono",
+)
+required_calls = (
+    "Conjugate_ciph", "Rotate_batch_ciph", "Raise_mod", "Mul_mono_ciph",
+)
+air_records = {}
+for stage, name in (("raw", "bootstrap-raw.air"),
+                    ("post_ckks", "bootstrap-post-ckks.air")):
+    air_text = (root / name).read_text(encoding="utf-8")
+    if re.search(
+        r"\bckks\.bootstrap(?:\b|[._])|"
+        r"\b(?:bootstrap_coeffs_to_slots|bootstrap_eval_mod|"
+        r"bootstrap_slots_to_coeffs)\b|"
+        r"(?:\bfhe::(?:poly|hpoly|lpoly)\b|\b(?:poly|hpoly|lpoly)\.[A-Za-z_])",
+        air_text,
+        re.IGNORECASE,
+    ):
+        raise SystemExit(f"packaged bootstrap {stage} AIR contains a forbidden operation")
+    lowered_air = air_text.lower()
+    opcode_counts = {opcode: lowered_air.count(opcode) for opcode in required_opcodes}
+    if any(count <= 0 for count in opcode_counts.values()):
+        raise SystemExit(f"packaged bootstrap {stage} AIR lacks a required opcode")
+    air_records[stage] = {
+        "required_opcode_counts": opcode_counts,
+        "forbidden_matches": [],
+    }
+source_text = (root / "bootstrap-generated.cu").read_text(encoding="utf-8")
+source_counts = {
+    call: len(re.findall(r"\b" + re.escape(call) + r"\s*\(", source_text))
+    for call in required_calls
+}
+if any(count <= 0 for count in source_counts.values()):
+    raise SystemExit("packaged bootstrap source lacks a required primitive call")
+if re.search(
+    r"Bootstrapper|Phantom_bootstrap|bootstrap_3|\bBootstrap\s*\(|"
+    r"\bEval_bootstrap[A-Za-z0-9_]*\s*\(|"
+    r"\b(?:bootstrap_coeffs_to_slots|CoeffToSlots?|bootstrap_eval_mod|EvalMod|"
+    r"bootstrap_slots_to_coeffs|SlotToCoeffs?)\b",
+    source_text,
+):
+    raise SystemExit("packaged bootstrap source contains a forbidden operation")
+expected_audit_keys = {
+    "schema_version", "status", "inputs", "errors", "air", "source",
+    "forbidden_matches", "forbidden_native_bts_matches", "counts",
+}
+if (
+    set(audit) != expected_audit_keys
+    or audit.get("errors") != []
+    or audit.get("air") != air_records
+    or audit.get("source") != {
+        "required_call_counts": source_counts, "forbidden_matches": [],
+    }
+    or audit.get("forbidden_matches") != {
+        "raw_air": [], "post_ckks_air": [], "source": [],
+    }
+    or audit.get("forbidden_native_bts_matches") != []
+    or audit.get("counts") != {
+        "constants": len(constants["constants"]),
+        "monomial_powers": len(resources["monomial_powers"]),
+        "rotation_batches": len(resources["rotation_batches"]),
+        "rotation_steps": len(resources["rotation_steps"]),
+    }
+):
+    raise SystemExit("packaged bootstrap source audit is incomplete or stale")
 qualification_hashes = {
     "generated_source_sha256": generated_source_sha,
+    "raw_air_sha256": digest("bootstrap-raw.air"),
+    "post_ckks_air_sha256": digest("bootstrap-post-ckks.air"),
     "linked_binary_sha256": artifact.get("linked_binary_sha256"),
     "harness_source_sha256": artifact.get("harness_source_sha256"),
     "compiler_context_manifest_sha256": digest("bootstrap-context-manifest.json"),
@@ -735,19 +907,95 @@ qualification_hashes = {
 }
 if any(qualification.get(field) != value for field, value in qualification_hashes.items()):
     raise SystemExit("packaged bootstrap host qualification hashes are stale")
-if (
-    binding.get("expected_generated_source_sha256") != generated_source_sha
-    or binding.get("expected_linked_binary_sha256")
-       != artifact.get("linked_binary_sha256")
-    or binding.get("expected_harness_source_sha256")
-       != artifact.get("harness_source_sha256")
-    or any(re.fullmatch(r"[0-9a-f]{64}", str(value)) is None for value in (
-        binding.get("expected_generated_source_sha256"),
-        binding.get("expected_linked_binary_sha256"),
-        binding.get("expected_harness_source_sha256"),
-    ))
-):
+artifact_bindings = {
+    "raw_air_sha256": artifact.get("raw_air_sha256"),
+    "post_ckks_air_sha256": artifact.get("post_ckks_air_sha256"),
+    "generated_source_sha256": generated_source_sha,
+    "host_linked_binary_sha256": artifact.get("linked_binary_sha256"),
+    "harness_source_sha256": artifact.get("harness_source_sha256"),
+}
+if any(binding.get(field) != value for field, value in artifact_bindings.items()):
     raise SystemExit("packaged bootstrap artifact hashes are incomplete")
+if any(
+    re.fullmatch(r"[0-9a-f]{64}", str(value)) is None
+    for value in artifact_bindings.values()
+):
+    raise SystemExit("packaged bootstrap artifact hash is malformed")
+
+handoff_paths = {
+    "bootstrap_qualification/bootstrap_raw.air": "bootstrap-raw.air",
+    "bootstrap_qualification/bootstrap_post_ckks.air": "bootstrap-post-ckks.air",
+    "bootstrap_qualification/bootstrap_qualification.cu": "bootstrap-generated.cu",
+    "bootstrap_qualification/bootstrap_phantom_constants_sm80":
+        "bootstrap-host-linked-sm80",
+    "bootstrap_qualification/link-commands.txt": "bootstrap-link-commands.txt",
+    "bootstrap_qualification/cuda_elf.txt": "bootstrap-cuda-elf.txt",
+    "bootstrap_qualification/cuda_resources.txt": "bootstrap-cuda-resources.txt",
+    "bootstrap_qualification/file.txt": "bootstrap-file-report.txt",
+    "bootstrap_qualification/readelf.txt": "bootstrap-readelf.txt",
+    "bootstrap_qualification/linked_binary_symbols.txt": "bootstrap-linked-symbols.txt",
+    "bootstrap_qualification/symbol-closure.json": "bootstrap-symbol-closure.json",
+}
+for frozen_name, handoff_name in handoff_paths.items():
+    if artifact.get("files", {}).get(frozen_name) != digest(handoff_name):
+        raise SystemExit(f"packaged bootstrap handoff differs from frozen artifact: {handoff_name}")
+
+symbol_closure = load("bootstrap-symbol-closure.json")
+required_symbols = symbol_closure.get("required_symbols")
+expected_required_symbols = [
+    "bootstrap_full",
+    "Conjugate_ciph",
+    "Rotate_batch_ciph",
+    "Raise_mod",
+    "Mul_mono_ciph",
+    "Phantom_conjugate",
+    "Phantom_rotate_batch",
+    "Phantom_raise_mod",
+    "Phantom_mul_mono",
+    "complex_conjugate_inplace",
+    "rotate_batch",
+    "raise_modulus",
+    "multiply_by_monomial",
+    "Get_phantom_context_manifest",
+    "Get_phantom_resource_manifest",
+    "Get_phantom_constant_manifest",
+    "Load_cached_plain",
+    "main",
+]
+linked_symbols = (root / "bootstrap-linked-symbols.txt").read_text(encoding="utf-8")
+forbidden_symbol_pattern = re.compile(
+    r"Bootstrapper|\bBootstrap\b|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|"
+    r"bootstrap_(?:coeffs_to_slots|eval_mod|slots_to_coeffs)|"
+    r"cnn_phantom|conv_eval|FHErt_(?:ant|poly)|fhe::(?:ant|poly)|"
+    r"CoeffToSlot|SlotToCoeff|EvalMod|Native.*precom|precom.*Native|"
+    r"Bootstrap.*stage|stage.*Bootstrap",
+    re.IGNORECASE,
+)
+if (
+    symbol_closure.get("schema_version")
+       != "ace.phantom.bootstrap-symbol-closure/2.0.0"
+    or symbol_closure.get("status") != "pass"
+    or required_symbols != expected_required_symbols
+    or symbol_closure.get("missing_symbols") != []
+    or symbol_closure.get("native_bootstrap_symbol_count") != 0
+    or symbol_closure.get("linked_binary_symbols_sha256")
+       != digest("bootstrap-linked-symbols.txt")
+    or any(
+        re.search(
+            r"(?<![A-Za-z0-9_])" + re.escape(symbol) + r"(?![A-Za-z0-9_])",
+            linked_symbols,
+        ) is None
+        for symbol in expected_required_symbols
+    )
+    or forbidden_symbol_pattern.search(linked_symbols) is not None
+):
+    raise SystemExit("packaged bootstrap symbol closure is invalid")
+if "sm_80" not in (root / "bootstrap-cuda-elf.txt").read_text(encoding="utf-8"):
+    raise SystemExit("packaged bootstrap CUDA image inventory lacks sm_80")
+link_commands = (root / "bootstrap-link-commands.txt").read_text(encoding="utf-8")
+for token in ("-arch=sm_80", "-dlink", "bootstrap_phantom_constants_sm80"):
+    if token not in link_commands:
+        raise SystemExit(f"packaged bootstrap link command record lacks {token}")
 PY
 }
 
@@ -835,7 +1083,12 @@ verify_frozen_bootstrap_qualification() {
   cmp "${output}/compiler_constant_manifest.json" \
     "${INPUT}/bootstrap-constant-manifest.json"
   cmp "${output}/generation.json" "${INPUT}/bootstrap-generation.json"
-  python3 - "${INPUT}/payload.json" "${frozen_artifact}" \
+  cmp "${output}/bootstrap_raw.air" "${INPUT}/bootstrap-raw.air"
+  cmp "${output}/bootstrap_post_ckks.air" \
+    "${INPUT}/bootstrap-post-ckks.air"
+  cmp "${output}/bootstrap_qualification.cu" \
+    "${INPUT}/bootstrap-generated.cu"
+  python3 - "${INPUT}" "${output}" "${frozen_artifact}" \
     "${generated_artifact}" "${output}/qualification.json" \
     "${output}/source-audit.json" \
     "${output}/bootstrap_phantom_constants_sm80" \
@@ -846,7 +1099,8 @@ from pathlib import Path
 import sys
 
 (
-    payload_path,
+    input_root,
+    regenerated_root,
     frozen_path,
     generated_path,
     qualification_path,
@@ -856,34 +1110,43 @@ import sys
 ) = map(Path, sys.argv[1:])
 load = lambda path: json.loads(path.read_text(encoding="utf-8"))
 digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-binding = load(payload_path)["bootstrap_qualification"]
+binding = load(input_root / "payload.json")["bootstrap_qualification"]
 frozen = load(frozen_path)
 generated = load(generated_path)
 qualification = load(qualification_path)
 audit = load(audit_path)
 stable_paths = (
+    "bootstrap_qualification/bootstrap_raw.air",
+    "bootstrap_qualification/bootstrap_post_ckks.air",
     "bootstrap_qualification/bootstrap_qualification.cu",
     "bootstrap_qualification/bootstrap_phantom_constants.cu",
     "bootstrap_qualification/compiler_context_manifest.json",
     "bootstrap_qualification/compiler_resource_manifest.json",
     "bootstrap_qualification/compiler_constant_manifest.json",
     "bootstrap_qualification/generation.json",
+    "bootstrap_qualification/source-audit.json",
 )
 binary_path = "bootstrap_qualification/bootstrap_phantom_constants_sm80"
 for relative in stable_paths:
     if generated["files"].get(relative) != frozen["files"].get(relative):
         raise SystemExit(f"regenerated bootstrap artifact differs: {relative}")
-packaged_source_sha = binding["expected_generated_source_sha256"]
-packaged_harness_sha = binding["expected_harness_source_sha256"]
-packaged_binary_sha = binding["expected_linked_binary_sha256"]
-regenerated_source_sha = generated["files"][stable_paths[0]]
-regenerated_harness_sha = generated["files"][stable_paths[1]]
+packaged_raw_air_sha = binding["raw_air_sha256"]
+packaged_post_ckks_air_sha = binding["post_ckks_air_sha256"]
+packaged_source_sha = binding["generated_source_sha256"]
+packaged_harness_sha = binding["harness_source_sha256"]
+packaged_binary_sha = binding["host_linked_binary_sha256"]
+regenerated_raw_air_sha = generated["files"][stable_paths[0]]
+regenerated_post_ckks_air_sha = generated["files"][stable_paths[1]]
+regenerated_source_sha = generated["files"][stable_paths[2]]
+regenerated_harness_sha = generated["files"][stable_paths[3]]
 regenerated_binary_sha = generated["files"][binary_path]
 if (
-    packaged_source_sha != regenerated_source_sha
+    packaged_raw_air_sha != regenerated_raw_air_sha
+    or packaged_post_ckks_air_sha != regenerated_post_ckks_air_sha
+    or packaged_source_sha != regenerated_source_sha
     or packaged_harness_sha != regenerated_harness_sha
 ):
-    raise SystemExit("regenerated bootstrap source differs from the packaged host freeze")
+    raise SystemExit("regenerated bootstrap AIR/source differs from the packaged host freeze")
 for label, value in (
     ("packaged linked binary", packaged_binary_sha),
     ("regenerated linked binary", regenerated_binary_sha),
@@ -895,30 +1158,106 @@ for label, value in (
 if digest(binary_file_path) != regenerated_binary_sha:
     raise SystemExit("regenerated linked binary bytes differ from its artifact manifest")
 qualification_expected = {
+    "architecture": "sm_80",
+    "raw_air_sha256": regenerated_raw_air_sha,
+    "post_ckks_air_sha256": regenerated_post_ckks_air_sha,
     "generated_source_sha256": regenerated_source_sha,
     "linked_binary_sha256": regenerated_binary_sha,
     "harness_source_sha256": regenerated_harness_sha,
-    "compiler_context_manifest_sha256": generated["files"][stable_paths[2]],
-    "compiler_resource_manifest_sha256": generated["files"][stable_paths[3]],
-    "compiler_constant_manifest_sha256": generated["files"][stable_paths[4]],
-    "generation_record_sha256": generated["files"][stable_paths[5]],
+    "compiler_context_manifest_sha256": generated["files"][stable_paths[4]],
+    "compiler_resource_manifest_sha256": generated["files"][stable_paths[5]],
+    "compiler_constant_manifest_sha256": generated["files"][stable_paths[6]],
+    "generation_record_sha256": generated["files"][stable_paths[7]],
+    "generated_artifact_audit_sha256": generated["files"][stable_paths[8]],
 }
 if any(qualification.get(field) != value for field, value in qualification_expected.items()):
     raise SystemExit("regenerated bootstrap qualification hash binding is stale")
-if audit.get("status") != "pass" or not audit.get("counts", {}).get("constants"):
+if (
+    audit.get("schema_version")
+       != "ace.phantom.bootstrap-generated-artifact-audit/2.0.0"
+    or audit.get("status") != "pass"
+    or not audit.get("counts", {}).get("constants")
+):
     raise SystemExit("regenerated bootstrap source audit did not pass")
+
+def symbol_projection(path):
+    value = load(path)
+    return {
+        "schema_version": value.get("schema_version"),
+        "status": value.get("status"),
+        "required_symbols": value.get("required_symbols"),
+        "missing_symbols": value.get("missing_symbols"),
+        "native_bootstrap_symbol_count": value.get("native_bootstrap_symbol_count"),
+    }
+
+expected_required_symbols = [
+    "bootstrap_full",
+    "Conjugate_ciph",
+    "Rotate_batch_ciph",
+    "Raise_mod",
+    "Mul_mono_ciph",
+    "Phantom_conjugate",
+    "Phantom_rotate_batch",
+    "Phantom_raise_mod",
+    "Phantom_mul_mono",
+    "complex_conjugate_inplace",
+    "rotate_batch",
+    "raise_modulus",
+    "multiply_by_monomial",
+    "Get_phantom_context_manifest",
+    "Get_phantom_resource_manifest",
+    "Get_phantom_constant_manifest",
+    "Load_cached_plain",
+    "main",
+]
+packaged_symbol_projection = symbol_projection(
+    input_root / "bootstrap-symbol-closure.json"
+)
+regenerated_symbol_projection = symbol_projection(
+    regenerated_root / "symbol-closure.json"
+)
+expected_symbol_projection = {
+    "schema_version": "ace.phantom.bootstrap-symbol-closure/2.0.0",
+    "status": "pass",
+    "required_symbols": expected_required_symbols,
+    "missing_symbols": [],
+    "native_bootstrap_symbol_count": 0,
+}
+if (
+    packaged_symbol_projection != expected_symbol_projection
+    or regenerated_symbol_projection != expected_symbol_projection
+):
+    raise SystemExit("regenerated bootstrap semantic symbol closure differs")
+
+packaged_architecture = "sm_80" in (
+    input_root / "bootstrap-cuda-elf.txt"
+).read_text(encoding="utf-8")
+regenerated_architecture = "sm_80" in (
+    regenerated_root / "cuda_elf.txt"
+).read_text(encoding="utf-8")
+if not packaged_architecture or not regenerated_architecture:
+    raise SystemExit("bootstrap package/regeneration lacks an sm_80 image")
 record = {
-    "schema_version": "ace.phantom.bootstrap-frozen-reference/1.1.0",
+    "schema_version": "ace.phantom.bootstrap-frozen-reference/2.0.0",
     "status": "pass",
     "comparison": "exact-source-and-setup-with-per-run-cuda-artifacts",
     "source_and_setup_match": True,
     "linked_binary_byte_identity_required": False,
+    "raw_air_matches": True,
+    "post_ckks_air_matches": True,
+    "generated_source_matches": True,
+    "architecture": "sm_80",
+    "semantic_symbol_closure": packaged_symbol_projection,
     "packaged_artifact_manifest_sha256": digest(frozen_path),
     "packaged_host_qualification_sha256": binding["host_qualification_sha256"],
     "packaged_source_audit_sha256": binding["source_audit_sha256"],
     "regenerated_artifact_manifest_sha256": digest(generated_path),
     "regenerated_host_qualification_sha256": digest(qualification_path),
     "regenerated_source_audit_sha256": digest(audit_path),
+    "packaged_raw_air_sha256": packaged_raw_air_sha,
+    "regenerated_raw_air_sha256": regenerated_raw_air_sha,
+    "packaged_post_ckks_air_sha256": packaged_post_ckks_air_sha,
+    "regenerated_post_ckks_air_sha256": regenerated_post_ckks_air_sha,
     "packaged_generated_source_sha256": packaged_source_sha,
     "regenerated_generated_source_sha256": regenerated_source_sha,
     "packaged_harness_source_sha256": packaged_harness_sha,
@@ -1302,7 +1641,7 @@ run_retained_host_qualification() {
 verify_frozen_retained_reference() {
   jq -e '
     .contents ==
-      "audited-source-snapshots-and-frozen-provider-neutral-references-with-bootstrap-qualification-regeneration-attestations-without-build-output"
+      "audited-source-snapshots-and-frozen-provider-neutral-references-with-exact-bootstrap-compile-handoff-and-regeneration-attestations"
     and .frozen_retained_reference.status == "pass"
     and .frozen_retained_reference.contents ==
       "provider-neutral-references-and-attestations-no-build-output"
@@ -1972,12 +2311,33 @@ verify_success_evidence() {
         .gate == "bootstrap" and .status == "pass" and .exit_code == 0
       '
       require_terminal_record bootstrap-frozen-reference.json '
-        .schema_version == "ace.phantom.bootstrap-frozen-reference/1.1.0"
+        .schema_version == "ace.phantom.bootstrap-frozen-reference/2.0.0"
         and .status == "pass"
         and .comparison ==
           "exact-source-and-setup-with-per-run-cuda-artifacts"
         and .source_and_setup_match == true
         and .linked_binary_byte_identity_required == false
+        and .raw_air_matches == true
+        and .post_ckks_air_matches == true
+        and .generated_source_matches == true
+        and .architecture == "sm_80"
+        and .semantic_symbol_closure.schema_version ==
+          "ace.phantom.bootstrap-symbol-closure/2.0.0"
+        and .semantic_symbol_closure.status == "pass"
+        and .semantic_symbol_closure.required_symbols == [
+          "bootstrap_full", "Conjugate_ciph", "Rotate_batch_ciph",
+          "Raise_mod", "Mul_mono_ciph", "Phantom_conjugate",
+          "Phantom_rotate_batch", "Phantom_raise_mod", "Phantom_mul_mono",
+          "complex_conjugate_inplace", "rotate_batch", "raise_modulus",
+          "multiply_by_monomial", "Get_phantom_context_manifest",
+          "Get_phantom_resource_manifest", "Get_phantom_constant_manifest",
+          "Load_cached_plain", "main"
+        ]
+        and .semantic_symbol_closure.missing_symbols == []
+        and .semantic_symbol_closure.native_bootstrap_symbol_count == 0
+        and .packaged_raw_air_sha256 == .regenerated_raw_air_sha256
+        and .packaged_post_ckks_air_sha256 ==
+          .regenerated_post_ckks_air_sha256
         and .packaged_generated_source_sha256 ==
           .regenerated_generated_source_sha256
         and .packaged_harness_source_sha256 ==
@@ -1988,6 +2348,10 @@ verify_success_evidence() {
               .regenerated_artifact_manifest_sha256,
               .regenerated_host_qualification_sha256,
               .regenerated_source_audit_sha256,
+              .packaged_raw_air_sha256,
+              .regenerated_raw_air_sha256,
+              .packaged_post_ckks_air_sha256,
+              .regenerated_post_ckks_air_sha256,
               .packaged_generated_source_sha256,
               .regenerated_generated_source_sha256,
               .packaged_harness_source_sha256,
@@ -2016,12 +2380,33 @@ verify_success_evidence() {
         .gate == "bootstrap" and .status == "pass" and .exit_code == 0
       '
       require_terminal_record bootstrap-frozen-reference.json '
-        .schema_version == "ace.phantom.bootstrap-frozen-reference/1.1.0"
+        .schema_version == "ace.phantom.bootstrap-frozen-reference/2.0.0"
         and .status == "pass"
         and .comparison ==
           "exact-source-and-setup-with-per-run-cuda-artifacts"
         and .source_and_setup_match == true
         and .linked_binary_byte_identity_required == false
+        and .raw_air_matches == true
+        and .post_ckks_air_matches == true
+        and .generated_source_matches == true
+        and .architecture == "sm_80"
+        and .semantic_symbol_closure.schema_version ==
+          "ace.phantom.bootstrap-symbol-closure/2.0.0"
+        and .semantic_symbol_closure.status == "pass"
+        and .semantic_symbol_closure.required_symbols == [
+          "bootstrap_full", "Conjugate_ciph", "Rotate_batch_ciph",
+          "Raise_mod", "Mul_mono_ciph", "Phantom_conjugate",
+          "Phantom_rotate_batch", "Phantom_raise_mod", "Phantom_mul_mono",
+          "complex_conjugate_inplace", "rotate_batch", "raise_modulus",
+          "multiply_by_monomial", "Get_phantom_context_manifest",
+          "Get_phantom_resource_manifest", "Get_phantom_constant_manifest",
+          "Load_cached_plain", "main"
+        ]
+        and .semantic_symbol_closure.missing_symbols == []
+        and .semantic_symbol_closure.native_bootstrap_symbol_count == 0
+        and .packaged_raw_air_sha256 == .regenerated_raw_air_sha256
+        and .packaged_post_ckks_air_sha256 ==
+          .regenerated_post_ckks_air_sha256
         and .packaged_generated_source_sha256 ==
           .regenerated_generated_source_sha256
         and .packaged_harness_source_sha256 ==
@@ -2032,6 +2417,10 @@ verify_success_evidence() {
               .regenerated_artifact_manifest_sha256,
               .regenerated_host_qualification_sha256,
               .regenerated_source_audit_sha256,
+              .packaged_raw_air_sha256,
+              .regenerated_raw_air_sha256,
+              .packaged_post_ckks_air_sha256,
+              .regenerated_post_ckks_air_sha256,
               .packaged_generated_source_sha256,
               .regenerated_generated_source_sha256,
               .packaged_harness_source_sha256,

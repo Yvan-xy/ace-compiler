@@ -18,6 +18,39 @@ from check_primitive_codegen import compare_context, extract_context
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 C_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_]\w*$")
 HEXFLOAT_PATTERN = re.compile(r"^0x[0-9a-f]+\.[0-9a-f]+p[+-][0-9]+$")
+SCHEMA = "ace.phantom.bootstrap-generated-artifact-audit/2.0.0"
+
+REQUIRED_AIR_OPCODES = (
+    "ckks.conjugate",
+    "ckks.rotate_batch",
+    "ckks.raise_mod",
+    "ckks.mul_mono",
+)
+REQUIRED_SOURCE_CALLS = (
+    "Conjugate_ciph",
+    "Rotate_batch_ciph",
+    "Raise_mod",
+    "Mul_mono_ciph",
+)
+
+FORBIDDEN_AIR = {
+    "opaque CKKS bootstrap opcode": re.compile(
+        r"\bckks\.bootstrap(?:\b|[._])", re.IGNORECASE
+    ),
+    "coefficient-to-slot stage opcode": re.compile(
+        r"\b(?:ckks\.)?bootstrap_coeffs_to_slots\b", re.IGNORECASE
+    ),
+    "evaluation stage opcode": re.compile(
+        r"\b(?:ckks\.)?bootstrap_eval_mod\b", re.IGNORECASE
+    ),
+    "slot-to-coefficient stage opcode": re.compile(
+        r"\b(?:ckks\.)?bootstrap_slots_to_coeffs\b", re.IGNORECASE
+    ),
+    "POLY/HPOLY/LPOLY opcode": re.compile(
+        r"(?:\bfhe::(?:poly|hpoly|lpoly)\b|\b(?:poly|hpoly|lpoly)\.[A-Za-z_])",
+        re.IGNORECASE,
+    ),
+}
 
 CONTEXT_KEYS = {
     "data_q_bit_sizes",
@@ -89,6 +122,10 @@ FORBIDDEN_NATIVE_BTS = {
     "native Phantom bootstrap entry point": re.compile(
         r"\b(?:Phantom_bootstrap|bootstrap_3)\b"
     ),
+    "opaque bootstrap call": re.compile(r"\bBootstrap\s*\("),
+    "opaque ANT bootstrap call": re.compile(
+        r"\bEval_bootstrap[A-Za-z0-9_]*\s*\("
+    ),
     "native Phantom coefficient-to-slot stage": re.compile(
         r"\b(?:bootstrap_coeffs_to_slots|CoeffToSlots?)\b"
     ),
@@ -152,6 +189,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--context-manifest", required=True, type=Path)
     parser.add_argument("--resource-manifest", required=True, type=Path)
     parser.add_argument("--constant-manifest", required=True, type=Path)
+    parser.add_argument("--raw-air", required=True, type=Path)
+    parser.add_argument("--post-ckks-air", required=True, type=Path)
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--report", type=Path)
     return parser.parse_args()
@@ -597,22 +636,66 @@ def compare_constant_source(source: str, manifest: dict[str, Any]) -> None:
         )
 
 
+def inspect_air(air: str) -> dict[str, Any]:
+    lowered = air.lower()
+    return {
+        "required_opcode_counts": {
+            opcode: lowered.count(opcode) for opcode in REQUIRED_AIR_OPCODES
+        },
+        "forbidden_matches": [
+            label for label, pattern in FORBIDDEN_AIR.items() if pattern.search(air)
+        ],
+    }
+
+
+def inspect_source(source: str) -> dict[str, Any]:
+    return {
+        "required_call_counts": {
+            call: len(re.findall(r"\b" + re.escape(call) + r"\s*\(", source))
+            for call in REQUIRED_SOURCE_CALLS
+        },
+        "forbidden_matches": [
+            label
+            for label, pattern in FORBIDDEN_NATIVE_BTS.items()
+            if pattern.search(source)
+        ],
+    }
+
+
 def audit(
     context_path: Path,
     resource_path: Path,
     constant_path: Path,
+    raw_air_path: Path,
+    post_ckks_air_path: Path,
     source_path: Path,
 ) -> dict[str, Any]:
     input_paths = {
         "context_manifest": context_path,
         "resource_manifest": resource_path,
         "constant_manifest": constant_path,
+        "raw_air": raw_air_path,
+        "post_ckks_air": post_ckks_air_path,
         "source": source_path,
     }
     report: dict[str, Any] = {
+        "schema_version": SCHEMA,
         "status": "fail",
         "inputs": {},
         "errors": [],
+        "air": {
+            "raw": {"required_opcode_counts": {}, "forbidden_matches": []},
+            "post_ckks": {
+                "required_opcode_counts": {},
+                "forbidden_matches": [],
+            },
+        },
+        "source": {"required_call_counts": {}, "forbidden_matches": []},
+        "forbidden_matches": {
+            "raw_air": [],
+            "post_ckks_air": [],
+            "source": [],
+        },
         "forbidden_native_bts_matches": [],
     }
     try:
@@ -628,11 +711,55 @@ def audit(
         context = _read_json(context_path)
         resource = _read_json(resource_path)
         constants = _read_json(constant_path)
+        raw_air = raw["raw_air"].decode("utf-8")
+        post_ckks_air = raw["post_ckks_air"].decode("utf-8")
         source = raw["source"].decode("utf-8")
-        forbidden = [
-            label for label, pattern in FORBIDDEN_NATIVE_BTS.items() if pattern.search(source)
+        report["air"]["raw"] = inspect_air(raw_air)
+        report["air"]["post_ckks"] = inspect_air(post_ckks_air)
+        report["source"] = inspect_source(source)
+        report["forbidden_matches"] = {
+            "raw_air": report["air"]["raw"]["forbidden_matches"],
+            "post_ckks_air": report["air"]["post_ckks"]["forbidden_matches"],
+            "source": report["source"]["forbidden_matches"],
+        }
+        report["forbidden_native_bts_matches"] = report["source"][
+            "forbidden_matches"
         ]
-        report["forbidden_native_bts_matches"] = forbidden
+        for air_name in ("raw", "post_ckks"):
+            missing = [
+                opcode
+                for opcode, count in report["air"][air_name][
+                    "required_opcode_counts"
+                ].items()
+                if count == 0
+            ]
+            if missing:
+                raise AuditError(
+                    f"{air_name} AIR is missing required CKKS opcodes: "
+                    + ", ".join(missing)
+                )
+            forbidden_air = report["air"][air_name]["forbidden_matches"]
+            if forbidden_air:
+                raise AuditError(
+                    f"{air_name} AIR contains forbidden opcodes: "
+                    + ", ".join(forbidden_air)
+                )
+        missing_calls = [
+            call
+            for call, count in report["source"]["required_call_counts"].items()
+            if count == 0
+        ]
+        if missing_calls:
+            raise AuditError(
+                "generated source is missing required primitive calls: "
+                + ", ".join(missing_calls)
+            )
+        forbidden = report["source"]["forbidden_matches"]
+        if forbidden:
+            raise AuditError(
+                "generated source contains forbidden bootstrap calls or helpers: "
+                + ", ".join(forbidden)
+            )
         verify_context_manifest(context)
         verify_resource_manifest(resource, context)
         verify_constant_manifest(
@@ -655,8 +782,6 @@ def audit(
         ):
             if accessor not in source:
                 raise AuditError(f"required generated accessor is absent: {accessor}")
-        if forbidden:
-            raise AuditError("generated source contains forbidden native BTS symbols")
         report["counts"] = {
             "constants": len(constants["constants"]),
             "monomial_powers": len(resource["monomial_powers"]),
@@ -675,6 +800,8 @@ def main() -> int:
         arguments.context_manifest,
         arguments.resource_manifest,
         arguments.constant_manifest,
+        arguments.raw_air,
+        arguments.post_ckks_air,
         arguments.source,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
