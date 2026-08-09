@@ -2139,20 +2139,34 @@ build_bootstrap_host_qualification() {
     "${context_manifest}" "${resource_manifest}" "${constant_manifest}"
     "${semantics}" "${post_operations_air}" "${post_operation_attestation}"
   )
+  local native_oracle_exit=0
   RTLIB_DISABLE_BOOTSTRAP_PRECOM=1 timeout "${HOST_ORACLE_TIMEOUT_SECONDS}" \
     "${native_oracle}" \
     "${oracle_authorities[@]}" \
     "${BOOTSTRAP_RESULTS}/native_ant_reference.json" \
     "${BOOTSTRAP_RESULTS}/native_ant_reference.bin" \
     >"${BOOTSTRAP_RESULTS}/native-ant.stdout.txt" \
-    2>"${BOOTSTRAP_RESULTS}/native-ant.stderr.txt"
+    2>"${BOOTSTRAP_RESULTS}/native-ant.stderr.txt" || native_oracle_exit=$?
+  if [[ ${native_oracle_exit} -ne 0 ]]; then
+    echo "native ANT oracle failed with exit ${native_oracle_exit}" >&2
+    cat -- "${BOOTSTRAP_RESULTS}/native-ant.stdout.txt" >&2
+    cat -- "${BOOTSTRAP_RESULTS}/native-ant.stderr.txt" >&2
+    return "${native_oracle_exit}"
+  fi
+  local generated_oracle_exit=0
   RTLIB_DISABLE_BOOTSTRAP_PRECOM=1 timeout "${HOST_ORACLE_TIMEOUT_SECONDS}" \
     "${generated_oracle}" \
     "${oracle_authorities[@]}" \
     "${BOOTSTRAP_RESULTS}/generated_ant_reference.json" \
     "${BOOTSTRAP_RESULTS}/generated_ant_reference.bin" \
     >"${BOOTSTRAP_RESULTS}/generated-ant.stdout.txt" \
-    2>"${BOOTSTRAP_RESULTS}/generated-ant.stderr.txt"
+    2>"${BOOTSTRAP_RESULTS}/generated-ant.stderr.txt" || generated_oracle_exit=$?
+  if [[ ${generated_oracle_exit} -ne 0 ]]; then
+    echo "generated DSL/ANT oracle failed with exit ${generated_oracle_exit}" >&2
+    cat -- "${BOOTSTRAP_RESULTS}/generated-ant.stdout.txt" >&2
+    cat -- "${BOOTSTRAP_RESULTS}/generated-ant.stderr.txt" >&2
+    return "${generated_oracle_exit}"
+  fi
   python3 "${SCRIPT_DIR}/bootstrap_correctness.py" verify-host \
     --fixture "${fixture}" \
     --native-record "${BOOTSTRAP_RESULTS}/native_ant_reference.json" \

@@ -184,6 +184,13 @@ def test_compile_gate_builds_and_runs_both_host_oracles_before_gpu_use() -> None
     assert "native_ant_reference.json" in script
     assert "generated_ant_reference.json" in script
     assert "host_oracle_replay.json" in script
+    assert 'echo "native ANT oracle failed with exit ${native_oracle_exit}"' in script
+    assert (
+        'echo "generated DSL/ANT oracle failed with exit '
+        '${generated_oracle_exit}"' in script
+    )
+    assert 'cat -- "${BOOTSTRAP_RESULTS}/native-ant.stderr.txt" >&2' in script
+    assert 'cat -- "${BOOTSTRAP_RESULTS}/generated-ant.stderr.txt" >&2' in script
     assert "generated_bootstrap_phantom_correctness_sm80" in script
     assert "ace.phantom.bootstrap-artifacts/3.0.0" in script
     assert "ace.phantom.bootstrap-host-qualification/2.0.0" in script
