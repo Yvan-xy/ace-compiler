@@ -1431,14 +1431,51 @@ verify_success_evidence() {
         and (.inventories | length) == 6
         and ([.inventories[].forbidden_entries] | all(. == []))
       '
-      require_terminal_record retained_generated_source_audit.json '
+      require_terminal_record retained_generated_source_audit.json \
+        --slurpfile fixture "${RESULT_DIR}/retained_ckks_v1.json" \
+        --slurpfile artifact \
+          "${RESULT_DIR}/retained-host/artifact-manifest.json" '
+        (keys | sort) ==
+          (["argument_order", "call_counts", "cipher_array_copy_count",
+            "cipher_array_copy_indices", "expected_cipher_array_copy_count",
+            "expected_cipher_array_copy_indices",
+            "expected_rotation_batches", "first_distinct_calls",
+            "forbidden_matches", "observed_rotation_batches",
+            "raw_cipher_array_assignments", "required_calls",
+            "rotation_array_emission", "schema_version", "source_sha256",
+            "status"] | sort)
+        and
         .schema_version ==
-          "ace.phantom.retained_ckks.generated-source-audit/1.0.0"
+          "ace.phantom.retained_ckks.generated-source-audit/2.0.0"
         and .status == "pass"
+        and .source_sha256 ==
+          $artifact[0].files["outputs/retained_ckks_phantom.cu"]
         and .required_calls ==
           ["Conjugate_ciph", "Rotate_batch_ciph", "Raise_mod", "Mul_mono_ciph"]
         and .first_distinct_calls == .required_calls
+        and (.call_counts | keys | sort) == (.required_calls | sort)
+        and ([.call_counts[] |
+          type == "number" and . > 0 and floor == .] | all)
+        and .argument_order == {
+          "Conjugate_ciph": true, "Rotate_batch_ciph": true,
+          "Raise_mod": true, "Mul_mono_ciph": true
+        }
         and .rotation_array_emission == "ckks-owned-static-int32"
+        and .expected_rotation_batches ==
+          ([$fixture[0].rotate_batch_steps]
+           + $fixture[0].production_rotation_batches
+           + [$fixture[0].rotate_batch_steps])
+        and .observed_rotation_batches == .expected_rotation_batches
+        and .cipher_array_copy_count == .expected_cipher_array_copy_count
+        and .expected_cipher_array_copy_count ==
+          (1 + ($fixture[0].production_rotation_batches | length)
+           + ($fixture[0].rotate_batch_steps | length))
+        and .cipher_array_copy_indices == .expected_cipher_array_copy_indices
+        and .expected_cipher_array_copy_indices ==
+          ([range(0;
+              1 + ($fixture[0].production_rotation_batches | length)) | 0]
+           + [range(0; ($fixture[0].rotate_batch_steps | length))])
+        and .raw_cipher_array_assignments == []
         and .forbidden_matches == []
       '
       require_terminal_record retained_gtest_source_attestation.json '

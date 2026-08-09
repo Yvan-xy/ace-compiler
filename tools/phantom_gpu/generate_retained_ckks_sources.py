@@ -122,7 +122,9 @@ def _audit_stable_functions(source: str, provider: str) -> None:
             raise SystemExit(f"{provider} source omits stable function {function}")
 
 
-def _audit_phantom_source(source: str) -> None:
+def _audit_phantom_source(
+    source: str, expected_cipher_array_copy_indices: list[int]
+) -> None:
     _audit_stable_functions(source, "Phantom")
     for call in RETAINED_CALLS:
         if f"{call}(" not in source:
@@ -135,6 +137,38 @@ def _audit_phantom_source(source: str) -> None:
     for pattern in forbidden_calls:
         if re.search(pattern, source, re.IGNORECASE):
             raise SystemExit(f"Phantom source contains forbidden call matching {pattern}")
+    cipher_arrays = set(
+        re.findall(
+            r"^\s*CIPHERTEXT\s+([A-Za-z_][A-Za-z0-9_]*)\s*"
+            r"\[[^\]\n]+\]\s*;",
+            source,
+            re.MULTILINE,
+        )
+    )
+    cipher_array_copy = re.compile(
+        r"Copy_ciph\s*\(\s*&[A-Za-z_][A-Za-z0-9_]*\s*,\s*"
+        r"&([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([0-9]+)\s*\]\s*\)"
+    )
+    raw_array_assignment = re.compile(
+        r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*[0-9]+\s*\]\s*;",
+        re.MULTILINE,
+    )
+    cipher_array_copies = [
+        match for match in cipher_array_copy.finditer(source)
+        if match.group(1) in cipher_arrays
+    ]
+    raw_cipher_array_assignments = [
+        match for match in raw_array_assignment.finditer(source)
+        if match.group(1) in cipher_arrays
+    ]
+    observed_indices = [int(match.group(2)) for match in cipher_array_copies]
+    if observed_indices != expected_cipher_array_copy_indices:
+        raise SystemExit(
+            "Phantom source ciphertext array copies differ from the retained fixture"
+        )
+    if raw_cipher_array_assignments:
+        raise SystemExit("Phantom source contains a raw ciphertext array assignment")
 
 
 def generate(arguments: argparse.Namespace) -> None:
@@ -168,6 +202,17 @@ def generate(arguments: argparse.Namespace) -> None:
         "hamming_weight": arguments.hamming_weight,
     }
     input_context = _load_context(arguments.context_manifest)
+    fixture = json.loads(arguments.fixture.read_text(encoding="utf-8"))
+    if (
+        not isinstance(fixture, dict)
+        or not isinstance(fixture.get("production_rotation_batches"), list)
+        or not isinstance(fixture.get("rotate_batch_steps"), list)
+    ):
+        raise SystemExit("retained fixture is missing rotation batches")
+    expected_cipher_array_copy_indices = (
+        [0] * (1 + len(fixture["production_rotation_batches"]))
+        + list(range(len(fixture["rotate_batch_steps"])))
+    )
     expected_parameters = {
         "polynomial_degree": int(input_context["polynomial_degree"]),
         "mul_level": len(input_context["data_q_bit_sizes"]),
@@ -203,7 +248,7 @@ def generate(arguments: argparse.Namespace) -> None:
     if emitted_context != _load_context(arguments.context_manifest):
         raise SystemExit("emitted Phantom context differs from the generator input")
     _audit_stable_functions(ant_source, "ANT")
-    _audit_phantom_source(phantom_source)
+    _audit_phantom_source(phantom_source, expected_cipher_array_copy_indices)
     artifacts = (
         (arguments.ant_source, ant_source),
         (arguments.phantom_source, phantom_source),

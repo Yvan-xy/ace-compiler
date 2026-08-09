@@ -114,13 +114,17 @@ public:
       ctx << ")";
       return;
     }
+    const air::base::OPCODE val_opcode = val->Opcode();
     if (ctx.Is_cipher_type(node->Addr_datum()->Type_id()) &&
-            val->Opcode() ==
-                air::base::OPCODE(air::core::CORE, air::core::LD) ||
-        val->Opcode() == air::base::OPCODE(air::core::CORE, air::core::LDP)) {
+        (val_opcode == air::core::OPC_LD ||
+         val_opcode == air::core::OPC_LDP ||
+         val_opcode == air::core::OPC_ILD)) {
       ctx << "Copy_ciph(&";
       ctx.Emit_var(node);
       ctx << ", ";
+      if (val_opcode == air::core::OPC_ILD) {
+        ctx << "&";
+      }
       visitor->template Visit<RETV>(val);
       ctx << ")";
       return;

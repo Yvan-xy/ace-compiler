@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import textwrap
@@ -537,6 +538,43 @@ def test_same_conformance_module_generates_both_terminal_sources(
         "Poly_",
     ):
         assert forbidden not in phantom
+    cipher_arrays = set(
+        re.findall(
+            r"^\s*CIPHERTEXT\s+([A-Za-z_][A-Za-z0-9_]*)\s*"
+            r"\[[^\]\n]+\]\s*;",
+            phantom,
+            re.MULTILINE,
+        )
+    )
+    cipher_array_copy_pattern = re.compile(
+        r"Copy_ciph\s*\(\s*&[A-Za-z_][A-Za-z0-9_]*\s*,\s*"
+        r"&([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([0-9]+)\s*\]\s*\)"
+    )
+    raw_array_assignment_pattern = re.compile(
+        r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*[0-9]+\s*\]\s*;",
+        re.MULTILINE,
+    )
+    cipher_array_copies = [
+        match
+        for match in cipher_array_copy_pattern.finditer(phantom)
+        if match.group(1) in cipher_arrays
+    ]
+    raw_array_assignments = [
+        match.group(0)
+        for match in raw_array_assignment_pattern.finditer(phantom)
+        if match.group(1) in cipher_arrays
+    ]
+    assert len(cipher_array_copies) == (
+        1
+        + len(fixture["production_rotation_batches"])
+        + len(fixture["rotate_batch_steps"])
+    )
+    assert [int(match.group(2)) for match in cipher_array_copies] == (
+        [0] * (1 + len(fixture["production_rotation_batches"]))
+        + list(range(len(fixture["rotate_batch_steps"])))
+    )
+    assert raw_array_assignments == []
     resources = json.loads(outputs["emitted_resources"].read_text(encoding="utf-8"))
     assert resources["rotation_batches"] == [
         fixture["rotate_batch_steps"],

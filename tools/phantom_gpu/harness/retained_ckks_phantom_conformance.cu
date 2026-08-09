@@ -1059,15 +1059,18 @@ ImportCoefficientCipher(const PhantomContext &context,
   Require(values.size() == expected, "EXACT_IMPORT",
           "coefficient source shape mismatch");
   PhantomCiphertext cipher;
-  const auto stream = phantom::util::global_variables::current_stream();
+  const auto &stream = phantom::util::global_variables::current_stream();
   cipher.resize(context, chain_index, 2, stream.get_stream());
   cipher.set_ntt_form(false);
   cipher.SetNoiseScaleDeg(1);
   cipher.set_scale(std::ldexp(1.0, manifest._scaling_modulus_bits));
-  RequireCuda(cudaMemcpyAsync(cipher.data(), values.data(),
-                              values.size() * sizeof(std::uint64_t),
-                              cudaMemcpyHostToDevice, stream.get_stream()),
-              "exact import cudaMemcpyAsync");
+  {
+    auto destination_access = cipher.write_access(stream.get_stream());
+    RequireCuda(cudaMemcpyAsync(cipher.data(), values.data(),
+                                values.size() * sizeof(std::uint64_t),
+                                cudaMemcpyHostToDevice, stream.get_stream()),
+                "exact import cudaMemcpyAsync");
+  }
   RequireCuda(cudaStreamSynchronize(stream.get_stream()),
               "exact import cudaStreamSynchronize");
   return cipher;

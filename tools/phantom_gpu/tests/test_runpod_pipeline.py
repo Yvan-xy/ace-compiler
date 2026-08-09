@@ -793,6 +793,7 @@ def test_runpod_success_completeness_requires_every_terminal_record(
     native_stdout.write_text("[  PASSED  ] 9 tests.\n", encoding="utf-8")
     native_stderr.write_text("", encoding="utf-8")
     native_binary_sha256 = "a" * 64
+    generated_source_sha256 = "b" * 64
     artifact_directory = results / "retained-host"
     artifact_directory.mkdir()
     (artifact_directory / "artifact-manifest.json").write_text(
@@ -801,7 +802,8 @@ def test_runpod_success_completeness_requires_every_terminal_record(
                 "files": {
                     "build/retained_ckks_native_primitives_sm80": (
                         native_binary_sha256
-                    )
+                    ),
+                    "outputs/retained_ckks_phantom.cu": generated_source_sha256,
                 }
             }
         )
@@ -924,9 +926,10 @@ def test_runpod_success_completeness_requires_every_terminal_record(
         },
         "retained_generated_source_audit.json": {
             "schema_version": (
-                "ace.phantom.retained_ckks.generated-source-audit/1.0.0"
+                "ace.phantom.retained_ckks.generated-source-audit/2.0.0"
             ),
             "status": "pass",
+            "source_sha256": generated_source_sha256,
             "required_calls": [
                 "Conjugate_ciph",
                 "Rotate_batch_ciph",
@@ -939,7 +942,36 @@ def test_runpod_success_completeness_requires_every_terminal_record(
                 "Raise_mod",
                 "Mul_mono_ciph",
             ],
+            "call_counts": {
+                "Conjugate_ciph": 1,
+                "Rotate_batch_ciph": 1,
+                "Raise_mod": 1,
+                "Mul_mono_ciph": 1,
+            },
+            "argument_order": {
+                "Conjugate_ciph": True,
+                "Rotate_batch_ciph": True,
+                "Raise_mod": True,
+                "Mul_mono_ciph": True,
+            },
             "rotation_array_emission": "ckks-owned-static-int32",
+            "expected_rotation_batches": [
+                [5, 0, -7, 5],
+                [1],
+                [-2, 3],
+                [5, 0, -7, 5],
+            ],
+            "observed_rotation_batches": [
+                [5, 0, -7, 5],
+                [1],
+                [-2, 3],
+                [5, 0, -7, 5],
+            ],
+            "cipher_array_copy_count": 7,
+            "expected_cipher_array_copy_count": 7,
+            "cipher_array_copy_indices": [0, 0, 0, 0, 1, 2, 3],
+            "expected_cipher_array_copy_indices": [0, 0, 0, 0, 1, 2, 3],
+            "raw_cipher_array_assignments": [],
             "forbidden_matches": [],
         },
         "retained_gtest_source_attestation.json": {
@@ -958,6 +990,7 @@ def test_runpod_success_completeness_requires_every_terminal_record(
                 }
             ],
             "rotate_batch_steps": [5, 0, -7, 5],
+            "production_rotation_batches": [[1], [-2, 3]],
             "ownership": {
                 "iterations": 100,
                 "batch_outputs_are_independent": True,
@@ -1026,6 +1059,57 @@ def test_runpod_success_completeness_requires_every_terminal_record(
         "retained_ckks_rejections.json\n"
     )
     assert not (results / "result-completeness.json").exists()
+
+    records["retained_ckks_rejections.json"]["schema_version"] = (
+        "ace.phantom.retained_ckks.rejections/1.0.0"
+    )
+    (results / "retained_ckks_rejections.json").write_text(
+        json.dumps(records["retained_ckks_rejections.json"]) + "\n",
+        encoding="utf-8",
+    )
+    generated_path = results / "retained_generated_source_audit.json"
+    valid_generated = records["retained_generated_source_audit.json"]
+
+    def assert_generated_audit_rejected(record: dict[str, object]) -> None:
+        generated_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        rejected = subprocess.run(
+            ["bash", "-c", script, "completeness-test", str(results)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert rejected.returncode != 0
+        assert rejected.stderr == (
+            "result completeness: terminal record violates its contract: "
+            "retained_generated_source_audit.json\n"
+        )
+        assert not (results / "result-completeness.json").exists()
+
+    wrong_count = json.loads(json.dumps(valid_generated))
+    wrong_count["cipher_array_copy_count"] = 6
+    wrong_count["expected_cipher_array_copy_count"] = 6
+    assert_generated_audit_rejected(wrong_count)
+
+    wrong_indices = json.loads(json.dumps(valid_generated))
+    wrong_indices["cipher_array_copy_indices"] = [0] * 7
+    wrong_indices["expected_cipher_array_copy_indices"] = [0] * 7
+    assert_generated_audit_rejected(wrong_indices)
+
+    wrong_source = json.loads(json.dumps(valid_generated))
+    wrong_source["source_sha256"] = "c" * 64
+    assert_generated_audit_rejected(wrong_source)
+
+    raw_assignment = json.loads(json.dumps(valid_generated))
+    raw_assignment["raw_cipher_array_assignments"] = ["_t0 = _t1[0];"]
+    assert_generated_audit_rejected(raw_assignment)
+
+    missing_key = json.loads(json.dumps(valid_generated))
+    missing_key.pop("source_sha256")
+    assert_generated_audit_rejected(missing_key)
+
+    unexpected_key = json.loads(json.dumps(valid_generated))
+    unexpected_key["unbound_claim"] = True
+    assert_generated_audit_rejected(unexpected_key)
 
 
 def test_pipeline_failure_record_names_the_failed_phase() -> None:

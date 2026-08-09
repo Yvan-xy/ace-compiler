@@ -500,6 +500,15 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
         *fixture["production_rotation_batches"],
         fixture["rotate_batch_steps"],
     ]
+    expected_cipher_array_copy_count = (
+        1
+        + len(fixture["production_rotation_batches"])
+        + len(fixture["rotate_batch_steps"])
+    )
+    expected_cipher_array_copy_indices = (
+        [0] * (1 + len(fixture["production_rotation_batches"]))
+        + list(range(len(fixture["rotate_batch_steps"])))
+    )
     call_counts = generated_audit.get("call_counts")
     argument_order = generated_audit.get("argument_order")
     if (
@@ -515,10 +524,15 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
             "rotation_array_emission",
             "expected_rotation_batches",
             "observed_rotation_batches",
+            "cipher_array_copy_count",
+            "expected_cipher_array_copy_count",
+            "cipher_array_copy_indices",
+            "expected_cipher_array_copy_indices",
+            "raw_cipher_array_assignments",
             "forbidden_matches",
         }
         or generated_audit.get("schema_version")
-        != "ace.phantom.retained_ckks.generated-source-audit/1.0.0"
+        != "ace.phantom.retained_ckks.generated-source-audit/2.0.0"
         or generated_audit.get("status") != "pass"
         or generated_audit.get("source_sha256")
         != sha256_path(root / "outputs/retained_ckks_phantom.cu")
@@ -535,6 +549,15 @@ def validate_root(root: Path, ace_commit: str, phantom_commit: str) -> dict[str,
         or argument_order != {call: True for call in required_calls}
         or generated_audit.get("expected_rotation_batches") != expected_batches
         or generated_audit.get("observed_rotation_batches") != expected_batches
+        or generated_audit.get("cipher_array_copy_count")
+        != expected_cipher_array_copy_count
+        or generated_audit.get("expected_cipher_array_copy_count")
+        != expected_cipher_array_copy_count
+        or generated_audit.get("cipher_array_copy_indices")
+        != expected_cipher_array_copy_indices
+        or generated_audit.get("expected_cipher_array_copy_indices")
+        != expected_cipher_array_copy_indices
+        or generated_audit.get("raw_cipher_array_assignments") != []
         or generated_audit.get("forbidden_matches") != []
         or generated_audit.get("rotation_array_emission")
         != "ckks-owned-static-int32"

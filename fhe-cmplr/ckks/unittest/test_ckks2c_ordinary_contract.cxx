@@ -1501,6 +1501,7 @@ TEST_F(CKKS2COrdinaryAirVerifier, RejectsDynamicMulMonoPower) {
 TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
   TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
   TYPE_PTR i64 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S64);
+  TYPE_PTR i32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
 
   NODE_PTR conjugate =
       _container->New_cust_node(fhe::ckks::OPC_CONJUGATE, _cipher, _spos);
@@ -1522,6 +1523,25 @@ TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
       _func_scope->New_var(batch_type, "rotated", _spos);
   _container->Stmt_list().Append(_container->New_st(batch, rotated, _spos));
 
+  NODE_PTR rotated_address = _container->New_array(
+      _container->New_lda(rotated, POINTER_KIND::FLAT64, _spos), 1, _spos);
+  _container->Set_array_idx(
+      rotated_address, 0, _container->New_intconst(i32, 0, _spos));
+  NODE_PTR extracted_value = _container->New_ild(rotated_address, _spos);
+  Set_metadata(extracted_value, 2, 1, 3);
+  ADDR_DATUM_PTR extracted =
+      _func_scope->New_var(_cipher, "extracted", _spos);
+  _container->Stmt_list().Append(
+      _container->New_st(extracted_value, extracted, _spos));
+
+  PREG_PTR primitive_preg = _func_scope->New_preg(i64);
+  _container->Stmt_list().Append(_container->New_stp(
+      _container->New_intconst(i64, 7, _spos), primitive_preg, _spos));
+  ADDR_DATUM_PTR primitive_value =
+      _func_scope->New_var(i64, "primitive_value", _spos);
+  _container->Stmt_list().Append(_container->New_st(
+      _container->New_ldp(primitive_preg, _spos), primitive_value, _spos));
+
   NODE_PTR raise =
       _container->New_cust_node(fhe::ckks::OPC_RAISE_MOD, _cipher, _spos);
   raise->Set_child(0, Cipher_load(1, 1, 4));
@@ -1532,7 +1552,9 @@ TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
 
   NODE_PTR mono =
       _container->New_cust_node(fhe::ckks::OPC_MUL_MONO, _cipher, _spos);
-  mono->Set_child(0, Cipher_load(2, 1, 3));
+  NODE_PTR extracted_load = _container->New_ld(extracted, _spos);
+  Set_metadata(extracted_load, 2, 1, 3);
+  mono->Set_child(0, extracted_load);
   mono->Set_child(1, _container->New_intconst(i64, -1, _spos));
   Set_metadata(mono, 2, 1, 3);
   ADDR_DATUM_PTR monomial =
@@ -1612,9 +1634,17 @@ TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
       generated_cipher_symbol("conjugated", false);
   const std::string rotated_symbol =
       generated_cipher_symbol("rotated", true);
+  const std::string extracted_symbol =
+      generated_cipher_symbol("extracted", false);
   const std::string raised_symbol = generated_cipher_symbol("raised", false);
   const std::string monomial_symbol =
       generated_cipher_symbol("monomial", false);
+  const std::regex primitive_declaration(
+      "(^|\\n)  int64_t (primitive_value_[0-9]+);(\\n|$)");
+  std::smatch primitive_match;
+  ASSERT_TRUE(std::regex_search(source, primitive_match,
+                                primitive_declaration));
+  const std::string primitive_symbol = primitive_match[2].str();
 
   const std::size_t input_registration =
       source.find("Register_ciph_lifetime(&" + input_symbol + ")");
@@ -1644,11 +1674,27 @@ TEST_F(CKKS2COrdinaryAirVerifier, EmitsExactRetainedCallsAndResources) {
       source,
       std::regex("Rotate_batch_ciph\\(" + rotated_symbol + ", &" +
                  input_symbol + ", _rot_batch_[0-9]+, 4\\)")));
+  EXPECT_NE(source.find("Copy_ciph(&" + extracted_symbol + ", &" +
+                        rotated_symbol + "[0])"),
+            std::string::npos);
+  EXPECT_EQ(source.find(extracted_symbol + " = " + rotated_symbol + "[0]"),
+            std::string::npos);
+  const std::size_t extracted_registration =
+      source.find("Register_ciph_lifetime(&" + extracted_symbol + ")");
+  const std::size_t extracted_copy =
+      source.find("Copy_ciph(&" + extracted_symbol + ", &" + rotated_symbol +
+                  "[0])");
+  ASSERT_NE(extracted_registration, std::string::npos);
+  ASSERT_NE(extracted_copy, std::string::npos);
+  EXPECT_LT(extracted_registration, extracted_copy);
+  EXPECT_TRUE(std::regex_search(
+      source, std::regex(primitive_symbol + " = _preg_[0-9]+;")));
+  EXPECT_EQ(source.find("Copy_ciph(&" + primitive_symbol), std::string::npos);
   EXPECT_NE(source.find("Raise_mod(&" + raised_symbol + ", &" + input_symbol +
                         ", 4)"),
             std::string::npos);
   EXPECT_NE(source.find("Mul_mono_ciph(&" + monomial_symbol + ", &" +
-                        input_symbol + ", 63)"),
+                        extracted_symbol + ", 63)"),
             std::string::npos);
   EXPECT_NE(source.find("phantom_rotation_batch_offsets[] = {0, 4}"),
             std::string::npos);

@@ -86,6 +86,14 @@ def test_exact_path_imports_and_observes_both_representations() -> None:
     ):
         assert not re.search(rf"\b{wrapper}\s*\(", body)
 
+    imported = _function_body(source, "ImportCoefficientCipher")
+    assert "const auto &stream" in imported
+    assert not re.search(r"const\s+auto\s+stream\s*=", imported)
+    write_access = imported.index("cipher.write_access(stream.get_stream())")
+    host_to_device = imported.index("cudaMemcpyHostToDevice")
+    synchronize = imported.index("cudaStreamSynchronize")
+    assert write_access < host_to_device < synchronize
+
 
 def test_case_matrix_order_and_strict_artifact_schemas_are_literal() -> None:
     source = _source()

@@ -9,7 +9,7 @@
 function(build_external_phantom)
   set(PHANTOM_SOURCE_DIR "" CACHE PATH
       "Local Git repository used to clone the pinned Phantom source")
-  set(PHANTOM_GIT_TAG "7836df81468098bb803c314ac38c8560ae9b2e99"
+  set(PHANTOM_GIT_TAG "dfb94d9d2b60596256f0cae6d8085fdfadf0112e"
       CACHE STRING "Exact Phantom Git commit")
   option(PHANTOM_SOURCE_SNAPSHOT
          "Use a preverified source-only Phantom snapshot" OFF)

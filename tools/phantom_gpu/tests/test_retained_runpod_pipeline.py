@@ -144,6 +144,11 @@ def test_formal_host_gate_audits_production_closure_and_native_test() -> None:
     assert "native-primitives-forbidden-symbols.txt" in host
     assert "ckks-owned-static-int32" in host
     assert "first_distinct_calls" in host
+    assert "cipher_array_copy_count" in host
+    assert "cipher_array_copy_indices" in host
+    assert "raw_cipher_array_assignments" in host
+    assert "expected_cipher_array_copy_count" in runner
+    assert "expected_cipher_array_copy_indices" in runner
     assert "PHANTOM_BUILD_TESTS=ON" in host
     assert "ckks_retained_primitives" in host
     assert "retained_ckks_native_primitives_sm80" in host

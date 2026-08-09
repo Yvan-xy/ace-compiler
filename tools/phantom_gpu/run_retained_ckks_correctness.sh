@@ -784,6 +784,46 @@ expected_batches = [
     *fixture["production_rotation_batches"],
     fixture["rotate_batch_steps"],
 ]
+cipher_arrays = set(
+    re.findall(
+        r"^\s*CIPHERTEXT\s+([A-Za-z_][A-Za-z0-9_]*)\s*"
+        r"\[[^\]\n]+\]\s*;",
+        source,
+        re.MULTILINE,
+    )
+)
+cipher_array_copy_pattern = re.compile(
+    r"Copy_ciph\s*\(\s*&[A-Za-z_][A-Za-z0-9_]*\s*,\s*"
+    r"&([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([0-9]+)\s*\]\s*\)"
+)
+raw_array_assignment_pattern = re.compile(
+    r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*[0-9]+\s*\]\s*;",
+    re.MULTILINE,
+)
+cipher_array_copy_count = sum(
+    match.group(1) in cipher_arrays
+    for match in cipher_array_copy_pattern.finditer(source)
+)
+cipher_array_copy_indices = [
+    int(match.group(2))
+    for match in cipher_array_copy_pattern.finditer(source)
+    if match.group(1) in cipher_arrays
+]
+expected_cipher_array_copy_count = (
+    1
+    + len(fixture["production_rotation_batches"])
+    + len(fixture["rotate_batch_steps"])
+)
+expected_cipher_array_copy_indices = (
+    [0] * (1 + len(fixture["production_rotation_batches"]))
+    + list(range(len(fixture["rotate_batch_steps"])))
+)
+raw_cipher_array_assignments = [
+    match.group(0)
+    for match in raw_array_assignment_pattern.finditer(source)
+    if match.group(1) in cipher_arrays
+]
 forbidden_pattern = re.compile(
     r"Bootstrapper|Phantom_bootstrap|Eval_bootstrap|bootstrap_3|"
     r"FHErt_(?:ant|poly)|fhe::(?:ant|poly)|CoeffToSlot|SlotToCoeff|"
@@ -800,11 +840,14 @@ status = (
     and all(count > 0 for count in call_counts.values())
     and all(argument_order.values())
     and observed_batches == expected_batches
+    and cipher_array_copy_count == expected_cipher_array_copy_count
+    and cipher_array_copy_indices == expected_cipher_array_copy_indices
+    and not raw_cipher_array_assignments
     and source.find("Rotate_ciph(") < 0
     and not forbidden
 )
 value = {
-    "schema_version": "ace.phantom.retained_ckks.generated-source-audit/1.0.0",
+    "schema_version": "ace.phantom.retained_ckks.generated-source-audit/2.0.0",
     "status": "pass" if status else "fail",
     "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
     "required_calls": required_calls,
@@ -814,6 +857,11 @@ value = {
     "rotation_array_emission": "ckks-owned-static-int32",
     "expected_rotation_batches": expected_batches,
     "observed_rotation_batches": observed_batches,
+    "cipher_array_copy_count": cipher_array_copy_count,
+    "expected_cipher_array_copy_count": expected_cipher_array_copy_count,
+    "cipher_array_copy_indices": cipher_array_copy_indices,
+    "expected_cipher_array_copy_indices": expected_cipher_array_copy_indices,
+    "raw_cipher_array_assignments": raw_cipher_array_assignments,
     "forbidden_matches": forbidden,
 }
 report_path.write_text(
