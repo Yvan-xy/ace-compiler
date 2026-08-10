@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
@@ -80,6 +81,8 @@ FORBIDDEN_BOOTSTRAP_SYMBOL_PATTERN = re.compile(
     r"[Pp]recom.*Native|Bootstrap.*[Ss]tage|[Ss]tage.*Bootstrap",
     re.IGNORECASE,
 )
+REPOSITORY = Path(__file__).resolve().parents[2]
+CORRECTNESS_COMPARISON_ENTRYPOINT = "tools/phantom_gpu/compare_environments.py"
 
 
 def sha256(path: Path) -> str:
@@ -123,6 +126,127 @@ def require_digest(value: Any, label: str) -> str:
     if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
         raise SystemExit(f"{label} is not a lowercase SHA-256 digest")
     return value
+
+
+def require_selected_commit_entrypoint(
+    repository: Path,
+    selected_commit: str,
+    entrypoint: Path,
+    repository_relative_path: str,
+) -> None:
+    """Require the executing correctness comparator bytes from its source commit."""
+    if re.fullmatch(r"[0-9a-f]{40}", selected_commit) is None:
+        raise SystemExit("correctness comparison ACE commit is invalid")
+    try:
+        expected = subprocess.run(
+            [
+                "git", "-C", str(repository), "show",
+                f"{selected_commit}:{repository_relative_path}",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+        observed = entrypoint.read_bytes()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SystemExit(
+            "cannot resolve correctness comparison entrypoint from the selected "
+            "ACE commit"
+        ) from error
+    if observed != expected:
+        raise SystemExit(
+            "correctness comparison entrypoint differs from the selected ACE commit"
+        )
+
+
+def validate_terminal_body_closure(
+    source_audit: dict[str, Any],
+    semantics: dict[str, Any],
+    post_ckks_air_sha256: str,
+) -> None:
+    try:
+        constant_count = source_audit["counts"]["constants"]
+        qualification_closure = source_audit["qualification_closure"]
+        closure = qualification_closure["terminal_body_closure"]
+        phantom = closure["phantom"]
+        ant = closure["generated_dsl_ant"]
+        transform_semantics = semantics["identity_domain_attestation"][
+            "normalization"
+        ]["compiler_transform_payload_semantics"]
+        transform_stage_groups = [
+            transform_semantics[direction]["stages"]
+            for direction in ("coefficients_to_slots", "slots_to_coefficients")
+        ]
+        expected_transform_stage_count = sum(
+            len(stages) for stages in transform_stage_groups
+        )
+    except (KeyError, TypeError) as error:
+        raise SystemExit("correctness terminal-body closure is incomplete") from error
+    if (
+        any(not isinstance(stages, list) or not stages for stages in transform_stage_groups)
+        or expected_transform_stage_count <= 0
+        or qualification_closure.get("canonical_post_ckks_air_sha256")
+        != post_ckks_air_sha256
+        or qualification_closure.get("identity_domain_attested") is not True
+        or qualification_closure.get("post_operations_attested") is not True
+        or qualification_closure.get("post_ckks_transform_roles_attested") is not True
+        or qualification_closure.get("post_ckks_evalmod_polynomial_attested")
+        is not True
+        or isinstance(
+            qualification_closure.get("post_ckks_transform_stage_count"), bool
+        )
+        or not isinstance(
+            qualification_closure.get("post_ckks_transform_stage_count"), int
+        )
+        or qualification_closure["post_ckks_transform_stage_count"] <= 0
+        or qualification_closure["post_ckks_transform_stage_count"]
+        != expected_transform_stage_count
+        or set(closure) != {"phantom", "generated_dsl_ant"}
+        or not isinstance(phantom, dict)
+        or set(phantom)
+        != {
+            "reachable_value_count",
+            "transform_constant_count",
+            "reachable_required_stage_count",
+            "scalar_encode_count",
+            "scalar_encode_payload_sha256",
+        }
+        or not isinstance(ant, dict)
+        or set(ant)
+        != {
+            "returned_dependency_count",
+            "transform_constant_count",
+            "reachable_required_stage_count",
+            "scalar_encode_count",
+            "scalar_encode_payload_sha256",
+        }
+        or isinstance(constant_count, bool)
+        or not isinstance(constant_count, int)
+        or constant_count <= 0
+        or phantom["transform_constant_count"] != constant_count
+        or ant["transform_constant_count"] != constant_count
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (
+                phantom["reachable_value_count"],
+                phantom["reachable_required_stage_count"],
+                phantom["scalar_encode_count"],
+                ant["returned_dependency_count"],
+                ant["reachable_required_stage_count"],
+                ant["scalar_encode_count"],
+            )
+        )
+        or phantom["reachable_required_stage_count"] != 4
+        or ant["reachable_required_stage_count"] != 4
+        or phantom["scalar_encode_count"] != ant["scalar_encode_count"]
+        or phantom["scalar_encode_payload_sha256"]
+        != ant["scalar_encode_payload_sha256"]
+    ):
+        raise SystemExit("correctness terminal-body closure is invalid")
+    require_digest(
+        phantom["scalar_encode_payload_sha256"],
+        "correctness terminal scalar payload",
+    )
 
 
 def require_fields(record: dict[str, Any], expected: dict[str, Any], label: str) -> None:
@@ -1475,7 +1599,7 @@ def correctness_fields(root: Path, expected_mode: str) -> dict[str, Any]:
         artifact.get("schema_version") != "ace.phantom.bootstrap-artifacts/3.0.0"
         or artifact.get("status") != "bound"
         or source_audit.get("schema_version")
-        != "ace.phantom.bootstrap-generated-artifact-audit/3.0.0"
+        != "ace.phantom.bootstrap-generated-artifact-audit/4.0.0"
         or source_audit.get("status") != "pass"
         or host_qualification.get("schema_version")
         != "ace.phantom.bootstrap-host-qualification/2.0.0"
@@ -1483,6 +1607,49 @@ def correctness_fields(root: Path, expected_mode: str) -> dict[str, Any]:
         or host_qualification.get("architecture") != "sm_80"
     ):
         raise SystemExit("correctness artifact, source audit, or architecture is invalid")
+    semantics = read_json(packaged / "correctness-bootstrap-semantics.json")
+    generation = read_json(packaged / "correctness-generation.json")
+    post_ckks_air_sha256 = sha256(packaged / "correctness-post-ckks.air")
+    if (
+        generation.get("air", {}).get("post_ckks", {}).get("sha256")
+        != post_ckks_air_sha256
+    ):
+        raise SystemExit("correctness generated post-CKKS AIR binding is invalid")
+    validate_terminal_body_closure(
+        source_audit, semantics, post_ckks_air_sha256
+    )
+    fixture = read_json(packaged / "correctness-fixture.json")
+    identity_attestation = semantics.get("identity_domain_attestation")
+    identity_domain = semantics.get("supported_identity_domain")
+    if (
+        semantics.get("schema_version")
+        != "ace.phantom.generated-bootstrap.semantics/2.0.0"
+        or semantics.get("status") != "pass"
+        or fixture.get("schema_version")
+        != "ace.phantom.bootstrap-correctness-fixture/2.0.0"
+        or not isinstance(identity_domain, dict)
+        or fixture.get("supported_identity_domain", {}).get(
+            "attested_domain"
+        )
+        != identity_domain
+        or not isinstance(identity_attestation, dict)
+        or identity_attestation.get("schema_version")
+        != "ace.phantom.bootstrap-clear-evalmod-domain/1.0.0"
+        or identity_attestation.get("status") != "attested"
+        or identity_attestation.get("scope")
+        != {
+            "purpose": "domain-attestation-only",
+            "provider_value_oracle": False,
+            "may_supply_expected_case_values": False,
+        }
+        or identity_domain.get("evidence", {}).get("attestation_sha256")
+        != hashlib.sha256(
+            json.dumps(
+                identity_attestation, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+        ).hexdigest()
+    ):
+        raise SystemExit("correctness identity-domain authority is invalid")
     for kind in ("ace", "phantom"):
         source = read_json(packaged / f"{kind}-source.manifest.json")
         if source.get("commit") != payload.get(f"{kind}_commit"):
@@ -1567,6 +1734,7 @@ def correctness_fields(root: Path, expected_mode: str) -> dict[str, Any]:
         "correctness-generated-ant.cxx",
         "run_build_and_health.sh",
         "bootstrap_environment.sh",
+        "bootstrap_domain_attestation.py",
         "bootstrap_correctness.py",
         "phase_helpers.sh",
         "source_archive.py",
@@ -1649,6 +1817,13 @@ def main() -> int:
     parser.add_argument("--remote", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
+    if (
+        arguments.mode == "generated-bootstrap-correctness"
+        and arguments.output.exists()
+    ):
+        raise SystemExit(
+            f"correctness comparison output already exists: {arguments.output}"
+        )
     with tempfile.TemporaryDirectory(prefix="ace-environment-compare-") as temporary:
         base = Path(temporary)
         local_root = safe_extract(arguments.local, base / "local")
@@ -1656,6 +1831,16 @@ def main() -> int:
         if arguments.mode == "generated-bootstrap-correctness":
             local = correctness_fields(local_root, "local")
             remote = correctness_fields(remote_root, "runpod")
+            if local["ace_commit"] != remote["ace_commit"]:
+                raise SystemExit(
+                    "correctness comparison source commits differ"
+                )
+            require_selected_commit_entrypoint(
+                REPOSITORY,
+                local["ace_commit"],
+                Path(__file__).resolve(),
+                CORRECTNESS_COMPARISON_ENTRYPOINT,
+            )
         else:
             local = fields(local_root)
             remote = fields(remote_root)

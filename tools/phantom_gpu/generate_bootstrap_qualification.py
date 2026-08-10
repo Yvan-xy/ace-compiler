@@ -35,12 +35,20 @@ from ace_edsl.edsl import (  # noqa: E402
     CkksCiphertext,
     ckks_kernel,
 )
+from ace_edsl.edsl.core.bootstrap_decomposition import (  # noqa: E402
+    build_bootstrap_evalmod_scalar_manifest,
+    build_bootstrap_transform_payload_manifest,
+)
 from retained_air_tools import canonicalize_checkout_paths  # noqa: E402
+from bootstrap_domain_attestation import (  # noqa: E402
+    CLEAR_MAP_BUDGET_FRACTION,
+    derive_supported_identity_domain,
+)
 
 
-GENERATION_SCHEMA = "ace.phantom.bootstrap-generation/3.0.0"
+GENERATION_SCHEMA = "ace.phantom.bootstrap-generation/4.0.0"
 INVOCATION_SCHEMA = "ace.phantom.generated-bootstrap.compiler-invocation/1.0.0"
-SEMANTICS_SCHEMA = "ace.phantom.generated-bootstrap.semantics/1.0.0"
+SEMANTICS_SCHEMA = "ace.phantom.generated-bootstrap.semantics/2.0.0"
 POST_OPERATIONS_SCHEMA = "ace.phantom.bootstrap-post-operation-semantics/1.0.0"
 GENERATOR_TOOL = "tools/phantom_gpu/generate_bootstrap_qualification.py"
 RAW_SCALE_COORDINATE_TOLERANCE = 1.0e-4
@@ -93,6 +101,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--post-multiply-imag", required=True, type=float)
     parser.add_argument("--post-multiply-scale-degree", required=True, type=int)
     parser.add_argument("--post-rotation-step", required=True, type=int)
+    parser.add_argument("--identity-error-threshold", required=True, type=float)
     return parser.parse_args(argv)
 
 
@@ -157,6 +166,11 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         )
     if arguments.post_rotation_step % arguments.vector_capacity == 0:
         raise SystemExit("post-operation rotation must be nonzero modulo vector capacity")
+    if (
+        not math.isfinite(arguments.identity_error_threshold)
+        or arguments.identity_error_threshold <= 0.0
+    ):
+        raise SystemExit("--identity-error-threshold must be finite and positive")
     normalized_rotation = normalize_runtime_rotation_step(
         arguments.post_rotation_step,
         arguments.vector_capacity,
@@ -640,8 +654,6 @@ def build_semantics_record(
     restoration = dict(air_attestation["restoration"])
     restoration["air_sha256"] = sha256_path(post_air_path)
     restored_factor = restoration["restored_factor"]
-    lower = -float(restored_factor) / 2.0
-    upper = float(restored_factor) / 2.0
     scale_degree = attributes["scale"]
     raw_scale = math.ldexp(1.0, scale_degree * arguments.scaling_factor_bits)
     data_q_count = len(context["data_q_bit_sizes"])
@@ -650,23 +662,56 @@ def build_semantics_record(
     post_operation_contracts = json.loads(json.dumps(post_operation_attestation))
     post_operation_contracts["status"] = "pass"
     post_operation_contracts["air_sha256"] = sha256_path(post_operations_air_path)
+    bindings = {
+        "compiler_invocation_sha256": sha256_path(invocation_path),
+        "raw_air_sha256": sha256_path(raw_air_path),
+        "post_ckks_air_sha256": sha256_path(post_air_path),
+        "post_operations_air_sha256": sha256_path(post_operations_air_path),
+        "post_operations_attestation_sha256": sha256_path(
+            post_operations_attestation_path
+        ),
+        "context_manifest_sha256": sha256_path(context_path),
+        "resource_manifest_sha256": sha256_path(resource_path),
+        "constant_manifest_sha256": sha256_path(constant_path),
+        "phantom_source_sha256": sha256_path(phantom_source_path),
+        "generated_dsl_ant_source_sha256": sha256_path(ant_source_path),
+    }
+    domain_bindings = {
+        key: value
+        for key, value in bindings.items()
+        if key
+        not in {
+            "post_operations_air_sha256",
+            "post_operations_attestation_sha256",
+        }
+    }
+    evalmod_scalar_manifest = build_bootstrap_evalmod_scalar_manifest(config)
+    supported_identity_domain, identity_domain_attestation = (
+        derive_supported_identity_domain(
+            coefficients=config.chebyshev_coefficients,
+            scalars=config.double_angle_scalars,
+            overflow_bound=config.eval_sin_upper_bound_k,
+            restoration_factor=float(restored_factor),
+            evalmod_lower=EVALMOD_COMPONENT_LOWER_BOUND,
+            evalmod_upper=EVALMOD_COMPONENT_UPPER_BOUND,
+            provider_clear_threshold=arguments.identity_error_threshold,
+            artifact_bindings=domain_bindings,
+            polynomial_degree=arguments.poly_degree,
+            logical_slots=arguments.vector_capacity,
+            transform_payload_manifest=(
+                build_bootstrap_transform_payload_manifest(config)
+            ),
+            constant_manifest=json.loads(
+                constant_path.read_text(encoding="utf-8")
+            ),
+            evalmod_scalar_manifest=evalmod_scalar_manifest,
+            raw_air=raw_air_path.read_text(encoding="utf-8"),
+        )
+    )
     return {
         "schema_version": SEMANTICS_SCHEMA,
         "status": "pass",
-        "bindings": {
-            "compiler_invocation_sha256": sha256_path(invocation_path),
-            "raw_air_sha256": sha256_path(raw_air_path),
-            "post_ckks_air_sha256": sha256_path(post_air_path),
-            "post_operations_air_sha256": sha256_path(post_operations_air_path),
-            "post_operations_attestation_sha256": sha256_path(
-                post_operations_attestation_path
-            ),
-            "context_manifest_sha256": sha256_path(context_path),
-            "resource_manifest_sha256": sha256_path(resource_path),
-            "constant_manifest_sha256": sha256_path(constant_path),
-            "phantom_source_sha256": sha256_path(phantom_source_path),
-            "generated_dsl_ant_source_sha256": sha256_path(ant_source_path),
-        },
+        "bindings": bindings,
         "expanded_bootstrap": {
             "packing": arguments.packing,
             "logical_slot_capacity": arguments.vector_capacity,
@@ -695,6 +740,9 @@ def build_semantics_record(
                     config.double_angle_scalars
                 ),
             },
+            "evalmod_scalar_encodings": (
+                evalmod_scalar_manifest
+            ),
             "post_scale": {
                 "degree": config.post_scale_degree,
                 "factor": config.post_scale,
@@ -722,19 +770,8 @@ def build_semantics_record(
             "derivation": "terminal-post-ckks-air-and-compiler-context",
         },
         "restoration_attestation": restoration,
-        "supported_identity_domain": {
-            "kind": "centered-evalmod-half-period",
-            "components": ["real", "imaginary"],
-            "lower_exclusive": lower,
-            "upper_exclusive": upper,
-            "period": float(restored_factor),
-            "evidence": {
-                "post_ckks_air_sha256": sha256_path(post_air_path),
-                "constant_manifest_sha256": sha256_path(constant_path),
-                "expanded_coefficient_payload_sha256": coefficient_hash,
-                "restoration_self_add_count": restoration["self_add_count"],
-            },
-        },
+        "supported_identity_domain": supported_identity_domain,
+        "identity_domain_attestation": identity_domain_attestation,
         "post_operation_contracts": post_operation_contracts,
     }
 
@@ -890,6 +927,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "enc_budget": config.enc_budget,
             "dec_budget": config.dec_budget,
             "ct_encode": config.ct_encode,
+        },
+        "identity_domain_policy": {
+            "provider_clear_maximum_absolute": (
+                arguments.identity_error_threshold
+            ),
+            "clear_map_budget_fraction": CLEAR_MAP_BUDGET_FRACTION,
         },
         "normalized_compiler_invocation": file_record(invocation_path),
         "bootstrap_semantics": file_record(semantics_path),

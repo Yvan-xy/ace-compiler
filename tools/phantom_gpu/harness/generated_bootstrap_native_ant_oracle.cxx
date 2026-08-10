@@ -136,7 +136,9 @@ Json RunOracle(const QualificationInputs& inputs, const std::string& executable,
     RequireFullExecution(attestation);
     ++invocation_count;
     const std::vector<Complex> values = Decode(result, inputs.slots);
-    const Json metric = Metric(values, fixture_case.clear, inputs.maximum_error);
+    const Json metric =
+        Metric(values, fixture_case.clear, inputs.maximum_error,
+               std::string(kProvider) + ":" + fixture_case.id);
     records.push_back(AppendValues(
         payload, fixture_case.id, kProvider, values,
         {{"recipe", fixture_case.recipe},

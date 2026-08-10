@@ -2915,7 +2915,10 @@ import sys
 
 runner, record, values, log, version, output = map(Path, sys.argv[1:])
 text = log.read_text(encoding="utf-8")
-if text.count("ERROR SUMMARY:") != 1 or text.count("ERROR SUMMARY: 0") != 1:
+summary_lines = [
+    line for line in text.splitlines() if "ERROR SUMMARY:" in line
+]
+if summary_lines != ["========= ERROR SUMMARY: 0 errors"]:
     raise SystemExit("Compute Sanitizer did not report exactly one zero-error summary")
 digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
 receipt = {

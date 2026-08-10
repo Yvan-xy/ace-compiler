@@ -27,6 +27,7 @@ Usage (from AIRValue._bootstrap_*_primitive methods):
     )
 """
 
+import hashlib
 import math
 import struct
 from dataclasses import dataclass
@@ -516,6 +517,76 @@ def apply_double_angle(
     return x
 
 
+def build_bootstrap_evalmod_scalar_manifest(config: BootstrapConfig):
+    """Trace the exact scalar-encode order of both expanded EvalMod branches."""
+    encoded = []
+
+    class ScalarTrace:
+        def _binary(self, other):
+            if isinstance(other, (int, float)) and not isinstance(other, bool):
+                encoded.append(float(other))
+            return self
+
+        def __add__(self, other):
+            return self._binary(other)
+
+        def __radd__(self, other):
+            return self._binary(other)
+
+        def __sub__(self, other):
+            if isinstance(other, (int, float)) and not isinstance(other, bool):
+                encoded.append(-float(other))
+            return self
+
+        def __rsub__(self, other):
+            return self._binary(other)
+
+        def __mul__(self, other):
+            return self._binary(other)
+
+        def __rmul__(self, other):
+            return self._binary(other)
+
+        def mod_switch(self):
+            return self
+
+    traced = eval_chebyshev_ps(
+        ScalarTrace(),
+        list(config.chebyshev_coefficients),
+        config,
+    )
+    apply_double_angle(
+        traced,
+        num_iter=len(config.double_angle_scalars),
+        scalars=list(config.double_angle_scalars),
+        config=config,
+    )
+    branch = list(encoded)
+    both_branches = branch + branch
+
+    def record(values):
+        payload = b"".join(
+            struct.pack("<dQQ", value, 1, 1) for value in values
+        )
+        return {
+            "count": len(values),
+            "values_binary64_hex": [value.hex() for value in values],
+            "plaintext_length": 1,
+            "scale_degree": 1,
+            "ordered_payload_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+
+    return {
+        "schema_version": (
+            "ace.phantom.bootstrap-evalmod-scalar-encodings/1.0.0"
+        ),
+        "status": "pass",
+        "branch_count": 2,
+        "single_branch": record(branch),
+        "full_program": record(both_branches),
+    }
+
+
 # =========================================================================
 # EvalMod  (Chebyshev + double-angle)
 # =========================================================================
@@ -971,6 +1042,177 @@ def _rotate_plain_vector(values, rotation: int):
     if rot == 0:
         return list(values)
     return [values[(idx + rot) % length] for idx in range(length)]
+
+
+def _complex_vector_sha256(values) -> str:
+    payload = bytearray()
+    for value in values:
+        payload.extend(
+            struct.pack("<dd", float(value.real), float(value.imag))
+        )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _collapsed_fft_stage_payload_manifest(
+    config: BootstrapConfig,
+    encoding: bool,
+):
+    """Describe the exact ordered plaintext arrays emitted by one transform."""
+    slots = config.slots
+    coeff, stages = _collapsed_fft_stage_plan(config, encoding)
+    result = []
+    for stage_order, stage in enumerate(stages):
+        s = stage["s"]
+        num_rot = stage["num_rot"]
+        baby_step = stage["baby_step"]
+        giant_step = stage["giant_step"]
+        shift = stage["shift"]
+        diag_scale = stage["diag_scale"]
+        rot_in = [
+            _reduce_rotation(
+                (j - ((num_rot + 1) // 2) + 1) * shift, slots
+            )
+            for j in range(giant_step)
+        ]
+        compact_terms = _compact_grouped_stage_terms(
+            coeff, stage, slots, config
+        )
+        if compact_terms is None:
+            term_count = num_rot
+            stage_giant_step = giant_step
+        else:
+            term_count = len(compact_terms)
+            stage_giant_step = max(
+                1, (term_count + baby_step - 1) // baby_step
+            )
+            rot_in = [
+                _reduce_rotation(j * shift, slots)
+                for j in range(min(stage_giant_step, term_count))
+            ]
+
+        payload_hashes = []
+        payload_roles = []
+        for i in range(baby_step):
+            giant = stage_giant_step * i
+            giant_rot = giant * shift
+            diag_rotation = _reduce_rotation(-giant_rot, slots)
+            for j in range(len(rot_in)):
+                dim2 = giant + j
+                if dim2 >= term_count:
+                    continue
+                if compact_terms is None:
+                    diag = coeff[s][dim2]
+                else:
+                    _, diag = compact_terms[dim2]
+                if diag_scale != 1.0:
+                    diag = [value * diag_scale for value in diag]
+                if diag_rotation != 0:
+                    diag = _rotate_plain_vector(diag, diag_rotation)
+                payload_sha256 = _complex_vector_sha256(diag)
+                payload_roles.append(
+                    {
+                        "term_order": len(payload_roles),
+                        "baby_step_index": i,
+                        "rotation_batch_index": j,
+                        "collapsed_term_index": dim2,
+                        "input_rotation": rot_in[j],
+                        "giant_rotation": _reduce_rotation(
+                            giant_rot, slots
+                        ),
+                        "diagonal_rotation": diag_rotation,
+                        "payload_sha256": payload_sha256,
+                    }
+                )
+                payload_hashes.append(payload_sha256)
+        result.append(
+            {
+                "stage_order": stage_order,
+                "collapsed_stage": s,
+                "plaintext_level": stage["plain_level"],
+                "diagonal_scale": diag_scale,
+                "diagonal_scale_hex": float(diag_scale).hex(),
+                "payload_count": len(payload_hashes),
+                "ordered_payload_sha256": payload_hashes,
+                "payload_roles": payload_roles,
+            }
+        )
+    return result
+
+
+def build_bootstrap_transform_payload_manifest(config: BootstrapConfig):
+    """Return semantic roles for every emitted transform plaintext payload."""
+    encoding = _collapsed_fft_stage_payload_manifest(config, True)
+    decoding = _collapsed_fft_stage_payload_manifest(config, False)
+
+    def flatten(stages):
+        return [
+            payload
+            for stage in stages
+            for payload in stage["ordered_payload_sha256"]
+        ]
+
+    encoding_payloads = flatten(encoding)
+    decoding_payloads = flatten(decoding)
+    all_payloads = encoding_payloads + decoding_payloads
+    encoding_scale_product = math.prod(
+        stage["diagonal_scale"] for stage in encoding
+    )
+    transform_gain = 2 * config.slots
+    component_input_gain = transform_gain * encoding_scale_product
+    return {
+        "schema_version": (
+            "ace.phantom.bootstrap-transform-payload-semantics/1.0.0"
+        ),
+        "status": "pass",
+        "context": {
+            "polynomial_degree": config.poly_degree,
+            "logical_slots": config.slots,
+            "mul_level": config.mul_level,
+            "first_prime_bits": config.first_prime_bits,
+            "scaling_factor_bits": config.scaling_factor_bits,
+            "q_part_count": config.q_parts,
+            "encode_transform_budget": config.enc_budget,
+            "decode_transform_budget": config.dec_budget,
+            "overflow_bound": config.eval_sin_upper_bound_k,
+            "restoration_factor": config.post_scale,
+        },
+        "normalization": {
+            "configured_coefficients_to_slots_factor": (
+                config.coeffs_to_slots_factor
+            ),
+            "configured_coefficients_to_slots_factor_hex": (
+                config.coeffs_to_slots_factor.hex()
+            ),
+            "encoding_stage_scale_product": encoding_scale_product,
+            "encoding_stage_scale_product_hex": (
+                encoding_scale_product.hex()
+            ),
+            "nominal_full_packed_transform_gain": transform_gain,
+            "nominal_component_input_gain": component_input_gain,
+            "nominal_component_input_gain_hex": component_input_gain.hex(),
+        },
+        "coefficients_to_slots": {
+            "stages": encoding,
+            "payload_count": len(encoding_payloads),
+            "ordered_payload_set_sha256": hashlib.sha256(
+                b"".join(bytes.fromhex(value) for value in encoding_payloads)
+            ).hexdigest(),
+        },
+        "slots_to_coefficients": {
+            "stages": decoding,
+            "payload_count": len(decoding_payloads),
+            "ordered_payload_set_sha256": hashlib.sha256(
+                b"".join(bytes.fromhex(value) for value in decoding_payloads)
+            ).hexdigest(),
+        },
+        "constant_manifest_order": {
+            "payload_count": len(all_payloads),
+            "ordered_payload_sha256": all_payloads,
+            "ordered_payload_set_sha256": hashlib.sha256(
+                b"".join(bytes.fromhex(value) for value in all_payloads)
+            ).hexdigest(),
+        },
+    }
 
 
 def _apply_collapsed_fft_transform(

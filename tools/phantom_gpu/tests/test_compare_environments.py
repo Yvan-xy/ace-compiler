@@ -30,6 +30,205 @@ def digest(character: str) -> str:
     return character * 64
 
 
+def terminal_body_audit() -> dict:
+    scalar_digest = digest("a")
+    return {
+        "counts": {"constants": 6},
+        "qualification_closure": {
+            "canonical_post_ckks_air_sha256": digest("b"),
+            "identity_domain_attested": True,
+            "post_operations_attested": True,
+            "post_ckks_transform_roles_attested": True,
+            "post_ckks_evalmod_polynomial_attested": True,
+            "post_ckks_transform_stage_count": 4,
+            "terminal_body_closure": {
+                "phantom": {
+                    "reachable_value_count": 20,
+                    "transform_constant_count": 6,
+                    "reachable_required_stage_count": 4,
+                    "scalar_encode_count": 8,
+                    "scalar_encode_payload_sha256": scalar_digest,
+                },
+                "generated_dsl_ant": {
+                    "returned_dependency_count": 19,
+                    "transform_constant_count": 6,
+                    "reachable_required_stage_count": 4,
+                    "scalar_encode_count": 8,
+                    "scalar_encode_payload_sha256": scalar_digest,
+                },
+            }
+        },
+    }
+
+
+def terminal_body_semantics() -> dict:
+    return {
+        "identity_domain_attestation": {
+            "normalization": {
+                "compiler_transform_payload_semantics": {
+                    "coefficients_to_slots": {"stages": [{}, {}]},
+                    "slots_to_coefficients": {"stages": [{}, {}]},
+                }
+            }
+        }
+    }
+
+
+def test_correctness_terminal_body_closure_is_exact() -> None:
+    module = load_module()
+    module.validate_terminal_body_closure(
+        terminal_body_audit(), terminal_body_semantics(), digest("b")
+    )
+
+
+def test_correctness_terminal_body_closure_rejects_missing_dependency() -> None:
+    module = load_module()
+    audit = terminal_body_audit()
+    audit["qualification_closure"]["terminal_body_closure"][
+        "generated_dsl_ant"
+    ]["transform_constant_count"] -= 1
+    with pytest.raises(SystemExit, match="terminal-body closure is invalid"):
+        module.validate_terminal_body_closure(
+            audit, terminal_body_semantics(), digest("b")
+        )
+
+
+@pytest.mark.parametrize("provider", ["phantom", "generated_dsl_ant"])
+def test_correctness_terminal_body_closure_rejects_extra_provider_key(
+    provider: str,
+) -> None:
+    module = load_module()
+    audit = terminal_body_audit()
+    audit["qualification_closure"]["terminal_body_closure"][provider][
+        "unexpected"
+    ] = True
+    with pytest.raises(SystemExit, match="terminal-body closure is invalid"):
+        module.validate_terminal_body_closure(
+            audit, terminal_body_semantics(), digest("b")
+        )
+
+
+def test_correctness_terminal_body_closure_requires_all_four_stages() -> None:
+    module = load_module()
+    audit = terminal_body_audit()
+    closure = audit["qualification_closure"]["terminal_body_closure"]
+    closure["phantom"]["reachable_required_stage_count"] = 1
+    closure["generated_dsl_ant"]["reachable_required_stage_count"] = 1
+    with pytest.raises(SystemExit, match="terminal-body closure is invalid"):
+        module.validate_terminal_body_closure(
+            audit, terminal_body_semantics(), digest("b")
+        )
+
+
+def test_correctness_terminal_body_closure_requires_outer_attestations() -> None:
+    module = load_module()
+    for field in (
+        "identity_domain_attested",
+        "post_operations_attested",
+        "post_ckks_transform_roles_attested",
+        "post_ckks_evalmod_polynomial_attested",
+    ):
+        audit = terminal_body_audit()
+        del audit["qualification_closure"][field]
+        with pytest.raises(SystemExit, match="terminal-body closure is invalid"):
+            module.validate_terminal_body_closure(
+                audit, terminal_body_semantics(), digest("b")
+            )
+
+
+def test_correctness_terminal_body_closure_rejects_post_air_mismatch() -> None:
+    module = load_module()
+    with pytest.raises(SystemExit, match="terminal-body closure is invalid"):
+        module.validate_terminal_body_closure(
+            terminal_body_audit(), terminal_body_semantics(), digest("c")
+        )
+
+
+def test_correctness_terminal_stage_count_comes_from_semantics() -> None:
+    module = load_module()
+    semantics = terminal_body_semantics()
+    semantics["identity_domain_attestation"]["normalization"][
+        "compiler_transform_payload_semantics"
+    ]["coefficients_to_slots"]["stages"].append({})
+    with pytest.raises(SystemExit, match="terminal-body closure is invalid"):
+        module.validate_terminal_body_closure(
+            terminal_body_audit(), semantics, digest("b")
+        )
+
+
+def test_correctness_comparator_requires_exact_selected_commit_bytes(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    repository = tmp_path / "repository"
+    entrypoint = repository / "tools/phantom_gpu/compare_environments.py"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_bytes(b"selected comparator bytes\n")
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "add", "tools/phantom_gpu/compare_environments.py"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-qm", "selected comparator"],
+        check=True,
+    )
+    selected_commit = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    module.require_selected_commit_entrypoint(
+        repository,
+        selected_commit,
+        entrypoint,
+        "tools/phantom_gpu/compare_environments.py",
+    )
+    entrypoint.write_bytes(b"dirty comparator bytes\n")
+    with pytest.raises(
+        SystemExit,
+        match="comparison entrypoint differs from the selected ACE commit",
+    ):
+        module.require_selected_commit_entrypoint(
+            repository,
+            selected_commit,
+            entrypoint,
+            "tools/phantom_gpu/compare_environments.py",
+        )
+
+
+def test_correctness_comparator_refuses_existing_output_before_archive_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_module()
+    output = tmp_path / "comparison.json"
+    output.write_text("do not replace\n", encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(SCRIPT),
+            "--mode", "generated-bootstrap-correctness",
+            "--local", str(tmp_path / "missing-local.tar.gz"),
+            "--remote", str(tmp_path / "missing-remote.tar.gz"),
+            "--output", str(output),
+        ],
+    )
+    with pytest.raises(SystemExit, match="output already exists"):
+        module.main()
+    assert output.read_text(encoding="utf-8") == "do not replace\n"
+
+
 def write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")

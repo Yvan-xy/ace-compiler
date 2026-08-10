@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 source "${SCRIPT_DIR}/transport_helpers.sh"
 
 HOST=""
@@ -46,6 +47,132 @@ if (( REMOTE_TIMEOUT < 60 || REMOTE_TIMEOUT > 2100 )); then
 fi
 
 PAYLOAD="$(realpath -- "${PAYLOAD}")"
+CORRECTNESS_ACE_COMMIT="$(python3 - "${PAYLOAD}" <<'PY'
+import hashlib
+import json
+from pathlib import Path, PurePosixPath
+import re
+import sys
+
+root = Path(sys.argv[1])
+payload_path = root / "payload.json"
+correctness_schema = (
+    "ace.phantom.generated-bootstrap-correctness-payload/1.0.0"
+)
+if not payload_path.is_file():
+    print("")
+    raise SystemExit(0)
+
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate payload key: {key}")
+        result[key] = value
+    return result
+
+
+try:
+    payload = json.loads(
+        payload_path.read_text(encoding="utf-8"),
+        object_pairs_hook=reject_duplicates,
+    )
+except (OSError, UnicodeError, ValueError) as error:
+    try:
+        mentions_correctness = correctness_schema in payload_path.read_text(
+            encoding="utf-8"
+        )
+    except (OSError, UnicodeError):
+        mentions_correctness = False
+    if mentions_correctness:
+        raise SystemExit("correctness payload JSON is invalid") from error
+    print("")
+    raise SystemExit(0)
+if not isinstance(payload, dict) or payload.get("schema_version") != correctness_schema:
+    print("")
+    raise SystemExit(0)
+
+sums_path = root / "SHA256SUMS"
+if not sums_path.is_file():
+    raise SystemExit("correctness payload lacks SHA256SUMS")
+listed = {}
+for line in sums_path.read_text(encoding="utf-8").splitlines():
+    match = re.fullmatch(r"([0-9a-f]{64}) ([ *])(.+)", line)
+    if match is None:
+        raise SystemExit("correctness payload SHA256SUMS has a malformed entry")
+    name = match.group(3).removeprefix("./")
+    path = PurePosixPath(name)
+    if (
+        not name
+        or path.is_absolute()
+        or ".." in path.parts
+        or len(path.parts) != 1
+        or str(path) != name
+        or name == "SHA256SUMS"
+        or name in listed
+    ):
+        raise SystemExit("correctness payload SHA256SUMS has an unsafe entry")
+    listed[name] = match.group(1)
+actual = {}
+for path in root.iterdir():
+    if path.name == "SHA256SUMS":
+        continue
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit("correctness payload contains a non-regular entry")
+    actual[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+if listed != actual:
+    raise SystemExit("correctness payload checksum closure is invalid")
+if set(payload) != {
+    "schema_version", "status", "ace_commit", "phantom_commit",
+    "source_snapshots", "host_oracles_replayed", "files",
+}:
+    raise SystemExit("correctness payload schema is invalid")
+source_snapshots = payload["source_snapshots"]
+files = payload["files"]
+expected_files = {
+    name: digest
+    for name, digest in actual.items()
+    if name != "payload.json"
+}
+if (
+    payload["status"] != "pass"
+    or payload["host_oracles_replayed"] is not True
+    or not isinstance(payload["ace_commit"], str)
+    or re.fullmatch(r"[0-9a-f]{40}", payload["ace_commit"]) is None
+    or not isinstance(payload["phantom_commit"], str)
+    or re.fullmatch(r"[0-9a-f]{40}", payload["phantom_commit"]) is None
+    or not isinstance(source_snapshots, dict)
+    or set(source_snapshots) != {
+        "ace_manifest_sha256", "phantom_manifest_sha256"
+    }
+    or any(
+        not isinstance(value, str)
+        or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in source_snapshots.values()
+    )
+    or not isinstance(files, dict)
+    or files != expected_files
+):
+    raise SystemExit("correctness payload schema is invalid")
+print(payload["ace_commit"])
+PY
+)"
+if [[ -n "${CORRECTNESS_ACE_COMMIT}" ]]; then
+  expected_entrypoint_sha256="$(
+    git -C "${REPO_ROOT}" show \
+      "${CORRECTNESS_ACE_COMMIT}:tools/phantom_gpu/runpod_transfer.sh" |
+      sha256sum | awk '{print $1}'
+  )"
+  observed_entrypoint_sha256="$(
+    sha256sum "${REPO_ROOT}/tools/phantom_gpu/runpod_transfer.sh" |
+      awk '{print $1}'
+  )"
+  if [[ "${observed_entrypoint_sha256}" != "${expected_entrypoint_sha256}" ]]; then
+    echo "correctness RunPod transfer entrypoint differs from the selected ACE commit" >&2
+    exit 1
+  fi
+fi
 OUTPUT="$(realpath -m -- "${OUTPUT}")"
 if [[ -e "${OUTPUT}" ]]; then
   echo "output already exists: ${OUTPUT}" >&2

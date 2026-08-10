@@ -33,6 +33,7 @@ OPTION_VALUES = {
     "--post-multiply-imag": "0",
     "--post-multiply-scale-degree": "0",
     "--post-rotation-step": "3",
+    "--identity-error-threshold": "0.01",
 }
 
 
@@ -68,6 +69,8 @@ def test_normalized_invocation_is_typed_and_destination_independent() -> None:
     assert first["options"] == generator.typed_options(arguments())
     assert "fresh-output" not in json.dumps(first)
     assert "another-destination" not in json.dumps(first)
+    assert "identity_error_threshold" not in first["options"]
+    assert "--identity-error-threshold" not in first["normalized_argv"]
 
 
 def test_rotation_normalization_preserves_even_capacity_half_turn() -> None:

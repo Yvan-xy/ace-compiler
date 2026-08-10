@@ -51,7 +51,16 @@ def test_runtime_attestation_distinguishes_the_identity_copy_path() -> None:
 
 def test_shared_contract_matches_the_canonical_fixture_and_value_file() -> None:
     shared = source(COMMON)
-    assert "ace.phantom.bootstrap-correctness-fixture/1.0.0" in shared
+    assert "ace.phantom.bootstrap-correctness-fixture/2.0.0" in shared
+    assert "ace.phantom.generated-bootstrap.semantics/2.0.0" in shared
+    assert "ace.phantom.bootstrap-clear-evalmod-domain/1.0.0" in shared
+    assert "centered-evalmod-complex-error-bounded" in shared
+    assert "canonical_identity_attestation" in shared
+    assert "identity_attestation_sha256" in shared
+    assert (
+        'domain_evidence.at("attestation_sha256") ==\n'
+        "              identity_attestation_sha256"
+    ) in shared
     assert "ace.bootstrap-correctness.complex_float64le/1.0.0" in shared
     assert "'A', 'C', 'E', 'B',\n                                                      'S', 'C', '0', '1'" in shared
     for binding in (
@@ -84,6 +93,26 @@ def test_shared_contract_matches_the_canonical_fixture_and_value_file() -> None:
         assert option in shared
     assert "provider_clear_maximum_absolute" in shared
     assert "kRequiredMaximumError = 1.0e-2" in shared
+    for field in (
+        "comparison=",
+        "maximum_absolute_error=",
+        "maximum_absolute_error_index=",
+        "actual_real=",
+        "actual_imaginary=",
+        "expected_real=",
+        "expected_imaginary=",
+        "mean_absolute_error=",
+        "root_mean_square_error=",
+        "threshold=",
+    ):
+        assert field in shared
+    assert "std::numeric_limits<double>::max_digits10" in shared
+    random_real = shared.index("const double real = generator.Symmetric(bound)")
+    random_imaginary = shared.index(
+        "const double imaginary = generator.Symmetric(bound)"
+    )
+    random_complex = shared.index("value = Complex(real, imaginary)")
+    assert random_real < random_imaginary < random_complex
     assert "post-operation rotation is not canonical and nonzero" in shared
     assert "post-operation rotation is absent from compiler resources" in shared
     assert "bytes.size() == 128U" in shared
@@ -112,6 +141,7 @@ def test_native_oracle_uses_explicit_budgets_and_requires_full_execution() -> No
     assert "value.full_completion_count == 1U" in native
     assert "Decode(result, inputs.slots)" in native
     assert 'constexpr char kProvider[] = "native-ant"' in native
+    assert 'std::string(kProvider) + ":" + fixture_case.id' in native
     assert '"context_attestation", context_attestation' in native
 
 
@@ -124,6 +154,7 @@ def test_generated_oracle_calls_only_the_linked_decomposition() -> None:
     assert "Eval_bootstrap_ciph(" not in generated
     assert re.search(r"\bBootstrap\s*\(", generated) is None
     assert 'constexpr char kProvider[] = "generated-ant"' in generated
+    assert 'std::string(kProvider) + ":" + fixture_case.id' in generated
     assert "Decode(&result, inputs.slots)" in generated
     assert '"context_attestation", context_attestation' in generated
     io_block = generated[generated.index('extern "C" {') : generated.index(
@@ -160,6 +191,7 @@ def test_compile_gate_builds_and_runs_both_host_oracles_before_gpu_use() -> None
         "--post-multiply-imag",
         "--post-multiply-scale-degree",
         "--post-rotation-step",
+        "--identity-error-threshold",
         "--fixture-id",
         "--fixture-seed",
         "--inside-margin",
@@ -206,7 +238,19 @@ def test_compile_gate_builds_and_runs_both_host_oracles_before_gpu_use() -> None
     assert "generated_bootstrap_phantom_correctness_sm80" in script
     assert "ace.phantom.bootstrap-artifacts/3.0.0" in script
     assert "ace.phantom.bootstrap-host-qualification/2.0.0" in script
-    assert "ace.phantom.bootstrap-generated-artifact-audit/3.0.0" in script
+    assert "ace.phantom.bootstrap-generated-artifact-audit/4.0.0" in script
+    assert "bootstrap terminal-body closure is invalid" in script
+    assert 'set(phantom_body)' in script
+    assert 'set(ant_body)' in script
+    assert 'phantom_body["reachable_required_stage_count"] != 4' in script
+    assert 'ant_body["reachable_required_stage_count"] != 4' in script
+    assert 'qualification_closure.get("post_ckks_transform_roles_attested")' in script
+    assert (
+        'qualification_closure.get("post_ckks_evalmod_polynomial_attested")'
+        in script
+    )
+    assert 'transform_semantics[direction]["stages"]' in script
+    assert 'qualification_closure.get("canonical_post_ckks_air_sha256")' in script
     for audit_option in (
         "--ant-source",
         "--generation-record",
@@ -217,6 +261,7 @@ def test_compile_gate_builds_and_runs_both_host_oracles_before_gpu_use() -> None
         assert audit_option in script
     for suite in (
         "test_generated_bootstrap_invocation.py",
+        "test_bootstrap_domain_attestation.py",
         "test_bootstrap_correctness.py",
         "test_generated_bootstrap_host_oracle_sources.py",
         "test_generated_bootstrap_correctness_lifecycle.py",

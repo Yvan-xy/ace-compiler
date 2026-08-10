@@ -224,13 +224,13 @@ Inputs Authenticate(char **argv) {
                0,
                0};
   Require(input.fixture.at("schema_version") ==
-              "ace.phantom.bootstrap-correctness-fixture/1.0.0",
+              "ace.phantom.bootstrap-correctness-fixture/2.0.0",
           "fixture schema mismatch");
   Require(input.invocation.at("schema_version") ==
               "ace.phantom.generated-bootstrap.compiler-invocation/1.0.0",
           "invocation schema mismatch");
   Require(input.semantics.at("schema_version") ==
-              "ace.phantom.generated-bootstrap.semantics/1.0.0",
+              "ace.phantom.generated-bootstrap.semantics/2.0.0",
           "semantics schema mismatch");
   Require(input.attestation.at("schema_version") ==
                   "ace.phantom.bootstrap-post-operation-semantics/1.0.0" &&
@@ -264,6 +264,78 @@ Inputs Authenticate(char **argv) {
   Require(input.fixture.at("supported_identity_domain").at("attested_domain") ==
               input.semantics.at("supported_identity_domain"),
           "identity domain mismatch");
+  const auto &domain = input.semantics.at("supported_identity_domain");
+  const auto &domain_evidence = domain.at("evidence");
+  const auto &identity_attestation =
+      input.semantics.at("identity_domain_attestation");
+  const std::string canonical_identity_attestation =
+      identity_attestation.dump();
+  const std::string identity_attestation_sha256 = Sha256(
+      reinterpret_cast<const std::uint8_t *>(
+          canonical_identity_attestation.data()),
+      canonical_identity_attestation.size());
+  const double domain_lower = domain.at("lower_exclusive").get<double>();
+  const double domain_upper = domain.at("upper_exclusive").get<double>();
+  Require(domain.at("kind") ==
+                  "centered-evalmod-complex-error-bounded" &&
+              domain.at("components") == Json::array({"real", "imaginary"}) &&
+              std::isfinite(domain_lower) && std::isfinite(domain_upper) &&
+              domain_lower < 0.0 && domain_upper > 0.0 &&
+              domain_lower == -domain_upper &&
+              domain_evidence.at("attestation_schema_version") ==
+                  "ace.phantom.bootstrap-clear-evalmod-domain/1.0.0" &&
+              identity_attestation.at("schema_version") ==
+                  "ace.phantom.bootstrap-clear-evalmod-domain/1.0.0" &&
+              identity_attestation.at("status") == "attested" &&
+              identity_attestation.at("scope") ==
+                  Json{{"purpose", "domain-attestation-only"},
+                       {"provider_value_oracle", false},
+                       {"may_supply_expected_case_values", false}} &&
+              domain_evidence.at("attestation_sha256").is_string() &&
+              domain_evidence.at("attestation_sha256") ==
+                  identity_attestation_sha256,
+          "identity-domain attestation is invalid");
+  const auto &semantic_bindings = input.semantics.at("bindings");
+  const auto &domain_bindings =
+      identity_attestation.at("artifact_bindings");
+  const std::array<const char *, 8> required_domain_bindings = {
+      "compiler_invocation_sha256", "constant_manifest_sha256",
+      "context_manifest_sha256", "generated_dsl_ant_source_sha256",
+      "phantom_source_sha256", "post_ckks_air_sha256", "raw_air_sha256",
+      "resource_manifest_sha256"};
+  Require(domain_bindings.size() == required_domain_bindings.size(),
+          "identity-domain artifact binding count changed");
+  for (const char *name : required_domain_bindings)
+    Require(domain_bindings.at(name) == semantic_bindings.at(name),
+            std::string("identity-domain artifact binding mismatch: ") + name);
+  const auto &domain_errors = identity_attestation.at("error_contract");
+  Require(domain_errors.at("target") ==
+                  "original-clear-complex-identity" &&
+              domain_errors.at("aggregate_norm") == "complex-absolute-l2" &&
+              domain_errors.at("provider_clear_maximum_absolute") == 1e-2 &&
+              domain_errors.at("clear_map_budget_fraction") == 0.5 &&
+              domain_errors.at("maximum_complex_clear_map_error") == 0.005 &&
+              domain_errors.at("reserved_provider_numerical_error") == 0.005 &&
+              domain_evidence.at("provider_clear_maximum_absolute") == 1e-2 &&
+              domain_evidence.at("maximum_complex_clear_map_error") == 0.005 &&
+              domain_evidence.at("reserved_provider_numerical_error") == 0.005,
+          "identity-domain error budget differs from frozen tolerances");
+  const auto &domain_proof = identity_attestation.at("proof");
+  Require(domain_proof.at("selected_radius") == domain_upper &&
+              domain_proof.at("next_outward_radius").get<double>() >
+                  domain_upper &&
+              domain_proof.at("binary64_selection") ==
+                  "conservative-certified-binary64-marker-used-as-exclusive-endpoint" &&
+              domain_proof.at("arithmetic")
+                      .at("transcendental_approximations_used") == false,
+          "identity-domain boundary proof is invalid");
+  const auto &domain_context =
+      identity_attestation.at("normalization").at("compiler_context");
+  Require(domain_context.at("polynomial_degree") ==
+                  input.context.at("polynomial_degree") &&
+              domain_context.at("logical_slots") ==
+                  input.context.at("logical_slot_capacity"),
+          "identity-domain normalization differs from compiler context");
   input.slots = input.context.at("logical_slot_capacity").get<std::size_t>();
   input.input_level = input.context.at("input_level").get<int>();
   Require(input.slots > 0 && input.input_level > 0,
@@ -295,8 +367,11 @@ Materialize(const Inputs &input) {
           seed ^
           std::stoull(recipe.at("seed_xor").get<std::string>(), nullptr, 16));
       const double bound = recipe.at("component_bound");
-      for (auto &value : values)
-        value = {generator.Symmetric(bound), generator.Symmetric(bound)};
+      for (auto &value : values) {
+        const double real = generator.Symmetric(bound);
+        const double imaginary = generator.Symmetric(bound);
+        value = {real, imaginary};
+      }
     } else if (kind == "zero")
       std::fill(values.begin(), values.end(), Complex{});
     else if (kind == "real_constant" || kind == "complex_constant") {
@@ -435,11 +510,15 @@ double Maximum(const std::vector<Complex> &actual,
   return maximum;
 }
 Json Metric(const std::vector<Complex> &actual,
-            const std::vector<Complex> &expected, double threshold) {
+            const std::vector<Complex> &expected, double threshold,
+            const std::string &comparison) {
+  Require(actual.size() == expected.size() && !actual.empty(),
+          "metric vectors have unequal or zero length");
   double maximum = -1, sum = 0, squares = 0;
   std::size_t max_index = 0;
   for (std::size_t index = 0; index < actual.size(); ++index) {
     const double error = std::abs(actual[index] - expected[index]);
+    Require(std::isfinite(error), "metric contains a non-finite error");
     if (error > maximum) {
       maximum = error;
       max_index = index;
@@ -447,7 +526,23 @@ Json Metric(const std::vector<Complex> &actual,
     sum += error;
     squares += error * error;
   }
-  Require(maximum <= threshold, "numerical threshold exceeded");
+  if (maximum > threshold) {
+    std::ostringstream message;
+    message << std::setprecision(std::numeric_limits<double>::max_digits10)
+            << "generated Phantom result exceeds the frozen numerical threshold: "
+            << "comparison=" << comparison
+            << ", maximum_absolute_error=" << maximum
+            << ", maximum_absolute_error_index=" << max_index
+            << ", actual_real=" << actual[max_index].real()
+            << ", actual_imaginary=" << actual[max_index].imag()
+            << ", expected_real=" << expected[max_index].real()
+            << ", expected_imaginary=" << expected[max_index].imag()
+            << ", mean_absolute_error=" << sum / actual.size()
+            << ", root_mean_square_error="
+            << std::sqrt(squares / actual.size())
+            << ", threshold=" << threshold;
+    Fail(message.str());
+  }
   return {{"status", "pass"},
           {"comparison_count", actual.size()},
           {"threshold", threshold},
@@ -547,7 +642,10 @@ Json Run(const Inputs &input,
       else
         Require(metadata == expected_metadata,
                 "bootstrap metadata differs across calls or cases");
-      call_metrics.push_back(Metric(decoded, item.second, input.threshold));
+      call_metrics.push_back(Metric(
+          decoded, item.second, input.threshold,
+          "generated-phantom/" + item.first + "/bootstrap-call-" +
+              std::to_string(call)));
       calls.push_back(decoded);
       call_metadata.push_back(metadata);
       if (call == 0)
@@ -581,7 +679,9 @@ Json Run(const Inputs &input,
     const double post_threshold =
         input.threshold * std::max(1.0, std::abs(multiplier));
     Json multiply_metric =
-        Metric(multiply_values, multiply_expected, post_threshold);
+        Metric(multiply_values, multiply_expected, post_threshold,
+               "generated-phantom/" + item.first +
+                   "/ciphertext-plaintext-multiply");
     Json multiply_metadata = Metadata(&multiply_result);
     Require(multiply_metadata ==
                 Transition(expected_metadata, multiply_transition),
@@ -600,7 +700,8 @@ Json Run(const Inputs &input,
     }
     auto rotate_values = Decode(&rotate_result, input.slots);
     Json rotate_metric =
-        Metric(rotate_values, rotate_expected, input.threshold);
+        Metric(rotate_values, rotate_expected, input.threshold,
+               "generated-phantom/" + item.first + "/rotation");
     Json rotate_metadata = Metadata(&rotate_result);
     Require(rotate_metadata ==
                 Transition(expected_metadata,
@@ -618,7 +719,9 @@ Json Run(const Inputs &input,
         {"value_count", input.slots},
         {"metadata",
          {{"bootstrap", expected_metadata},
-          {"metrics_vs_clear", Metric(calls[0], item.second, input.threshold)},
+          {"metrics_vs_clear",
+           Metric(calls[0], item.second, input.threshold,
+                  "generated-phantom/" + item.first + "/primary-output")},
           {"repeatability",
            {{"calls", 3},
             {"independently_owned_clones", true},

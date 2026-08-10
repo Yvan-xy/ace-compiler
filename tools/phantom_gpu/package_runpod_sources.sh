@@ -140,27 +140,208 @@ package_generated_bootstrap_correctness() {
   python3 - "${run_root}/artifact_manifest.json" \
     "${qualification}/qualification.json" \
     "${run_root}/qualification_invocation.json" \
+    "${run_root}/bootstrap_generation_invocation.json" \
+    "${qualification}/generation.json" \
+    "${qualification}/bootstrap_semantics.json" \
+    "${qualification}/bootstrap_correctness_fixture.json" \
+    "${qualification}/source-audit.json" \
     "${qualification}/cuda_elf.txt" <<'PY'
+import hashlib
 import json
 from pathlib import Path
 import sys
 
-artifact, qualification, invocation = [
-    json.loads(Path(value).read_text(encoding="utf-8")) for value in sys.argv[1:4]
+(
+    artifact,
+    qualification,
+    qualification_invocation,
+    generation_invocation,
+    generation,
+    semantics,
+    fixture,
+    source_audit,
+) = [
+    json.loads(Path(value).read_text(encoding="utf-8")) for value in sys.argv[1:9]
 ]
 if artifact.get("schema_version") != "ace.phantom.bootstrap-artifacts/3.0.0":
     raise SystemExit("correctness artifact manifest schema is unsupported")
 if qualification.get("schema_version") != "ace.phantom.bootstrap-host-qualification/2.0.0":
     raise SystemExit("correctness host qualification schema is unsupported")
 if (
-    invocation.get("schema_version")
-    != "ace.phantom.bootstrap-qualification-invocation/1.0.0"
-    or not isinstance(invocation.get("argv"), list)
-    or len(invocation["argv"]) < 2
-    or not all(isinstance(value, str) for value in invocation["argv"])
+    generation.get("schema_version")
+    != "ace.phantom.bootstrap-generation/4.0.0"
+    or generation.get("status") != "pass"
+    or semantics.get("schema_version")
+    != "ace.phantom.generated-bootstrap.semantics/2.0.0"
+    or semantics.get("status") != "pass"
+    or fixture.get("schema_version")
+    != "ace.phantom.bootstrap-correctness-fixture/2.0.0"
+    or source_audit.get("schema_version")
+    != "ace.phantom.bootstrap-generated-artifact-audit/4.0.0"
+    or source_audit.get("status") != "pass"
 ):
-    raise SystemExit("correctness qualification invocation is invalid")
-if "sm_80" not in Path(sys.argv[4]).read_text(encoding="utf-8"):
+    raise SystemExit("correctness generated authority schema is unsupported")
+try:
+    constant_count = source_audit["counts"]["constants"]
+    qualification_closure = source_audit["qualification_closure"]
+    body_closure = qualification_closure["terminal_body_closure"]
+    phantom_body = body_closure["phantom"]
+    ant_body = body_closure["generated_dsl_ant"]
+    transform_semantics = semantics["identity_domain_attestation"][
+        "normalization"
+    ]["compiler_transform_payload_semantics"]
+    transform_stage_groups = [
+        transform_semantics[direction]["stages"]
+        for direction in ("coefficients_to_slots", "slots_to_coefficients")
+    ]
+    expected_transform_stage_count = sum(
+        len(stages) for stages in transform_stage_groups
+    )
+    generated_post_ckks_sha256 = generation["air"]["post_ckks"]["sha256"]
+except (KeyError, TypeError) as error:
+    raise SystemExit("correctness terminal-body closure is incomplete") from error
+if (
+    any(not isinstance(stages, list) or not stages for stages in transform_stage_groups)
+    or expected_transform_stage_count <= 0
+    or generated_post_ckks_sha256 != artifact.get("post_ckks_air_sha256")
+    or generated_post_ckks_sha256
+    != source_audit.get("inputs", {}).get("post_ckks_air", {}).get("sha256")
+    or qualification_closure.get("canonical_post_ckks_air_sha256")
+    != generated_post_ckks_sha256
+    or qualification_closure.get("identity_domain_attested") is not True
+    or qualification_closure.get("post_operations_attested") is not True
+    or qualification_closure.get("post_ckks_transform_roles_attested") is not True
+    or qualification_closure.get("post_ckks_evalmod_polynomial_attested") is not True
+    or isinstance(
+        qualification_closure.get("post_ckks_transform_stage_count"), bool
+    )
+    or not isinstance(
+        qualification_closure.get("post_ckks_transform_stage_count"), int
+    )
+    or qualification_closure["post_ckks_transform_stage_count"] <= 0
+    or qualification_closure["post_ckks_transform_stage_count"]
+    != expected_transform_stage_count
+    or set(body_closure) != {"phantom", "generated_dsl_ant"}
+    or not isinstance(phantom_body, dict)
+    or set(phantom_body)
+    != {
+        "reachable_value_count",
+        "transform_constant_count",
+        "reachable_required_stage_count",
+        "scalar_encode_count",
+        "scalar_encode_payload_sha256",
+    }
+    or not isinstance(ant_body, dict)
+    or set(ant_body)
+    != {
+        "returned_dependency_count",
+        "transform_constant_count",
+        "reachable_required_stage_count",
+        "scalar_encode_count",
+        "scalar_encode_payload_sha256",
+    }
+    or phantom_body["transform_constant_count"] != constant_count
+    or ant_body["transform_constant_count"] != constant_count
+    or phantom_body["reachable_required_stage_count"] != 4
+    or ant_body["reachable_required_stage_count"] != 4
+    or phantom_body["scalar_encode_count"] != ant_body["scalar_encode_count"]
+    or phantom_body["scalar_encode_payload_sha256"]
+    != ant_body["scalar_encode_payload_sha256"]
+    or not all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (
+            constant_count,
+            phantom_body["reachable_value_count"],
+            phantom_body["reachable_required_stage_count"],
+            phantom_body["scalar_encode_count"],
+            ant_body["returned_dependency_count"],
+            ant_body["reachable_required_stage_count"],
+            ant_body["scalar_encode_count"],
+        )
+    )
+    or not isinstance(phantom_body["scalar_encode_payload_sha256"], str)
+    or len(phantom_body["scalar_encode_payload_sha256"]) != 64
+    or any(
+        character not in "0123456789abcdef"
+        for character in phantom_body["scalar_encode_payload_sha256"]
+    )
+):
+    raise SystemExit("correctness terminal-body closure is invalid")
+
+
+def checked_argv(record, schema, label):
+    argv = record.get("argv")
+    if (
+        record.get("schema_version") != schema
+        or not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(value, str) and value for value in argv)
+    ):
+        raise SystemExit(f"correctness {label} invocation is invalid")
+    normalized = json.dumps(
+        argv, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    if hashlib.sha256(normalized).hexdigest() != record.get(
+        "normalized_argv_sha256"
+    ):
+        raise SystemExit(f"correctness {label} invocation hash is invalid")
+    return argv
+
+
+qualification_argv = checked_argv(
+    qualification_invocation,
+    "ace.phantom.qualification-invocation/1.0.0",
+    "qualification",
+)
+generation_argv = checked_argv(
+    generation_invocation,
+    "ace.phantom.bootstrap-qualification-invocation/1.0.0",
+    "generation",
+)
+if qualification_argv[0] != "tools/phantom_gpu/compile_only.sh":
+    raise SystemExit("correctness qualification tool is invalid")
+if generation_argv[:2] != [
+    "tools/phantom_gpu/generate_bootstrap_qualification.py",
+    "bootstrap_qualification",
+]:
+    raise SystemExit("correctness generation tool or destination is invalid")
+
+
+def unique_options(arguments, label):
+    if len(arguments) % 2:
+        raise SystemExit(f"correctness {label} invocation has an unpaired option")
+    options = dict(zip(arguments[0::2], arguments[1::2]))
+    if len(options) != len(arguments) // 2:
+        raise SystemExit(f"correctness {label} invocation repeats an option")
+    return options
+
+
+qualification_options = unique_options(qualification_argv[1:], "qualification")
+generation_options = unique_options(generation_argv[2:], "generation")
+compiler_option_names = {
+    "--poly-degree", "--vector-capacity", "--mul-level", "--input-level",
+    "--security-level", "--scaling-factor-bits", "--first-prime-bits",
+    "--hamming-weight", "--q-part-count", "--encode-transform-budget",
+    "--decode-transform-budget", "--ciphertext-constant-encoding", "--packing",
+    "--post-multiply-real", "--post-multiply-imag",
+    "--post-multiply-scale-degree", "--post-rotation-step",
+}
+semantic_policy_names = {"--identity-error-threshold"}
+if set(generation_options) != compiler_option_names | semantic_policy_names:
+    raise SystemExit("correctness generation invocation is not fully explicit")
+if {
+    key: value for key, value in qualification_options.items()
+    if key in compiler_option_names
+} != {
+    key: value for key, value in generation_options.items()
+    if key in compiler_option_names
+}:
+    raise SystemExit("correctness qualification and generation options differ")
+if generation_options["--identity-error-threshold"] != qualification_options.get(
+    "--provider-clear-threshold"
+):
+    raise SystemExit("correctness identity threshold differs from qualification")
+if "sm_80" not in Path(sys.argv[9]).read_text(encoding="utf-8"):
     raise SystemExit("correctness CUDA inventory lacks sm_80")
 PY
   (
@@ -212,6 +393,7 @@ tools/phantom_gpu/source_archive.py
 tools/phantom_gpu/phase_helpers.sh
 tools/phantom_gpu/bootstrap_environment.sh
 tools/phantom_gpu/run_build_and_health.sh
+tools/phantom_gpu/bootstrap_domain_attestation.py
 tools/phantom_gpu/bootstrap_correctness.py
 tools/phantom_gpu/configs/apt-packages.lock
 tools/phantom_gpu/configs/python-requirements-hashed.lock
@@ -222,6 +404,7 @@ FILES
   chmod 0755 "${output}/source_archive.py" \
     "${output}/phase_helpers.sh" "${output}/bootstrap_environment.sh" \
     "${output}/run_build_and_health.sh" \
+    "${output}/bootstrap_domain_attestation.py" \
     "${output}/bootstrap_correctness.py"
   local -a copies=(
     "artifact_manifest.json:correctness-artifact-manifest.json"
@@ -318,6 +501,19 @@ PY
 }
 
 if [[ "${PACKAGE_MODE}" == "generated-bootstrap-correctness" ]]; then
+  expected_entrypoint_sha256="$(
+    git -C "${REPO_ROOT}" show \
+      "${ACE_COMMIT}:tools/phantom_gpu/package_runpod_sources.sh" |
+      sha256sum | awk '{print $1}'
+  )"
+  observed_entrypoint_sha256="$(
+    sha256sum "${REPO_ROOT}/tools/phantom_gpu/package_runpod_sources.sh" |
+      awk '{print $1}'
+  )"
+  if [[ "${observed_entrypoint_sha256}" != "${expected_entrypoint_sha256}" ]]; then
+    echo "correctness packaging entrypoint differs from the selected ACE commit" >&2
+    exit 1
+  fi
   package_generated_bootstrap_correctness
   exit 0
 fi

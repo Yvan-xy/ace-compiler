@@ -12,10 +12,15 @@ import re
 import struct
 from typing import Any, Iterable, Sequence
 
+from bootstrap_domain_attestation import (
+    DOMAIN_ATTESTATION_SCHEMA,
+    DOMAIN_ARTIFACT_BINDING_KEYS,
+    validate_supported_identity_domain,
+)
 
-FIXTURE_SCHEMA = "ace.phantom.bootstrap-correctness-fixture/1.0.0"
+FIXTURE_SCHEMA = "ace.phantom.bootstrap-correctness-fixture/2.0.0"
 INVOCATION_SCHEMA = "ace.phantom.generated-bootstrap.compiler-invocation/1.0.0"
-SEMANTICS_SCHEMA = "ace.phantom.generated-bootstrap.semantics/1.0.0"
+SEMANTICS_SCHEMA = "ace.phantom.generated-bootstrap.semantics/2.0.0"
 POST_OPERATION_SCHEMA = "ace.phantom.bootstrap-post-operation-semantics/1.0.0"
 SANITIZER_SCHEMA = "ace.phantom.bootstrap-compute-sanitizer/1.0.0"
 COMPARISON_SCHEMA = "ace.phantom.bootstrap-three-way-comparison/1.0.0"
@@ -256,7 +261,10 @@ def validate_authorities(paths: dict[str, Path]) -> tuple[dict[str, Any], dict[s
         fail("compiler invocation normalized argv hash differs")
 
     semantics = load_json(paths["bootstrap_semantics"])
-    if semantics.get("schema_version") != SEMANTICS_SCHEMA:
+    if (
+        semantics.get("schema_version") != SEMANTICS_SCHEMA
+        or semantics.get("status") != "pass"
+    ):
         fail("unsupported bootstrap semantics schema")
     domain = semantics.get("supported_identity_domain")
     require_keys(domain, {"kind", "components", "lower_exclusive", "upper_exclusive", "period", "evidence"}, "supported_identity_domain")
@@ -347,6 +355,27 @@ def validate_authorities(paths: dict[str, Path]) -> tuple[dict[str, Any], dict[s
         key = f"{name}_sha256"
         if _find_binding(semantics, key) != hashes[key]:
             fail(f"bootstrap semantics {key} disagrees with supplied artifact")
+    semantics_bindings = semantics.get("bindings")
+    if not isinstance(semantics_bindings, dict):
+        fail("bootstrap semantics bindings must be an object")
+    try:
+        domain_bindings = {
+            key: semantics_bindings[key]
+            for key in DOMAIN_ARTIFACT_BINDING_KEYS
+        }
+        validate_supported_identity_domain(
+            domain,
+            semantics.get("identity_domain_attestation"),
+            provider_clear_threshold=1.0e-2,
+            artifact_bindings=domain_bindings,
+            constant_manifest=load_json(paths["constant_manifest"]),
+            evalmod_scalar_manifest=semantics["expanded_bootstrap"][
+                "evalmod_scalar_encodings"
+            ],
+            raw_air=paths["raw_air"].read_text(encoding="utf-8"),
+        )
+    except (KeyError, OSError, UnicodeError, ValueError) as error:
+        fail(f"bootstrap identity-domain attestation is invalid: {error}")
     attestation_bindings = require_keys(post_attestation["bindings"], {"compiler_invocation_sha256", "post_ckks_air_sha256", "context_manifest_sha256", "resource_manifest_sha256", "post_operations_air_sha256"}, "post-operation attestation.bindings")
     for key, value in attestation_bindings.items():
         if value != hashes[key]:
@@ -457,6 +486,26 @@ def validate_fixture(fixture: dict[str, Any]) -> None:
         positive(value, f"fixture.tolerances.{key}")
     if tolerances["provider_clear_maximum_absolute"] != 1e-2:
         fail("fixture provider-clear threshold changed")
+    evidence = require_keys(
+        attested["evidence"],
+        {
+            "attestation_schema_version",
+            "attestation_sha256",
+            "provider_clear_maximum_absolute",
+            "maximum_complex_clear_map_error",
+            "reserved_provider_numerical_error",
+        },
+        "fixture identity-domain evidence",
+    )
+    sha(evidence["attestation_sha256"], "fixture identity-domain attestation")
+    if (
+        evidence["attestation_schema_version"] != DOMAIN_ATTESTATION_SCHEMA
+        or evidence["provider_clear_maximum_absolute"]
+        != tolerances["provider_clear_maximum_absolute"]
+        or evidence["maximum_complex_clear_map_error"] != 0.005
+        or evidence["reserved_provider_numerical_error"] != 0.005
+    ):
+        fail("fixture identity-domain error budget differs from frozen tolerances")
     if not isinstance(fixture["post_operations"], dict) or not fixture["post_operations"]:
         fail("fixture post_operations must be nonempty")
     if fixture["repeat_contract"] != {"calls_per_case": 3, "independently_owned_clones": True}:
@@ -915,7 +964,12 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
         sanitizer_log = Path(arguments.sanitizer_log).read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         fail(f"cannot read Compute Sanitizer log: {error}")
-    if sanitizer_log.count("ERROR SUMMARY:") != 1 or sanitizer_log.count("ERROR SUMMARY: 0") != 1:
+    summary_lines = [
+        line
+        for line in sanitizer_log.splitlines()
+        if "ERROR SUMMARY:" in line
+    ]
+    if summary_lines != ["========= ERROR SUMMARY: 0 errors"]:
         fail("Compute Sanitizer log lacks exactly one zero-error summary")
     if sanitizer["coverage"] != {"bootstrap": True, "post_operations": True, "repeatability": True, "teardown": True}:
         fail("Compute Sanitizer coverage is incomplete")

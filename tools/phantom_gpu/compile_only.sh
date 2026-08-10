@@ -451,14 +451,99 @@ if (qualification.get("schema_version") !=
         or qualification.get("status") != "pass"
         or generation.get("status") != "pass"):
     raise SystemExit("bootstrap qualification/generation status is not pass")
-if generation.get("schema_version") != "ace.phantom.bootstrap-generation/3.0.0":
+if generation.get("schema_version") != "ace.phantom.bootstrap-generation/4.0.0":
     raise SystemExit("bootstrap generation schema is not supported")
 if (
     audit.get("schema_version")
-    != "ace.phantom.bootstrap-generated-artifact-audit/3.0.0"
+    != "ace.phantom.bootstrap-generated-artifact-audit/4.0.0"
     or audit.get("status") != "pass"
 ):
     raise SystemExit("bootstrap generated-artifact audit status is not pass")
+try:
+    constant_count = audit["counts"]["constants"]
+    qualification_closure = audit["qualification_closure"]
+    body_closure = qualification_closure["terminal_body_closure"]
+    phantom_body = body_closure["phantom"]
+    ant_body = body_closure["generated_dsl_ant"]
+    transform_semantics = semantics["identity_domain_attestation"][
+        "normalization"
+    ]["compiler_transform_payload_semantics"]
+    transform_stage_groups = [
+        transform_semantics[direction]["stages"]
+        for direction in ("coefficients_to_slots", "slots_to_coefficients")
+    ]
+    expected_transform_stage_count = sum(
+        len(stages) for stages in transform_stage_groups
+    )
+    generated_post_ckks_sha256 = generation["air"]["post_ckks"]["sha256"]
+except (KeyError, TypeError) as error:
+    raise SystemExit("bootstrap terminal-body closure is incomplete") from error
+if (
+    any(not isinstance(stages, list) or not stages for stages in transform_stage_groups)
+    or expected_transform_stage_count <= 0
+    or generated_post_ckks_sha256
+    != files["bootstrap_qualification/bootstrap_post_ckks.air"]
+    or qualification_closure.get("canonical_post_ckks_air_sha256")
+    != generated_post_ckks_sha256
+    or qualification_closure.get("identity_domain_attested") is not True
+    or qualification_closure.get("post_operations_attested") is not True
+    or qualification_closure.get("post_ckks_transform_roles_attested") is not True
+    or qualification_closure.get("post_ckks_evalmod_polynomial_attested") is not True
+    or isinstance(
+        qualification_closure.get("post_ckks_transform_stage_count"), bool
+    )
+    or not isinstance(
+        qualification_closure.get("post_ckks_transform_stage_count"), int
+    )
+    or qualification_closure["post_ckks_transform_stage_count"] <= 0
+    or qualification_closure["post_ckks_transform_stage_count"]
+    != expected_transform_stage_count
+    or set(body_closure) != {"phantom", "generated_dsl_ant"}
+    or not isinstance(phantom_body, dict)
+    or set(phantom_body)
+    != {
+        "reachable_value_count",
+        "transform_constant_count",
+        "reachable_required_stage_count",
+        "scalar_encode_count",
+        "scalar_encode_payload_sha256",
+    }
+    or not isinstance(ant_body, dict)
+    or set(ant_body)
+    != {
+        "returned_dependency_count",
+        "transform_constant_count",
+        "reachable_required_stage_count",
+        "scalar_encode_count",
+        "scalar_encode_payload_sha256",
+    }
+    or phantom_body["transform_constant_count"] != constant_count
+    or ant_body["transform_constant_count"] != constant_count
+    or phantom_body["reachable_required_stage_count"] != 4
+    or ant_body["reachable_required_stage_count"] != 4
+    or phantom_body["scalar_encode_count"] != ant_body["scalar_encode_count"]
+    or phantom_body["scalar_encode_payload_sha256"]
+    != ant_body["scalar_encode_payload_sha256"]
+    or not all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (
+            constant_count,
+            phantom_body["reachable_value_count"],
+            phantom_body["reachable_required_stage_count"],
+            phantom_body["scalar_encode_count"],
+            ant_body["returned_dependency_count"],
+            ant_body["reachable_required_stage_count"],
+            ant_body["scalar_encode_count"],
+        )
+    )
+    or not isinstance(phantom_body["scalar_encode_payload_sha256"], str)
+    or len(phantom_body["scalar_encode_payload_sha256"]) != 64
+    or any(
+        character not in "0123456789abcdef"
+        for character in phantom_body["scalar_encode_payload_sha256"]
+    )
+):
+    raise SystemExit("bootstrap terminal-body closure is invalid")
 for stage, filename, audit_name in (
     ("raw", "bootstrap_raw.air", "raw_air"),
     ("post_ckks", "bootstrap_post_ckks.air", "post_ckks_air"),
@@ -1296,10 +1381,12 @@ run_compiler_tests() {
     tools/phantom_gpu/tests/test_a100_evidence_archives.py
     tools/phantom_gpu/tests/test_codegen_tools.py
     tools/phantom_gpu/tests/test_bootstrap_generated_artifact_audit.py
+    tools/phantom_gpu/tests/test_bootstrap_domain_attestation.py
     tools/phantom_gpu/tests/test_generated_bootstrap_invocation.py
     tools/phantom_gpu/tests/test_bootstrap_correctness.py
     tools/phantom_gpu/tests/test_generated_bootstrap_host_oracle_sources.py
     tools/phantom_gpu/tests/test_generated_bootstrap_correctness_lifecycle.py
+    tools/phantom_gpu/tests/test_compare_environments.py
     tools/phantom_gpu/tests/test_bootstrap_host_freeze_wrapper.py
     tools/phantom_gpu/tests/test_ordinary_ckks_fixture.py
     tools/phantom_gpu/tests/test_ordinary_runtime_source.py
@@ -1980,6 +2067,7 @@ build_bootstrap_host_qualification() {
     --post-multiply-imag "${POST_MULTIPLY_IMAG}"
     --post-multiply-scale-degree "${POST_MULTIPLY_SCALE_DEGREE}"
     --post-rotation-step "${POST_ROTATION_STEP}"
+    --identity-error-threshold "${PROVIDER_CLEAR_THRESHOLD}"
   )
   write_invocation "${RUN_ROOT}/bootstrap_generation_invocation.json" \
     "ace.phantom.bootstrap-qualification-invocation/1.0.0" \

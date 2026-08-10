@@ -10,8 +10,17 @@ import pytest
 
 
 TOOLS_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 sys.path.insert(0, str(TOOLS_ROOT))
+sys.path.insert(0, str(TOOLS_ROOT / "tests"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "ace_edsl/examples"))
 import bootstrap_correctness as correctness  # noqa: E402
+from bootstrap_domain_attestation import derive_supported_identity_domain  # noqa: E402
+from bootstrap_domain_test_support import transform_authorities  # noqa: E402
+from bootstrap_full import build_bootstrap_trace_config  # noqa: E402
+from ace_edsl.edsl.core.bootstrap_decomposition import (  # noqa: E402
+    build_bootstrap_evalmod_scalar_manifest,
+)
 
 
 def write_json(path: Path, value: object) -> Path:
@@ -20,18 +29,35 @@ def write_json(path: Path, value: object) -> Path:
 
 
 def authorities(tmp_path: Path) -> dict[str, Path]:
+    config = build_bootstrap_trace_config(
+        poly_degree=32,
+        mul_level=2,
+        first_prime_bits=41,
+        scaling_factor_bits=40,
+        hamming_weight=4,
+        q_parts=1,
+        enc_budget=1,
+        dec_budget=1,
+        ct_encode=False,
+    )
+    transform_manifest, constant_manifest, raw_air_text = (
+        transform_authorities(config)
+    )
     paths = {
         "ace_source_manifest": write_json(tmp_path / "ace-source.json", {"commit": "a" * 40, "tree": "b" * 40}),
         "phantom_source_manifest": write_json(tmp_path / "phantom-source.json", {"commit": "c" * 40, "tree": "d" * 40}),
-        "raw_air": write_json(tmp_path / "raw.air", {"stage": "raw"}),
+        "raw_air": tmp_path / "raw.air",
         "post_ckks_air": write_json(tmp_path / "post.air", {"stage": "post-ckks"}),
         "context_manifest": write_json(tmp_path / "context.json", {"logical_slot_capacity": 16, "input_level": 1, "polynomial_degree": 32, "packing": "full", "data_q_bit_sizes": [40, 40], "special_p_bit_sizes": [41], "scaling_modulus_bits": 40, "first_modulus_bits": 41, "hamming_weight": 4, "security_level": 0, "q_part_count": 1}),
         "resource_manifest": write_json(tmp_path / "resources.json", {"schema_version": 3, "rotation_steps": [4]}),
-        "constant_manifest": write_json(tmp_path / "constants.json", {"schema_version": 1}),
+        "constant_manifest": write_json(
+            tmp_path / "constants.json", constant_manifest
+        ),
         "post_operations_air": write_json(tmp_path / "post-operations.air", {"operations": ["multiply_plain", "rotate"]}),
     }
+    paths["raw_air"].write_text(raw_air_text, encoding="utf-8")
     options = {
-        "ciphertext_constant_encoding": "enabled",
+        "ciphertext_constant_encoding": "disabled",
         "decode_transform_budget": 1,
         "encode_transform_budget": 1,
         "first_prime_bits": 41,
@@ -57,7 +83,7 @@ def authorities(tmp_path: Path) -> dict[str, Path]:
         "--first-prime-bits", "41", "--hamming-weight", "4",
         "--q-part-count", "1", "--encode-transform-budget", "1",
         "--decode-transform-budget", "1",
-        "--ciphertext-constant-encoding", "enabled", "--packing", "full",
+        "--ciphertext-constant-encoding", "disabled", "--packing", "full",
         "--post-multiply-real", "-1.0", "--post-multiply-imag", "0.0",
         "--post-multiply-scale-degree", "0", "--post-rotation-step", "4",
     ]
@@ -79,6 +105,40 @@ def authorities(tmp_path: Path) -> dict[str, Path]:
         f"{name}_sha256": correctness.digest(paths[name])
         for name in ("compiler_invocation", "raw_air", "post_ckks_air", "context_manifest", "resource_manifest", "constant_manifest")
     }
+    semantic_bindings["phantom_source_sha256"] = "e" * 64
+    semantic_bindings["generated_dsl_ant_source_sha256"] = "f" * 64
+    domain_bindings = {
+        key: value
+        for key, value in semantic_bindings.items()
+        if key
+        in {
+            "compiler_invocation_sha256",
+            "raw_air_sha256",
+            "post_ckks_air_sha256",
+            "context_manifest_sha256",
+            "resource_manifest_sha256",
+            "constant_manifest_sha256",
+            "phantom_source_sha256",
+            "generated_dsl_ant_source_sha256",
+        }
+    }
+    evalmod_scalar_manifest = build_bootstrap_evalmod_scalar_manifest(config)
+    supported_domain, identity_attestation = derive_supported_identity_domain(
+        coefficients=config.chebyshev_coefficients,
+        scalars=config.double_angle_scalars,
+        overflow_bound=config.eval_sin_upper_bound_k,
+        restoration_factor=config.post_scale,
+        evalmod_lower=-1.0,
+        evalmod_upper=1.0,
+        provider_clear_threshold=1.0e-2,
+        artifact_bindings=domain_bindings,
+        polynomial_degree=32,
+        logical_slots=16,
+        transform_payload_manifest=transform_manifest,
+        constant_manifest=constant_manifest,
+        evalmod_scalar_manifest=evalmod_scalar_manifest,
+        raw_air=raw_air_text,
+    )
     preserved_transition = {
         "ace_logical_level_delta": 0, "active_q_count_delta": 0,
         "phantom_chain_index_delta": 0, "scale_degree_delta": 0,
@@ -95,14 +155,12 @@ def authorities(tmp_path: Path) -> dict[str, Path]:
     }
     semantics = {
         "schema_version": correctness.SEMANTICS_SCHEMA,
+        "status": "pass",
         "bindings": semantic_bindings,
-        "supported_identity_domain": {
-            "kind": "centered-evalmod-half-period",
-            "components": ["real", "imaginary"],
-            "lower_exclusive": -8.0,
-            "upper_exclusive": 8.0,
-            "period": 16.0,
-            "evidence": {"post_ckks_air_sha256": semantic_bindings["post_ckks_air_sha256"]},
+        "supported_identity_domain": supported_domain,
+        "identity_domain_attestation": identity_attestation,
+        "expanded_bootstrap": {
+            "evalmod_scalar_encodings": evalmod_scalar_manifest,
         },
         "output_air_contract": {"ace_logical_level": 1, "active_q_count": 1, "phantom_chain_index": 1, "raw_scale_contract": {"kind": "ace-log2-scale-coordinate", "nominal_raw_scale": "0x1.0000000000000p+40", "scaling_modulus_bits": 40, "expected_scale_degree": 1, "maximum_absolute_coordinate_error": 1.0e-4}, "scale_degree": 1, "logical_slots": 16, "ciphertext_size": 2, "ntt_state": True},
         "post_operation_contracts": operation_contract,
@@ -127,7 +185,6 @@ def authorities(tmp_path: Path) -> dict[str, Path]:
     )
     semantics["bindings"]["post_operations_air_sha256"] = correctness.digest(paths["post_operations_air"])
     semantics["bindings"]["post_operations_attestation_sha256"] = correctness.digest(paths["post_operation_attestation"])
-    semantics["bindings"]["generated_dsl_ant_source_sha256"] = "f" * 64
     write_json(paths["bootstrap_semantics"], semantics)
     return paths
 
@@ -288,6 +345,20 @@ def test_raw_scale_contract_accepts_exact_prime_drift_only() -> None:
         correctness._validate_raw_scale(2.0**38, contract, "test")
 
 
+def test_splitmix_fixture_stream_has_frozen_cross_language_words() -> None:
+    state = 7640891576956012809 ^ 0x42534352414E444F
+    observed = []
+    for _ in range(4):
+        state, value = correctness.splitmix64(state)
+        observed.append(value)
+    assert observed == [
+        0x6C5F24FC11A466E8,
+        0x559CFF89394149CA,
+        0x79DAC66A159692A3,
+        0x74F6283DB86357A2,
+    ]
+
+
 def test_freeze_refuses_existing_output_and_changed_attestation(tmp_path: Path) -> None:
     paths, fixture_path, _ = freeze(tmp_path)
     args = argparse.Namespace(
@@ -323,7 +394,8 @@ def test_three_way_comparison_requires_full_provenance_and_external_sanitizer(tm
     gpu_document["execution"]["executable_sha256"] = correctness.digest(executable)
     write_json(gpu[0], gpu_document)
     log = tmp_path / "sanitizer.log"
-    log.write_text("ERROR SUMMARY: 0 errors\n", encoding="utf-8")
+    exact_summary = "========= ERROR SUMMARY: 0 errors\n"
+    log.write_text(exact_summary, encoding="utf-8")
     tool = tmp_path / "sanitizer-version.txt"
     tool.write_text("compute-sanitizer test\n", encoding="utf-8")
     sanitizer = tmp_path / "sanitizer.json"
@@ -344,6 +416,30 @@ def test_three_way_comparison_requires_full_provenance_and_external_sanitizer(tm
     result = correctness.compare(arguments)
     assert result["status"] == "pass"
     assert len(result["comparisons"]) == 5
+
+    for index, invalid_log in enumerate(
+        (
+            "========= ERROR SUMMARY: 00 errors\n",
+            exact_summary + exact_summary,
+        )
+    ):
+        log.write_text(invalid_log, encoding="utf-8")
+        invalid_sanitizer = json.loads(sanitizer.read_text())
+        invalid_sanitizer["bindings"]["log_sha256"] = correctness.digest(log)
+        invalid_sanitizer_path = tmp_path / f"invalid-log-sanitizer-{index}.json"
+        write_json(invalid_sanitizer_path, invalid_sanitizer)
+        arguments.sanitizer_record = str(invalid_sanitizer_path)
+        arguments.output = str(tmp_path / f"invalid-log-comparison-{index}.json")
+        with pytest.raises(
+            correctness.CorrectnessError,
+            match="exactly one zero-error summary",
+        ):
+            correctness.compare(arguments)
+
+    log.write_text(exact_summary, encoding="utf-8")
+    restored = json.loads(sanitizer.read_text())
+    restored["bindings"]["log_sha256"] = correctness.digest(log)
+    write_json(sanitizer, restored)
 
     broken = json.loads(sanitizer.read_text())
     broken["coverage"]["teardown"] = False
@@ -378,6 +474,45 @@ def test_generated_phantom_harness_covers_full_correctness_lifecycle() -> None:
     assert "PLAINplain=newPLAINTEXT();Register_plain_lifetime(plain);" in compact
     assert "input.context.at(\"logical_slot_capacity\")" in source
     assert "input.context.at(\"input_level\")" in source
+    assert "ace.phantom.bootstrap-correctness-fixture/2.0.0" in source
+    assert "ace.phantom.generated-bootstrap.semantics/2.0.0" in source
+    assert "ace.phantom.bootstrap-clear-evalmod-domain/1.0.0" in source
+    assert "canonical_identity_attestation" in source
+    assert "identity_attestation_sha256" in source
+    assert (
+        'domain_evidence.at("attestation_sha256") ==\n'
+        "                  identity_attestation_sha256"
+    ) in source
+    assert "conservative-certified-binary64-marker-used-as-exclusive-endpoint" in source
+    assert 'domain_errors.at("target")' in source
+    assert 'domain_proof.at("selected_radius")' in source
+    for field in (
+        "comparison=",
+        "maximum_absolute_error=",
+        "maximum_absolute_error_index=",
+        "actual_real=",
+        "actual_imaginary=",
+        "expected_real=",
+        "expected_imaginary=",
+        "mean_absolute_error=",
+        "root_mean_square_error=",
+        "threshold=",
+    ):
+        assert field in source
+    assert "std::numeric_limits<double>::max_digits10" in source
+    for comparison in (
+        "/bootstrap-call-",
+        "/ciphertext-plaintext-multiply",
+        "/rotation",
+        "/primary-output",
+    ):
+        assert comparison in source
+    random_real = source.index("const double real = generator.Symmetric(bound)")
+    random_imaginary = source.index(
+        "const double imaginary = generator.Symmetric(bound)"
+    )
+    random_complex = source.index("value = {real, imaginary}")
+    assert random_real < random_imaginary < random_complex
     for query in ("Level(value)", "Active_q_count(value)", "Chain_index(value)", "Raw_scale(value)", "Sc_degree(value)", "Get_ciph_slots(value)", "Get_ciph_size(value)", "Is_ciph_ntt(value)"):
         assert query in source
     assert "Mul_plain(&multiply_result" in source

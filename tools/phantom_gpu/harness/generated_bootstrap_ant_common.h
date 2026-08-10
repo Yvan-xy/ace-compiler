@@ -35,11 +35,13 @@ constexpr std::array<std::uint8_t, 8> kValueMagic = {'A', 'C', 'E', 'B',
 constexpr char kValueFormat[] =
     "ace.bootstrap-correctness.complex_float64le/1.0.0";
 constexpr char kFixtureSchema[] =
-    "ace.phantom.bootstrap-correctness-fixture/1.0.0";
+    "ace.phantom.bootstrap-correctness-fixture/2.0.0";
 constexpr char kInvocationSchema[] =
     "ace.phantom.generated-bootstrap.compiler-invocation/1.0.0";
 constexpr char kSemanticsSchema[] =
-    "ace.phantom.generated-bootstrap.semantics/1.0.0";
+    "ace.phantom.generated-bootstrap.semantics/2.0.0";
+constexpr char kDomainAttestationSchema[] =
+    "ace.phantom.bootstrap-clear-evalmod-domain/1.0.0";
 constexpr char kPostOperationSchema[] =
     "ace.phantom.bootstrap-post-operation-semantics/1.0.0";
 constexpr double kRequiredMaximumError = 1.0e-2;
@@ -410,14 +412,84 @@ inline QualificationInputs LoadQualificationInputs(
   }
 
   const Json& domain = result.semantics.at("supported_identity_domain");
-  Require(domain.at("kind") == "centered-evalmod-half-period",
+  Require(domain.at("kind") == "centered-evalmod-complex-error-bounded" &&
+              domain.at("components") == Json::array({"real", "imaginary"}),
           "unsupported identity-domain convention");
   result.domain_lower = domain.at("lower_exclusive").get<double>();
   result.domain_upper = domain.at("upper_exclusive").get<double>();
   Require(std::isfinite(result.domain_lower) &&
               std::isfinite(result.domain_upper) && result.domain_lower < 0.0 &&
-              result.domain_upper > 0.0,
+              result.domain_upper > 0.0 &&
+              result.domain_lower == -result.domain_upper,
           "invalid supported identity domain");
+  const Json& domain_evidence = domain.at("evidence");
+  const Json& identity_attestation =
+      result.semantics.at("identity_domain_attestation");
+  const std::string canonical_identity_attestation =
+      identity_attestation.dump();
+  const std::string identity_attestation_sha256 = Sha256(
+      reinterpret_cast<const std::uint8_t*>(
+          canonical_identity_attestation.data()),
+      canonical_identity_attestation.size());
+  Require(identity_attestation.at("schema_version") ==
+                  kDomainAttestationSchema &&
+              identity_attestation.at("status") == "attested" &&
+              identity_attestation.at("scope") ==
+                  Json{{"purpose", "domain-attestation-only"},
+                       {"provider_value_oracle", false},
+                       {"may_supply_expected_case_values", false}},
+          "identity-domain attestation scope is invalid");
+  Require(
+      domain_evidence.at("attestation_schema_version") ==
+              kDomainAttestationSchema &&
+          domain_evidence.at("attestation_sha256").is_string() &&
+          domain_evidence.at("attestation_sha256") ==
+              identity_attestation_sha256,
+      "identity-domain summary does not bind its full attestation");
+  const Json& domain_bindings =
+      identity_attestation.at("artifact_bindings");
+  const std::array<const char*, 8> required_domain_bindings = {
+      "compiler_invocation_sha256", "constant_manifest_sha256",
+      "context_manifest_sha256", "generated_dsl_ant_source_sha256",
+      "phantom_source_sha256", "post_ckks_air_sha256", "raw_air_sha256",
+      "resource_manifest_sha256"};
+  Require(domain_bindings.size() == required_domain_bindings.size(),
+          "identity-domain artifact binding count changed");
+  for (const char* name : required_domain_bindings)
+    Require(domain_bindings.at(name) == semantic_bindings.at(name),
+            std::string("identity-domain artifact binding mismatch: ") + name);
+  const Json& error_contract = identity_attestation.at("error_contract");
+  Require(error_contract.at("target") ==
+                  "original-clear-complex-identity" &&
+              error_contract.at("aggregate_norm") == "complex-absolute-l2" &&
+              error_contract.at("provider_clear_maximum_absolute") ==
+                  kRequiredMaximumError &&
+              error_contract.at("clear_map_budget_fraction") == 0.5 &&
+              error_contract.at("maximum_complex_clear_map_error") == 0.005 &&
+              error_contract.at("reserved_provider_numerical_error") == 0.005,
+          "identity-domain error budget differs from the frozen gate");
+  Require(domain_evidence.at("provider_clear_maximum_absolute") ==
+                  kRequiredMaximumError &&
+              domain_evidence.at("maximum_complex_clear_map_error") ==
+                  0.005 &&
+              domain_evidence.at("reserved_provider_numerical_error") ==
+                  0.005,
+          "identity-domain summary error budget changed");
+  const Json& proof = identity_attestation.at("proof");
+  Require(proof.at("selected_radius") == result.domain_upper &&
+              proof.at("next_outward_radius").get<double>() >
+                  result.domain_upper &&
+              proof.at("binary64_selection") ==
+                  "conservative-certified-binary64-marker-used-as-exclusive-endpoint" &&
+              proof.at("arithmetic").at("transcendental_approximations_used") ==
+                  false,
+          "identity-domain boundary proof is invalid");
+  const Json& normalization = identity_attestation.at("normalization");
+  Require(normalization.at("compiler_context").at("polynomial_degree") ==
+                  result.context.at("polynomial_degree") &&
+              normalization.at("compiler_context").at("logical_slots") ==
+                  result.context.at("logical_slot_capacity"),
+          "identity-domain normalization differs from compiler context");
 
   Require(result.fixture.at("supported_identity_domain")
                   .at("attested_domain") == domain &&
@@ -520,8 +592,11 @@ inline std::vector<FixtureCase> MaterializeCases(
       SplitMix64 generator(
           seed ^ std::stoull(descriptor.at("seed_xor").get<std::string>(),
                             nullptr, 16));
-      for (Complex& value : values)
-        value = Complex(generator.Symmetric(bound), generator.Symmetric(bound));
+      for (Complex& value : values) {
+        const double real = generator.Symmetric(bound);
+        const double imaginary = generator.Symmetric(bound);
+        value = Complex(real, imaginary);
+      }
     } else if (recipe == "zero") {
       std::fill(values.begin(), values.end(), Complex{});
     } else if (recipe == "real_constant" || recipe == "complex_constant") {
@@ -649,7 +724,8 @@ inline Json AppendValues(std::vector<std::uint8_t>& payload,
 }
 
 inline Json Metric(const std::vector<Complex>& actual,
-                   const std::vector<Complex>& expected, double threshold) {
+                   const std::vector<Complex>& expected, double threshold,
+                   const std::string& comparison) {
   Require(actual.size() == expected.size() && !actual.empty(),
           "metric vectors have unequal or zero length");
   double maximum = -1.0;
@@ -679,8 +755,23 @@ inline Json Metric(const std::vector<Complex>& actual,
       {"estimated_precision_is_infinite", precision_infinite},
       {"threshold", threshold},
   };
-  Require(maximum <= threshold,
-          "provider result exceeds the frozen clear-identity threshold");
+  if (maximum > threshold) {
+    std::ostringstream message;
+    message << std::setprecision(std::numeric_limits<double>::max_digits10)
+            << "provider result exceeds the frozen clear-identity threshold: "
+            << "comparison=" << comparison
+            << ", maximum_absolute_error=" << maximum
+            << ", maximum_absolute_error_index=" << maximum_index
+            << ", actual_real=" << actual[maximum_index].real()
+            << ", actual_imaginary=" << actual[maximum_index].imag()
+            << ", expected_real=" << expected[maximum_index].real()
+            << ", expected_imaginary=" << expected[maximum_index].imag()
+            << ", mean_absolute_error=" << absolute_sum / actual.size()
+            << ", root_mean_square_error="
+            << std::sqrt(squared_sum / actual.size())
+            << ", threshold=" << threshold;
+    Fail(message.str());
+  }
   return metric;
 }
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import struct
@@ -15,8 +16,19 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TOOLS_ROOT = REPO_ROOT / "tools/phantom_gpu"
 sys.path.insert(0, str(TOOLS_ROOT))
+sys.path.insert(0, str(TOOLS_ROOT / "tests"))
+sys.path.insert(0, str(REPO_ROOT / "ace_edsl/examples"))
 
 from check_bootstrap_generated_artifacts import audit, cache_key_sha256  # noqa: E402
+from bootstrap_domain_attestation import derive_supported_identity_domain  # noqa: E402
+from bootstrap_domain_test_support import (  # noqa: E402
+    transform_authorities,
+    transform_payload_values,
+)
+from bootstrap_full import build_bootstrap_trace_config  # noqa: E402
+from ace_edsl.edsl.core.bootstrap_decomposition import (  # noqa: E402
+    build_bootstrap_evalmod_scalar_manifest,
+)
 
 
 CONTEXT: dict[str, Any] = {
@@ -247,51 +259,406 @@ def artifact_record(path: Path) -> dict[str, Any]:
     }
 
 
+def _versioned_terminal_source(
+    context: dict[str, Any],
+    resource: dict[str, Any],
+    constants: dict[str, Any],
+    payload_values: list[list[complex]],
+    evalmod_values: list[float],
+    evalmod_scalar_values: list[float],
+    operation_trace: list[str],
+    *,
+    phantom: bool,
+) -> str:
+    scalar_definitions = "".join(
+        f"float64_t _evalmod_{index} = {value!r};\n"
+        for index, value in enumerate(evalmod_values)
+    )
+    payload_definitions = []
+    for entry, values in zip(
+        constants["constants"], payload_values, strict=True
+    ):
+        flattened = [component for value in values for component in (value.real, value.imag)]
+        payload_definitions.append(
+            f"float64_t {entry['symbol']}[{len(flattened)}] = {{\n  "
+            + ", ".join(repr(float(value)) for value in flattened)
+            + "\n};\n"
+        )
+    body = [
+        "CIPHERTEXT bootstrap_full(CIPHERTEXT input, CIPHERTEXT zero) {\n",
+        "  (void)zero;\n",
+        "  static const int32_t body_rotation_steps[] = {",
+        str(resource["rotation_batches"][0][0]),
+        "};\n",
+    ]
+    current = "input"
+    payload_index = 0
+    scalar_index = 0
+    for operation_index, operation in enumerate(operation_trace):
+        output = f"trace_value_{operation_index}"
+        body.append(f"  CIPHERTEXT {output};\n")
+        if operation == "mul" and payload_index < len(constants["constants"]):
+            entry = constants["constants"][payload_index]
+            plain = f"payload_plain_{payload_index}"
+            body.append(f"  PLAINTEXT {plain};\n")
+            if phantom:
+                body.append(
+                    f"  Load_cached_plain(&{plain}, {entry['entry_id']});\n"
+                )
+                body.append(f"  Mul_plain(&{output}, &{current}, &{plain});\n")
+            else:
+                body.append(
+                    f"  Encode_dcmplx_ext(&{plain}, (DCMPLX*){entry['symbol']}, "
+                    f"{entry['slot_count']}, {entry['ace_level']}, "
+                    f"{len(context['special_p_bit_sizes'])});\n"
+                )
+                body.append(
+                    f"  Init_ciph_up_scale_plain(&{output}, &{current}, &{plain});\n"
+                )
+                body.append(
+                    f"  Hw_modmul(Coeffs(&{output}._c0_poly, 0, degree), 0, 0, 0, degree);\n"
+                )
+            payload_index += 1
+        elif operation == "mul" and scalar_index < len(evalmod_scalar_values):
+            plain = f"scalar_plain_{scalar_index}"
+            value = evalmod_scalar_values[scalar_index]
+            body.extend(
+                (
+                    f"  PLAINTEXT {plain};\n",
+                    f"  Encode_double_mask(&{plain}, {value!r}, 1, 1, 1);\n",
+                )
+            )
+            if phantom:
+                body.append(f"  Mul_plain(&{output}, &{current}, &{plain});\n")
+            else:
+                body.append(
+                    f"  Init_ciph_up_scale_plain(&{output}, &{current}, &{plain});\n"
+                )
+                body.append(
+                    f"  Hw_modmul(Coeffs(&{output}._c0_poly, 0, degree), 0, 0, 0, degree);\n"
+                )
+            scalar_index += 1
+        elif operation == "mul":
+            if phantom:
+                body.append(f"  Mul_ciph(&{output}, &{current}, &{current});\n")
+            else:
+                product = f"trace_product_{operation_index}"
+                aux0 = f"trace_aux0_{operation_index}"
+                aux1 = f"trace_aux1_{operation_index}"
+                body.append(
+                    f"  Init_ciph3_up_scale(&{product}, &{current}, &{current});\n"
+                )
+                body.extend(
+                    f"  Hw_mod{kind}(Coeffs(&{destination}, 0, degree), 0, 0, 0, degree);\n"
+                    for kind, destination in (
+                        ("mul", aux0),
+                        ("mul", aux1),
+                        ("mul", f"{product}._c0_poly"),
+                        ("add", f"{product}._c1_poly"),
+                        ("mul", f"{product}._c2_poly"),
+                    )
+                )
+                body.append(f"  {output} = Relinearize({product});\n")
+        elif operation in {"add", "sub"}:
+            if phantom:
+                runtime = "Add_ciph" if operation == "add" else "Sub_ciph"
+                body.append(f"  {runtime}(&{output}, &{current}, &{current});\n")
+            else:
+                body.append(
+                    f"  Init_ciph_same_scale(&{output}, &{current}, &{current});\n"
+                )
+                body.append(
+                    f"  Hw_mod{operation}(Coeffs(&{output}._c0_poly, 0, degree), 0, 0, 0, degree);\n"
+                )
+        elif operation == "rescale":
+            if phantom:
+                body.append(f"  Rescale_ciph(&{output}, &{current});\n")
+            else:
+                body.append(f"  Init_ciph_down_scale(&{output}, &{current});\n")
+                body.append(
+                    f"  Rescale(&{output}._c0_poly, &{current}._c0_poly);\n"
+                )
+        elif operation == "modswitch":
+            if phantom:
+                body.append(f"  Mod_switch(&{output}, &{current});\n")
+            else:
+                body.append(
+                    f"  Init_ciph_same_scale(&{output}, &{current}, &{current});\n"
+                )
+                body.append(
+                    f"  Modswitch(&{output}._c0_poly, &{current}._c0_poly);\n"
+                )
+        elif operation == "rotate":
+            if phantom:
+                body.append(f"  Rotate_ciph(&{output}, &{current}, 1);\n")
+            else:
+                body.append(f"  {output} = Rotate({current}, 1);\n")
+        elif operation == "rotate_batch":
+            batch = f"trace_batch_{operation_index}"
+            body.append(f"  CIPHERTEXT {batch}[1];\n")
+            body.append(
+                f"  Rotate_batch_ciph({batch}, &{current}, body_rotation_steps, 1);\n"
+            )
+            if phantom:
+                body.append(f"  Copy_ciph(&{output}, &{batch}[0]);\n")
+            else:
+                body.append(f"  {output} = {batch}[0];\n")
+        elif operation == "raise_mod":
+            body.append(
+                f"  Raise_mod(&{output}, &{current}, {len(context['data_q_bit_sizes'])});\n"
+            )
+        elif operation == "conjugate":
+            body.append(f"  Conjugate_ciph(&{output}, &{current});\n")
+        elif operation == "mul_mono":
+            body.append(
+                f"  Mul_mono_ciph(&{output}, &{current}, {context['logical_slot_capacity']});\n"
+            )
+        else:
+            raise AssertionError(f"unsupported synthetic operation {operation}")
+        current = output
+    assert payload_index == len(constants["constants"])
+    assert scalar_index == len(evalmod_scalar_values)
+    body.extend(
+        (
+            "  CIPHERTEXT returned;\n",
+            f"  Copy_ciph(&returned, &{current});\n",
+            "  return returned;\n",
+            "}\n",
+        )
+    )
+    terminal_body = "".join(body)
+    common = scalar_definitions + "".join(payload_definitions) + terminal_body
+    if not phantom:
+        return common
+
+    data_q = ", ".join(str(value) for value in context["data_q_bit_sizes"])
+    special_p = ", ".join(
+        str(value) for value in context["special_p_bit_sizes"]
+    )
+    rotations = ", ".join(str(value) for value in resource["rotation_steps"])
+    batch_steps = [step for batch in resource["rotation_batches"] for step in batch]
+    batch_offsets = [0]
+    for batch in resource["rotation_batches"]:
+        batch_offsets.append(batch_offsets[-1] + len(batch))
+    monomials = ", ".join(str(value) for value in resource["monomial_powers"])
+    entries = []
+    for entry in constants["constants"]:
+        entries.append(
+            f"  // ACE_PHANTOM_CONSTANT_ENTRY entry_id={entry['entry_id']} "
+            f"constant_id={entry['constant_id']}\n"
+            "  {"
+            f"{entry['entry_id']}, {entry['constant_id']}, "
+            f"PHANTOM_CONSTANT_COMPLEX_F64, {entry['slot_count']}, "
+            f"{entry['ace_level']}, {entry['chain_index']}, "
+            f"{entry['scale_degree']}, {entry['raw_scale']}, "
+            f"{json.dumps(entry['symbol'])}, "
+            f"{json.dumps(entry['payload_sha256'])}, "
+            f"{json.dumps(entry['cache_key_sha256'])}, "
+            f"{entry['slot_count'] * 2}, "
+            f"(const double*){entry['symbol']}"
+            "},\n"
+        )
+    return f'''#include "rt_phantom/rt_phantom.h"
+static const uint32_t phantom_data_q_bit_sizes[] = {{{data_q}}};
+static const uint32_t phantom_special_p_bit_sizes[] = {{{special_p}}};
+extern "C" const PHANTOM_CONTEXT_MANIFEST* Get_phantom_context_manifest() {{
+  static const PHANTOM_CONTEXT_MANIFEST context = {{
+    1, PHANTOM_PACKING_FULL, {context["polynomial_degree"]},
+    {context["logical_slot_capacity"]}, {len(context["data_q_bit_sizes"])},
+    phantom_data_q_bit_sizes, {len(context["special_p_bit_sizes"])},
+    phantom_special_p_bit_sizes, {context["input_level"]},
+    {context["q_part_count"]}, {context["hamming_weight"]},
+    {context["security_level"]}, {context["first_modulus_bits"]},
+    {context["scaling_modulus_bits"]}, 3
+  }};
+  return &context;
+}}
+static const int32_t phantom_rotation_steps[] = {{{rotations}}};
+static const size_t phantom_rotation_batch_offsets[] = {{{", ".join(str(value) for value in batch_offsets)}}};
+static const int32_t phantom_rotation_batch_steps[] = {{{", ".join(str(value) for value in batch_steps)}}};
+static const uint32_t phantom_monomial_powers[] = {{{monomials}}};
+extern "C" const PHANTOM_RESOURCE_MANIFEST* Get_phantom_resource_manifest() {{
+  static const PHANTOM_RESOURCE_MANIFEST resources = {{
+    3, 1,
+    PHANTOM_RESOURCE_RELIN_KEY | PHANTOM_RESOURCE_ROTATION_KEYS |
+      PHANTOM_RESOURCE_CONJUGATION_KEY | PHANTOM_RESOURCE_ROTATE_BATCH |
+      PHANTOM_RESOURCE_RAISE_MOD | PHANTOM_RESOURCE_MONOMIALS |
+      PHANTOM_RESOURCE_COMPLEX_PLAINTEXT,
+    {len(resource["rotation_steps"])}, phantom_rotation_steps,
+    {len(resource["rotation_batches"])}, phantom_rotation_batch_offsets,
+    phantom_rotation_batch_steps, {len(resource["monomial_powers"])},
+    phantom_monomial_powers
+  }};
+  return &resources;
+}}
+{scalar_definitions}{"".join(payload_definitions)}
+static const PHANTOM_CONSTANT_ENTRY phantom_constant_entries[] = {{
+{"".join(entries)}}};
+extern "C" const PHANTOM_CONSTANT_MANIFEST* Get_phantom_constant_manifest() {{
+  static const PHANTOM_CONSTANT_MANIFEST constants = {{
+    1, 1, 3, {json.dumps(constants["context_manifest_sha256"])},
+    {len(constants["constants"])}, phantom_constant_entries
+  }};
+  return &constants;
+}}
+{terminal_body}
+'''
+
+
 def write_versioned_closure(tmp_path: Path) -> tuple[Path, ...]:
-    base = write_inputs(
-        tmp_path,
-        post_ckks_air=POST_CKKS_AIR
-        + """
+    config = build_bootstrap_trace_config(
+        poly_degree=4,
+        mul_level=26,
+        first_prime_bits=60,
+        scaling_factor_bits=56,
+        hamming_weight=4,
+        q_parts=3,
+        enc_budget=1,
+        dec_budget=1,
+        ct_encode=False,
+    )
+    transform, descriptor_manifest, transform_air = transform_authorities(config)
+    payload_values = transform_payload_values(config)
+    expected_payloads = transform["constant_manifest_order"][
+        "ordered_payload_sha256"
+    ]
+    assert [
+        payload_sha256(
+            tuple(
+                component
+                for value in values
+                for component in (float(value.real), float(value.imag))
+            )
+        )
+        for values in payload_values
+    ] == expected_payloads
+
+    context = {
+        "schema_version": 1,
+        "packing": "full",
+        "polynomial_degree": config.poly_degree,
+        "logical_slot_capacity": config.slots,
+        "data_q_bit_sizes": [config.first_prime_bits]
+        + [config.scaling_factor_bits] * (config.mul_level - 1),
+        "special_p_bit_sizes": [60] * config.num_p,
+        "input_level": 1,
+        "q_part_count": config.q_parts,
+        "hamming_weight": config.hamming_weight,
+        "security_level": 0,
+        "first_modulus_bits": config.first_prime_bits,
+        "scaling_modulus_bits": config.scaling_factor_bits,
+        "resource_schema_version": 3,
+    }
+    context_sha256 = hashlib.sha256(canonical_bytes(context)).hexdigest()
+    constants = {
+        "schema_version": 1,
+        "context_schema_version": 1,
+        "resource_schema_version": 3,
+        "context_manifest_sha256": context_sha256,
+        "constants": [],
+    }
+    for descriptor in descriptor_manifest["constants"]:
+        entry = dict(descriptor)
+        entry["cache_key_sha256"] = ""
+        entry["cache_key_sha256"] = cache_key_sha256(context_sha256, entry)
+        constants["constants"].append(entry)
+    resource = {
+        "schema_version": 3,
+        "context_schema_version": 1,
+        "relinearization_key": True,
+        "rotation_steps": [1],
+        "conjugation_key": True,
+        "rotate_batch": True,
+        "rotation_batches": [[1]],
+        "raise_mod": True,
+        "monomial_powers": [config.slots, 3 * config.slots],
+        "complex_plaintext": True,
+        "native_bootstrap_precompute": False,
+    }
+    evalmod_values = list(config.chebyshev_coefficients) + list(
+        config.double_angle_scalars
+    ) + [config.post_scale]
+    evalmod_scalar_manifest = build_bootstrap_evalmod_scalar_manifest(config)
+    evalmod_scalar_values = [
+        float.fromhex(value)
+        for value in evalmod_scalar_manifest["full_program"][
+            "values_binary64_hex"
+        ]
+    ]
+    raw_air = "CKKS.raise_mod\n" + transform_air
+    operation_trace = re.findall(
+        r"\bCKKS\.(add|sub|mul|rescale|rotate|conjugate|raise_mod|"
+        r"rotate_batch|mul_mono|modswitch)\b",
+        raw_air,
+    )
+    phantom_source = _versioned_terminal_source(
+        context,
+        resource,
+        constants,
+        payload_values,
+        evalmod_values,
+        evalmod_scalar_values,
+        operation_trace,
+        phantom=True,
+    )
+    ant_source = _versioned_terminal_source(
+        context,
+        resource,
+        constants,
+        payload_values,
+        evalmod_values,
+        evalmod_scalar_values,
+        operation_trace,
+        phantom=False,
+    )
+    post_air = raw_air + """
   st "__ret_tmp_0" VAR[4] ATTR[level=1,rescale_level=13,scale=1]
     ld "__ret_tmp_0" VAR[4] ATTR[level=1,rescale_level=13,scale=1]
   retv ID(5)
-""",
-        source=SOURCE
-        + "\nCIPHERTEXT bootstrap_full(CIPHERTEXT input, CIPHERTEXT zero) { return input; }\n",
+"""
+    base = write_inputs(
+        tmp_path,
+        context=context,
+        resource=resource,
+        constants=constants,
+        raw_air=raw_air,
+        post_ckks_air=post_air,
+        source=phantom_source,
     )
-    context_path, resource_path, constant_path, raw_air_path, post_air_path, source_path = base
+    (
+        context_path,
+        resource_path,
+        constant_path,
+        raw_air_path,
+        post_air_path,
+        source_path,
+    ) = base
     ant_source_path = tmp_path / "generated_ant.cxx"
-    ant_source_path.write_text(
-        "CIPHERTEXT bootstrap_full(CIPHERTEXT input, CIPHERTEXT zero) { return input; }\n",
-        encoding="utf-8",
-    )
+    ant_source_path.write_text(ant_source, encoding="utf-8")
     operations_air_path = tmp_path / "bootstrap_post_operations.air"
     operations_air_path.write_text(
-        """
-CKKS.rotate ATTR[level=1,rescale_level=13,scale=1]
-CKKS.mul ATTR[level=1,rescale_level=13,scale=1]
-""",
+        "CKKS.rotate ATTR[level=1,rescale_level=13,scale=1]\n"
+        "CKKS.mul ATTR[level=1,rescale_level=13,scale=1]\n",
         encoding="utf-8",
     )
-    invocation_path = tmp_path / "compiler_invocation.json"
     options = {
-        "poly_degree": CONTEXT["polynomial_degree"],
-        "vector_capacity": CONTEXT["logical_slot_capacity"],
-        "mul_level": len(CONTEXT["data_q_bit_sizes"]),
-        "input_level": CONTEXT["input_level"],
-        "security_level": CONTEXT["security_level"],
-        "scaling_factor_bits": CONTEXT["scaling_modulus_bits"],
-        "first_prime_bits": CONTEXT["first_modulus_bits"],
-        "hamming_weight": CONTEXT["hamming_weight"],
-        "q_part_count": CONTEXT["q_part_count"],
-        "packing": CONTEXT["packing"],
-        "encode_transform_budget": 1,
-        "decode_transform_budget": 1,
+        "poly_degree": config.poly_degree,
+        "vector_capacity": config.slots,
+        "mul_level": config.mul_level,
+        "input_level": 1,
+        "security_level": 0,
+        "scaling_factor_bits": config.scaling_factor_bits,
+        "first_prime_bits": config.first_prime_bits,
+        "hamming_weight": config.hamming_weight,
+        "q_part_count": config.q_parts,
+        "packing": "full",
+        "encode_transform_budget": config.enc_budget,
+        "decode_transform_budget": config.dec_budget,
         "ciphertext_constant_encoding": "disabled",
         "post_multiply_real": -1.0,
         "post_multiply_imag": 0.0,
         "post_multiply_scale_degree": 0,
-        "post_rotation_step": 5,
+        "post_rotation_step": 1,
     }
     normalized = [
         "tools/phantom_gpu/generate_bootstrap_qualification.py",
@@ -306,15 +673,14 @@ CKKS.mul ATTR[level=1,rescale_level=13,scale=1]
         "--q-part-count", str(options["q_part_count"]),
         "--encode-transform-budget", str(options["encode_transform_budget"]),
         "--decode-transform-budget", str(options["decode_transform_budget"]),
-        "--ciphertext-constant-encoding",
-        options["ciphertext_constant_encoding"],
+        "--ciphertext-constant-encoding", options["ciphertext_constant_encoding"],
         "--packing", options["packing"],
         "--post-multiply-real", repr(options["post_multiply_real"]),
         "--post-multiply-imag", repr(options["post_multiply_imag"]),
-        "--post-multiply-scale-degree",
-        str(options["post_multiply_scale_degree"]),
+        "--post-multiply-scale-degree", str(options["post_multiply_scale_degree"]),
         "--post-rotation-step", str(options["post_rotation_step"]),
     ]
+    invocation_path = tmp_path / "compiler_invocation.json"
     invocation_path.write_text(
         json.dumps(
             {
@@ -323,7 +689,9 @@ CKKS.mul ATTR[level=1,rescale_level=13,scale=1]
                 "tool": normalized[0],
                 "normalized_argv": normalized,
                 "normalized_argv_sha256": hashlib.sha256(
-                    json.dumps(normalized, separators=(",", ":"), sort_keys=True).encode()
+                    json.dumps(
+                        normalized, separators=(",", ":"), sort_keys=True
+                    ).encode()
                 ).hexdigest(),
                 "options": options,
                 "output_destination_in_identity": False,
@@ -332,7 +700,6 @@ CKKS.mul ATTR[level=1,rescale_level=13,scale=1]
         ),
         encoding="utf-8",
     )
-    attestation_path = tmp_path / "post_operations_attestation.json"
     common_transition = {
         "ace_logical_level_delta": 0,
         "active_q_count_delta": 0,
@@ -344,6 +711,7 @@ CKKS.mul ATTR[level=1,rescale_level=13,scale=1]
         "ntt_state": "preserved",
     }
     attrs = {"level": 1, "rescale_level": 13, "scale": 1}
+    attestation_path = tmp_path / "post_operations_attestation.json"
     attestation_path.write_text(
         json.dumps(
             {
@@ -362,7 +730,7 @@ CKKS.mul ATTR[level=1,rescale_level=13,scale=1]
                         "imaginary": 0.0,
                         "plaintext_scale_degree": 0,
                     },
-                    "rotation_step": 5,
+                    "rotation_step": 1,
                 },
                 "input_coordinate": {
                     "ace_logical_level": 1,
@@ -379,23 +747,93 @@ CKKS.mul ATTR[level=1,rescale_level=13,scale=1]
         ),
         encoding="utf-8",
     )
+    semantics_bindings = {
+        "compiler_invocation_sha256": hashlib.sha256(invocation_path.read_bytes()).hexdigest(),
+        "raw_air_sha256": hashlib.sha256(raw_air_path.read_bytes()).hexdigest(),
+        "post_ckks_air_sha256": hashlib.sha256(post_air_path.read_bytes()).hexdigest(),
+        "post_operations_air_sha256": hashlib.sha256(operations_air_path.read_bytes()).hexdigest(),
+        "post_operations_attestation_sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+        "context_manifest_sha256": hashlib.sha256(context_path.read_bytes()).hexdigest(),
+        "resource_manifest_sha256": hashlib.sha256(resource_path.read_bytes()).hexdigest(),
+        "constant_manifest_sha256": hashlib.sha256(constant_path.read_bytes()).hexdigest(),
+        "phantom_source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        "generated_dsl_ant_source_sha256": hashlib.sha256(ant_source_path.read_bytes()).hexdigest(),
+    }
+    domain_bindings = {
+        key: value
+        for key, value in semantics_bindings.items()
+        if key not in {
+            "post_operations_air_sha256",
+            "post_operations_attestation_sha256",
+        }
+    }
+    supported_domain, domain_attestation = derive_supported_identity_domain(
+        coefficients=config.chebyshev_coefficients,
+        scalars=config.double_angle_scalars,
+        overflow_bound=config.eval_sin_upper_bound_k,
+        restoration_factor=config.post_scale,
+        evalmod_lower=-1.0,
+        evalmod_upper=1.0,
+        provider_clear_threshold=1.0e-2,
+        artifact_bindings=domain_bindings,
+        polynomial_degree=config.poly_degree,
+        logical_slots=config.slots,
+        transform_payload_manifest=transform,
+        constant_manifest=constants,
+        evalmod_scalar_manifest=evalmod_scalar_manifest,
+        raw_air=raw_air,
+    )
+    operation_contracts = {
+        "status": "pass",
+        "air_sha256": hashlib.sha256(operations_air_path.read_bytes()).hexdigest(),
+        "input_coordinate": {
+            "ace_logical_level": 1,
+            "rescale_level": 13,
+            "scale_degree": 1,
+        },
+        "rotation": {"air_attributes": attrs, "transition": common_transition},
+        "ciphertext_plaintext_multiply": {
+            "air_attributes": attrs,
+            "transition": common_transition,
+        },
+    }
     semantics_path = tmp_path / "bootstrap_semantics.json"
     semantics_path.write_text(
         json.dumps(
             {
-                "schema_version": "ace.phantom.generated-bootstrap.semantics/1.0.0",
+                "schema_version": "ace.phantom.generated-bootstrap.semantics/2.0.0",
                 "status": "pass",
-                "bindings": {
-                    "compiler_invocation_sha256": hashlib.sha256(invocation_path.read_bytes()).hexdigest(),
-                    "raw_air_sha256": hashlib.sha256(raw_air_path.read_bytes()).hexdigest(),
-                    "post_ckks_air_sha256": hashlib.sha256(post_air_path.read_bytes()).hexdigest(),
-                    "post_operations_air_sha256": hashlib.sha256(operations_air_path.read_bytes()).hexdigest(),
-                    "post_operations_attestation_sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
-                    "context_manifest_sha256": hashlib.sha256(context_path.read_bytes()).hexdigest(),
-                    "resource_manifest_sha256": hashlib.sha256(resource_path.read_bytes()).hexdigest(),
-                    "constant_manifest_sha256": hashlib.sha256(constant_path.read_bytes()).hexdigest(),
-                    "phantom_source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
-                    "generated_dsl_ant_source_sha256": hashlib.sha256(ant_source_path.read_bytes()).hexdigest(),
+                "bindings": semantics_bindings,
+                "expanded_bootstrap": {
+                    "packing": "full",
+                    "logical_slot_capacity": config.slots,
+                    "transform_budgets": {
+                        "encode": config.enc_budget,
+                        "decode": config.dec_budget,
+                    },
+                    "ciphertext_constant_encoding": "disabled",
+                    "coefficient_family": {
+                        "coefficient_count": len(config.chebyshev_coefficients),
+                        "coefficient_payload_sha256": hashlib.sha256(
+                            b"".join(struct.pack("<d", value) for value in config.chebyshev_coefficients)
+                        ).hexdigest(),
+                        "evalmod_component_interval": {
+                            "lower": -1.0,
+                            "upper": 1.0,
+                            "lower_inclusive": True,
+                            "upper_inclusive": True,
+                        },
+                    },
+                    "double_angle": {
+                        "count": len(config.double_angle_scalars),
+                        "scalar_payload_sha256": hashlib.sha256(
+                            b"".join(struct.pack("<d", value) for value in config.double_angle_scalars)
+                        ).hexdigest(),
+                    },
+                    "evalmod_scalar_encodings": evalmod_scalar_manifest,
+                    "eval_sin_upper_bound_k": config.eval_sin_upper_bound_k,
+                    "post_scale": {"factor": config.post_scale},
+                    "coeffs_to_slots_factor": config.coeffs_to_slots_factor,
                 },
                 "output_air_contract": {
                     "ace_logical_level": 1,
@@ -404,32 +842,16 @@ CKKS.mul ATTR[level=1,rescale_level=13,scale=1]
                     "scale_degree": 1,
                     "raw_scale_contract": {
                         "kind": "ace-log2-scale-coordinate",
-                        "nominal_raw_scale": "0x1.0000000000000p+56",
-                        "scaling_modulus_bits": 56,
+                        "nominal_raw_scale": math.ldexp(1.0, config.scaling_factor_bits).hex(),
+                        "scaling_modulus_bits": config.scaling_factor_bits,
                         "expected_scale_degree": 1,
                         "maximum_absolute_coordinate_error": 1.0e-4,
                     },
-                    "logical_slots": CONTEXT["logical_slot_capacity"],
+                    "logical_slots": config.slots,
                 },
-                "post_operation_contracts": {
-                    "status": "pass",
-                    "air_sha256": hashlib.sha256(
-                        operations_air_path.read_bytes()
-                    ).hexdigest(),
-                    "input_coordinate": {
-                        "ace_logical_level": 1,
-                        "rescale_level": 13,
-                        "scale_degree": 1,
-                    },
-                    "rotation": {
-                        "air_attributes": attrs,
-                        "transition": common_transition,
-                    },
-                    "ciphertext_plaintext_multiply": {
-                        "air_attributes": attrs,
-                        "transition": common_transition,
-                    },
-                },
+                "post_operation_contracts": operation_contracts,
+                "supported_identity_domain": supported_domain,
+                "identity_domain_attestation": domain_attestation,
             },
             sort_keys=True,
         ),
@@ -440,8 +862,12 @@ CKKS.mul ATTR[level=1,rescale_level=13,scale=1]
     generation_path.write_text(
         json.dumps(
             {
-                "schema_version": "ace.phantom.bootstrap-generation/3.0.0",
+                "schema_version": "ace.phantom.bootstrap-generation/4.0.0",
                 "status": "pass",
+                "identity_domain_policy": {
+                    "provider_clear_maximum_absolute": 1.0e-2,
+                    "clear_map_budget_fraction": 0.5,
+                },
                 "source": artifact_record(source_path),
                 "sources": {
                     "phantom": artifact_record(source_path),
@@ -465,7 +891,9 @@ CKKS.mul ATTR[level=1,rescale_level=13,scale=1]
                     "generated_dsl_ant": {
                         "provider": "ant",
                         "codegen_ir": "poly",
-                        "stages_completed": ["ckks_driver", "poly_driver", "poly2c"],
+                        "stages_completed": [
+                            "ckks_driver", "poly_driver", "poly2c"
+                        ],
                         "post_ckks_air_sha256": post_hash,
                     },
                 },
@@ -488,16 +916,323 @@ def run_versioned_audit(tmp_path: Path) -> dict[str, Any]:
     return audit(*write_versioned_closure(tmp_path))
 
 
+def rebind_terminal_sources(paths: tuple[Path, ...]) -> None:
+    semantics = json.loads(paths[9].read_text(encoding="utf-8"))
+    semantics["bindings"]["phantom_source_sha256"] = hashlib.sha256(
+        paths[5].read_bytes()
+    ).hexdigest()
+    semantics["bindings"]["generated_dsl_ant_source_sha256"] = hashlib.sha256(
+        paths[6].read_bytes()
+    ).hexdigest()
+    paths[9].write_text(json.dumps(semantics, sort_keys=True), encoding="utf-8")
+    generation = json.loads(paths[7].read_text(encoding="utf-8"))
+    generation["source"] = artifact_record(paths[5])
+    generation["sources"] = {
+        "phantom": artifact_record(paths[5]),
+        "generated_dsl_ant": artifact_record(paths[6]),
+    }
+    generation["bootstrap_semantics"] = artifact_record(paths[9])
+    paths[7].write_text(json.dumps(generation, sort_keys=True), encoding="utf-8")
+
+
+def rebind_post_ckks_air(paths: tuple[Path, ...]) -> None:
+    """Rebind a post-CKKS mutation without changing the raw domain authority."""
+    post_hash = hashlib.sha256(paths[4].read_bytes()).hexdigest()
+    post_attestation = json.loads(paths[11].read_text(encoding="utf-8"))
+    post_attestation["bindings"]["post_ckks_air_sha256"] = post_hash
+    paths[11].write_text(
+        json.dumps(post_attestation, sort_keys=True), encoding="utf-8"
+    )
+
+    semantics = json.loads(paths[9].read_text(encoding="utf-8"))
+    semantics["bindings"]["post_ckks_air_sha256"] = post_hash
+    semantics["bindings"]["post_operations_attestation_sha256"] = (
+        hashlib.sha256(paths[11].read_bytes()).hexdigest()
+    )
+    identity_attestation = semantics["identity_domain_attestation"]
+    identity_attestation["artifact_bindings"]["post_ckks_air_sha256"] = post_hash
+    semantics["supported_identity_domain"]["evidence"][
+        "attestation_sha256"
+    ] = hashlib.sha256(canonical_bytes(identity_attestation)).hexdigest()
+    paths[9].write_text(json.dumps(semantics, sort_keys=True), encoding="utf-8")
+
+    generation = json.loads(paths[7].read_text(encoding="utf-8"))
+    generation["air"]["post_ckks"] = artifact_record(paths[4])
+    for terminal in generation["terminal_paths"].values():
+        terminal["post_ckks_air_sha256"] = post_hash
+    generation["bootstrap_semantics"] = artifact_record(paths[9])
+    generation["post_operations_attestation"] = artifact_record(paths[11])
+    paths[7].write_text(json.dumps(generation, sort_keys=True), encoding="utf-8")
+
+
 def test_versioned_generated_artifact_closure_passes(tmp_path: Path) -> None:
     report = run_versioned_audit(tmp_path)
     assert report["status"] == "pass", report["errors"]
-    assert report["schema_version"] == "ace.phantom.bootstrap-generated-artifact-audit/3.0.0"
+    assert report["schema_version"] == "ace.phantom.bootstrap-generated-artifact-audit/4.0.0"
     assert report["qualification_closure"]["post_operations_attested"] is True
+    assert report["qualification_closure"]["identity_domain_attested"] is True
+    assert (
+        report["qualification_closure"][
+            "post_ckks_evalmod_polynomial_attested"
+        ]
+        is True
+    )
+    body_closure = report["qualification_closure"]["terminal_body_closure"]
+    assert body_closure["phantom"]["transform_constant_count"] == 6
+    assert body_closure["generated_dsl_ant"]["transform_constant_count"] == 6
+    assert body_closure["phantom"]["reachable_required_stage_count"] == 4
+    assert body_closure["generated_dsl_ant"][
+        "reachable_required_stage_count"
+    ] == 4
+    assert body_closure["phantom"]["scalar_encode_count"] == body_closure[
+        "generated_dsl_ant"
+    ]["scalar_encode_count"]
+    assert body_closure["phantom"][
+        "scalar_encode_payload_sha256"
+    ] == body_closure["generated_dsl_ant"]["scalar_encode_payload_sha256"]
+
+
+def test_versioned_dead_bootstrap_body_is_rejected(tmp_path: Path) -> None:
+    paths = write_versioned_closure(tmp_path)
+    source = paths[5].read_text(encoding="utf-8").replace(
+        "CIPHERTEXT bootstrap_full(",
+        "CIPHERTEXT dead_generated_program(",
+        1,
+    )
+    source += (
+        "\nCIPHERTEXT bootstrap_full(CIPHERTEXT input, CIPHERTEXT zero) {\n"
+        "  (void)zero;\n"
+        "  return input;\n"
+        "}\n"
+    )
+    paths[5].write_text(source, encoding="utf-8")
+    rebind_terminal_sources(paths)
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert "does not return an owned result" in report["errors"][0]
+
+
+def test_versioned_dead_ant_bootstrap_body_is_rejected(tmp_path: Path) -> None:
+    paths = write_versioned_closure(tmp_path)
+    source = paths[6].read_text(encoding="utf-8").replace(
+        "CIPHERTEXT bootstrap_full(",
+        "CIPHERTEXT dead_generated_program(",
+        1,
+    )
+    source += (
+        "\nCIPHERTEXT bootstrap_full(CIPHERTEXT input, CIPHERTEXT zero) {\n"
+        "  (void)zero;\n"
+        "  return input;\n"
+        "}\n"
+    )
+    paths[6].write_text(source, encoding="utf-8")
+    rebind_terminal_sources(paths)
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert "does not return an owned result" in report["errors"][0]
+
+
+def test_versioned_ant_terminal_payload_bypass_is_rejected(
+    tmp_path: Path,
+) -> None:
+    paths = write_versioned_closure(tmp_path)
+    source, replacement_count = re.subn(
+        r"Copy_ciph\(&returned, &trace_value_[0-9]+\);",
+        "Copy_ciph(&returned, &input);",
+        paths[6].read_text(encoding="utf-8"),
+        count=1,
+    )
+    assert replacement_count == 1
+    paths[6].write_text(source, encoding="utf-8")
+    rebind_terminal_sources(paths)
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert (
+        "return is not copied from a generated value" in report["errors"][0]
+        or "does not depend on every transform constant" in report["errors"][0]
+    )
+
+
+@pytest.mark.parametrize("source_index", (5, 6))
+def test_versioned_post_return_payload_overwrite_is_rejected(
+    tmp_path: Path,
+    source_index: int,
+) -> None:
+    paths = write_versioned_closure(tmp_path)
+    source, copy_count = re.subn(
+        r"Copy_ciph\(&returned, &trace_value_[0-9]+\);",
+        "Copy_ciph(&returned, &input);",
+        paths[source_index].read_text(encoding="utf-8"),
+        count=1,
+    )
+    assert copy_count == 1
+    source, replacement_count = re.subn(
+        r"(\breturn\s+returned\s*;)(\s*\n\s*})",
+        r"\1\n  Add_ciph(&returned, &input, &input);\2",
+        source,
+        count=1,
+    )
+    assert replacement_count == 1
+    paths[source_index].write_text(source, encoding="utf-8")
+    rebind_terminal_sources(paths)
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert (
+        "return is not copied from a generated value" in report["errors"][0]
+        or "does not depend on every transform constant" in report["errors"][0]
+    )
+
+
+def test_versioned_unreachable_terminal_payload_is_rejected(
+    tmp_path: Path,
+) -> None:
+    paths = write_versioned_closure(tmp_path)
+    source, replacement_count = re.subn(
+        r"Mul_plain\(&(trace_value_[0-9]+), &(trace_value_[0-9]+), "
+        r"&payload_plain_0\);",
+        r"Mul_ciph(&\1, &\2, &\2);",
+        paths[5].read_text(encoding="utf-8"),
+        count=1,
+    )
+    assert replacement_count == 1
+    paths[5].write_text(source, encoding="utf-8")
+    rebind_terminal_sources(paths)
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert "does not depend on every transform constant" in report["errors"][0]
+
+
+def test_versioned_phantom_primary_input_bypass_is_rejected(
+    tmp_path: Path,
+) -> None:
+    paths = write_versioned_closure(tmp_path)
+    source = paths[5].read_text(encoding="utf-8").replace(
+        "Raise_mod(&trace_value_0, &input,",
+        "Raise_mod(&trace_value_0, &zero,",
+        1,
+    )
+    paths[5].write_text(source, encoding="utf-8")
+    rebind_terminal_sources(paths)
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert "does not depend on its primary input" in report["errors"][0]
+
+
+def test_versioned_terminal_scalar_tamper_is_rejected(tmp_path: Path) -> None:
+    paths = write_versioned_closure(tmp_path)
+    source = paths[5].read_text(encoding="utf-8")
+    source, replacement_count = re.subn(
+        r"^\s*Encode_double_mask\(&scalar_plain_0,[^\n]+\n",
+        "",
+        source,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    assert replacement_count == 1
+    paths[5].write_text(source, encoding="utf-8")
+    rebind_terminal_sources(paths)
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert "differ in EvalMod scalar encodings" in report["errors"][0]
+
+
+def test_versioned_matching_terminal_scalar_tamper_is_rejected(
+    tmp_path: Path,
+) -> None:
+    paths = write_versioned_closure(tmp_path)
+    pattern = re.compile(
+        r"(Encode_double_mask\(&scalar_plain_0,\s*)[^,]+(,\s*1,\s*1,\s*1\);)"
+    )
+    for source_index in (5, 6):
+        source, replacement_count = pattern.subn(
+            r"\g<1>0.25\g<2>",
+            paths[source_index].read_text(encoding="utf-8"),
+            count=1,
+        )
+        assert replacement_count == 1
+        paths[source_index].write_text(source, encoding="utf-8")
+    rebind_terminal_sources(paths)
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert "attested polynomial" in report["errors"][0]
+
+
+def test_versioned_post_ckks_evalmod_operator_tamper_is_rejected(
+    tmp_path: Path,
+) -> None:
+    paths = write_versioned_closure(tmp_path)
+    post_air = paths[4].read_text(encoding="utf-8")
+    conjugate = post_air.index("CKKS.conjugate")
+    suffix, replacement_count = re.subn(
+        r"\bCKKS\.mul(\s+ATTR\[[^\]]+\])?\s+RTYPE",
+        r"CKKS.add\1 RTYPE",
+        post_air[conjugate:],
+        count=1,
+    )
+    assert replacement_count == 1
+    paths[4].write_text(post_air[:conjugate] + suffix, encoding="utf-8")
+    rebind_post_ckks_air(paths)
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert (
+        "post-CKKS AIR EvalMod" in report["errors"][0]
+        or "terminal operation trace differs" in report["errors"][0]
+    )
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    (("Mul_ciph(", "Add_ciph("), ("Sub_ciph(", "Add_ciph(")),
+)
+def test_versioned_phantom_terminal_operator_substitution_is_rejected(
+    tmp_path: Path,
+    original: str,
+    replacement: str,
+) -> None:
+    paths = write_versioned_closure(tmp_path)
+    source = paths[5].read_text(encoding="utf-8")
+    assert original in source
+    paths[5].write_text(
+        source.replace(original, replacement, 1), encoding="utf-8"
+    )
+    rebind_terminal_sources(paths)
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert "terminal operation trace differs" in report["errors"][0]
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    (("Hw_modmul(", "Hw_modadd("), ("Hw_modsub(", "Hw_modadd(")),
+)
+def test_versioned_ant_terminal_operator_substitution_is_rejected(
+    tmp_path: Path,
+    original: str,
+    replacement: str,
+) -> None:
+    paths = write_versioned_closure(tmp_path)
+    source = paths[6].read_text(encoding="utf-8")
+    assert original in source
+    paths[6].write_text(
+        source.replace(original, replacement, 1), encoding="utf-8"
+    )
+    rebind_terminal_sources(paths)
+    report = audit(*paths)
+    assert report["status"] == "fail"
+    assert (
+        "lowering" in report["errors"][0]
+        or "terminal operation trace differs" in report["errors"][0]
+    )
 
 
 def test_versioned_ant_abi_tamper_is_rejected(tmp_path: Path) -> None:
     paths = write_versioned_closure(tmp_path)
-    paths[6].write_text("CIPHERTEXT wrong(CIPHERTEXT a, CIPHERTEXT b) { return a; }\n")
+    paths[6].write_text(
+        paths[6].read_text(encoding="utf-8").replace(
+            "CIPHERTEXT bootstrap_full(", "CIPHERTEXT wrong(", 1
+        ),
+        encoding="utf-8",
+    )
     report = audit(*paths)
     assert report["status"] == "fail"
     assert "exact bootstrap_full" in report["errors"][0]

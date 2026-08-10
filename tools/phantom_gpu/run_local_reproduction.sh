@@ -98,6 +98,21 @@ if [[ "${PHANTOM_COMMIT}" != "${LOCKED_PHANTOM_COMMIT}" ]]; then
   echo "requested Phantom commit does not match the selected ACE commit lock" >&2
   exit 1
 fi
+if [[ "${QUALIFICATION_MODE}" == "generated-bootstrap-correctness" ]]; then
+  expected_entrypoint_sha256="$(
+    git -C "${REPO_ROOT}" show \
+      "${ACE_COMMIT}:tools/phantom_gpu/run_local_reproduction.sh" |
+      sha256sum | awk '{print $1}'
+  )"
+  observed_entrypoint_sha256="$(
+    sha256sum "${REPO_ROOT}/tools/phantom_gpu/run_local_reproduction.sh" |
+      awk '{print $1}'
+  )"
+  if [[ "${observed_entrypoint_sha256}" != "${expected_entrypoint_sha256}" ]]; then
+    echo "correctness local-replay entrypoint differs from the selected ACE commit" >&2
+    exit 1
+  fi
+fi
 
 OUTPUT="$(realpath -m -- "${OUTPUT_ARGUMENT}")"
 if [[ -e "${OUTPUT}" ]]; then
