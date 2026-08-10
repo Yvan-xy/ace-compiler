@@ -8,9 +8,9 @@
 
 #include "scale_manager.h"
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 
 #include "air/base/container.h"
 #include "air/base/container_decl.h"
@@ -26,7 +26,6 @@ namespace fhe {
 namespace ckks {
 SCALE_INFO PARS::Handle(NODE_PTR node) {
   Rescale_ana(node);
-  Level_match(node);
   Scale_match(node);
   SCALE_INFO info = Downscale_analysis(node);
   Context()->Set_node_scale_info(node, info);
@@ -58,54 +57,59 @@ void PARS::Rescale_ana(NODE_PTR node) {
   }
 }
 
-void PARS::Level_match(NODE_PTR node) {
-// In current implementation, waterline is equal to scale factor.
-// Only Modswitch is needed to match level of operands of binary operations.
-#if 0
-  if (node->Opcode() != OPC_ADD && node->Opcode() != OPC_MUL) return;
+uint32_t SCALE_MNG_CTX::Align_binary_rescale_levels(NODE_PTR node,
+                                                     SCALE_INFO& si0,
+                                                     SCALE_INFO& si1) {
+  AIR_ASSERT(node->Opcode() == OPC_ADD || node->Opcode() == OPC_SUB ||
+             node->Opcode() == OPC_MUL);
+  AIR_ASSERT(node->Num_child() == 2);
 
-  NODE_ID                   child0    = node->Child_id(0);
-  NODE_ID                   child1    = node->Child_id(1);
-  SCALE_MNG_CTX::SCALE_MAP& scale_map = Context()->Node_scale_info();
-  SCALE_MAP_ITER            iter0     = scale_map.find(child0.Value());
-  if (iter0 == scale_map.end()) return;
-  SCALE_MAP_ITER iter1 = scale_map.find(child1.Value());
-  if (iter1 == scale_map.end()) return;
-
-  SCALE_INFO& info0   = iter0->second;
-  SCALE_INFO& info1   = iter1->second;
-  uint32_t    rs_lev0 = info0.Rescale_level();
-  uint32_t    rs_lev1 = info1.Rescale_level();
-  if (rs_lev0 < rs_lev1) {
-    if (info0.Scale_deg() > 1) {
-      uint32_t rs_cnt = info0.Scale_deg() - 1;
-      rs_lev0 += rs_cnt;
-      info0.Set_scale_deg(1);
-      info0.Set_rescale_level(rs_lev0);
-      EXPR_RESCALE_INFO rs_info(node, node->Child(0), rs_cnt, info0);
-      Context()->Add_expr_rescale_info(rs_info);
-    } else {
-      info0.Set_rescale_level(info0.Rescale_level() + 1);
-      info0.Set_scale_deg(info0.Scale_deg() - 1);
-    }
-  } else if (rs_lev0 > rs_lev1) {
-    if (info1.Scale_deg() > 1) {
-      uint32_t rs_cnt = info1.Scale_deg() - 1;
-      rs_lev1 += rs_cnt;
-      info1.Set_scale_deg(1);
-      info1.Set_rescale_level(rs_lev1);
-      EXPR_RESCALE_INFO rs_info(node, node->Child(1), rs_cnt, info1);
-      Context()->Add_expr_rescale_info(rs_info);
-    } else {
-      info1.Set_rescale_level(info1.Rescale_level() + 1);
-      info1.Set_scale_deg(info1.Scale_deg() - 1);
-    }
+  NODE_PTR child0 = node->Child(0);
+  NODE_PTR child1 = node->Child(1);
+  auto is_cipher = [this](NODE_PTR child) {
+    return Lower_ctx()->Is_cipher_type(child->Rtype_id()) ||
+           Lower_ctx()->Is_cipher3_type(child->Rtype_id());
+  };
+  if (!is_cipher(child0) || !is_cipher(child1)) {
+    return std::max(si0.Rescale_level(), si1.Rescale_level());
   }
-#endif
+
+  // An unfixed add/sub value such as CORE.zero adopts the other operand's
+  // coordinate and does not require a physical modulus switch.
+  if (node->Opcode() == OPC_ADD || node->Opcode() == OPC_SUB) {
+    if (Is_unfix_scale(si0.Scale_deg())) si0 = si1;
+    if (Is_unfix_scale(si1.Scale_deg())) si1 = si0;
+  } else {
+    AIR_ASSERT_MSG(!Is_unfix_scale(si0.Scale_deg()) &&
+                       !Is_unfix_scale(si1.Scale_deg()),
+                   "ciphertext multiply requires fixed operand scales");
+  }
+
+  uint32_t target_level =
+      std::max(si0.Rescale_level(), si1.Rescale_level());
+  uint32_t full_q_count = Lower_ctx()->Get_ctx_param().Get_mul_level();
+  AIR_ASSERT_MSG(full_q_count == 0 || target_level <= full_q_count,
+                 "ciphertext binary operand exceeds the data-Q chain");
+
+  SCALE_INFO* operands[2] = {&si0, &si1};
+  for (uint32_t child_id = 0; child_id < 2; ++child_id) {
+    SCALE_INFO* operand = operands[child_id];
+    uint32_t current_level = operand->Rescale_level();
+    if (current_level == target_level) continue;
+
+    uint32_t ms_count = target_level - current_level;
+    operand->Set_rescale_level(target_level);
+    Add_expr_modswitch_info(EXPR_MODSWITCH_INFO(
+        node, child_id, ms_count, *operand));
+    Trace(TD_CKKS_SCALE_MGT, std::string(Indent(), ' '),
+          "Modswitch-align opnd", child_id, " of binary node: ");
+    Trace_obj(TD_CKKS_SCALE_MGT, node);
+  }
+  return target_level;
 }
 
 void PARS::Scale_match(NODE_PTR node) {
-  if (node->Opcode() != OPC_ADD) return;
+  if (node->Opcode() != OPC_ADD && node->Opcode() != OPC_SUB) return;
   SCALE_MNG_CTX*            ctx       = Context();
   NODE_ID                   child0    = node->Child_id(0);
   NODE_ID                   child1    = node->Child_id(1);
@@ -119,18 +123,22 @@ void PARS::Scale_match(NODE_PTR node) {
   if (ctx->Is_unfix_scale(info0.Scale_deg())) {
     AIR_ASSERT(!ctx->Is_unfix_scale(info1.Scale_deg()));
     info0 = info1;
+  } else if (ctx->Is_unfix_scale(info1.Scale_deg())) {
+    info1 = info0;
   }
-  if (info0.Scale_deg() < info1.Scale_deg()) {
-    uint32_t rs_cnt   = info1.Scale_deg() - info0.Scale_deg();
-    uint32_t rs_level = info1.Rescale_level() + rs_cnt;
+  if (info0.Scale_deg() == info1.Scale_deg()) return;
 
-    EXPR_RESCALE_INFO rs_info(node, node->Child(1), rs_cnt,
-                              SCALE_INFO(info0.Scale_deg(), rs_level));
-    ctx->Add_expr_rescale_info(rs_info);
-    ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
-               "Rescale opnd1 of add: ");
-    ctx->Trace_obj(TD_CKKS_SCALE_MGT, node);
-  }
+  uint32_t high_id = info0.Scale_deg() > info1.Scale_deg() ? 0 : 1;
+  SCALE_INFO& high = high_id == 0 ? info0 : info1;
+  SCALE_INFO& low  = high_id == 0 ? info1 : info0;
+  uint32_t rs_count = high.Scale_deg() - low.Scale_deg();
+  SCALE_INFO result(low.Scale_deg(), high.Rescale_level() + rs_count);
+  ctx->Add_expr_rescale_info(
+      EXPR_RESCALE_INFO(node, node->Child(high_id), rs_count, result));
+  high = result;
+  ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
+             "Rescale opnd", high_id, " of add/sub: ");
+  ctx->Trace_obj(TD_CKKS_SCALE_MGT, node);
 }
 
 SCALE_INFO PARS::Downscale_analysis(NODE_PTR node) {
@@ -184,7 +192,8 @@ SCALE_INFO PARS::Downscale_analysis(NODE_PTR node) {
   return SCALE_INFO(scale_deg - 2, rs_level + 1);
 }
 
-SCALE_INFO ACE_SM::Handle_mul(NODE_PTR node, SCALE_INFO si0, SCALE_INFO si1) {
+SCALE_INFO ACE_SM::Handle_mul(NODE_PTR node, SCALE_INFO& si0,
+                              SCALE_INFO& si1) {
   SCALE_MNG_CTX* ctx = Context();
   const uint32_t* lazy_rescale_attr =
       node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::SKIP_AUTO_RESCALE);
@@ -209,7 +218,8 @@ SCALE_INFO ACE_SM::Handle_mul(NODE_PTR node, SCALE_INFO si0, SCALE_INFO si1) {
   return si;
 }
 
-SCALE_INFO ACE_SM::Handle_add(NODE_PTR node, SCALE_INFO si0, SCALE_INFO si1) {
+SCALE_INFO ACE_SM::Handle_add(NODE_PTR node, SCALE_INFO& si0,
+                              SCALE_INFO& si1) {
   // scale match
   SCALE_MNG_CTX* ctx = Context();
   if (Context()->Is_unfix_scale(si0.Scale_deg())) {
@@ -653,6 +663,46 @@ void SCALE_MANAGER::Rescale_expr() {
     Mng_ctx().Trace(TD_CKKS_SCALE_MGT, "\n", ++cnt, ": Rescale ", child_id,
                     "-th operand of:\n");
     Mng_ctx().Trace(TD_CKKS_SCALE_MGT, parent->To_str());
+  }
+}
+
+void SCALE_MANAGER::Modswitch_expr() {
+  uint32_t count = 0;
+  CKKS_GEN ckks_gen(&Func_scope()->Container(), Lower_ctx());
+  for (const EXPR_MODSWITCH_INFO& ms_info : Mng_ctx().Modswitch_expr()) {
+    NODE_PTR parent   = ms_info.Parent();
+    uint32_t child_id = ms_info.Child_id();
+    AIR_ASSERT(child_id < parent->Num_child());
+
+    // Rescale_expr() may already have replaced this child. Always wrap the
+    // current operand so explicit rescaling precedes explicit level matching.
+    NODE_PTR operand = parent->Child(child_id);
+    const SCALE_INFO& target = ms_info.Result_scale();
+    AIR_ASSERT(target.Rescale_level() >= ms_info.Modswitch_cnt());
+    uint32_t expected_source_level =
+        target.Rescale_level() - ms_info.Modswitch_cnt();
+    const uint32_t* scale =
+        operand->Attr<uint32_t>(core::FHE_ATTR_KIND::SCALE);
+    const uint32_t* rescale_level =
+        operand->Attr<uint32_t>(core::FHE_ATTR_KIND::RESCALE_LEVEL);
+    AIR_ASSERT_MSG((scale == nullptr) == (rescale_level == nullptr),
+                   "modulus-switch source has incomplete scale metadata");
+    if (scale != nullptr) {
+      AIR_ASSERT(*scale == target.Scale_deg());
+      AIR_ASSERT(*rescale_level == expected_source_level);
+    }
+
+    uint32_t current_level = expected_source_level;
+    for (uint32_t id = 0; id < ms_info.Modswitch_cnt(); ++id) {
+      operand = ckks_gen.Gen_modswitch(operand);
+      Mng_ctx().Set_node_scale_info(
+          operand, SCALE_INFO(target.Scale_deg(), ++current_level));
+    }
+    parent->Set_child(child_id, operand);
+
+    Mng_ctx().Trace(TD_CKKS_SCALE_MGT, "\n", ++count,
+                    ": Modswitch-align ", child_id, "-th operand of:\n");
+    Mng_ctx().Trace_obj(TD_CKKS_SCALE_MGT, parent);
   }
 }
 

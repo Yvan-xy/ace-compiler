@@ -8,6 +8,7 @@
 
 #include <climits>
 #include <list>
+#include <set>
 #include <string>
 
 #include "air/base/analyze_ctx.h"
@@ -161,6 +162,63 @@ private:
   SCALE_INFO _scale_info;  // scale info after rescale.
 };
 
+//! @brief Modulus-switch information for one binary-expression operand.
+//!
+//! The operand is identified by its parent and child index instead of its
+//! current node. Rescale insertion runs first and may replace the node in that
+//! slot; modulus switching must wrap the replacement.
+class EXPR_MODSWITCH_INFO {
+public:
+  using SET  = std::set<EXPR_MODSWITCH_INFO>;
+  using ITER = SET::iterator;
+
+  EXPR_MODSWITCH_INFO(NODE_PTR parent, uint32_t child_id, uint32_t ms_cnt,
+                      const SCALE_INFO& result_scale)
+      : _parent(parent),
+        _child_id(child_id),
+        _ms_cnt(ms_cnt),
+        _scale_info(result_scale) {
+    AIR_ASSERT(parent != Null_ptr);
+    AIR_ASSERT(child_id < parent->Num_child());
+    AIR_ASSERT(ms_cnt > 0);
+  }
+  EXPR_MODSWITCH_INFO(const EXPR_MODSWITCH_INFO& other)
+      : EXPR_MODSWITCH_INFO(other._parent, other._child_id, other._ms_cnt,
+                            other._scale_info) {}
+
+  ~EXPR_MODSWITCH_INFO() {}
+
+  NODE_PTR          Parent(void) const { return _parent; }
+  uint32_t          Child_id(void) const { return _child_id; }
+  uint32_t          Modswitch_cnt(void) const { return _ms_cnt; }
+  const SCALE_INFO& Result_scale(void) const { return _scale_info; }
+
+  bool operator<(const EXPR_MODSWITCH_INFO& other) const {
+    if (_parent->Id() != other._parent->Id()) {
+      return _parent->Id() < other._parent->Id();
+    }
+    return _child_id < other._child_id;
+  }
+
+  void Print(std::ostream& os) const {
+    os << "Require " << _ms_cnt << " modulus switches on child "
+       << _child_id << " of" << std::endl
+       << _parent->To_str() << "to ";
+    _scale_info.Print(os);
+  }
+  void Print(void) const { Print(std::cout); }
+
+private:
+  // REQUIRED UNDEFINED UNWANTED methods
+  EXPR_MODSWITCH_INFO(void);
+  EXPR_MODSWITCH_INFO& operator=(const EXPR_MODSWITCH_INFO&);
+
+  NODE_PTR   _parent;
+  uint32_t   _child_id;
+  uint32_t   _ms_cnt;
+  SCALE_INFO _scale_info;
+};
+
 //! context of scale manage handlers.
 class SCALE_MNG_CTX : public ANALYZE_CTX {
 public:
@@ -270,6 +328,10 @@ public:
     return _rescale_expr;
   }
 
+  const EXPR_MODSWITCH_INFO::SET& Modswitch_expr(void) const {
+    return _modswitch_expr;
+  }
+
   //! @brief Record the expr that require rescaling. If the expr has already
   //! been recorded, update the rescaling info to one with lower resulting scale
   //! degree.
@@ -295,6 +357,22 @@ public:
       Trace_obj(TD_CKKS_SCALE_MGT, &rs_info);
     }
   }
+
+  void Add_expr_modswitch_info(const EXPR_MODSWITCH_INFO& ms_info) {
+    std::pair<EXPR_MODSWITCH_INFO::ITER, bool> result =
+        _modswitch_expr.insert(ms_info);
+    AIR_ASSERT_MSG(result.second,
+                   "duplicate modulus-switch candidate for operand");
+    Trace(TD_CKKS_SCALE_MGT, _modswitch_expr.size(), "-th candidate:\n");
+    Trace_obj(TD_CKKS_SCALE_MGT, &ms_info);
+  }
+
+  //! @brief Schedule explicit modulus switches so direct ciphertext operands
+  //! of an add, subtract, or multiply use the same physical data-Q level.
+  //! Operand scale information must already include any rescale operations
+  //! scheduled by the selected scale-management policy.
+  uint32_t Align_binary_rescale_levels(NODE_PTR node, SCALE_INFO& si0,
+                                       SCALE_INFO& si1);
 
   uint32_t Formal_scale_deg() const { return _formal_scale_deg; }
   air::opt::SSA_CONTAINER*       Ssa_cntr() const { return _ssa_cntr; }
@@ -373,6 +451,8 @@ private:
   SCALE_MAP     _node_scale_info;        // scale and rescale level of node
   PHI_NODE_LIST _rescale_phi_res;        // phi nodes need rescale result
   EXPR_RESCALE_INFO::SET _rescale_expr;  // expr need rescale
+  EXPR_MODSWITCH_INFO::SET
+      _modswitch_expr;  // binary operands need explicit modulus switching
   uint32_t               _formal_scale_deg;  // scale degree of formals
 };
 
@@ -398,14 +478,8 @@ private:
 
   //! @brief If arg0.scale > waterline * scale_factor: arg0 <- Rescale(arg0)
   void Rescale_ana(NODE_PTR node);
-  //! @brief If opc in {CKKS.add, CKKS.mul}, arg0.level < arg1.level then:
-  //! if arg0.scale == waterline: arg0 <- Modswitch(arg0)
-  //! if arg0.scale > waterline:  arg0 <- Downscale(arg0)
-  //! In current implementation, waterline is equal to scale_factor, only
-  //! Modswitch is needed. Level match can be done by RTLIB automatically.
-  void Level_match(NODE_PTR node);
-  //! @brief If opc == CKKS.add and arg0.scale < arg1.scale then: arg1 <-
-  //! rescale(arg1, arg0.scale).
+  //! @brief For CKKS.add/sub, rescale the operand with the larger scale degree
+  //! until both operands have the same scale degree.
   void Scale_match(NODE_PTR node);
   //! @brief If opc == CKKS.mul and arg0.scale * arg1.scale > waterline^2 *
   //! scale_factor then: arg0 <- Rescale(arg0); arg1 <- Rescale(arg1).
@@ -423,8 +497,8 @@ public:
   explicit ACE_SM(SCALE_MNG_CTX* ctx) : _ctx(ctx) {}
   ~ACE_SM() {}
 
-  SCALE_INFO Handle_mul(NODE_PTR node, SCALE_INFO si0, SCALE_INFO si1);
-  SCALE_INFO Handle_add(NODE_PTR node, SCALE_INFO si0, SCALE_INFO si1);
+  SCALE_INFO Handle_mul(NODE_PTR node, SCALE_INFO& si0, SCALE_INFO& si1);
+  SCALE_INFO Handle_add(NODE_PTR node, SCALE_INFO& si0, SCALE_INFO& si1);
   SCALE_INFO Handle_relin(NODE_PTR node, SCALE_INFO si);
   SCALE_INFO Handle_rotate(NODE_PTR node, SCALE_INFO si);
 
@@ -985,7 +1059,9 @@ RETV CKKS_SCALE_MANAGER::Handle_mul(VISITOR* visitor, NODE_PTR node) {
   NODE_PTR   child1       = node->Child(1);
   TYPE_ID    rtype_child1 = child1->Rtype_id();
   SCALE_INFO si1          = si0;
-  if (lower_ctx->Is_cipher_type(rtype_child1)) {
+  bool cipher_pair = lower_ctx->Is_cipher_type(rtype_child1) ||
+                     lower_ctx->Is_cipher3_type(rtype_child1);
+  if (cipher_pair) {
     RETV retv1 = visitor->template Visit<RETV>(child1);
     si1        = retv1.Scale_info();
   } else if (lower_ctx->Is_plain_type(rtype_child1)) {
@@ -1014,7 +1090,6 @@ RETV CKKS_SCALE_MANAGER::Handle_mul(VISITOR* visitor, NODE_PTR node) {
   uint16_t   scale_deg     = si0.Scale_deg() + si1.Scale_deg();
   uint16_t   rescale_level = std::max(si0.Rescale_level(), si1.Rescale_level());
   SCALE_INFO scale_info(scale_deg, rescale_level);
-  ctx.Set_node_scale_info(node, scale_info);
 
   if (ctx.Req_eva()) {
     if (!lazy_rescale) {
@@ -1027,13 +1102,25 @@ RETV CKKS_SCALE_MANAGER::Handle_mul(VISITOR* visitor, NODE_PTR node) {
   } else if (ctx.Req_pars()) {
     if (!lazy_rescale) {
       scale_info = PARS(&ctx).Handle(node);
+      si0        = ctx.Get_scale_info(child0->Id());
+      if (cipher_pair) {
+        si1 = ctx.Get_scale_info(child1->Id());
+      }
     }
   } else if (ctx.Req_ace_sm()) {
     scale_info = ACE_SM(&ctx).Handle_mul(node, si0, si1);
   }
 
+  uint32_t operation_level =
+      ctx.Align_binary_rescale_levels(node, si0, si1);
+  SCALE_INFO operation_scale(si0.Scale_deg() + si1.Scale_deg(),
+                             operation_level);
+  ctx.Set_node_scale_info(node, operation_scale);
+  AIR_ASSERT(scale_info.Rescale_level() >= operation_level);
+
   ctx.Trace(TD_CKKS_SCALE_MGT, std::string(ctx.Indent(), ' '),
-            "mul: s=", scale_deg, " l=", rescale_level, "\n");
+            "mul: s=", operation_scale.Scale_deg(),
+            " l=", operation_scale.Rescale_level(), "\n");
   return RETV{scale_info, node};
 }
 
@@ -1076,8 +1163,17 @@ RETV CKKS_SCALE_MANAGER::Handle_add(VISITOR* visitor, NODE_PTR node) {
   SCALE_INFO si = si1;
   if (ctx.Req_pars()) {
     si = PARS(&ctx).Handle(node);
+    if (lower_ctx->Is_cipher_type(rtype_child1) ||
+        lower_ctx->Is_cipher3_type(rtype_child1)) {
+      si0 = ctx.Get_scale_info(child0->Id());
+      si1 = ctx.Get_scale_info(child1->Id());
+    }
   } else if (ctx.Req_ace_sm()) {
     si = ACE_SM(&ctx).Handle_add(node, si0, si1);
+  }
+  if (lower_ctx->Is_cipher_type(rtype_child1) ||
+      lower_ctx->Is_cipher3_type(rtype_child1)) {
+    si.Set_rescale_level(ctx.Align_binary_rescale_levels(node, si0, si1));
   }
   if (opc_child1 == OPC_ENCODE) {
     AIR_ASSERT(!ctx.Is_unfix_scale(si.Scale_deg()));
@@ -1126,8 +1222,17 @@ RETV CKKS_SCALE_MANAGER::Handle_sub(VISITOR* visitor, NODE_PTR node) {
   SCALE_INFO si = si1;
   if (ctx.Req_pars()) {
     si = PARS(&ctx).Handle(node);
+    if (lower_ctx->Is_cipher_type(rtype_child1) ||
+        lower_ctx->Is_cipher3_type(rtype_child1)) {
+      si0 = ctx.Get_scale_info(child0->Id());
+      si1 = ctx.Get_scale_info(child1->Id());
+    }
   } else if (ctx.Req_ace_sm()) {
     si = ACE_SM(&ctx).Handle_add(node, si0, si1);  // SUB uses same logic as ADD
+  }
+  if (lower_ctx->Is_cipher_type(rtype_child1) ||
+      lower_ctx->Is_cipher3_type(rtype_child1)) {
+    si.Set_rescale_level(ctx.Align_binary_rescale_levels(node, si0, si1));
   }
   if (opc_child1 == OPC_ENCODE) {
     AIR_ASSERT(!ctx.Is_unfix_scale(si.Scale_deg()));
@@ -1388,6 +1493,8 @@ public:
     Rescale_phi_res();
     // 3.2 rescale expressions
     Rescale_expr();
+    // 3.3 explicitly align ciphertext operands after any rescale replacement.
+    Modswitch_expr();
   }
 
 private:
@@ -1400,6 +1507,7 @@ private:
                              SPOS spos);
   void           Rescale_phi_res();
   void           Rescale_expr();
+  void           Modswitch_expr();
   FUNC_SCOPE*    Func_scope() const { return _func_scope; }
   SCALE_MNG_CTX& Mng_ctx() { return _mng_ctx; }
   LOWER_CTX*     Lower_ctx() const { return _mng_ctx.Lower_ctx(); }

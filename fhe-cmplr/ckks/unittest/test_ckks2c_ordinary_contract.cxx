@@ -1159,6 +1159,70 @@ TEST_F(CKKS2COrdinaryAirVerifier, RejectsVisibleSubScaleMismatch) {
             "statically known: lhs=1, rhs=2");
 }
 
+TEST_F(CKKS2COrdinaryAirVerifier,
+       RejectsVisibleAddPhysicalRescaleMismatch) {
+  NODE_PTR lhs = Cipher_load(2, 1, 0);
+  NODE_PTR rhs = Cipher_load(2, 1, 1);
+  NODE_PTR add = _container->New_bin_arith(fhe::ckks::OPC_ADD, _cipher, lhs,
+                                            rhs, _spos);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(add, &diagnostic));
+  EXPECT_EQ(diagnostic,
+            "Phantom CKKS2C add requires matching physical rescale levels "
+            "when statically known: lhs=0, rhs=1");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier,
+       RejectsVisibleSubPhysicalRescaleMismatch) {
+  NODE_PTR lhs = Cipher_load(2, 1, 1);
+  NODE_PTR rhs = Cipher_load(2, 1, 2);
+  NODE_PTR sub = _container->New_bin_arith(fhe::ckks::OPC_SUB, _cipher, lhs,
+                                            rhs, _spos);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(sub, &diagnostic));
+  EXPECT_EQ(diagnostic,
+            "Phantom CKKS2C sub requires matching physical rescale levels "
+            "when statically known: lhs=1, rhs=2");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier,
+       RejectsVisibleMulPhysicalRescaleMismatch) {
+  NODE_PTR lhs = Cipher_load(2, 1, 2);
+  NODE_PTR rhs = Cipher_load(2, 1, 3);
+  NODE_PTR mul = _container->New_bin_arith(fhe::ckks::OPC_MUL, _cipher, lhs,
+                                            rhs, _spos);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(mul, &diagnostic));
+  EXPECT_EQ(diagnostic,
+            "Phantom CKKS2C mul requires matching physical rescale levels "
+            "when statically known: lhs=2, rhs=3");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier,
+       AcceptsExplicitlyMatchedPhysicalRescaleLevels) {
+  NODE_PTR source = Cipher_load(2, 1, 0);
+  NODE_PTR matched =
+      fhe::ckks::CKKS_GEN(_container, &_lower_ctx).Gen_modswitch(source);
+  Set_metadata(matched, 2, 1, 1);
+  NODE_PTR rhs = Cipher_load(2, 1, 1);
+  NODE_PTR add = _container->New_bin_arith(fhe::ckks::OPC_ADD, _cipher,
+                                            matched, rhs, _spos);
+  std::string diagnostic;
+  EXPECT_TRUE(Verify(add, &diagnostic)) << diagnostic;
+  EXPECT_TRUE(diagnostic.empty());
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier,
+       AcceptsMulScaleMismatchAtMatchingPhysicalRescaleLevel) {
+  NODE_PTR lhs = Cipher_load(2, 1, 1);
+  NODE_PTR rhs = Cipher_load(2, 2, 1);
+  NODE_PTR mul = _container->New_bin_arith(fhe::ckks::OPC_MUL, _cipher, lhs,
+                                            rhs, _spos);
+  std::string diagnostic;
+  EXPECT_TRUE(Verify(mul, &diagnostic)) << diagnostic;
+  EXPECT_TRUE(diagnostic.empty());
+}
+
 TEST_F(CKKS2COrdinaryAirVerifier, RejectsDynamicScalarRotation) {
   TYPE_PTR i32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_S32);
   ADDR_DATUM_PTR dynamic_step =

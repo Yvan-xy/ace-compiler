@@ -361,6 +361,24 @@ bool Verify_static_add_sub_metadata(NODE_PTR node, CKKS_OPERATOR op,
   return true;
 }
 
+bool Verify_static_cipher_rescale_metadata(NODE_PTR node, CKKS_OPERATOR op,
+                                           std::string* diagnostic) {
+  const uint32_t* lhs_rescale_level =
+      node->Child(0)->Attr<uint32_t>(core::FHE_ATTR_KIND::RESCALE_LEVEL);
+  const uint32_t* rhs_rescale_level =
+      node->Child(1)->Attr<uint32_t>(core::FHE_ATTR_KIND::RESCALE_LEVEL);
+  if (lhs_rescale_level != nullptr && rhs_rescale_level != nullptr &&
+      *lhs_rescale_level != *rhs_rescale_level) {
+    std::ostringstream os;
+    os << "Phantom CKKS2C " << Operator_name(op)
+       << " requires matching physical rescale levels when statically known: "
+          "lhs="
+       << *lhs_rescale_level << ", rhs=" << *rhs_rescale_level;
+    return Fail(os.str(), diagnostic);
+  }
+  return true;
+}
+
 bool Verify_phantom_binary(NODE_PTR node, CKKS_OPERATOR op,
                            std::string* diagnostic) {
   if (node->Num_child() != 2) {
@@ -401,6 +419,10 @@ bool Verify_phantom_binary(NODE_PTR node, CKKS_OPERATOR op,
           "right "
           "operand";
     return Fail(os.str(), diagnostic);
+  }
+  if (Is_cipher_family(rhs_kind) &&
+      !Verify_static_cipher_rescale_metadata(node, op, diagnostic)) {
+    return false;
   }
   if ((op == CKKS_OPERATOR::ADD || op == CKKS_OPERATOR::SUB) &&
       rhs_kind != OPERAND_KIND::FLOAT_SCALAR) {
