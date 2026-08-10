@@ -147,6 +147,7 @@ def test_native_oracle_uses_explicit_budgets_and_requires_full_execution() -> No
 
 def test_generated_oracle_calls_only_the_linked_decomposition() -> None:
     generated = source(GENERATED)
+    shared = source(COMMON)
     assert "bootstrap_full(*source, *encrypted_zero)" in generated
     assert "EncryptComplex(zero_values, inputs.input_level)" in generated
     assert "ACE_POST_CKKS_AIR_SHA256" in generated
@@ -167,6 +168,16 @@ def test_generated_oracle_calls_only_the_linked_decomposition() -> None:
         "Get_decode_scheme",
     ):
         assert len(re.findall(rf"\b{helper}\s*\(", io_block)) == 1
+    assert "ProvisionAntConjugationKey" in shared
+    assert 'inputs.resources.at("conjugation_key")' in shared
+    assert "2U * degree - 1U" in shared
+    assert "Insert_rot_map(generator, conjugation_index)" in shared
+    assert "Get_auto_key(generator," in shared
+    prepare = generated.index("Prepare_context();")
+    provision = generated.index("ProvisionAntConjugationKey(inputs);")
+    verify = generated.index("VerifyRuntimeContext(inputs);")
+    run = generated.index("RunOracle(inputs", verify)
+    assert prepare < provision < verify < run
 
 
 def test_owned_paths_do_not_embed_milestone_tokens() -> None:

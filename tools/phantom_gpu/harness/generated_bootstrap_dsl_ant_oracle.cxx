@@ -42,6 +42,7 @@ using generated_bootstrap_ant::LoadQualificationInputs;
 using generated_bootstrap_ant::MaterializeCases;
 using generated_bootstrap_ant::Metric;
 using generated_bootstrap_ant::Provenance;
+using generated_bootstrap_ant::ProvisionAntConjugationKey;
 using generated_bootstrap_ant::QualificationInputs;
 using generated_bootstrap_ant::Require;
 using generated_bootstrap_ant::RuntimeContextAttestation;
@@ -141,6 +142,7 @@ int main(int argc, char** argv) {
     VerifyLinkedProgram(inputs);
     setenv("RTLIB_DISABLE_BOOTSTRAP_PRECOM", "1", 1);
     Prepare_context();
+    ProvisionAntConjugationKey(inputs);
     VerifyRuntimeContext(inputs);
     VerifyPrimeChain(inputs.context);
     const Json record = RunOracle(inputs, argv[0], argv[14],

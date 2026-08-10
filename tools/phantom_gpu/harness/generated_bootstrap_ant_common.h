@@ -2,6 +2,7 @@
 #define ACE_GENERATED_BOOTSTRAP_ANT_COMMON_H
 
 #include "ckks/cipher.h"
+#include "ckks/key_gen.h"
 #include "ckks/plain.h"
 #include "common/rt_api.h"
 #include "context/ckks_context.h"
@@ -871,6 +872,30 @@ inline void VerifyPrimeChain(const Json& manifest) {
                 expected_p.at(index).get<std::uint32_t>(),
             "ANT special-P bit size disagrees with the compiler context");
   }
+}
+
+inline void ProvisionAntConjugationKey(const QualificationInputs& inputs) {
+  const Json& required = inputs.resources.at("conjugation_key");
+  Require(required.is_boolean() && required.get<bool>(),
+          "compiler resources do not require an ANT conjugation key");
+  const std::uint64_t degree =
+      inputs.context.at("polynomial_degree").get<std::uint64_t>();
+  Require(degree != 0U && degree <=
+                              (static_cast<std::uint64_t>(
+                                   std::numeric_limits<std::int32_t>::max()) +
+                               1U) /
+                                  2U,
+          "ANT conjugation index exceeds the runtime representation");
+  const std::int32_t conjugation_index =
+      static_cast<std::int32_t>(2U * degree - 1U);
+  CKKS_KEY_GENERATOR* generator =
+      reinterpret_cast<CKKS_KEY_GENERATOR*>(Keygen());
+  Require(generator != nullptr, "ANT key generator is unavailable");
+  SWITCH_KEY* key = Insert_rot_map(generator, conjugation_index);
+  Require(key != nullptr &&
+              Get_auto_key(generator,
+                           static_cast<std::uint32_t>(conjugation_index)) == key,
+          "ANT conjugation key provisioning failed");
 }
 
 inline void VerifyRuntimeContext(const QualificationInputs& inputs) {

@@ -166,15 +166,19 @@ protected:
 
     PLAINTEXT*  plain          = Alloc_plaintext();
     CIPHERTEXT* ciph           = Alloc_ciphertext();
-    SWITCH_KEY* conj_key       = Alloc_switch_key();
+    SWITCH_KEY* conj_key       = nullptr;
     CIPHERTEXT* ciph_conj      = Alloc_ciphertext();
     PLAINTEXT*  decrypted_conj = Alloc_plaintext();
     VALUE_LIST* decoded_conj   = Alloc_value_list(DCMPLX_TYPE, _degree >> 1);
 
     ENCODE(plain, _encoder, vec);
     Encrypt_msg(ciph, _encryptor, plain);
-    Generate_conj_key(conj_key, _keygen);
-    Insert_auto_key(_keygen, 2 * _degree - 1, conj_key);
+    const int32_t conjugation_index = 2 * _degree - 1;
+    EXPECT_EQ(Get_precomp_auto_idx(_keygen, conjugation_index), 0U);
+    EXPECT_EQ(Get_auto_key(_keygen, conjugation_index), nullptr);
+    conj_key = Insert_rot_map(_keygen, conjugation_index);
+    ASSERT_NE(conj_key, nullptr);
+    EXPECT_EQ(Get_auto_key(_keygen, conjugation_index), conj_key);
 
     Conjugate(ciph_conj, ciph, _evaluator);
     Decrypt(decrypted_conj, _decryptor, ciph_conj, NULL);
