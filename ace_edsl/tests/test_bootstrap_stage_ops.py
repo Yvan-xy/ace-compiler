@@ -103,7 +103,7 @@ class TestBootstrapStageOps(unittest.TestCase):
             pipeline = AcePipeline(dsl.current_air_module)
             pipeline.configure_fhe(
                 poly_degree=16384,
-                mul_level=8,
+                mul_level=26,
                 security_level=0,
                 scaling_factor_bits=56,
                 first_prime_bits=60,
