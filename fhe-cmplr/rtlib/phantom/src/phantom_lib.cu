@@ -451,13 +451,13 @@ public:
         *result = rescale_to_next(*_context, *source);
       }
     });
+    MarkCipher(result, ObjectState::kLive);
     if (ActiveQ(result, "RESCALE_RESULT") + 1 != source_q ||
         result->size() != source_size || !result->is_ntt_form()) {
       Fail("RESCALE_METADATA", "rescale did not drop exactly one data-Q modulus");
     }
     result->SetNoiseScaleDeg(
         static_cast<size_t>(QueryScaleDegree(result, "RESCALE_SCALE")));
-    MarkCipher(result, ObjectState::kLive);
   }
 
   void ModSwitch(Ciphertext* result, Ciphertext* source) {
@@ -478,13 +478,13 @@ public:
       }
       mod_switch_to_next_inplace(*_context, *result);
     });
+    MarkCipher(result, ObjectState::kLive);
     if (ActiveQ(result, "MODSWITCH_RESULT") + 1 != source_q ||
         result->size() != source_size || result->scale() != source_scale ||
         !result->is_ntt_form()) {
       Fail("MODSWITCH_METADATA",
            "modulus switch did not drop exactly one data-Q modulus");
     }
-    MarkCipher(result, ObjectState::kLive);
   }
 
   void Rotate(Ciphertext* result, Ciphertext* source, std::int64_t step) {

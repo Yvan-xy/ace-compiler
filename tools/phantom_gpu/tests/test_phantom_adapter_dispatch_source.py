@@ -48,9 +48,11 @@ def test_monomial_alias_uses_provider_in_place_entry_point() -> None:
     assert "multiply_by_monomial(*_context, *source, power, *result)" in body
 
 
-def test_retained_outputs_are_live_before_metadata_validation() -> None:
+def test_provider_outputs_are_live_before_metadata_validation() -> None:
     source = ADAPTER.read_text(encoding="utf-8")
     for function, provider, result_check in (
+        ("Rescale", "RESCALE_PROVIDER", "RESCALE_RESULT"),
+        ("ModSwitch", "MODSWITCH_PROVIDER", "MODSWITCH_RESULT"),
         ("Conjugate", "CONJUGATE_PROVIDER", "CONJUGATE_RESULT"),
         ("MultiplyMonomial", "MUL_MONO_PROVIDER", "MUL_MONO_RESULT"),
     ):
