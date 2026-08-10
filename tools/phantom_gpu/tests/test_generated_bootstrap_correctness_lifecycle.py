@@ -121,11 +121,20 @@ def test_package_binds_dependency_sources_and_replays_host_oracles() -> None:
     assert source.index("SELECTED_DEPENDENCY_LOCK") < branch
     assert source.index("SELECTED_PHANTOM_COMMIT") < branch
     assert "host_oracle_replay.json:correctness-compiler-host-replay.json" in source
-    replay = source.index("bootstrap_correctness.py\" verify-host")
+    replay = source.index(
+        'python3 -B "${output}/bootstrap_correctness.py" verify-host'
+    )
+    inventory = source.index("non_regular = [", replay)
     payload = source.index(
         '"ace.phantom.generated-bootstrap-correctness-payload/1.0.0"'
     )
-    assert replay < payload < branch
+    assert replay < inventory < payload < branch
+    assert "path.is_symlink() or not path.is_file()" in source[
+        inventory:payload
+    ]
+    assert "correctness package contains a non-regular top-level entry" in source[
+        inventory:payload
+    ]
     assert '"source_snapshots"' in source
     assert '"files": files' in source
     assert "tools/phantom_gpu/bootstrap_domain_attestation.py" in source
@@ -382,6 +391,25 @@ def test_correctness_transfer_rejects_payload_tamper_before_mutation(
     completed = run_transfer_preflight(transfer, payload, output, key)
     assert completed.returncode == 1
     assert "payload checksum closure is invalid" in completed.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("entry_kind", ("directory", "symlink"))
+def test_correctness_transfer_rejects_non_regular_payload_before_mutation(
+    tmp_path: Path, entry_kind: str,
+) -> None:
+    transfer, payload, _ = write_correctness_transfer_fixture(tmp_path)
+    unexpected = payload / "unexpected"
+    if entry_kind == "directory":
+        unexpected.mkdir()
+    else:
+        unexpected.symlink_to(payload / "authority.txt")
+    key = tmp_path / "key"
+    key.write_text("unused\n", encoding="utf-8")
+    output = tmp_path / "output"
+    completed = run_transfer_preflight(transfer, payload, output, key)
+    assert completed.returncode == 1
+    assert "payload contains a non-regular entry" in completed.stderr
     assert not output.exists()
 
 

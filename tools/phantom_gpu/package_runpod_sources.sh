@@ -440,7 +440,7 @@ FILES
     destination_name="${entry#*:}"
     cp -- "${run_root}/${source_name}" "${output}/${destination_name}"
   done
-  python3 "${output}/bootstrap_correctness.py" verify-host \
+  python3 -B "${output}/bootstrap_correctness.py" verify-host \
     --fixture "${output}/correctness-fixture.json" \
     --ace-source-manifest "${output}/ace-source.manifest.json" \
     --phantom-source-manifest "${output}/phantom-source.manifest.json" \
@@ -466,10 +466,19 @@ from pathlib import Path
 import sys
 
 root = Path(sys.argv[1])
+entries = sorted(root.iterdir())
+non_regular = [
+    path.name for path in entries if path.is_symlink() or not path.is_file()
+]
+if non_regular:
+    raise SystemExit(
+        "correctness package contains a non-regular top-level entry: "
+        + ", ".join(non_regular)
+    )
 files = {
     path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-    for path in sorted(root.iterdir())
-    if path.is_file() and path.name not in {"payload.json", "SHA256SUMS"}
+    for path in entries
+    if path.name not in {"payload.json", "SHA256SUMS"}
 }
 record = {
     "schema_version": "ace.phantom.generated-bootstrap-correctness-payload/1.0.0",
