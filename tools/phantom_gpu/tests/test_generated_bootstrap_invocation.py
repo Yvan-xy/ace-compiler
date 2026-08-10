@@ -264,7 +264,7 @@ def test_unmarked_zero_scale_encode_keeps_legacy_scale_degree_one() -> None:
         generator.CkksCiphertext(
             shape=(value.poly_degree,),
             name="bootstrap_output",
-            level=1,
+            level=2,
         )
     )
     module = generator.AceEDSL._get_dsl().current_air_module
@@ -272,7 +272,7 @@ def test_unmarked_zero_scale_encode_keeps_legacy_scale_degree_one() -> None:
     pipeline = generator.AcePipeline(module).configure_fhe(
         poly_degree=value.poly_degree,
         mul_level=value.mul_level,
-        input_level=1,
+        input_level=2,
         security_level=value.security_level,
         scaling_factor_bits=value.scaling_factor_bits,
         first_prime_bits=value.first_prime_bits,
@@ -285,5 +285,5 @@ def test_unmarked_zero_scale_encode_keeps_legacy_scale_degree_one() -> None:
     assert result["success"], result
     post_air = generator.canonicalize_checkout_paths(module.dump(), REPOSITORY)
     assert generator.operation_attributes(post_air, "mul") == [
-        {"level": 2, "rescale_level": value.mul_level, "scale": 2}
+        {"level": 2, "rescale_level": value.mul_level - 1, "scale": 2}
     ]
