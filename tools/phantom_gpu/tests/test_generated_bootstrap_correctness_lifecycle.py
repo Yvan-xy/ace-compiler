@@ -85,9 +85,15 @@ def write_correctness_transfer_fixture(tmp_path: Path) -> tuple[Path, Path, str]
 
 
 def run_transfer_preflight(
-    transfer: Path, payload: Path, output: Path, key: Path
+    transfer: Path,
+    payload: Path,
+    output: Path,
+    key: Path,
+    environment_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
+    if environment_overrides is not None:
+        environment.update(environment_overrides)
     return subprocess.run(
         [
             "bash", str(transfer),
@@ -262,6 +268,19 @@ def test_local_replay_keeps_legacy_identity_and_uses_public_local_mode() -> None
         '"${ACE_COMMIT}:tools/phantom_gpu/run_local_reproduction.sh"'
         in source[:output_creation]
     )
+    assert '$0 --finalize OUTPUT_DIRECTORY' in source
+    assert 'RUN_MODE=detached-launch' in source
+    assert 'RUN_MODE=detached-finalize' in source
+    assert 'docker start "${CONTAINER_ID}"' in source
+    assert 'docker wait "${CONTAINER_ID}"' in source
+    assert 'docker logs "${CONTAINER_ID}"' in source
+    assert 'ace.phantom.local-reproduction-intent/1.0.0' in source
+    assert '--label "ace.phantom.intent-sha256=${INTENT_SHA256}"' in source
+    assert 'flock -n 9' in source
+    assert 'docker rm -f "${exact_id}"' in source
+    assert 'label=ace.phantom.run=${RUN_LABEL}' in source
+    assert 'find . -type f ! -path ./BUNDLE_SHA256SUMS -print0' in source
+    assert 'sha256sum -c BUNDLE_SHA256SUMS' in source
 
 
 def test_remote_transport_verifies_a_checksum_closed_correctness_archive(
@@ -354,14 +373,29 @@ def test_remote_transport_verifies_a_checksum_closed_correctness_archive(
 def test_correctness_transfer_guard_precedes_output_and_network_mutation() -> None:
     transfer = text("runpod_transfer.sh")
     checksum = transfer.index("correctness payload checksum closure is invalid")
-    guard = transfer.index(
+    entrypoint_guard = transfer.index(
         "correctness RunPod transfer entrypoint differs from the selected ACE commit"
     )
+    helper_guard = transfer.index(
+        "correctness RunPod transport helper differs from the selected ACE commit"
+    )
+    helper_source = transfer.index('source "${SCRIPT_DIR}/transport_helpers.sh"')
     output = transfer.index('mkdir -p "${OUTPUT}"')
     network = transfer.index("ssh-keyscan", output)
-    assert checksum < guard < output < network
+    assert (
+        checksum
+        < entrypoint_guard
+        < helper_guard
+        < helper_source
+        < output
+        < network
+    )
     assert (
         '"${CORRECTNESS_ACE_COMMIT}:tools/phantom_gpu/runpod_transfer.sh"'
+        in transfer[checksum:output]
+    )
+    assert (
+        '"${CORRECTNESS_ACE_COMMIT}:tools/phantom_gpu/transport_helpers.sh"'
         in transfer[checksum:output]
     )
 
@@ -377,6 +411,50 @@ def test_correctness_transfer_rejects_dirty_entrypoint_before_mutation(
     completed = run_transfer_preflight(transfer, payload, output, key)
     assert completed.returncode == 1
     assert "transfer entrypoint differs from the selected ACE commit" in completed.stderr
+    assert not output.exists()
+
+
+def test_correctness_transfer_rejects_dirty_helper_before_source_or_network(
+    tmp_path: Path,
+) -> None:
+    transfer, payload, _ = write_correctness_transfer_fixture(tmp_path)
+    helper = transfer.with_name("transport_helpers.sh")
+    helper.write_text(
+        helper.read_text(encoding="utf-8")
+        + '\ntouch -- "${DIRTY_HELPER_MARKER}"\n',
+        encoding="utf-8",
+    )
+    key = tmp_path / "key"
+    key.write_text("unused\n", encoding="utf-8")
+    output = tmp_path / "output"
+    dirty_helper_marker = tmp_path / "dirty-helper-executed"
+    network_marker = tmp_path / "network-command-executed"
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_ssh_keyscan = fake_bin / "ssh-keyscan"
+    fake_ssh_keyscan.write_text(
+        '#!/usr/bin/env bash\ntouch -- "${NETWORK_MARKER}"\nexit 1\n',
+        encoding="utf-8",
+    )
+    fake_ssh_keyscan.chmod(0o755)
+    completed = run_transfer_preflight(
+        transfer,
+        payload,
+        output,
+        key,
+        {
+            "DIRTY_HELPER_MARKER": str(dirty_helper_marker),
+            "NETWORK_MARKER": str(network_marker),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+    )
+    assert completed.returncode == 1
+    assert (
+        "transport helper differs from the selected ACE commit"
+        in completed.stderr
+    )
+    assert not dirty_helper_marker.exists()
+    assert not network_marker.exists()
     assert not output.exists()
 
 

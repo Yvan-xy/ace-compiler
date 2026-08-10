@@ -727,7 +727,9 @@ def test_reproduction_uses_one_canonical_container_build_root() -> None:
     )
 
     assert '"${PAYLOAD}:/retained-qualification/input:ro"' in local
-    assert '"${OUTPUT}:/retained-qualification/output:rw"' in local
+    assert '"${RESULT_STAGING}:/retained-qualification/output:rw"' in local
+    assert 'RESULT_STAGING="${OUTPUT}/incoming-results"' in local
+    assert '"${OUTPUT}:/retained-qualification/output:rw"' not in local
     assert "--input-dir /retained-qualification/input" in local
     assert "--work-dir /retained-qualification/work" in local
     assert "--work-dir /retained-qualification/work" in remote

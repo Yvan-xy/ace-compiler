@@ -3,7 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
-source "${SCRIPT_DIR}/transport_helpers.sh"
 
 HOST=""
 PORT=""
@@ -172,7 +171,22 @@ if [[ -n "${CORRECTNESS_ACE_COMMIT}" ]]; then
     echo "correctness RunPod transfer entrypoint differs from the selected ACE commit" >&2
     exit 1
   fi
+  expected_transport_helper_sha256="$(
+    git -C "${REPO_ROOT}" show \
+      "${CORRECTNESS_ACE_COMMIT}:tools/phantom_gpu/transport_helpers.sh" |
+      sha256sum | awk '{print $1}'
+  )"
+  observed_transport_helper_sha256="$(
+    sha256sum "${REPO_ROOT}/tools/phantom_gpu/transport_helpers.sh" |
+      awk '{print $1}'
+  )"
+  if [[ "${observed_transport_helper_sha256}" != \
+        "${expected_transport_helper_sha256}" ]]; then
+    echo "correctness RunPod transport helper differs from the selected ACE commit" >&2
+    exit 1
+  fi
 fi
+source "${SCRIPT_DIR}/transport_helpers.sh"
 OUTPUT="$(realpath -m -- "${OUTPUT}")"
 if [[ -e "${OUTPUT}" ]]; then
   echo "output already exists: ${OUTPUT}" >&2
