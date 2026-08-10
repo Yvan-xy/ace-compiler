@@ -106,6 +106,17 @@ int main(int argc, char** argv) {
     const double scale = contract::ScaleForDegree(degree, scaling_bits);
     assert(contract::ScaleDegree(scale, scaling_bits) == degree);
   }
+  constexpr std::size_t observed_scaling_bits = 56;
+  const double nominal_degree_one_scale = 72057594037927936.0;
+  const double observed_rescaled_degree_one_scale = 72057594043695104.0;
+  assert(observed_rescaled_degree_one_scale != nominal_degree_one_scale);
+  assert(contract::ScaleDegree(nominal_degree_one_scale,
+                               observed_scaling_bits) == 1);
+  assert(contract::ScaleDegree(observed_rescaled_degree_one_scale,
+                               observed_scaling_bits) == 1);
+  assert(contract::ScaleDegree(
+             contract::ScaleForDegree(2, observed_scaling_bits),
+             observed_scaling_bits) == 2);
   ExpectContractFailure([=] {
     contract::ScaleDegree(std::numeric_limits<double>::quiet_NaN(),
                           scaling_bits);

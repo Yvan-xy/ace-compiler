@@ -280,6 +280,8 @@ public:
     }
     ValidateAddSub(left, right, "ADD_COMPAT");
     RequireWritableCipher(result, "ADD_DESTINATION");
+    const double output_scale = left->scale();
+    const size_t output_scale_degree = left->GetNoiseScaleDeg();
     ProviderCall("ADD_PROVIDER", [&] {
       if (result == left) {
         add_inplace(*_context, *result, *right);
@@ -290,48 +292,62 @@ public:
         add_inplace(*_context, *result, *right);
       }
     });
-    result->SetNoiseScaleDeg(left->GetNoiseScaleDeg());
+    result->scale() = output_scale;
+    result->SetNoiseScaleDeg(output_scale_degree);
     MarkCipher(result, ObjectState::kLive);
   }
 
   void SubCipher(Ciphertext* result, Ciphertext* left, Ciphertext* right) {
     ValidateAddSub(left, right, "SUB_COMPAT");
     RequireWritableCipher(result, "SUB_DESTINATION");
+    const double output_scale = left->scale();
+    const size_t output_scale_degree = left->GetNoiseScaleDeg();
     ProviderCall("SUB_PROVIDER", [&] {
       if (result == left) {
+        result->scale() = right->scale();
         sub_inplace(*_context, *result, *right, false);
       } else if (result == right) {
         // Phantom's negate form computes right_argument - destination, which
         // preserves ACE's left-minus-right order without a repair copy.
+        result->scale() = left->scale();
         sub_inplace(*_context, *result, *left, true);
       } else {
         *result = *left;
+        result->scale() = right->scale();
         sub_inplace(*_context, *result, *right, false);
       }
     });
-    result->SetNoiseScaleDeg(left->GetNoiseScaleDeg());
+    result->scale() = output_scale;
+    result->SetNoiseScaleDeg(output_scale_degree);
     MarkCipher(result, ObjectState::kLive);
   }
 
   void AddPlain(Ciphertext* result, Ciphertext* left, Plaintext* right) {
     ValidateCipherPlainAddSub(left, right, "ADD_PLAIN_COMPAT");
     RequireWritableCipher(result, "ADD_PLAIN_DESTINATION");
+    const double output_scale = left->scale();
+    const size_t output_scale_degree = left->GetNoiseScaleDeg();
     ProviderCall("ADD_PLAIN_PROVIDER", [&] {
       if (result != left) *result = *left;
       add_plain_inplace(*_context, *result, *right);
     });
-    result->SetNoiseScaleDeg(left->GetNoiseScaleDeg());
+    result->scale() = output_scale;
+    result->SetNoiseScaleDeg(output_scale_degree);
     MarkCipher(result, ObjectState::kLive);
   }
 
   void SubPlain(Ciphertext* result, Ciphertext* left, Plaintext* right) {
     ValidateCipherPlainAddSub(left, right, "SUB_PLAIN_COMPAT");
     RequireWritableCipher(result, "SUB_PLAIN_DESTINATION");
+    const double output_scale = left->scale();
+    const size_t output_scale_degree = left->GetNoiseScaleDeg();
     ProviderCall("SUB_PLAIN_PROVIDER", [&] {
       if (result != left) *result = *left;
+      result->scale() = right->scale();
       sub_plain_inplace(*_context, *result, *right);
     });
-    result->SetNoiseScaleDeg(left->GetNoiseScaleDeg());
+    result->scale() = output_scale;
+    result->SetNoiseScaleDeg(output_scale_degree);
     MarkCipher(result, ObjectState::kLive);
   }
 
@@ -1753,23 +1769,31 @@ private:
                       const char* diagnostic) {
     ValidateCipher(left, diagnostic);
     ValidateCipher(right, diagnostic);
+    const std::int64_t left_scale_degree =
+        QueryScaleDegree(left, diagnostic);
+    const std::int64_t right_scale_degree =
+        QueryScaleDegree(right, diagnostic);
     if (left->chain_index() != right->chain_index() ||
-        left->scale() != right->scale() || left->size() != right->size() ||
+        left_scale_degree != right_scale_degree ||
+        left->size() != right->size() ||
         left->is_ntt_form() != right->is_ntt_form()) {
       Fail(diagnostic,
-           "exact compatibility failed: lhs(level=%zu chain=%zu scale=%.17g "
-           "size=%zu ntt=%d) rhs(level=%zu chain=%zu scale=%.17g size=%zu "
+           "logical compatibility failed: lhs(level=%zu chain=%zu "
+           "scale=%.17g scale_degree=%lld size=%zu ntt=%d) "
+           "rhs(level=%zu chain=%zu scale=%.17g scale_degree=%lld size=%zu "
            "ntt=%d)",
            ChainIndexToAceLevel(left->chain_index(),
                                 _manifest->_data_q_count,
                                 _first_data_chain_index),
            left->chain_index(),
-           left->scale(), left->size(), left->is_ntt_form(),
+           left->scale(), static_cast<long long>(left_scale_degree),
+           left->size(), left->is_ntt_form(),
            ChainIndexToAceLevel(right->chain_index(),
                                 _manifest->_data_q_count,
                                 _first_data_chain_index),
            right->chain_index(),
-           right->scale(), right->size(), right->is_ntt_form());
+           right->scale(), static_cast<long long>(right_scale_degree),
+           right->size(), right->is_ntt_form());
     }
   }
 
@@ -1777,13 +1801,19 @@ private:
                                  const char* diagnostic) {
     ValidateCipher(left, diagnostic);
     ValidatePlain(right, diagnostic);
+    const std::int64_t left_scale_degree =
+        QueryScaleDegree(left, diagnostic);
+    const std::int64_t right_scale_degree =
+        QueryPlainScaleDegree(right, diagnostic);
     if (left->chain_index() != right->chain_index() ||
-        left->scale() != right->scale()) {
+        left_scale_degree != right_scale_degree) {
       Fail(diagnostic,
-           "exact cipher/plain compatibility failed: cipher(chain=%zu "
-           "scale=%.17g) plain(chain=%zu scale=%.17g)",
-           left->chain_index(), left->scale(), right->chain_index(),
-           right->scale());
+           "logical cipher/plain compatibility failed: cipher(chain=%zu "
+           "scale=%.17g scale_degree=%lld) plain(chain=%zu scale=%.17g "
+           "scale_degree=%lld)",
+           left->chain_index(), left->scale(),
+           static_cast<long long>(left_scale_degree), right->chain_index(),
+           right->scale(), static_cast<long long>(right_scale_degree));
     }
   }
 
