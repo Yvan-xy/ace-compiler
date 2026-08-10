@@ -302,10 +302,42 @@ if baseline.is_file():
     if not isinstance(baseline_record, list) or len(baseline_record) != 1:
         raise SystemExit("created-container host comparison evidence is invalid")
     original = baseline_record[0]
+
+    def exact_json_equal(left, right):
+        options = {
+            "allow_nan": False,
+            "ensure_ascii": False,
+            "separators": (",", ":"),
+            "sort_keys": True,
+        }
+        return json.dumps(left, **options) == json.dumps(right, **options)
+
+    def normalized_host_configs(current_record, original_record):
+        current = current_record.get("HostConfig")
+        original = original_record.get("HostConfig")
+        if not isinstance(current, dict) or not isinstance(original, dict):
+            return current, original
+        current = dict(current)
+        original = dict(original)
+        key = "OomKillDisable"
+        if key in current and key in original:
+            current_value = current[key]
+            original_value = original[key]
+            current_is_normalized = current_value is False or current_value is None
+            original_is_normalized = original_value is False or original_value is None
+            if current_is_normalized and original_is_normalized:
+                current[key] = False
+                original[key] = False
+        return current, original
+
+    current_host_config, original_host_config = normalized_host_configs(
+        item, original
+    )
+
     if (
-        item.get("Config") != original.get("Config")
-        or item.get("HostConfig") != original.get("HostConfig")
-        or item.get("Mounts") != original.get("Mounts")
+        not exact_json_equal(item.get("Config"), original.get("Config"))
+        or not exact_json_equal(current_host_config, original_host_config)
+        or not exact_json_equal(item.get("Mounts"), original.get("Mounts"))
     ):
         raise SystemExit("Docker immutable configuration changed after creation")
 if expected_state == "created" and (state.get("Status"), state.get("Running")) != ("created", False):

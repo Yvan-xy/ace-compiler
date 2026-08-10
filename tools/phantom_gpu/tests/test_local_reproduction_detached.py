@@ -147,10 +147,14 @@ elif command == "create":
     value = {
         "Id": container_id, "Name": "/" + name,
         "Image": os.environ["FAKE_BASE_CONFIG"],
-        "Config": {"Image": image, "Cmd": cmd, "Env": environment, "Labels": labels},
+        "Config": {
+            "Image": image, "Cmd": cmd, "Env": environment,
+            "Labels": labels, "Tty": False,
+        },
         "HostConfig": {
             "Runtime": "runc", "Privileged": False, "Devices": [],
             "DeviceRequests": [], "RestartPolicy": {"Name": "no"},
+            "OomKillDisable": False,
         },
         "Mounts": volumes,
         "State": {
@@ -183,6 +187,7 @@ elif command == "start":
                 raise SystemExit("fake Docker start gate timed out")
             time.sleep(0.01)
     value = load()
+    value["HostConfig"]["OomKillDisable"] = None
     value["State"].update({
         "Status": "exited", "Running": False,
         "ExitCode": int(os.environ.get("FAKE_PIPELINE_EXIT", "0")),
@@ -365,11 +370,64 @@ def test_detached_fast_exit_recovers_receipt_and_checksum_closes_empty_log(
     assert already_closed.returncode == 0, already_closed.stderr
 
 
+def test_detached_accepts_only_observed_oom_kill_disable_normalization(
+    local_lifecycle: dict[str, object],
+) -> None:
+    environment = local_lifecycle["environment"]
+    output = local_lifecycle["output"]
+    launched = run(local_lifecycle["launch"], environment)
+    assert launched.returncode == 0, launched.stderr
+    created = json.loads(
+        (output / "docker/disposable-container-created.json").read_text()
+    )[0]
+    assert created["HostConfig"]["OomKillDisable"] is False
+    state = json.loads(local_lifecycle["state"].read_text())
+    assert state["HostConfig"]["OomKillDisable"] is None
+    finalized = run(local_lifecycle["finalize"], environment)
+    assert finalized.returncode == 0, finalized.stderr
+    completed = json.loads(
+        (output / "docker/disposable-container.json").read_text()
+    )[0]
+    assert completed["HostConfig"]["OomKillDisable"] is None
+    assert_exact_bundle(output)
+
+
+@pytest.mark.parametrize(
+    ("operation", "value"),
+    [
+        ("delete", None),
+        ("replace", 0),
+        ("replace", 0.0),
+        ("replace", "false"),
+    ],
+)
+def test_detached_rejects_other_oom_kill_disable_changes_without_cleanup(
+    local_lifecycle: dict[str, object],
+    operation: str,
+    value: object,
+) -> None:
+    environment = local_lifecycle["environment"]
+    launched = run(local_lifecycle["launch"], environment)
+    assert launched.returncode == 0, launched.stderr
+    state = json.loads(local_lifecycle["state"].read_text())
+    if operation == "delete":
+        del state["HostConfig"]["OomKillDisable"]
+    else:
+        state["HostConfig"]["OomKillDisable"] = value
+    local_lifecycle["state"].write_text(json.dumps(state) + "\n")
+    finalized = run(local_lifecycle["finalize"], environment)
+    assert finalized.returncode != 0
+    state = json.loads(local_lifecycle["state"].read_text())
+    assert state["Removed"] is False
+    assert state["RemovedIds"] == []
+
+
 @pytest.mark.parametrize(
     ("section", "key", "value"),
     [
         ("Config", "WorkingDir", "/changed-after-create"),
         ("HostConfig", "ReadonlyRootfs", True),
+        ("HostConfig", "OomKillDisable", True),
     ],
 )
 def test_detached_immutable_config_mismatch_refuses_cleanup(
@@ -383,6 +441,49 @@ def test_detached_immutable_config_mismatch_refuses_cleanup(
     assert launched.returncode == 0, launched.stderr
     state = json.loads(local_lifecycle["state"].read_text())
     state[section][key] = value
+    local_lifecycle["state"].write_text(json.dumps(state) + "\n")
+    finalized = run(local_lifecycle["finalize"], environment)
+    assert finalized.returncode != 0
+    state = json.loads(local_lifecycle["state"].read_text())
+    assert state["Removed"] is False
+    assert state["RemovedIds"] == []
+
+
+@pytest.mark.parametrize("location", ["config", "mount"])
+def test_detached_immutable_comparison_is_type_sensitive(
+    local_lifecycle: dict[str, object],
+    location: str,
+) -> None:
+    environment = local_lifecycle["environment"]
+    launched = run(local_lifecycle["launch"], environment)
+    assert launched.returncode == 0, launched.stderr
+    state = json.loads(local_lifecycle["state"].read_text())
+    if location == "config":
+        assert state["Config"]["Tty"] is False
+        state["Config"]["Tty"] = 0
+    else:
+        assert state["Mounts"][0]["RW"] is False
+        state["Mounts"][0]["RW"] = 0
+    local_lifecycle["state"].write_text(json.dumps(state) + "\n")
+    finalized = run(local_lifecycle["finalize"], environment)
+    assert finalized.returncode != 0
+    state = json.loads(local_lifecycle["state"].read_text())
+    assert state["Removed"] is False
+    assert state["RemovedIds"] == []
+
+
+@pytest.mark.parametrize("value", [1, 1.0])
+def test_detached_rejects_writable_mount_bool_numeric_aliases(
+    local_lifecycle: dict[str, object],
+    value: object,
+) -> None:
+    environment = local_lifecycle["environment"]
+    launched = run(local_lifecycle["launch"], environment)
+    assert launched.returncode == 0, launched.stderr
+    state = json.loads(local_lifecycle["state"].read_text())
+    writable_mounts = [mount for mount in state["Mounts"] if mount["RW"] is True]
+    assert len(writable_mounts) == 1
+    writable_mounts[0]["RW"] = value
     local_lifecycle["state"].write_text(json.dumps(state) + "\n")
     finalized = run(local_lifecycle["finalize"], environment)
     assert finalized.returncode != 0
