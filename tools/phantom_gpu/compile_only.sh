@@ -443,6 +443,11 @@ qualification = json.loads(
 generation = json.loads(
     (run_root / "bootstrap_qualification/generation.json").read_text(encoding="utf-8")
 )
+semantics = json.loads(
+    (run_root / "bootstrap_qualification/bootstrap_semantics.json").read_text(
+        encoding="utf-8"
+    )
+)
 audit = json.loads(
     (run_root / "bootstrap_qualification/source-audit.json").read_text(encoding="utf-8")
 )

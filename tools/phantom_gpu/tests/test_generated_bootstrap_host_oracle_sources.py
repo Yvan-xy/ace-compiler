@@ -262,6 +262,14 @@ def test_compile_gate_builds_and_runs_both_host_oracles_before_gpu_use() -> None
     )
     assert 'transform_semantics[direction]["stages"]' in script
     assert 'qualification_closure.get("canonical_post_ckks_air_sha256")' in script
+    semantics_load = script.index(
+        'semantics = json.loads(\n'
+        '    (run_root / "bootstrap_qualification/bootstrap_semantics.json")'
+    )
+    semantics_use = script.index(
+        'transform_semantics = semantics["identity_domain_attestation"]'
+    )
+    assert semantics_load < semantics_use
     for audit_option in (
         "--ant-source",
         "--generation-record",
