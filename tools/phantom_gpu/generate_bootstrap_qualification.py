@@ -500,10 +500,28 @@ def operation_attributes(post_air: str, opcode: str) -> list[dict[str, int]]:
     return [parse_air_attributes(value) for value in matches]
 
 
+def runtime_cipher_coordinate(
+    *, data_q_count: int, rescale_level: int
+) -> dict[str, int]:
+    if data_q_count < 1:
+        raise SystemExit("compiler context contains no data-Q moduli")
+    if rescale_level < 1 or rescale_level > data_q_count:
+        raise SystemExit(
+            "terminal post-CKKS RESCALE_LEVEL is outside the data-Q chain"
+        )
+    active_q_count = data_q_count + 1 - rescale_level
+    return {
+        "ace_logical_level": active_q_count,
+        "active_q_count": active_q_count,
+        "phantom_chain_index": rescale_level,
+    }
+
+
 def attest_post_operations(
     post_air: str,
     *,
     bootstrap_output: dict[str, int],
+    data_q_count: int,
 ) -> dict[str, Any]:
     rotations = operation_attributes(post_air, "rotate")
     multiplies = operation_attributes(post_air, "mul")
@@ -521,9 +539,13 @@ def attest_post_operations(
         raise SystemExit(
             "raw-scale-1 ciphertext/plaintext multiply changed metadata"
         )
+    runtime_coordinate = runtime_cipher_coordinate(
+        data_q_count=data_q_count,
+        rescale_level=bootstrap_output["rescale_level"],
+    )
     return {
         "input_coordinate": {
-            "ace_logical_level": bootstrap_output["level"],
+            "ace_logical_level": runtime_coordinate["ace_logical_level"],
             "rescale_level": bootstrap_output["rescale_level"],
             "scale_degree": rotation["scale"],
         },
@@ -657,7 +679,10 @@ def build_semantics_record(
     scale_degree = attributes["scale"]
     raw_scale = math.ldexp(1.0, scale_degree * arguments.scaling_factor_bits)
     data_q_count = len(context["data_q_bit_sizes"])
-    ace_level = attributes["level"]
+    runtime_coordinate = runtime_cipher_coordinate(
+        data_q_count=data_q_count,
+        rescale_level=attributes["rescale_level"],
+    )
     coefficient_hash = float_sequence_sha256(config.chebyshev_coefficients)
     post_operation_contracts = json.loads(json.dumps(post_operation_attestation))
     post_operation_contracts["status"] = "pass"
@@ -750,11 +775,14 @@ def build_semantics_record(
             "coeffs_to_slots_factor": config.coeffs_to_slots_factor,
         },
         "output_air_contract": {
-            "ace_logical_level": ace_level,
+            "post_ckks_air_level": attributes["level"],
+            "ace_logical_level": runtime_coordinate["ace_logical_level"],
             "rescale_level": attributes["rescale_level"],
             "scale_degree": scale_degree,
-            "active_q_count": ace_level,
-            "phantom_chain_index": 1 + data_q_count - ace_level,
+            "active_q_count": runtime_coordinate["active_q_count"],
+            "phantom_chain_index": runtime_coordinate[
+                "phantom_chain_index"
+            ],
             "raw_scale_contract": {
                 "kind": "ace-log2-scale-coordinate",
                 "nominal_raw_scale": raw_scale.hex(),
@@ -767,7 +795,9 @@ def build_semantics_record(
             "logical_slots": arguments.vector_capacity,
             "ciphertext_size": 2,
             "ntt_state": True,
-            "derivation": "terminal-post-ckks-air-and-compiler-context",
+            "derivation": (
+                "terminal-post-ckks-rescale-coordinate-and-compiler-context"
+            ),
         },
         "restoration_attestation": restoration,
         "supported_identity_domain": supported_identity_domain,
@@ -872,6 +902,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     post_operation_attestation = attest_post_operations(
         post_operations_air,
         bootstrap_output=air_attestation["output_attributes"],
+        data_q_count=len(context["data_q_bit_sizes"]),
     )
     post_operation_record = {
         "schema_version": POST_OPERATIONS_SCHEMA,

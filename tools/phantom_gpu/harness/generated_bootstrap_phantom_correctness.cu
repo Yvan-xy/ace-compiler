@@ -636,7 +636,8 @@ Json Run(const Inputs &input,
       Json observed_contract = ExpectedBootstrapMetadata(
           input, metadata.at("raw_scale").get<double>());
       Require(metadata == observed_contract,
-              "bootstrap metadata differs from AIR contract");
+              "bootstrap metadata differs from AIR contract: observed=" +
+                  metadata.dump() + " expected=" + observed_contract.dump());
       if (expected_metadata.is_null())
         expected_metadata = metadata;
       else

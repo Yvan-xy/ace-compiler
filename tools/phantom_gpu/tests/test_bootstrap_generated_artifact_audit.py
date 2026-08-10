@@ -733,7 +733,7 @@ def write_versioned_closure(tmp_path: Path) -> tuple[Path, ...]:
                     "rotation_step": 1,
                 },
                 "input_coordinate": {
-                    "ace_logical_level": 1,
+                    "ace_logical_level": 14,
                     "rescale_level": 13,
                     "scale_degree": 1,
                 },
@@ -787,7 +787,7 @@ def write_versioned_closure(tmp_path: Path) -> tuple[Path, ...]:
         "status": "pass",
         "air_sha256": hashlib.sha256(operations_air_path.read_bytes()).hexdigest(),
         "input_coordinate": {
-            "ace_logical_level": 1,
+            "ace_logical_level": 14,
             "rescale_level": 13,
             "scale_degree": 1,
         },
@@ -836,8 +836,10 @@ def write_versioned_closure(tmp_path: Path) -> tuple[Path, ...]:
                     "coeffs_to_slots_factor": config.coeffs_to_slots_factor,
                 },
                 "output_air_contract": {
-                    "ace_logical_level": 1,
-                    "active_q_count": 1,
+                    "post_ckks_air_level": 1,
+                    "ace_logical_level": 14,
+                    "active_q_count": 14,
+                    "phantom_chain_index": 13,
                     "rescale_level": 13,
                     "scale_degree": 1,
                     "raw_scale_contract": {

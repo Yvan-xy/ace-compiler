@@ -477,6 +477,8 @@ def test_generated_phantom_harness_covers_full_correctness_lifecycle() -> None:
     assert "ace.phantom.bootstrap-correctness-fixture/2.0.0" in source
     assert "ace.phantom.generated-bootstrap.semantics/2.0.0" in source
     assert "ace.phantom.bootstrap-clear-evalmod-domain/1.0.0" in source
+    assert "bootstrap metadata differs from AIR contract: observed=" in source
+    assert 'metadata.dump() + " expected=" + observed_contract.dump()' in source
     assert "canonical_identity_attestation" in source
     assert "identity_attestation_sha256" in source
     assert (

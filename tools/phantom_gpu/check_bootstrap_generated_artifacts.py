@@ -1961,6 +1961,13 @@ def verify_v4_closure(
     }
     terminal = _terminal_attributes(post_air)
     contract = semantics.get("output_air_contract")
+    data_q_count = len(context["data_q_bit_sizes"])
+    terminal_rescale_level = terminal["rescale_level"]
+    if not 1 <= terminal_rescale_level <= data_q_count:
+        raise AuditError(
+            "bootstrap return RESCALE_LEVEL is outside the data-Q chain"
+        )
+    runtime_active_q_count = data_q_count + 1 - terminal_rescale_level
     raw_scale_contract = (
         contract.get("raw_scale_contract") if isinstance(contract, dict) else None
     )
@@ -1969,8 +1976,10 @@ def verify_v4_closure(
         terminal["scale"] * context["scaling_modulus_bits"],
     ).hex()
     if not isinstance(contract, dict) or (
-        contract.get("ace_logical_level") != terminal["level"]
-        or contract.get("active_q_count") != terminal["level"]
+        contract.get("post_ckks_air_level") != terminal["level"]
+        or contract.get("ace_logical_level") != runtime_active_q_count
+        or contract.get("active_q_count") != runtime_active_q_count
+        or contract.get("phantom_chain_index") != terminal_rescale_level
         or contract.get("rescale_level") != terminal["rescale_level"]
         or contract.get("scale_degree") != terminal["scale"]
         or contract.get("logical_slots") != context["logical_slot_capacity"]
@@ -2003,7 +2012,7 @@ def verify_v4_closure(
     if post_record.get("bindings") != expected_post_bindings:
         raise AuditError("post-operation bindings differ from artifacts")
     expected_input_coordinate = {
-        "ace_logical_level": terminal["level"],
+        "ace_logical_level": runtime_active_q_count,
         "rescale_level": terminal["rescale_level"],
         "scale_degree": terminal["scale"],
     }

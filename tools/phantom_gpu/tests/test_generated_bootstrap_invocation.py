@@ -151,7 +151,7 @@ def test_post_rotation_must_be_canonical_and_compiler_provisioned() -> None:
 
 
 def test_terminal_restoration_is_derived_from_air_chain() -> None:
-    attributes = "level=1,rescale_level=13,scale=1"
+    attributes = "level=1,rescale_level=3,scale=1"
     air = f"""
       ld "_base" VAR[1] ATTR[{attributes}]
       ld "_base" VAR[1] ATTR[{attributes}]
@@ -178,12 +178,13 @@ def test_terminal_restoration_is_derived_from_air_chain() -> None:
 
 def test_post_operation_air_transitions_are_checked() -> None:
     air = """
-    CKKS.rotate ATTR[level=1,rescale_level=13,scale=1]
-    CKKS.mul ATTR[level=1,rescale_level=13,scale=1]
+    CKKS.rotate ATTR[level=1,rescale_level=3,scale=1]
+    CKKS.mul ATTR[level=1,rescale_level=3,scale=1]
 """
     value = generator.attest_post_operations(
         air,
-        bootstrap_output={"level": 1, "rescale_level": 13, "scale": 1},
+        bootstrap_output={"level": 1, "rescale_level": 3, "scale": 1},
+        data_q_count=7,
     )
     assert value["rotation"]["transition"]["scale_degree_delta"] == 0
     assert (
@@ -194,8 +195,8 @@ def test_post_operation_air_transitions_are_checked() -> None:
     )
     serialized = json.loads(json.dumps(value))
     assert serialized["input_coordinate"] == {
-        "ace_logical_level": 1,
-        "rescale_level": 13,
+        "ace_logical_level": 5,
+        "rescale_level": 3,
         "scale_degree": 1,
     }
     assert (
@@ -205,13 +206,14 @@ def test_post_operation_air_transitions_are_checked() -> None:
         == 1.0
     )
     invalid = air.replace(
-        "CKKS.mul ATTR[level=1,rescale_level=13,scale=1]",
-        "CKKS.mul ATTR[level=0,rescale_level=13,scale=1]",
+        "CKKS.mul ATTR[level=1,rescale_level=3,scale=1]",
+        "CKKS.mul ATTR[level=0,rescale_level=3,scale=1]",
     )
     with pytest.raises(SystemExit, match="changed metadata"):
         generator.attest_post_operations(
             invalid,
-            bootstrap_output={"level": 1, "rescale_level": 13, "scale": 1},
+            bootstrap_output={"level": 1, "rescale_level": 3, "scale": 1},
+            data_q_count=7,
         )
 
 
@@ -224,9 +226,22 @@ def test_marked_raw_scale_one_post_operations_preserve_final_coordinate() -> Non
     attestation = generator.attest_post_operations(
         air,
         bootstrap_output=output,
+        data_q_count=26,
     )
     assert attestation["rotation"]["air_attributes"] == output
     assert attestation["ciphertext_plaintext_multiply"]["air_attributes"] == output
+
+
+def test_runtime_cipher_coordinate_uses_physical_rescale_position() -> None:
+    assert generator.runtime_cipher_coordinate(
+        data_q_count=26, rescale_level=16
+    ) == {
+        "ace_logical_level": 11,
+        "active_q_count": 11,
+        "phantom_chain_index": 16,
+    }
+    with pytest.raises(SystemExit, match="outside the data-Q chain"):
+        generator.runtime_cipher_coordinate(data_q_count=26, rescale_level=27)
 
 
 def test_unmarked_zero_scale_encode_keeps_legacy_scale_degree_one() -> None:
