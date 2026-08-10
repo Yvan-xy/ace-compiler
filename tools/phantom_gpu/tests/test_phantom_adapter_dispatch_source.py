@@ -48,6 +48,19 @@ def test_monomial_alias_uses_provider_in_place_entry_point() -> None:
     assert "multiply_by_monomial(*_context, *source, power, *result)" in body
 
 
+def test_single_element_mask_preserves_scalar_broadcast_semantics() -> None:
+    body = _function_body(ADAPTER.read_text(encoding="utf-8"), "EncodeMask")
+
+    length_selection = body.index(
+        "const size_t encoded_len = len == 1 ? _logical_slots : len"
+    )
+    vector_construction = body.index("std::vector<double> values(encoded_len")
+    provider_encoding = body.index("EncodeVector(plain, values")
+
+    assert length_selection < vector_construction < provider_encoding
+    assert "std::vector<double> values(len" not in body
+
+
 def test_provider_outputs_are_live_before_metadata_validation() -> None:
     source = ADAPTER.read_text(encoding="utf-8")
     for function, provider, result_check in (

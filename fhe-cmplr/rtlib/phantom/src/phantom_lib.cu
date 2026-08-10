@@ -268,7 +268,12 @@ public:
   void EncodeMask(Plaintext* plain, T value, size_t len, SCALE_T degree,
                   LEVEL_T level, const char* diagnostic) {
     ValidateEncodeDestination(plain, &value, len, diagnostic);
-    std::vector<double> values(len, static_cast<double>(value));
+    // ANT routes a one-element real mask through its scalar encoder, which
+    // broadcasts the value across every logical CKKS slot.  Phantom's vector
+    // encoder instead treats a one-element vector as a sparse one-slot value,
+    // so preserve the runtime API's scalar semantics explicitly here.
+    const size_t encoded_len = len == 1 ? _logical_slots : len;
+    std::vector<double> values(encoded_len, static_cast<double>(value));
     EncodeVector(plain, values, degree, level, diagnostic);
   }
 
