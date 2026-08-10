@@ -106,9 +106,26 @@ elif command == "image" and args[1] == "inspect":
     if "-f" in args:
         print(os.environ["FAKE_BASE_CONFIG"])
     else:
+        base_environment = []
+        base_environment_mutation = os.environ.get("FAKE_BASE_ENV_MUTATION", "")
+        if base_environment_mutation == "missing":
+            base_environment = "missing"
+        elif base_environment_mutation == "null":
+            base_environment = None
+        elif base_environment_mutation == "non-list":
+            base_environment = "BASE_ENVIRONMENT=value"
+        elif base_environment_mutation == "duplicate":
+            base_environment = ["BASE_ENVIRONMENT=first", "BASE_ENVIRONMENT=second"]
+        elif base_environment_mutation:
+            raise SystemExit(
+                f"unsupported base environment mutation: {base_environment_mutation}"
+            )
+        config = {"Env": base_environment, "Labels": {}}
+        if base_environment_mutation == "missing":
+            del config["Env"]
         print(json.dumps([{
             "Id": os.environ["FAKE_BASE_CONFIG"],
-            "Config": {"Env": [], "Labels": {}},
+            "Config": config,
         }]))
 elif command == "system":
     print("fake-disk")
@@ -144,6 +161,28 @@ elif command == "create":
         index += 2
     image = args[index]
     cmd = args[index + 1:]
+    if os.environ.get("FAKE_CREATE_ENV_REORDER") == "1":
+        environment.reverse()
+    environment_mutation = os.environ.get("FAKE_CREATE_ENV_MUTATION", "")
+    if environment_mutation == "non-list":
+        environment = environment[0]
+    elif environment_mutation == "duplicate":
+        environment.append(environment[0])
+    elif environment_mutation == "missing":
+        environment.pop()
+    elif environment_mutation == "extra":
+        environment.append("UNEXPECTED_ENVIRONMENT=value")
+    elif environment_mutation == "changed":
+        key = environment[0].split("=", 1)[0]
+        environment[0] = key + "=changed"
+    elif environment_mutation == "malformed":
+        environment.append("MALFORMED_ENVIRONMENT")
+    elif environment_mutation == "non-string":
+        environment.append(7)
+    elif environment_mutation == "empty-key":
+        environment.append("=value")
+    elif environment_mutation:
+        raise SystemExit(f"unsupported environment mutation: {environment_mutation}")
     value = {
         "Id": container_id, "Name": "/" + name,
         "Image": os.environ["FAKE_BASE_CONFIG"],
@@ -187,6 +226,8 @@ elif command == "start":
                 raise SystemExit("fake Docker start gate timed out")
             time.sleep(0.01)
     value = load()
+    if os.environ.get("FAKE_START_ENV_REORDER") == "1":
+        value["Config"]["Env"].reverse()
     value["HostConfig"]["OomKillDisable"] = None
     value["State"].update({
         "Status": "exited", "Running": False,
@@ -368,6 +409,132 @@ def test_detached_fast_exit_recovers_receipt_and_checksum_closes_empty_log(
     assert_exact_bundle(output)
     already_closed = run(local_lifecycle["finalize"], environment)
     assert already_closed.returncode == 0, already_closed.stderr
+
+
+@pytest.mark.parametrize(
+    ("phase", "environment_variable"),
+    [
+        pytest.param("create", "FAKE_CREATE_ENV_REORDER", id="create-inspect"),
+        pytest.param("start", "FAKE_START_ENV_REORDER", id="later-inspect"),
+    ],
+)
+def test_detached_accepts_exact_environment_mapping_in_any_inspect_order(
+    local_lifecycle: dict[str, object],
+    phase: str,
+    environment_variable: str,
+) -> None:
+    environment = dict(local_lifecycle["environment"])
+    environment[environment_variable] = "1"
+    output = local_lifecycle["output"]
+    launched = run(local_lifecycle["launch"], environment)
+    assert launched.returncode == 0, launched.stderr
+    created_environment = json.loads(
+        (output / "docker/disposable-container-created.json").read_text()
+    )[0]["Config"]["Env"]
+    state = json.loads(local_lifecycle["state"].read_text())
+    current_environment = state["Config"]["Env"]
+    expected_keys = [
+        "NVIDIA_VISIBLE_DEVICES",
+        "NVIDIA_DRIVER_CAPABILITIES",
+        "ACE_RUNPOD_BASE_IMAGE",
+        "ACE_RUNPOD_BASE_CONFIG_DIGEST",
+        "ACE_PHANTOM_BUILD_JOBS",
+    ]
+    created_keys = [entry.split("=", 1)[0] for entry in created_environment]
+    current_keys = [entry.split("=", 1)[0] for entry in current_environment]
+    if phase == "create":
+        assert created_keys == list(reversed(expected_keys))
+        assert current_keys == created_keys
+    else:
+        assert created_keys == expected_keys
+        assert current_keys == list(reversed(expected_keys))
+    assert sorted(created_environment) == sorted(current_environment)
+    finalized = run(local_lifecycle["finalize"], environment)
+    assert finalized.returncode == 0, finalized.stderr
+    state = json.loads(local_lifecycle["state"].read_text())
+    assert state["RemovedIds"] == ["a" * 64]
+    assert_exact_bundle(output)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("non-list", "is not a list"),
+        ("duplicate", "contains a duplicate key"),
+        ("missing", "identity differs"),
+        ("extra", "identity differs"),
+        ("changed", "identity differs"),
+        ("malformed", "contains a malformed entry"),
+        ("non-string", "contains a malformed entry"),
+        ("empty-key", "contains an empty key"),
+    ],
+)
+def test_detached_rejects_invalid_environment_before_start_or_cleanup(
+    local_lifecycle: dict[str, object],
+    mutation: str,
+    expected_error: str,
+) -> None:
+    environment = dict(local_lifecycle["environment"])
+    environment["FAKE_CREATE_ENV_MUTATION"] = mutation
+    launched = run(local_lifecycle["launch"], environment)
+    assert launched.returncode != 0
+    assert expected_error in launched.stderr
+    state = json.loads(local_lifecycle["state"].read_text())
+    assert state["State"] == {
+        "Status": "created",
+        "Running": False,
+        "ExitCode": 0,
+        "StartedAt": "0001-01-01T00:00:00Z",
+        "FinishedAt": "0001-01-01T00:00:00Z",
+    }
+    assert state["Removed"] is False
+    assert state["RemovedIds"] == []
+    output = local_lifecycle["output"]
+    assert (output / "docker/disposable-container-created.json.work").is_file()
+    assert not (output / "docker/disposable-container-created.json").exists()
+    for name in (
+        "container-start-attempt.json",
+        "start.txt",
+        "container-started.json",
+        "cleanup-intent.tsv",
+        "cleanup.txt",
+        "cleanup-verification.tsv",
+        "containers-after.txt",
+    ):
+        assert not (output / "docker" / name).exists()
+    assert not any((output / "incoming-results").iterdir())
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("missing", "is not a list"),
+        ("null", "is not a list"),
+        ("non-list", "is not a list"),
+        ("duplicate", "contains a duplicate key"),
+    ],
+)
+def test_detached_rejects_invalid_locked_base_environment_before_start(
+    local_lifecycle: dict[str, object],
+    mutation: str,
+    expected_error: str,
+) -> None:
+    environment = dict(local_lifecycle["environment"])
+    environment["FAKE_BASE_ENV_MUTATION"] = mutation
+    launched = run(local_lifecycle["launch"], environment)
+    assert launched.returncode != 0
+    assert expected_error in launched.stderr
+    state = json.loads(local_lifecycle["state"].read_text())
+    assert state["State"]["Status"] == "created"
+    assert state["State"]["Running"] is False
+    assert state["Removed"] is False
+    assert state["RemovedIds"] == []
+    output = local_lifecycle["output"]
+    assert (output / "docker/disposable-container-created.json.work").is_file()
+    assert not (output / "docker/disposable-container-created.json").exists()
+    assert not (output / "docker/container-start-attempt.json").exists()
+    assert not (output / "docker/cleanup-intent.tsv").exists()
+    assert not any((output / "incoming-results").iterdir())
 
 
 def test_detached_accepts_only_observed_oom_kill_disable_normalization(

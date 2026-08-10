@@ -261,17 +261,45 @@ owned_environment = [
     f"ACE_RUNPOD_BASE_CONFIG_DIGEST={intent['base_config_digest']}",
     f"ACE_PHANTOM_BUILD_JOBS={intent['build_jobs']}",
 ]
+
+def exact_json_equal(left, right):
+    options = {
+        "allow_nan": False,
+        "ensure_ascii": False,
+        "separators": (",", ":"),
+        "sort_keys": True,
+    }
+    return json.dumps(left, **options) == json.dumps(right, **options)
+
+def environment_mapping(entries, description):
+    if not isinstance(entries, list):
+        raise SystemExit(f"{description} is not a list")
+    result = {}
+    for entry in entries:
+        if not isinstance(entry, str) or "=" not in entry:
+            raise SystemExit(f"{description} contains a malformed entry")
+        key, value = entry.split("=", 1)
+        if not key:
+            raise SystemExit(f"{description} contains an empty key")
+        if key in result:
+            raise SystemExit(f"{description} contains a duplicate key")
+        result[key] = value
+    return result
+
 base_records = json.loads(pathlib.Path(base_image_path).read_text(encoding="utf-8"))
 if not isinstance(base_records, list) or len(base_records) != 1:
     raise SystemExit("locked base image inspect evidence is invalid")
 base_config = base_records[0].get("Config") or {}
-expected_environment = list(owned_environment)
-environment_keys = {entry.split("=", 1)[0] for entry in expected_environment}
-for entry in base_config.get("Env") or []:
-    key = entry.split("=", 1)[0]
-    if key not in environment_keys:
-        expected_environment.append(entry)
-        environment_keys.add(key)
+base_environment = base_config.get("Env")
+expected_environment = environment_mapping(
+    base_environment, "locked base image environment"
+)
+expected_environment.update(environment_mapping(
+    owned_environment, "owned container environment"
+))
+actual_environment = environment_mapping(
+    config.get("Env"), "Docker container environment"
+)
 expected_labels = dict(base_config.get("Labels") or {})
 expected_labels.update({
     "ace.phantom.task": intent["task_label"],
@@ -288,7 +316,7 @@ if (
     or item.get("Image") != intent["base_config_digest"]
     or config.get("Image") != intent["base_image"]
     or config.get("Cmd") != command
-    or config.get("Env") != expected_environment
+    or not exact_json_equal(actual_environment, expected_environment)
     or host.get("Runtime") != "runc" or host.get("Privileged") is not False
     or (host.get("Devices") or []) != [] or (host.get("DeviceRequests") or []) != []
     or (host.get("RestartPolicy") or {}).get("Name") not in {"", "no"}
@@ -302,15 +330,6 @@ if baseline.is_file():
     if not isinstance(baseline_record, list) or len(baseline_record) != 1:
         raise SystemExit("created-container host comparison evidence is invalid")
     original = baseline_record[0]
-
-    def exact_json_equal(left, right):
-        options = {
-            "allow_nan": False,
-            "ensure_ascii": False,
-            "separators": (",", ":"),
-            "sort_keys": True,
-        }
-        return json.dumps(left, **options) == json.dumps(right, **options)
 
     def normalized_host_configs(current_record, original_record):
         current = current_record.get("HostConfig")
@@ -330,12 +349,28 @@ if baseline.is_file():
                 original[key] = False
         return current, original
 
+    def normalized_configs(current_record, original_record):
+        current = current_record.get("Config")
+        original = original_record.get("Config")
+        if not isinstance(current, dict) or not isinstance(original, dict):
+            return current, original
+        current = dict(current)
+        original = dict(original)
+        current["Env"] = environment_mapping(
+            current.get("Env"), "current Docker container environment"
+        )
+        original["Env"] = environment_mapping(
+            original.get("Env"), "created Docker container environment"
+        )
+        return current, original
+
+    current_config, original_config = normalized_configs(item, original)
     current_host_config, original_host_config = normalized_host_configs(
         item, original
     )
 
     if (
-        not exact_json_equal(item.get("Config"), original.get("Config"))
+        not exact_json_equal(current_config, original_config)
         or not exact_json_equal(current_host_config, original_host_config)
         or not exact_json_equal(item.get("Mounts"), original.get("Mounts"))
     ):
