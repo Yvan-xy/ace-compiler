@@ -58,14 +58,17 @@ int main(int argc, char** argv) {
   const size_t half_turn = source.find(
       "_pgen_normalized_rotation > "
       "(int64_t)(_pgen_rotation_slots / 2U)", modulo);
-  const size_t zero = source.find(" == 0) {", half_turn);
+  const size_t assignment = source.find(
+      "rot_idx_1 = (int32_t)_pgen_normalized_rotation;", half_turn);
+  const size_t zero = source.find(" == 0) {", assignment);
   const size_t swk  = source.find("Swk(1,", zero);
   const size_t order = source.find("Auto_order(", swk);
   if (slots == std::string::npos || modulo == std::string::npos ||
-      half_turn == std::string::npos || zero == std::string::npos ||
-      swk == std::string::npos || order == std::string::npos ||
-      !(slots < modulo && modulo < half_turn && half_turn < zero &&
-        zero < swk && swk < order)) {
+      half_turn == std::string::npos || assignment == std::string::npos ||
+      zero == std::string::npos || swk == std::string::npos ||
+      order == std::string::npos ||
+      !(slots < modulo && modulo < half_turn && half_turn < assignment &&
+        assignment < zero && zero < swk && swk < order)) {
     std::cerr << "generated ANT rotate helper does not normalize before "
                  "zero/key/automorphism use"
               << std::endl;

@@ -83,6 +83,7 @@ NODE_PTR FindOpcode(NODE_PTR node, OPCODE opcode) {
 TEST(CKKS2COrdinaryContract, NormalizesScalarRotationKeys) {
   EXPECT_EQ(fhe::core::Normalize_scalar_rotation_index(-1, 8192), -1);
   EXPECT_EQ(fhe::core::Normalize_scalar_rotation_index(4096, 8192), 4096);
+  EXPECT_EQ(fhe::core::Normalize_scalar_rotation_index(-4096, 8192), 4096);
   EXPECT_EQ(fhe::core::Normalize_scalar_rotation_index(6144, 8192), -2048);
   EXPECT_EQ(fhe::core::Normalize_scalar_rotation_index(8192, 8192), 0);
   EXPECT_EQ(fhe::core::Normalize_scalar_rotation_index(8193, 8192), 1);
