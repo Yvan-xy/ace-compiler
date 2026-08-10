@@ -233,10 +233,25 @@ def test_binding_inserted_relin_updates_phantom_resource_manifest(
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "ckks.relin" in post_air.read_text(encoding="utf-8").lower()
+    post_air_text = post_air.read_text(encoding="utf-8").lower()
+    assert post_air_text.count("ckks.mul") == 1
+    assert post_air_text.count("ckks.relin") == 1
+    assert post_air_text.count("ckks.rotate") == 2
+    assert post_air_text.count("ckks.add") == 1
+    assert post_air_text.count("skip_auto_rescale=1") == 1
+    assert "ckks.rescale" not in post_air_text
+    assert "ckks.modswitch" not in post_air_text
     source = output.read_text(encoding="utf-8")
-    assert "Relin(" in source
+    assert source.count("Mul_ciph(") == 1
+    assert source.count("Relin(") == 1
+    assert source.count("Rotate_ciph(") == 2
+    assert source.count("Add_ciph(") == 1
+    assert "Rescale_ciph(" not in source
+    assert "Mod_switch(" not in source
     assert "PHANTOM_RESOURCE_RELIN_KEY" in source
+    context_manifest = json.loads(context.read_text(encoding="utf-8"))
+    assert context_manifest["input_level"] == 1
+    assert len(context_manifest["data_q_bit_sizes"]) == 4
     manifest = json.loads(resources.read_text(encoding="utf-8"))
     assert manifest["schema_version"] == 3
     assert manifest["context_schema_version"] == 1

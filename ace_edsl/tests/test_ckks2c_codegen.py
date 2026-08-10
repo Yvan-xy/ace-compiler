@@ -90,7 +90,8 @@ def test_phantom_add_mul_rotate_uses_only_dedicated_ckks2c():
         pipeline = AcePipeline(glob).configure_fhe(
             poly_degree=16384,
             mul_level=4,
-            input_level=1,
+            # This graph consumes one data-Q drop before its ADD operands meet.
+            input_level=2,
             security_level=0,
             scaling_factor_bits=56,
             first_prime_bits=60,
@@ -106,6 +107,8 @@ def test_phantom_add_mul_rotate_uses_only_dedicated_ckks2c():
         assert compiled.stages_completed == ["ckks_driver", "ckks2c"]
         post_air = compiled.air_dumps["ckks_driver"].lower()
         assert "fhe::poly" not in post_air
+        assert post_air.count("ckks.rescale") == 1
+        assert post_air.count("ckks.modswitch") == 1
 
         source = compiled.c_code or ""
         required = (
@@ -114,7 +117,9 @@ def test_phantom_add_mul_rotate_uses_only_dedicated_ckks2c():
             "Get_phantom_resource_manifest()",
             "Add_ciph(",
             "Mul_ciph(",
+            "Rescale_ciph(",
             "Rotate_ciph(",
+            "Mod_switch(",
         )
         forbidden = (
             "rt_ant/", "rt_seal/", "LIB_ANT", "LIB_SEAL",
@@ -125,6 +130,8 @@ def test_phantom_add_mul_rotate_uses_only_dedicated_ckks2c():
         )
         for token in required:
             assert token in source, token
+        assert source.count("Rescale_ciph(") == 1
+        assert source.count("Mod_switch(") == 1
         for token in forbidden:
             assert token not in source, token
         print("CKKS2C_ARITHMETIC_SOURCE_OK")

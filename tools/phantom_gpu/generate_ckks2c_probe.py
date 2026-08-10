@@ -7,11 +7,28 @@ import argparse
 from pathlib import Path
 
 from ace_edsl.edsl import (
+    AIRValue,
     AceEDSL,
     AcePipeline,
     CkksCiphertext,
     ckks_kernel,
 )
+
+
+def multiply_without_auto_rescale(left: AIRValue, right: AIRValue) -> AIRValue:
+    """Emit a ciphertext product while preserving its input Q coordinate."""
+    if left.container is not right.container:
+        raise ValueError("ciphertext product operands use different containers")
+    multiply = left.container.new_ckks_mul(left.value, right.value)
+    if not hasattr(multiply, "set_u32_attr"):
+        raise RuntimeError("CKKS multiply node cannot record scale policy")
+    multiply.set_u32_attr("skip_auto_rescale", 1)
+    value = AIRValue(
+        multiply,
+        left.container,
+        domain=getattr(left, "domain", None),
+    )
+    return value._flatten_result(multiply)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -86,9 +103,14 @@ def main() -> int:
         def arithmetic_probe(
             left_value: CkksCiphertext, right_value: CkksCiphertext
         ) -> CkksCiphertext:
-            return ((left_value * right_value) + left_value.rotate(3)) + (
-                right_value.rotate(-3)
+            # Retain a legal bottom-Q multiply/relinearize lifetime probe. Its
+            # scale-degree-two result cannot cross a function boundary without
+            # another Q modulus, so the returned value uses scale-one branches.
+            unused_product = multiply_without_auto_rescale(
+                left_value, right_value
             )
+            del unused_product
+            return left_value.rotate(3) + right_value.rotate(-3)
 
         right = CkksCiphertext(shape=shape, name="right")
         arithmetic_probe(left, right)
