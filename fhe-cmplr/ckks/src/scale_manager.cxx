@@ -24,37 +24,39 @@
 
 namespace fhe {
 namespace ckks {
-SCALE_INFO PARS::Handle(NODE_PTR node) {
-  Rescale_ana(node);
-  Scale_match(node);
-  SCALE_INFO info = Downscale_analysis(node);
+SCALE_INFO PARS::Handle(NODE_PTR node, SCALE_INFO& si0) {
+  Rescale_ana(node, 0, si0);
+  Context()->Set_node_scale_info(node, si0);
+  return si0;
+}
+
+SCALE_INFO PARS::Handle(NODE_PTR node, SCALE_INFO& si0, SCALE_INFO& si1) {
+  Rescale_ana(node, 0, si0);
+  LOWER_CTX* lower_ctx = Context()->Lower_ctx();
+  NODE_PTR   child1    = node->Child(1);
+  if (lower_ctx->Is_cipher_type(child1->Rtype_id()) ||
+      lower_ctx->Is_cipher3_type(child1->Rtype_id())) {
+    Rescale_ana(node, 1, si1);
+  }
+  Scale_match(node, si0, si1);
+  SCALE_INFO info = Downscale_analysis(node, si0, si1);
   Context()->Set_node_scale_info(node, info);
   return info;
 }
 
-void PARS::Rescale_ana(NODE_PTR node) {
+void PARS::Rescale_ana(NODE_PTR node, uint32_t child_id,
+                       SCALE_INFO& operand) {
   SCALE_MNG_CTX* ctx = Context();
-  for (uint32_t id = 0; id < node->Num_child(); ++id) {
-    NODE_PTR       child = node->Child(id);
-    SCALE_MAP_ITER iter  = ctx->Node_scale_info_iter(child->Id());
-    if (iter == ctx->Node_scale_info().end()) continue;
+  AIR_ASSERT(child_id < node->Num_child());
+  if (operand.Scale_deg() <= 2) return;
 
-    // rescale operands of which scale degree is larger than 2.
-    SCALE_INFO si        = iter->second;
-    uint32_t   scale_deg = iter->second.Scale_deg();
-    if (scale_deg > 2) {
-      uint32_t rs_cnt = scale_deg - 2;
-      uint32_t rs_lev = iter->second.Rescale_level() + rs_cnt;
-
-      si = SCALE_INFO(2, rs_lev);
-      EXPR_RESCALE_INFO rs_info(node, child, rs_cnt, si);
-      ctx->Add_expr_rescale_info(rs_info);
-      ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
-                 "Rescale opnd1 of node: ");
-      ctx->Trace_obj(TD_CKKS_SCALE_MGT, node);
-    }
-    ctx->Set_scale_info(child->Id(), si);
-  }
+  uint32_t rs_count = operand.Scale_deg() - 2;
+  operand = SCALE_INFO(2, operand.Rescale_level() + rs_count);
+  ctx->Add_expr_rescale_info(EXPR_RESCALE_INFO(
+      node, child_id, node->Child(child_id), rs_count, operand));
+  ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
+             "Rescale opnd", child_id, " of node: ");
+  ctx->Trace_obj(TD_CKKS_SCALE_MGT, node);
 }
 
 uint32_t SCALE_MNG_CTX::Align_binary_rescale_levels(NODE_PTR node,
@@ -87,8 +89,9 @@ uint32_t SCALE_MNG_CTX::Align_binary_rescale_levels(NODE_PTR node,
 
   uint32_t target_level =
       std::max(si0.Rescale_level(), si1.Rescale_level());
-  uint32_t full_q_count = Lower_ctx()->Get_ctx_param().Get_mul_level();
-  AIR_ASSERT_MSG(full_q_count == 0 || target_level <= full_q_count,
+  int64_t configured_full_q = Config()->Max_cipher_lvl();
+  AIR_ASSERT_MSG(configured_full_q <= 0 ||
+                     target_level <= static_cast<uint64_t>(configured_full_q),
                  "ciphertext binary operand exceeds the data-Q chain");
 
   SCALE_INFO* operands[2] = {&si0, &si1};
@@ -108,49 +111,46 @@ uint32_t SCALE_MNG_CTX::Align_binary_rescale_levels(NODE_PTR node,
   return target_level;
 }
 
-void PARS::Scale_match(NODE_PTR node) {
+void PARS::Scale_match(NODE_PTR node, SCALE_INFO& si0, SCALE_INFO& si1) {
   if (node->Opcode() != OPC_ADD && node->Opcode() != OPC_SUB) return;
-  SCALE_MNG_CTX*            ctx       = Context();
-  NODE_ID                   child0    = node->Child_id(0);
-  NODE_ID                   child1    = node->Child_id(1);
-  SCALE_MNG_CTX::SCALE_MAP& scale_map = ctx->Node_scale_info();
-  SCALE_MAP_ITER            iter0     = scale_map.find(child0.Value());
-  if (iter0 == scale_map.end()) return;
-  SCALE_MAP_ITER iter1 = scale_map.find(child1.Value());
-  if (iter1 == scale_map.end()) return;
-  SCALE_INFO& info0 = iter0->second;
-  SCALE_INFO& info1 = iter1->second;
-  if (ctx->Is_unfix_scale(info0.Scale_deg())) {
-    AIR_ASSERT(!ctx->Is_unfix_scale(info1.Scale_deg()));
-    info0 = info1;
-  } else if (ctx->Is_unfix_scale(info1.Scale_deg())) {
-    info1 = info0;
-  }
-  if (info0.Scale_deg() == info1.Scale_deg()) return;
+  SCALE_MNG_CTX* ctx = Context();
+  LOWER_CTX*     lower_ctx = ctx->Lower_ctx();
+  NODE_PTR       child0 = node->Child(0);
+  NODE_PTR       child1 = node->Child(1);
+  auto is_cipher = [lower_ctx](NODE_PTR child) {
+    return lower_ctx->Is_cipher_type(child->Rtype_id()) ||
+           lower_ctx->Is_cipher3_type(child->Rtype_id());
+  };
+  if (!is_cipher(child0) || !is_cipher(child1)) return;
 
-  uint32_t high_id = info0.Scale_deg() > info1.Scale_deg() ? 0 : 1;
-  SCALE_INFO& high = high_id == 0 ? info0 : info1;
-  SCALE_INFO& low  = high_id == 0 ? info1 : info0;
+  if (ctx->Is_unfix_scale(si0.Scale_deg())) {
+    AIR_ASSERT(!ctx->Is_unfix_scale(si1.Scale_deg()));
+    si0 = si1;
+  } else if (ctx->Is_unfix_scale(si1.Scale_deg())) {
+    si1 = si0;
+  }
+  if (si0.Scale_deg() == si1.Scale_deg()) return;
+
+  uint32_t high_id = si0.Scale_deg() > si1.Scale_deg() ? 0 : 1;
+  SCALE_INFO& high = high_id == 0 ? si0 : si1;
+  SCALE_INFO& low  = high_id == 0 ? si1 : si0;
   uint32_t rs_count = high.Scale_deg() - low.Scale_deg();
   SCALE_INFO result(low.Scale_deg(), high.Rescale_level() + rs_count);
-  ctx->Add_expr_rescale_info(
-      EXPR_RESCALE_INFO(node, node->Child(high_id), rs_count, result));
+  ctx->Add_expr_rescale_info(EXPR_RESCALE_INFO(
+      node, high_id, node->Child(high_id), rs_count, result));
   high = result;
   ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
              "Rescale opnd", high_id, " of add/sub: ");
   ctx->Trace_obj(TD_CKKS_SCALE_MGT, node);
 }
 
-SCALE_INFO PARS::Downscale_analysis(NODE_PTR node) {
-  SCALE_MNG_CTX*            ctx       = Context();
-  NODE_ID                   child0    = node->Child_id(0);
-  SCALE_MNG_CTX::SCALE_MAP& scale_map = ctx->Node_scale_info();
-  SCALE_MAP_ITER            iter0     = scale_map.find(child0.Value());
-  AIR_ASSERT(iter0 != scale_map.end());
-  if (node->Opcode() != OPC_MUL) return iter0->second;
+SCALE_INFO PARS::Downscale_analysis(NODE_PTR node, SCALE_INFO& si0,
+                                    SCALE_INFO& si1) {
+  if (node->Opcode() != OPC_MUL) return si0;
 
   NODE_PTR   child1    = node->Child(1);
   TYPE_ID    rtype     = child1->Rtype_id();
+  SCALE_MNG_CTX* ctx   = Context();
   LOWER_CTX* lower_ctx = ctx->Lower_ctx();
   // at runtime scale of plaintext operand of CKKS.mul is set as scale_factor
   if (!lower_ctx->Is_cipher_type(rtype) && !lower_ctx->Is_cipher3_type(rtype)) {
@@ -162,28 +162,23 @@ SCALE_INFO PARS::Downscale_analysis(NODE_PTR node) {
         plain_scale_deg = 0;
       }
     }
-    return SCALE_INFO(iter0->second.Scale_deg() + plain_scale_deg,
-                      iter0->second.Rescale_level());
+    return SCALE_INFO(si0.Scale_deg() + plain_scale_deg,
+                      si0.Rescale_level());
   }
 
-  SCALE_MAP_ITER iter1 = scale_map.find(child1->Id().Value());
-  AIR_ASSERT(iter1 != scale_map.end());
-
-  SCALE_INFO& info0     = iter0->second;
-  SCALE_INFO& info1     = iter1->second;
-  uint32_t    scale_deg = info0.Scale_deg() + info1.Scale_deg();
-  uint32_t    rs_level = std::max(info0.Rescale_level(), info1.Rescale_level());
+  uint32_t scale_deg = si0.Scale_deg() + si1.Scale_deg();
+  uint32_t rs_level = std::max(si0.Rescale_level(), si1.Rescale_level());
   if (scale_deg <= 3) return SCALE_INFO(scale_deg, rs_level);
 
   // rescale operand 0
-  info0.Set_scale_deg(info0.Scale_deg() - 1);
-  info0.Set_rescale_level(info0.Rescale_level() + 1);
-  EXPR_RESCALE_INFO rs_info0(node, node->Child(0), 1, info0);
+  si0.Set_scale_deg(si0.Scale_deg() - 1);
+  si0.Set_rescale_level(si0.Rescale_level() + 1);
+  EXPR_RESCALE_INFO rs_info0(node, 0, node->Child(0), 1, si0);
   ctx->Add_expr_rescale_info(rs_info0);
   // rescale operand 1
-  info1.Set_scale_deg(info1.Scale_deg() - 1);
-  info1.Set_rescale_level(info1.Rescale_level() + 1);
-  EXPR_RESCALE_INFO rs_info1(node, node->Child(1), 1, info1);
+  si1.Set_scale_deg(si1.Scale_deg() - 1);
+  si1.Set_rescale_level(si1.Rescale_level() + 1);
+  EXPR_RESCALE_INFO rs_info1(node, 1, node->Child(1), 1, si1);
   ctx->Add_expr_rescale_info(rs_info1);
 
   ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
@@ -200,10 +195,10 @@ SCALE_INFO ACE_SM::Handle_mul(NODE_PTR node, SCALE_INFO& si0,
   bool lazy_rescale =
       (lazy_rescale_attr != nullptr) && (*lazy_rescale_attr != 0);
   if (si0.Scale_deg() >= 2) {
-    si0 = Rescale_res(node->Child(0), si0);
+    si0 = Rescale_res(node, 0, si0);
   }
   if (si1.Scale_deg() >= 2) {
-    si1 = Rescale_res(node->Child(1), si1);
+    si1 = Rescale_res(node, 1, si1);
   }
   uint32_t   scale_deg = si0.Scale_deg() + si1.Scale_deg();
   uint32_t   rs_level  = std::max(si0.Rescale_level(), si1.Rescale_level());
@@ -213,8 +208,7 @@ SCALE_INFO ACE_SM::Handle_mul(NODE_PTR node, SCALE_INFO& si0,
 
   si                       = SCALE_INFO(1, rs_level + 1);
   NODE_PTR          parent = ctx->Parent(1);
-  EXPR_RESCALE_INFO rs_info(parent, node, 1, si);
-  ctx->Add_expr_rescale_info(rs_info);
+  ctx->Add_expr_rescale_info_for_node(parent, node, 1, si);
   return si;
 }
 
@@ -229,15 +223,17 @@ SCALE_INFO ACE_SM::Handle_add(NODE_PTR node, SCALE_INFO& si0,
     // summed ciphtertexts.
     AIR_ASSERT(!Context()->Is_unfix_scale(si1.Scale_deg()));
     si0 = si1;
+  } else if (Context()->Is_unfix_scale(si1.Scale_deg())) {
+    si1 = si0;
   } else if (si0.Scale_deg() > si1.Scale_deg()) {
     AIR_ASSERT(si0.Scale_deg() == (si1.Scale_deg() + 1));
-    si0 = Rescale_res(node->Child(0), si0);
+    si0 = Rescale_res(node, 0, si0);
     ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
                "Rescale opnd0 of add: ");
     ctx->Trace_obj(TD_CKKS_SCALE_MGT, node);
   } else if (si0.Scale_deg() < si1.Scale_deg()) {
     AIR_ASSERT(si1.Scale_deg() == (si0.Scale_deg() + 1));
-    si1 = Rescale_res(node->Child(1), si1);
+    si1 = Rescale_res(node, 1, si1);
     ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
                "Rescale opnd1 of add: ");
     ctx->Trace_obj(TD_CKKS_SCALE_MGT, node);
@@ -254,8 +250,7 @@ SCALE_INFO ACE_SM::Handle_rotate(NODE_PTR node, SCALE_INFO si) {
   if (!ctx->Rescale_node(node, ctx->Parent_stmt(), si.Scale_deg())) return si;
 
   AIR_ASSERT(si.Scale_deg() == 2);
-  NODE_PTR child = node->Child(0);
-  si             = Rescale_res(child, si);
+  si = Rescale_res(node, 0, si);
 
   ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
              "Rescale opnd of rotate: ");
@@ -263,9 +258,11 @@ SCALE_INFO ACE_SM::Handle_rotate(NODE_PTR node, SCALE_INFO si) {
   return si;
 }
 
-SCALE_INFO ACE_SM::Rescale_res(NODE_PTR node, const SCALE_INFO& si) {
+SCALE_INFO ACE_SM::Rescale_res(NODE_PTR parent, uint32_t child_id,
+                               const SCALE_INFO& si) {
   AIR_ASSERT(si.Scale_deg() >= 1);
   if (si.Scale_deg() == 1) return si;
+  AIR_ASSERT(child_id < parent->Num_child());
 
   uint32_t scale_deg = si.Scale_deg();
   AIR_ASSERT(scale_deg > 1);
@@ -273,7 +270,8 @@ SCALE_INFO ACE_SM::Rescale_res(NODE_PTR node, const SCALE_INFO& si) {
   uint32_t          rescale_level = si.Rescale_level() + rs_cnt;
   SCALE_INFO        res_si(1, rescale_level);
   SCALE_MNG_CTX*    ctx = Context();
-  EXPR_RESCALE_INFO rs_info(ctx->Parent(0), node, rs_cnt, res_si);
+  EXPR_RESCALE_INFO rs_info(parent, child_id, parent->Child(child_id), rs_cnt,
+                            res_si);
   ctx->Add_expr_rescale_info(rs_info);
 
   ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
@@ -405,25 +403,6 @@ SCALE_INFO CORE_SCALE_MANAGER::Rescale_prehead_opnd(SCALE_MNG_CTX&        ctx,
   ctx.Trace_obj(TD_CKKS_SCALE_MGT, sym);
   ctx.Trace_obj(TD_CKKS_SCALE_MGT, st);
   return SCALE_INFO(2, si.Rescale_level() + rs_cnt);
-}
-
-SCALE_INFO CKKS_SCALE_MANAGER::Rescale_res(SCALE_MNG_CTX* ctx, NODE_PTR node,
-                                           const SCALE_INFO& si) {
-  if (!ctx->Ace_sm() || si.Scale_deg() == 1) return si;
-
-  uint32_t scale_deg = si.Scale_deg();
-  AIR_ASSERT(scale_deg > 1);
-  uint32_t rs_cnt        = scale_deg - 1;
-  uint32_t rescale_level = si.Rescale_level() + rs_cnt;
-
-  SCALE_INFO        res_si(1, rescale_level);
-  EXPR_RESCALE_INFO rs_info(ctx->Parent(0), node, rs_cnt, res_si);
-  ctx->Add_expr_rescale_info(rs_info);
-
-  ctx->Trace(TD_CKKS_SCALE_MGT, std::string(ctx->Indent(), ' '),
-             "rescale: s=", res_si.Scale_deg(), " l=", res_si.Rescale_level(),
-             "\n");
-  return res_si;
 }
 
 void CKKS_SCALE_MANAGER::Handle_encode_in_bin_arith_node(
@@ -648,10 +627,15 @@ void SCALE_MANAGER::Rescale_expr() {
   for (const EXPR_RESCALE_INFO& rs_info : Mng_ctx().Rescale_expr()) {
     // 1. gen rescale node
     NODE_PTR rescale = rs_info.Node();
+    SCALE_INFO current_scale = rs_info.Source_scale();
     for (uint32_t id = 0; id < rs_info.Rescale_cnt(); ++id) {
       rescale = ckks_gen.Gen_rescale(rescale);
+      AIR_ASSERT(current_scale.Scale_deg() > 0);
+      current_scale.Set_scale_deg(current_scale.Scale_deg() - 1);
+      current_scale.Set_rescale_level(current_scale.Rescale_level() + 1);
+      Mng_ctx().Set_node_scale_info(rescale, current_scale);
     }
-    Mng_ctx().Set_node_scale_info(rescale, rs_info.Res_scale());
+    AIR_ASSERT(current_scale == rs_info.Res_scale());
 
     // 2. replace original node with rescale node
     NODE_PTR parent   = rs_info.Parent();

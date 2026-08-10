@@ -6,6 +6,7 @@
 //
 //=============================================================================
 
+#include <algorithm>
 #include <climits>
 #include <list>
 #include <set>
@@ -118,29 +119,40 @@ class EXPR_RESCALE_INFO {
 public:
   using SET  = std::set<EXPR_RESCALE_INFO>;
   using ITER = SET::iterator;
-  EXPR_RESCALE_INFO(NODE_PTR parent, NODE_PTR node, uint32_t rs_cnt,
-                    const SCALE_INFO& res_scale)
-      : _parent(parent), _node(node), _rs_cnt(rs_cnt), _scale_info(res_scale) {}
+  EXPR_RESCALE_INFO(NODE_PTR parent, uint32_t child_id, NODE_PTR node,
+                    uint32_t rs_cnt, const SCALE_INFO& res_scale)
+      : _parent(parent),
+        _node(node),
+        _child_id(child_id),
+        _rs_cnt(rs_cnt),
+        _scale_info(res_scale) {
+    AIR_ASSERT(parent != Null_ptr);
+    AIR_ASSERT(child_id < parent->Num_child());
+    AIR_ASSERT(parent->Child(child_id) == node);
+  }
   EXPR_RESCALE_INFO(const EXPR_RESCALE_INFO& o)
-      : EXPR_RESCALE_INFO(o._parent, o._node, o._rs_cnt, o._scale_info) {}
+      : EXPR_RESCALE_INFO(o._parent, o._child_id, o._node, o._rs_cnt,
+                          o._scale_info) {}
 
   ~EXPR_RESCALE_INFO() {}
 
   NODE_PTR Parent(void) const { return _parent; }
   NODE_PTR Node(void) const { return _node; }
-  uint32_t Child_id(void) const {
-    for (uint32_t id = 0; id < _parent->Num_child(); ++id) {
-      if (_parent->Child(id) == _node) return id;
-    }
-    AIR_ASSERT(false);
-    return UINT_MAX;
-  }
+  uint32_t Child_id(void) const { return _child_id; }
   uint32_t          Rescale_cnt(void) const { return _rs_cnt; }
   void              Set_rescale_cnt(uint32_t val) { _rs_cnt = val; }
   const SCALE_INFO& Res_scale(void) const { return _scale_info; }
   SCALE_INFO&       Res_scale(void) { return _scale_info; }
+  SCALE_INFO Source_scale(void) const {
+    AIR_ASSERT(_scale_info.Rescale_level() >= _rs_cnt);
+    return SCALE_INFO(_scale_info.Scale_deg() + _rs_cnt,
+                      _scale_info.Rescale_level() - _rs_cnt);
+  }
   bool              operator<(const EXPR_RESCALE_INFO& o) const {
-    return _node->Id() < o.Node()->Id();
+    if (_parent->Id() != o.Parent()->Id()) {
+      return _parent->Id() < o.Parent()->Id();
+    }
+    return _child_id < o.Child_id();
   }
 
   void Print(std::ostream& os) const {
@@ -158,6 +170,7 @@ private:
 
   NODE_PTR   _parent;
   NODE_PTR   _node;
+  uint32_t   _child_id;
   uint32_t   _rs_cnt;      // number of required rescale.
   SCALE_INFO _scale_info;  // scale info after rescale.
 };
@@ -332,37 +345,81 @@ public:
     return _modswitch_expr;
   }
 
-  //! @brief Record the expr that require rescaling. If the expr has already
-  //! been recorded, update the rescaling info to one with lower resulting scale
-  //! degree.
+  //! @brief Record the rescale sequence required on one parent/child edge.
+  //! Contiguous requests are accumulated exactly; overlapping, contained, and
+  //! repeated requests from expression-DAG replay are idempotent.
   void Add_expr_rescale_info(EXPR_RESCALE_INFO rs_info) {
+    int64_t configured_full_q = _config->Max_cipher_lvl();
+    AIR_ASSERT_MSG(configured_full_q <= 0 ||
+                       rs_info.Res_scale().Rescale_level() <=
+                           static_cast<uint64_t>(configured_full_q),
+                   "rescale candidate exceeds the data-Q chain");
     std::pair<EXPR_RESCALE_INFO::ITER, bool> res =
         _rescale_expr.insert(rs_info);
     if (!res.second) {
-      EXPR_RESCALE_INFO::ITER iter           = res.first;
-      uint32_t                prev_scale_deg = iter->Res_scale().Scale_deg();
-      uint32_t                cur_scale_deg  = rs_info.Res_scale().Scale_deg();
-      if (prev_scale_deg > cur_scale_deg) {
-        uint32_t new_rs_cnt =
-            rs_info.Rescale_cnt() + (prev_scale_deg - cur_scale_deg);
-        rs_info.Set_rescale_cnt(new_rs_cnt);
-        _rescale_expr.erase(iter);
-        _rescale_expr.insert(rs_info);
-        Trace(TD_CKKS_SCALE_MGT, "Update rescale candidate:\n");
-        Trace_obj(TD_CKKS_SCALE_MGT, &rs_info);
-      }
-      AIR_ASSERT(prev_scale_deg >= cur_scale_deg);
+      EXPR_RESCALE_INFO::ITER iter = res.first;
+      AIR_ASSERT(iter->Node() == rs_info.Node());
+      SCALE_INFO previous_source = iter->Source_scale();
+      SCALE_INFO current_source  = rs_info.Source_scale();
+      uint32_t previous_begin = previous_source.Rescale_level();
+      uint32_t previous_end   = iter->Res_scale().Rescale_level();
+      uint32_t current_begin  = current_source.Rescale_level();
+      uint32_t current_end    = rs_info.Res_scale().Rescale_level();
+      uint32_t previous_diagonal =
+          previous_source.Scale_deg() + previous_begin;
+      uint32_t current_diagonal = current_source.Scale_deg() + current_begin;
+      AIR_ASSERT_MSG(previous_diagonal == current_diagonal,
+                     "conflicting rescale coordinates on one expression edge");
+      AIR_ASSERT_MSG(current_begin <= previous_end &&
+                         previous_begin <= current_end,
+                     "noncontiguous rescale requests on one expression edge");
+
+      uint32_t merged_begin = std::min(previous_begin, current_begin);
+      uint32_t merged_end   = std::max(previous_end, current_end);
+      if (merged_begin == previous_begin && merged_end == previous_end) return;
+      AIR_ASSERT(previous_diagonal >= merged_end);
+      EXPR_RESCALE_INFO merged_info(
+          rs_info.Parent(), rs_info.Child_id(), rs_info.Node(),
+          merged_end - merged_begin,
+          SCALE_INFO(previous_diagonal - merged_end, merged_end));
+      _rescale_expr.erase(iter);
+      std::pair<EXPR_RESCALE_INFO::ITER, bool> updated =
+          _rescale_expr.insert(merged_info);
+      AIR_ASSERT(updated.second);
+      Trace(TD_CKKS_SCALE_MGT, "Update rescale candidate:\n");
+      Trace_obj(TD_CKKS_SCALE_MGT, &merged_info);
     } else {
       Trace(TD_CKKS_SCALE_MGT, _rescale_expr.size(), "-th candidate:\n");
       Trace_obj(TD_CKKS_SCALE_MGT, &rs_info);
     }
   }
 
+  //! @brief Record the same result rescale for every occurrence of node under
+  //! parent. This keeps expression-DAG uses in distinct operand slots local.
+  void Add_expr_rescale_info_for_node(NODE_PTR parent, NODE_PTR node,
+                                      uint32_t rs_cnt,
+                                      const SCALE_INFO& res_scale) {
+    AIR_ASSERT(parent != Null_ptr);
+    uint32_t matches = 0;
+    for (uint32_t child_id = 0; child_id < parent->Num_child(); ++child_id) {
+      if (parent->Child(child_id) != node) continue;
+      Add_expr_rescale_info(EXPR_RESCALE_INFO(
+          parent, child_id, node, rs_cnt, res_scale));
+      ++matches;
+    }
+    AIR_ASSERT_MSG(matches > 0, "rescale result is not a child of its parent");
+  }
+
   void Add_expr_modswitch_info(const EXPR_MODSWITCH_INFO& ms_info) {
     std::pair<EXPR_MODSWITCH_INFO::ITER, bool> result =
         _modswitch_expr.insert(ms_info);
-    AIR_ASSERT_MSG(result.second,
-                   "duplicate modulus-switch candidate for operand");
+    if (!result.second) {
+      AIR_ASSERT_MSG(
+          result.first->Modswitch_cnt() == ms_info.Modswitch_cnt() &&
+              result.first->Result_scale() == ms_info.Result_scale(),
+          "conflicting modulus-switch candidates for operand");
+      return;
+    }
     Trace(TD_CKKS_SCALE_MGT, _modswitch_expr.size(), "-th candidate:\n");
     Trace_obj(TD_CKKS_SCALE_MGT, &ms_info);
   }
@@ -468,7 +525,8 @@ public:
   PARS(SCALE_MNG_CTX* ctx) : _ctx(ctx) {}
   ~PARS() {}
 
-  SCALE_INFO Handle(NODE_PTR node);
+  SCALE_INFO Handle(NODE_PTR node, SCALE_INFO& si0);
+  SCALE_INFO Handle(NODE_PTR node, SCALE_INFO& si0, SCALE_INFO& si1);
 
 private:
   // REQUIRED UNDEFINED UNWANTED methods
@@ -476,14 +534,16 @@ private:
   PARS(const PARS&);
   const PARS& operator=(const PARS&);
 
-  //! @brief If arg0.scale > waterline * scale_factor: arg0 <- Rescale(arg0)
-  void Rescale_ana(NODE_PTR node);
+  //! @brief If operand.scale > waterline * scale_factor, schedule exact
+  //! per-occurrence rescaling and update its prospective coordinate.
+  void Rescale_ana(NODE_PTR node, uint32_t child_id, SCALE_INFO& operand);
   //! @brief For CKKS.add/sub, rescale the operand with the larger scale degree
   //! until both operands have the same scale degree.
-  void Scale_match(NODE_PTR node);
+  void Scale_match(NODE_PTR node, SCALE_INFO& si0, SCALE_INFO& si1);
   //! @brief If opc == CKKS.mul and arg0.scale * arg1.scale > waterline^2 *
   //! scale_factor then: arg0 <- Rescale(arg0); arg1 <- Rescale(arg1).
-  SCALE_INFO     Downscale_analysis(NODE_PTR node);
+  SCALE_INFO Downscale_analysis(NODE_PTR node, SCALE_INFO& si0,
+                                SCALE_INFO& si1);
   SCALE_MNG_CTX* Context(void) { return _ctx; }
 
   SCALE_MNG_CTX* _ctx;
@@ -508,7 +568,8 @@ private:
   ACE_SM(const ACE_SM&);
   const ACE_SM& operator=(const ACE_SM&);
 
-  SCALE_INFO     Rescale_res(NODE_PTR node, const SCALE_INFO& si);
+  SCALE_INFO Rescale_res(NODE_PTR parent, uint32_t child_id,
+                         const SCALE_INFO& si);
   SCALE_MNG_CTX* Context() { return _ctx; }
   SCALE_MNG_CTX* _ctx;
 };
@@ -893,7 +954,7 @@ RETV CORE_SCALE_MANAGER::Handle_call(VISITOR* visitor, NODE_PTR node) {
     if (scale_deg > 1) {
       uint32_t rs_cnt = scale_deg - 1;
       rescale_level += rs_cnt;
-      EXPR_RESCALE_INFO rs_info(node, child, rs_cnt,
+      EXPR_RESCALE_INFO rs_info(node, child_id, child, rs_cnt,
                                 SCALE_INFO(1, rescale_level));
       ctx.Add_expr_rescale_info(rs_info);
     }
@@ -969,7 +1030,7 @@ RETV CORE_SCALE_MANAGER::Handle_retv(VISITOR* visitor, NODE_PTR node) {
   if (!ctx.Rgn_scl_bts_mng() && scale_deg > 1) {
     uint32_t rs_cnt = scale_deg - 1;
     rescale_level += rs_cnt;
-    EXPR_RESCALE_INFO rs_info(stp->Node(), child, rs_cnt,
+    EXPR_RESCALE_INFO rs_info(stp->Node(), 0, child, rs_cnt,
                               SCALE_INFO(1, rescale_level));
     ctx.Add_expr_rescale_info(rs_info);
   }
@@ -1030,11 +1091,6 @@ public:
   RETV Handle_bootstrap_slots_to_coeffs(VISITOR* visitor, NODE_PTR node);
 
 private:
-  //! gen CKKS.rescale(node) to dec scale of node.
-  //! scale of CKKS.rescale(node) is (node.scale - sf).
-  SCALE_INFO Rescale_res(SCALE_MNG_CTX* ctx, NODE_PTR node,
-                         const SCALE_INFO& si);
-
   //! handle encode as 2nd child of CKKS.mul/add/sub
   void Handle_encode_in_bin_arith_node(SCALE_MNG_CTX* ctx, NODE_PTR bin_node,
                                        uint32_t child0_scale);
@@ -1096,16 +1152,12 @@ RETV CKKS_SCALE_MANAGER::Handle_mul(VISITOR* visitor, NODE_PTR node) {
       AIR_ASSERT(scale_deg == 2);
       NODE_PTR parent = ctx.Parent(1);
       scale_info      = SCALE_INFO(1, rescale_level + 1);
-      EXPR_RESCALE_INFO rs_info(parent, node, scale_deg - 1, scale_info);
-      ctx.Add_expr_rescale_info(rs_info);
+      ctx.Add_expr_rescale_info_for_node(parent, node, scale_deg - 1,
+                                         scale_info);
     }
   } else if (ctx.Req_pars()) {
     if (!lazy_rescale) {
-      scale_info = PARS(&ctx).Handle(node);
-      si0        = ctx.Get_scale_info(child0->Id());
-      if (cipher_pair) {
-        si1 = ctx.Get_scale_info(child1->Id());
-      }
+      scale_info = PARS(&ctx).Handle(node, si0, si1);
     }
   } else if (ctx.Req_ace_sm()) {
     scale_info = ACE_SM(&ctx).Handle_mul(node, si0, si1);
@@ -1149,7 +1201,7 @@ RETV CKKS_SCALE_MANAGER::Handle_add(VISITOR* visitor, NODE_PTR node) {
         !ctx.Is_unfix_scale(si0.Scale_deg()) ||
             !ctx.Is_unfix_scale(retv1.Scale()),
         "Unsupported case: At least one operand's scale must be fixed.");
-    if (!ctx.Is_unfix_scale(retv1.Scale())) si1 = retv1.Scale_info();
+    si1 = retv1.Scale_info();
   } else if (lower_ctx->Is_plain_type(rtype_child1)) {
     AIR_ASSERT(opc_child1 == OPC_ENCODE);
   } else {
@@ -1162,18 +1214,15 @@ RETV CKKS_SCALE_MANAGER::Handle_add(VISITOR* visitor, NODE_PTR node) {
 
   SCALE_INFO si = si1;
   if (ctx.Req_pars()) {
-    si = PARS(&ctx).Handle(node);
-    if (lower_ctx->Is_cipher_type(rtype_child1) ||
-        lower_ctx->Is_cipher3_type(rtype_child1)) {
-      si0 = ctx.Get_scale_info(child0->Id());
-      si1 = ctx.Get_scale_info(child1->Id());
-    }
+    si = PARS(&ctx).Handle(node, si0, si1);
   } else if (ctx.Req_ace_sm()) {
     si = ACE_SM(&ctx).Handle_add(node, si0, si1);
   }
   if (lower_ctx->Is_cipher_type(rtype_child1) ||
       lower_ctx->Is_cipher3_type(rtype_child1)) {
-    si.Set_rescale_level(ctx.Align_binary_rescale_levels(node, si0, si1));
+    uint32_t operation_level =
+        ctx.Align_binary_rescale_levels(node, si0, si1);
+    si = SCALE_INFO(si0.Scale_deg(), operation_level);
   }
   if (opc_child1 == OPC_ENCODE) {
     AIR_ASSERT(!ctx.Is_unfix_scale(si.Scale_deg()));
@@ -1208,7 +1257,7 @@ RETV CKKS_SCALE_MANAGER::Handle_sub(VISITOR* visitor, NODE_PTR node) {
         !ctx.Is_unfix_scale(si0.Scale_deg()) ||
             !ctx.Is_unfix_scale(retv1.Scale()),
         "Unsupported case: At least one operand's scale must be fixed.");
-    if (!ctx.Is_unfix_scale(retv1.Scale())) si1 = retv1.Scale_info();
+    si1 = retv1.Scale_info();
   } else if (lower_ctx->Is_plain_type(rtype_child1)) {
     AIR_ASSERT(opc_child1 == OPC_ENCODE);
   } else {
@@ -1221,18 +1270,15 @@ RETV CKKS_SCALE_MANAGER::Handle_sub(VISITOR* visitor, NODE_PTR node) {
 
   SCALE_INFO si = si1;
   if (ctx.Req_pars()) {
-    si = PARS(&ctx).Handle(node);
-    if (lower_ctx->Is_cipher_type(rtype_child1) ||
-        lower_ctx->Is_cipher3_type(rtype_child1)) {
-      si0 = ctx.Get_scale_info(child0->Id());
-      si1 = ctx.Get_scale_info(child1->Id());
-    }
+    si = PARS(&ctx).Handle(node, si0, si1);
   } else if (ctx.Req_ace_sm()) {
     si = ACE_SM(&ctx).Handle_add(node, si0, si1);  // SUB uses same logic as ADD
   }
   if (lower_ctx->Is_cipher_type(rtype_child1) ||
       lower_ctx->Is_cipher3_type(rtype_child1)) {
-    si.Set_rescale_level(ctx.Align_binary_rescale_levels(node, si0, si1));
+    uint32_t operation_level =
+        ctx.Align_binary_rescale_levels(node, si0, si1);
+    si = SCALE_INFO(si0.Scale_deg(), operation_level);
   }
   if (opc_child1 == OPC_ENCODE) {
     AIR_ASSERT(!ctx.Is_unfix_scale(si.Scale_deg()));
@@ -1255,7 +1301,7 @@ RETV CKKS_SCALE_MANAGER::Handle_rotate(VISITOR* visitor, NODE_PTR node) {
   (void)visitor->template Visit<RETV>(node->Child(1));
 
   if (ctx.Req_pars()) {
-    si = PARS(&ctx).Handle(node);
+    si = PARS(&ctx).Handle(node, si);
   } else if (ctx.Req_ace_sm()) {
     si = ACE_SM(&ctx).Handle_rotate(node, si);
   }
@@ -1284,7 +1330,7 @@ RETV CKKS_SCALE_MANAGER::Handle_relin(VISITOR* visitor, NODE_PTR node) {
   RETV       retv = visitor->template Visit<RETV>(child);
   SCALE_INFO si   = retv.Scale_info();
   if (ctx.Req_pars()) {
-    si = PARS(&ctx).Handle(node);
+    si = PARS(&ctx).Handle(node, si);
   } else if (ctx.Req_ace_sm()) {
     si = ACE_SM(&ctx).Handle_relin(node, si);
   }
@@ -1326,7 +1372,8 @@ RETV CKKS_SCALE_MANAGER::Handle_bootstrap(VISITOR* visitor, NODE_PTR node) {
   if (scale_deg > 1) {
     uint32_t rs_cnt = scale_deg - 1;
     rescale_lev += rs_cnt;
-    EXPR_RESCALE_INFO rs_info(node, child, rs_cnt, SCALE_INFO(1, rescale_lev));
+    EXPR_RESCALE_INFO rs_info(node, 0, child, rs_cnt,
+                              SCALE_INFO(1, rescale_lev));
     ctx.Add_expr_rescale_info(rs_info);
   }
 

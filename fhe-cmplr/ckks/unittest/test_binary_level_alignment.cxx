@@ -278,6 +278,54 @@ INSTANTIATE_TEST_SUITE_P(AceAndPars, ProjectedOperandAlignmentTest,
                          testing::Values(SCALE_POLICY::ACE_ENTRY,
                                          SCALE_POLICY::PARS_ENTRY));
 
+class SharedProducerResultTest
+    : public BinaryLevelAlignmentTest,
+      public testing::WithParamInterface<SCALE_POLICY> {};
+
+TEST_P(SharedProducerResultTest, RescalesEveryParentOperandSlot) {
+  SCALE_POLICY policy = GetParam();
+  FUNCTION_IR ir      = New_function(policy);
+
+  NODE_PTR inner_lhs = Cipher_load(ir.Container, ir.Formal, 1, 0);
+  NODE_PTR inner_rhs = Cipher_load(ir.Container, ir.Formal, 1, 0);
+  NODE_PTR shared = ir.Container->New_bin_arith(
+      OPC_MUL, _cipher, inner_lhs, inner_rhs, _spos);
+  NODE_PTR outer = ir.Container->New_bin_arith(
+      OPC_ADD, _cipher, shared, shared, _spos);
+  ADDR_DATUM_PTR result = ir.Scope->New_var(_cipher, "result", _spos);
+  STMT_PTR store = ir.Container->New_st(outer, result, _spos);
+  ir.Container->Stmt_list().Append(store);
+  NODE_PTR return_load = ir.Container->New_ld(result, _spos);
+  ir.Container->Stmt_list().Append(
+      ir.Container->New_retv(return_load, _spos));
+
+  air::driver::DRIVER_CTX driver_context;
+  CKKS_CONFIG             config;
+  Configure(config, policy);
+  SCALE_MANAGER manager(&driver_context, &config, ir.Scope, &_lower_ctx);
+  manager.Run();
+
+  ASSERT_EQ(outer->Child(0)->Opcode(), OPC_RESCALE);
+  ASSERT_EQ(outer->Child(1)->Opcode(), OPC_RESCALE);
+  EXPECT_NE(outer->Child(0), outer->Child(1));
+  EXPECT_EQ(outer->Child(0)->Child(0), shared);
+  EXPECT_EQ(outer->Child(1)->Child(0), shared);
+  EXPECT_EQ(Attr(outer->Child(0), FHE_ATTR_KIND::SCALE), 1U);
+  EXPECT_EQ(Attr(outer->Child(1), FHE_ATTR_KIND::SCALE), 1U);
+  EXPECT_EQ(Attr(outer->Child(0), FHE_ATTR_KIND::RESCALE_LEVEL), 1U);
+  EXPECT_EQ(Attr(outer->Child(1), FHE_ATTR_KIND::RESCALE_LEVEL), 1U);
+  EXPECT_EQ(Count_opcode(outer, OPC_RESCALE), 2U);
+  EXPECT_EQ(Attr(outer, FHE_ATTR_KIND::SCALE), 1U);
+  EXPECT_EQ(Attr(outer, FHE_ATTR_KIND::RESCALE_LEVEL), 1U);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 1U);
+  EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::RESCALE_LEVEL), 1U);
+  EXPECT_TRUE(_glob->Verify_ir());
+}
+
+INSTANTIATE_TEST_SUITE_P(AceAndEva, SharedProducerResultTest,
+                         testing::Values(SCALE_POLICY::ACE_ENTRY,
+                                         SCALE_POLICY::EVA_ENTRY));
+
 TEST_F(BinaryLevelAlignmentTest, AlignsCipherProducerWithoutSourceMetadata) {
   FUNCTION_IR ir = New_function(SCALE_POLICY::ACE_ENTRY);
 
@@ -338,6 +386,370 @@ TEST_F(BinaryLevelAlignmentTest, LeavesSymbolicZeroUnwrapped) {
   EXPECT_EQ(Attr(add, FHE_ATTR_KIND::RESCALE_LEVEL), 2U);
   EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 2U);
   EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::RESCALE_LEVEL), 2U);
+  EXPECT_TRUE(_glob->Verify_ir());
+}
+
+class SymbolicZeroTest
+    : public BinaryLevelAlignmentTest,
+      public testing::WithParamInterface<
+          std::tuple<OPCODE, SCALE_POLICY, bool>> {};
+
+TEST_P(SymbolicZeroTest, LeavesHighScaleCiphertextZeroUnwrapped) {
+  const auto [opcode, policy, zero_on_left] = GetParam();
+  FUNCTION_IR ir                           = New_function(policy);
+
+  NODE_PTR nonzero = Cipher_load(ir.Container, ir.Formal, 4, 0);
+  NODE_PTR zero    = ir.Container->New_zero(_cipher, _spos);
+  NODE_PTR lhs     = zero_on_left ? zero : nonzero;
+  NODE_PTR rhs     = zero_on_left ? nonzero : zero;
+  NODE_PTR binary =
+      ir.Container->New_bin_arith(opcode, _cipher, lhs, rhs, _spos);
+  ADDR_DATUM_PTR result = ir.Scope->New_var(_cipher, "result", _spos);
+  STMT_PTR store = ir.Container->New_st(binary, result, _spos);
+  ir.Container->Stmt_list().Append(store);
+  NODE_PTR return_load = ir.Container->New_ld(result, _spos);
+  ir.Container->Stmt_list().Append(
+      ir.Container->New_retv(return_load, _spos));
+
+  air::driver::DRIVER_CTX driver_context;
+  CKKS_CONFIG             config;
+  Configure(config, policy);
+  SCALE_MANAGER manager(&driver_context, &config, ir.Scope, &_lower_ctx);
+  manager.Run();
+
+  uint32_t zero_child    = zero_on_left ? 0U : 1U;
+  uint32_t nonzero_child = zero_on_left ? 1U : 0U;
+  EXPECT_EQ(binary->Child(zero_child), zero);
+  EXPECT_EQ(Count_opcode(binary->Child(zero_child), OPC_RESCALE), 0U);
+  EXPECT_EQ(Count_opcode(binary->Child(zero_child), OPC_MODSWITCH), 0U);
+  EXPECT_EQ(zero->Attr<uint32_t>(FHE_ATTR_KIND::SCALE), nullptr);
+  EXPECT_EQ(zero->Attr<uint32_t>(FHE_ATTR_KIND::RESCALE_LEVEL), nullptr);
+
+  bool pars = policy == SCALE_POLICY::PARS_ENTRY;
+  if (pars) {
+    NODE_PTR rescale = binary->Child(nonzero_child);
+    ASSERT_EQ(rescale->Opcode(), OPC_RESCALE);
+    ASSERT_EQ(rescale->Child(0)->Opcode(), OPC_RESCALE);
+    EXPECT_EQ(rescale->Child(0)->Child(0), nonzero);
+  } else {
+    EXPECT_EQ(binary->Child(nonzero_child), nonzero);
+  }
+  uint32_t expected_scale = pars ? 2U : 4U;
+  uint32_t expected_level = pars ? 2U : 0U;
+  EXPECT_EQ(Attr(binary, FHE_ATTR_KIND::SCALE), expected_scale);
+  EXPECT_EQ(Attr(binary, FHE_ATTR_KIND::RESCALE_LEVEL), expected_level);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::SCALE), expected_scale);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), expected_level);
+  EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::SCALE), expected_scale);
+  EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::RESCALE_LEVEL), expected_level);
+  EXPECT_TRUE(_glob->Verify_ir());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AddSubBothDirectionsAndAllPolicies, SymbolicZeroTest,
+    testing::Combine(
+        testing::Values(OPC_ADD, OPC_SUB),
+        testing::Values(SCALE_POLICY::ACE_ENTRY, SCALE_POLICY::EVA_ENTRY,
+                        SCALE_POLICY::PARS_ENTRY, SCALE_POLICY::REGION_ENTRY,
+                        SCALE_POLICY::EVA_CALLEE),
+        testing::Bool()));
+
+TEST_F(BinaryLevelAlignmentTest, AccumulatesSequentialRescalesExactly) {
+  FUNCTION_IR ir = New_function(SCALE_POLICY::PARS_ENTRY);
+
+  NODE_PTR lhs = Cipher_load(ir.Container, ir.Formal, 4, 0);
+  NODE_PTR rhs = Cipher_load(ir.Container, ir.Formal, 1, 3);
+  NODE_PTR add =
+      ir.Container->New_bin_arith(OPC_ADD, _cipher, lhs, rhs, _spos);
+  ADDR_DATUM_PTR result = ir.Scope->New_var(_cipher, "result", _spos);
+  STMT_PTR store = ir.Container->New_st(add, result, _spos);
+  ir.Container->Stmt_list().Append(store);
+  NODE_PTR return_load = ir.Container->New_ld(result, _spos);
+  ir.Container->Stmt_list().Append(
+      ir.Container->New_retv(return_load, _spos));
+
+  air::driver::DRIVER_CTX driver_context;
+  CKKS_CONFIG             config;
+  Configure(config, SCALE_POLICY::PARS_ENTRY);
+  SCALE_MANAGER manager(&driver_context, &config, ir.Scope, &_lower_ctx);
+  manager.Run();
+
+  NODE_PTR current = add->Child(0);
+  for (uint32_t level = 3; level > 0; --level) {
+    ASSERT_EQ(current->Opcode(), OPC_RESCALE);
+    EXPECT_EQ(Attr(current, FHE_ATTR_KIND::SCALE), 4U - level);
+    EXPECT_EQ(Attr(current, FHE_ATTR_KIND::RESCALE_LEVEL), level);
+    current = current->Child(0);
+  }
+  EXPECT_EQ(current, lhs);
+  EXPECT_EQ(Count_opcode(add, OPC_RESCALE), 3U);
+  EXPECT_EQ(Count_opcode(add, OPC_MODSWITCH), 0U);
+  EXPECT_EQ(Attr(add, FHE_ATTR_KIND::SCALE), 1U);
+  EXPECT_EQ(Attr(add, FHE_ATTR_KIND::RESCALE_LEVEL), 3U);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 3U);
+  EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::RESCALE_LEVEL), 3U);
+  EXPECT_TRUE(_glob->Verify_ir());
+}
+
+TEST_F(BinaryLevelAlignmentTest, RescalesSharedSourcePerParentOccurrence) {
+  FUNCTION_IR ir = New_function(SCALE_POLICY::PARS_ENTRY);
+
+  NODE_PTR shared = Cipher_load(ir.Container, ir.Formal, 2, 0);
+  NODE_PTR first_peer = Cipher_load(ir.Container, ir.Formal, 1, 1);
+  NODE_PTR second_peer = Cipher_load(ir.Container, ir.Formal, 1, 2);
+  NODE_PTR first = ir.Container->New_bin_arith(OPC_ADD, _cipher, shared,
+                                                first_peer, _spos);
+  NODE_PTR second = ir.Container->New_bin_arith(OPC_ADD, _cipher, shared,
+                                                 second_peer, _spos);
+  ADDR_DATUM_PTR first_result =
+      ir.Scope->New_var(_cipher, "first_result", _spos);
+  ADDR_DATUM_PTR second_result =
+      ir.Scope->New_var(_cipher, "second_result", _spos);
+  STMT_PTR first_store = ir.Container->New_st(first, first_result, _spos);
+  STMT_PTR second_store = ir.Container->New_st(second, second_result, _spos);
+  ir.Container->Stmt_list().Append(first_store);
+  ir.Container->Stmt_list().Append(second_store);
+
+  NODE_PTR first_reload = ir.Container->New_ld(first_result, _spos);
+  NODE_PTR second_reload = ir.Container->New_ld(second_result, _spos);
+  ADDR_DATUM_PTR first_copy =
+      ir.Scope->New_var(_cipher, "first_copy", _spos);
+  ir.Container->Stmt_list().Append(
+      ir.Container->New_st(first_reload, first_copy, _spos));
+  ir.Container->Stmt_list().Append(
+      ir.Container->New_retv(second_reload, _spos));
+
+  air::driver::DRIVER_CTX driver_context;
+  CKKS_CONFIG             config;
+  Configure(config, SCALE_POLICY::PARS_ENTRY);
+  SCALE_MANAGER manager(&driver_context, &config, ir.Scope, &_lower_ctx);
+  manager.Run();
+
+  ASSERT_EQ(first->Child(0)->Opcode(), OPC_RESCALE);
+  EXPECT_EQ(first->Child(0)->Child(0), shared);
+  ASSERT_EQ(second->Child(0)->Opcode(), OPC_MODSWITCH);
+  ASSERT_EQ(second->Child(0)->Child(0)->Opcode(), OPC_RESCALE);
+  EXPECT_EQ(second->Child(0)->Child(0)->Child(0), shared);
+  EXPECT_EQ(Count_opcode(first, OPC_RESCALE), 1U);
+  EXPECT_EQ(Count_opcode(second, OPC_RESCALE), 1U);
+  EXPECT_EQ(Count_opcode(first, OPC_MODSWITCH), 0U);
+  EXPECT_EQ(Count_opcode(second, OPC_MODSWITCH), 1U);
+  EXPECT_EQ(Attr(shared, FHE_ATTR_KIND::SCALE), 2U);
+  EXPECT_EQ(Attr(shared, FHE_ATTR_KIND::RESCALE_LEVEL), 0U);
+  EXPECT_EQ(Attr(first_store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 1U);
+  EXPECT_EQ(Attr(second_store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 2U);
+  EXPECT_EQ(Attr(first_reload, FHE_ATTR_KIND::RESCALE_LEVEL), 1U);
+  EXPECT_EQ(Attr(second_reload, FHE_ATTR_KIND::RESCALE_LEVEL), 2U);
+  EXPECT_TRUE(_glob->Verify_ir());
+}
+
+TEST_F(BinaryLevelAlignmentTest,
+       ReplaysSequentialRescaleCandidatesIdempotently) {
+  FUNCTION_IR ir = New_function(SCALE_POLICY::PARS_ENTRY);
+
+  NODE_PTR high = Cipher_load(ir.Container, ir.Formal, 4, 0);
+  NODE_PTR low  = Cipher_load(ir.Container, ir.Formal, 1, 3);
+  NODE_PTR shared =
+      ir.Container->New_bin_arith(OPC_ADD, _cipher, high, low, _spos);
+  NODE_PTR outer = ir.Container->New_bin_arith(
+      OPC_ADD, _cipher, shared, shared, _spos);
+  ADDR_DATUM_PTR result = ir.Scope->New_var(_cipher, "result", _spos);
+  STMT_PTR store = ir.Container->New_st(outer, result, _spos);
+  ir.Container->Stmt_list().Append(store);
+  NODE_PTR return_load = ir.Container->New_ld(result, _spos);
+  ir.Container->Stmt_list().Append(
+      ir.Container->New_retv(return_load, _spos));
+
+  air::driver::DRIVER_CTX driver_context;
+  CKKS_CONFIG             config;
+  Configure(config, SCALE_POLICY::PARS_ENTRY);
+  SCALE_MANAGER manager(&driver_context, &config, ir.Scope, &_lower_ctx);
+  manager.Run();
+
+  NODE_PTR current = shared->Child(0);
+  for (uint32_t level = 3; level > 0; --level) {
+    ASSERT_EQ(current->Opcode(), OPC_RESCALE);
+    EXPECT_EQ(Attr(current, FHE_ATTR_KIND::RESCALE_LEVEL), level);
+    current = current->Child(0);
+  }
+  EXPECT_EQ(current, high);
+  EXPECT_EQ(Count_opcode(shared->Child(0), OPC_RESCALE), 3U);
+  EXPECT_EQ(Count_opcode(shared, OPC_MODSWITCH), 0U);
+  EXPECT_EQ(outer->Child(0), shared);
+  EXPECT_EQ(outer->Child(1), shared);
+  EXPECT_EQ(Attr(outer, FHE_ATTR_KIND::SCALE), 1U);
+  EXPECT_EQ(Attr(outer, FHE_ATTR_KIND::RESCALE_LEVEL), 3U);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 3U);
+  EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::RESCALE_LEVEL), 3U);
+  EXPECT_TRUE(_glob->Verify_ir());
+}
+
+TEST_F(BinaryLevelAlignmentTest, ReplaysModswitchCandidateIdempotently) {
+  FUNCTION_IR ir = New_function(SCALE_POLICY::PARS_ENTRY);
+
+  NODE_PTR shallow = Cipher_load(ir.Container, ir.Formal, 1, 0);
+  NODE_PTR deep    = Cipher_load(ir.Container, ir.Formal, 1, 2);
+  NODE_PTR shared =
+      ir.Container->New_bin_arith(OPC_ADD, _cipher, shallow, deep, _spos);
+  NODE_PTR outer = ir.Container->New_bin_arith(
+      OPC_ADD, _cipher, shared, shared, _spos);
+  ADDR_DATUM_PTR result = ir.Scope->New_var(_cipher, "result", _spos);
+  STMT_PTR store = ir.Container->New_st(outer, result, _spos);
+  ir.Container->Stmt_list().Append(store);
+  NODE_PTR return_load = ir.Container->New_ld(result, _spos);
+  ir.Container->Stmt_list().Append(
+      ir.Container->New_retv(return_load, _spos));
+
+  air::driver::DRIVER_CTX driver_context;
+  CKKS_CONFIG             config;
+  Configure(config, SCALE_POLICY::PARS_ENTRY);
+  SCALE_MANAGER manager(&driver_context, &config, ir.Scope, &_lower_ctx);
+  manager.Run();
+
+  EXPECT_EQ(Count_opcode(shared->Child(0), OPC_MODSWITCH), 2U);
+  EXPECT_EQ(Count_opcode(shared, OPC_RESCALE), 0U);
+  EXPECT_EQ(outer->Child(0), shared);
+  EXPECT_EQ(outer->Child(1), shared);
+  EXPECT_EQ(Attr(shared, FHE_ATTR_KIND::RESCALE_LEVEL), 2U);
+  EXPECT_EQ(Attr(outer, FHE_ATTR_KIND::RESCALE_LEVEL), 2U);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 2U);
+  EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::RESCALE_LEVEL), 2U);
+  EXPECT_TRUE(_glob->Verify_ir());
+}
+
+TEST_F(BinaryLevelAlignmentTest, AlignsLazyMultiplyAtBottomQ) {
+  FUNCTION_IR ir = New_function(SCALE_POLICY::PARS_ENTRY);
+
+  NODE_PTR lhs = Cipher_load(ir.Container, ir.Formal, 1, 0);
+  NODE_PTR rhs = Cipher_load(ir.Container, ir.Formal, 1, 6);
+  NODE_PTR mul =
+      ir.Container->New_bin_arith(OPC_MUL, _cipher, lhs, rhs, _spos);
+  const uint32_t skip_auto_rescale = 1;
+  mul->Set_attr(FHE_ATTR_KIND::SKIP_AUTO_RESCALE, &skip_auto_rescale, 1);
+  ADDR_DATUM_PTR result = ir.Scope->New_var(_cipher, "result", _spos);
+  STMT_PTR store = ir.Container->New_st(mul, result, _spos);
+  ir.Container->Stmt_list().Append(store);
+  NODE_PTR return_load = ir.Container->New_ld(result, _spos);
+  ir.Container->Stmt_list().Append(
+      ir.Container->New_retv(return_load, _spos));
+
+  air::driver::DRIVER_CTX driver_context;
+  CKKS_CONFIG             config;
+  Configure(config, SCALE_POLICY::PARS_ENTRY);
+  SCALE_MANAGER manager(&driver_context, &config, ir.Scope, &_lower_ctx);
+  manager.Run();
+
+  EXPECT_EQ(Count_opcode(mul, OPC_MODSWITCH), 6U);
+  EXPECT_EQ(Count_opcode(mul, OPC_RESCALE), 0U);
+  EXPECT_EQ(Attr(mul, FHE_ATTR_KIND::SCALE), 2U);
+  EXPECT_EQ(Attr(mul, FHE_ATTR_KIND::RESCALE_LEVEL), 6U);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::SCALE), 2U);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 6U);
+  EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::RESCALE_LEVEL), 6U);
+  EXPECT_TRUE(_glob->Verify_ir());
+}
+
+TEST_F(BinaryLevelAlignmentTest, AllowsInferredQToGrowPastProvisionalLevel) {
+  FUNCTION_IR ir = New_function(SCALE_POLICY::ACE_ENTRY);
+
+  NODE_PTR lhs = Cipher_load(ir.Container, ir.Formal, 1, 6);
+  NODE_PTR rhs = Cipher_load(ir.Container, ir.Formal, 1, 6);
+  NODE_PTR mul =
+      ir.Container->New_bin_arith(OPC_MUL, _cipher, lhs, rhs, _spos);
+  ADDR_DATUM_PTR result = ir.Scope->New_var(_cipher, "result", _spos);
+  STMT_PTR store = ir.Container->New_st(mul, result, _spos);
+  ir.Container->Stmt_list().Append(store);
+  NODE_PTR return_load = ir.Container->New_ld(result, _spos);
+  ir.Container->Stmt_list().Append(
+      ir.Container->New_retv(return_load, _spos));
+
+  air::driver::DRIVER_CTX driver_context;
+  CKKS_CONFIG             config;
+  ASSERT_EQ(config.Max_cipher_lvl(), 0);
+  SCALE_MANAGER manager(&driver_context, &config, ir.Scope, &_lower_ctx);
+  manager.Run();
+
+  EXPECT_EQ(Attr(mul, FHE_ATTR_KIND::SCALE), 2U);
+  EXPECT_EQ(Attr(mul, FHE_ATTR_KIND::RESCALE_LEVEL), 6U);
+  NODE_PTR rescale = store->Node()->Child(0);
+  ASSERT_EQ(rescale->Opcode(), OPC_RESCALE);
+  EXPECT_EQ(rescale->Child(0), mul);
+  EXPECT_EQ(Attr(rescale, FHE_ATTR_KIND::SCALE), 1U);
+  EXPECT_EQ(Attr(rescale, FHE_ATTR_KIND::RESCALE_LEVEL), 7U);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::SCALE), 1U);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 7U);
+  EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::RESCALE_LEVEL), 7U);
+  EXPECT_TRUE(_glob->Verify_ir());
+}
+
+TEST_F(BinaryLevelAlignmentTest,
+       AllowsInferredQAlignmentPastProvisionalLevel) {
+  FUNCTION_IR ir = New_function(SCALE_POLICY::ACE_ENTRY);
+
+  NODE_PTR lhs = Cipher_load(ir.Container, ir.Formal, 1, 0);
+  NODE_PTR rhs = Cipher_load(ir.Container, ir.Formal, 1, 7);
+  NODE_PTR add =
+      ir.Container->New_bin_arith(OPC_ADD, _cipher, lhs, rhs, _spos);
+  ADDR_DATUM_PTR result = ir.Scope->New_var(_cipher, "result", _spos);
+  STMT_PTR store = ir.Container->New_st(add, result, _spos);
+  ir.Container->Stmt_list().Append(store);
+  NODE_PTR return_load = ir.Container->New_ld(result, _spos);
+  ir.Container->Stmt_list().Append(
+      ir.Container->New_retv(return_load, _spos));
+
+  air::driver::DRIVER_CTX driver_context;
+  CKKS_CONFIG             config;
+  ASSERT_EQ(config.Max_cipher_lvl(), 0);
+  SCALE_MANAGER manager(&driver_context, &config, ir.Scope, &_lower_ctx);
+  manager.Run();
+
+  EXPECT_EQ(Count_opcode(add->Child(0), OPC_MODSWITCH), 7U);
+  EXPECT_EQ(Count_opcode(add, OPC_RESCALE), 0U);
+  EXPECT_EQ(Attr(add, FHE_ATTR_KIND::SCALE), 1U);
+  EXPECT_EQ(Attr(add, FHE_ATTR_KIND::RESCALE_LEVEL), 7U);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 7U);
+  EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::RESCALE_LEVEL), 7U);
+  EXPECT_TRUE(_glob->Verify_ir());
+}
+
+TEST_F(BinaryLevelAlignmentTest, RescalesSharedSourceInBothOperandSlots) {
+  FUNCTION_IR ir = New_function(SCALE_POLICY::PARS_ENTRY);
+
+  NODE_PTR shared = Cipher_load(ir.Container, ir.Formal, 4, 0);
+  NODE_PTR mul = ir.Container->New_bin_arith(OPC_MUL, _cipher, shared, shared,
+                                              _spos);
+  ADDR_DATUM_PTR result = ir.Scope->New_var(_cipher, "result", _spos);
+  STMT_PTR store = ir.Container->New_st(mul, result, _spos);
+  ir.Container->Stmt_list().Append(store);
+  NODE_PTR return_load = ir.Container->New_ld(result, _spos);
+  ir.Container->Stmt_list().Append(
+      ir.Container->New_retv(return_load, _spos));
+
+  air::driver::DRIVER_CTX driver_context;
+  CKKS_CONFIG             config;
+  Configure(config, SCALE_POLICY::PARS_ENTRY);
+  SCALE_MANAGER manager(&driver_context, &config, ir.Scope, &_lower_ctx);
+  manager.Run();
+
+  EXPECT_EQ(Count_opcode(mul->Child(0), OPC_RESCALE), 3U);
+  EXPECT_EQ(Count_opcode(mul->Child(1), OPC_RESCALE), 3U);
+  EXPECT_EQ(Count_opcode(mul, OPC_MODSWITCH), 0U);
+  NODE_PTR lhs_source = mul->Child(0);
+  NODE_PTR rhs_source = mul->Child(1);
+  for (uint32_t level = 3; level > 0; --level) {
+    ASSERT_EQ(lhs_source->Opcode(), OPC_RESCALE);
+    ASSERT_EQ(rhs_source->Opcode(), OPC_RESCALE);
+    lhs_source = lhs_source->Child(0);
+    rhs_source = rhs_source->Child(0);
+  }
+  EXPECT_EQ(lhs_source, shared);
+  EXPECT_EQ(rhs_source, shared);
+  EXPECT_EQ(Attr(shared, FHE_ATTR_KIND::SCALE), 4U);
+  EXPECT_EQ(Attr(shared, FHE_ATTR_KIND::RESCALE_LEVEL), 0U);
+  EXPECT_EQ(Attr(mul, FHE_ATTR_KIND::SCALE), 2U);
+  EXPECT_EQ(Attr(mul, FHE_ATTR_KIND::RESCALE_LEVEL), 3U);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 3U);
+  EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::RESCALE_LEVEL), 3U);
   EXPECT_TRUE(_glob->Verify_ir());
 }
 
