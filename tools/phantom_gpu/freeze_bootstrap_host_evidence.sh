@@ -299,6 +299,44 @@ remove_exact_container() {
   CONTAINER_ID=""
 }
 
+write_outer_bundle_checksum_closure() {
+  local relative
+  local -a required_files=(
+    bootstrap-host-freeze.log
+    bootstrap-host-result-verification.json
+    bootstrap-host-result.tar.gz
+    bootstrap-host-result.tar.gz.sha256
+    docker/base-image.json
+    docker/cleanup-verification.tsv
+    docker/cleanup.txt
+    docker/container-completed.json
+    docker/container-created.json
+    docker/pull.txt
+  )
+  for relative in "${required_files[@]}"; do
+    if [[ ! -s "${OUTPUT}/${relative}" ]]; then
+      echo "outer host-freeze evidence is missing or empty: ${relative}" >&2
+      return 1
+    fi
+  done
+  if [[ -e "${OUTPUT}/lifecycle.json" &&
+        ! -s "${OUTPUT}/lifecycle.json" ]]; then
+    echo "outer host-freeze lifecycle receipt is empty" >&2
+    return 1
+  fi
+  if [[ -e "${OUTPUT}/BUNDLE_SHA256SUMS" ]]; then
+    echo "outer host-freeze bundle checksum manifest already exists" >&2
+    return 1
+  fi
+  (
+    cd "${OUTPUT}"
+    find . -type f ! -path ./BUNDLE_SHA256SUMS -print0 |
+      LC_ALL=C sort -z |
+      xargs -0 -r sha256sum >BUNDLE_SHA256SUMS
+    sha256sum -c BUNDLE_SHA256SUMS
+  )
+}
+
 cleanup() {
   local incoming="$?"
   trap - EXIT INT TERM
@@ -550,6 +588,7 @@ verify_result_archive \
   "${OUTPUT}/verified-bootstrap-host-result" \
   >"${OUTPUT}/bootstrap-host-result-verification.json"
 if [[ ${PIPELINE_EXIT} -ne 0 ]]; then
+  write_outer_bundle_checksum_closure
   echo "bootstrap host freeze failed with exit ${PIPELINE_EXIT}" >&2
   exit "${PIPELINE_EXIT}"
 fi
@@ -596,4 +635,5 @@ pathlib.Path(sys.argv[1]).write_text(
     json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
 )
 PY
+write_outer_bundle_checksum_closure
 echo "bootstrap host evidence: ${QUALIFICATION}"

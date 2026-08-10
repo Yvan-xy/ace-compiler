@@ -51,3 +51,48 @@ def test_wrapper_checksum_closes_results_and_removes_only_its_container() -> Non
     assert 'docker rm -f "${exact_id}"' in source
     assert '"container_cleanup": "removed-and-absent"' in source
     assert "verified-bootstrap-host-result/results/qualification" in source
+
+
+def test_wrapper_checksum_closes_the_exact_outer_inventory_after_cleanup() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+    required = (
+        "bootstrap-host-freeze.log",
+        "bootstrap-host-result-verification.json",
+        "bootstrap-host-result.tar.gz",
+        "bootstrap-host-result.tar.gz.sha256",
+        "docker/base-image.json",
+        "docker/cleanup-verification.tsv",
+        "docker/cleanup.txt",
+        "docker/container-completed.json",
+        "docker/container-created.json",
+        "docker/pull.txt",
+    )
+    function_start = source.index("write_outer_bundle_checksum_closure()")
+    function_end = source.index("\n}\n\ncleanup()", function_start)
+    function = source[function_start:function_end]
+    for relative in required:
+        assert relative in function
+    assert '[[ -e "${OUTPUT}/lifecycle.json" &&' in function
+    assert "find . -type f ! -path ./BUNDLE_SHA256SUMS -print0" in function
+    assert "LC_ALL=C sort -z" in function
+    assert "sha256sum -c BUNDLE_SHA256SUMS" in function
+    assert "! -name BUNDLE_SHA256SUMS" not in function
+
+    cleanup = source.index("\nremove_exact_container\n", function_end)
+    verification = source.index("\nverify_result_archive \\", cleanup)
+    failure = source.index("if [[ ${PIPELINE_EXIT} -ne 0 ]]; then", verification)
+    failure_close = source.index(
+        "write_outer_bundle_checksum_closure", failure
+    )
+    failure_exit = source.index('exit "${PIPELINE_EXIT}"', failure)
+    lifecycle = source.index(
+        'python3 - "${OUTPUT}/lifecycle.json"', failure_exit
+    )
+    success_close = source.index(
+        "write_outer_bundle_checksum_closure", lifecycle
+    )
+    success_message = source.index(
+        'echo "bootstrap host evidence: ${QUALIFICATION}"', success_close
+    )
+    assert cleanup < verification < failure < failure_close < failure_exit
+    assert failure_exit < lifecycle < success_close < success_message

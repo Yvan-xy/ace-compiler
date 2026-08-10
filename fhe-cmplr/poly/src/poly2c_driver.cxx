@@ -257,6 +257,22 @@ void POLY2C_DRIVER::Emit_rotate_zero_fast_path(FUNC_SCOPE* func_scope) {
 
   AIR_ASSERT_MSG(result != air::base::Null_ptr,
                  "rotate helper ciphertext result not found");
+  _ctx << "  uint32_t _pgen_rotation_slots = Get_ciph_slots(&";
+  _ctx.Emit_var(ciph);
+  _ctx << ");\n";
+  _ctx << "  FMT_ASSERT(_pgen_rotation_slots > 0, "
+          "\"cannot normalize a rotation without logical slots\");\n";
+  _ctx << "  int64_t _pgen_normalized_rotation = (int64_t)";
+  _ctx.Emit_var(rot_idx);
+  _ctx << " % (int64_t)_pgen_rotation_slots;\n";
+  _ctx << "  if (_pgen_normalized_rotation < 0) "
+          "_pgen_normalized_rotation += _pgen_rotation_slots;\n";
+  _ctx << "  if (_pgen_normalized_rotation > "
+          "(int64_t)(_pgen_rotation_slots / 2U)) "
+          "_pgen_normalized_rotation -= _pgen_rotation_slots;\n";
+  _ctx << "  ";
+  _ctx.Emit_var(rot_idx);
+  _ctx << " = (int32_t)_pgen_normalized_rotation;\n";
   _ctx << "  if (";
   _ctx.Emit_var(rot_idx);
   _ctx << " == 0) {\n";

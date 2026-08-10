@@ -8,6 +8,8 @@
 
 #include <limits.h>
 
+#include <sstream>
+
 #include "fhe/core/ctx_param_ana.h"
 #include "fhe/poly/poly2c_driver.h"
 #include "fhe/test/gen_ckks_ir.h"
@@ -42,11 +44,36 @@ int main(int argc, char** argv) {
   GLOB_SCOPE* glob =
       poly_driver.Run(poly_config, cntr->Glob_scope(), fhe_ctx, &driver_ctx);
 
-  std::ofstream            of("test_rotate_04.inc");
+  std::ostringstream       generated;
   fhe::poly::POLY2C_CONFIG p2c_config;
-  fhe::poly::POLY2C_DRIVER poly2c(of, fhe_ctx, p2c_config);
+  fhe::poly::POLY2C_DRIVER poly2c(generated, fhe_ctx, p2c_config);
   POLY2C_VISITOR           visitor(poly2c.Ctx());
   poly2c.Run(glob, visitor);
+
+  const std::string source = generated.str();
+  const size_t      slots  = source.find(
+      "uint32_t _pgen_rotation_slots = Get_ciph_slots(&");
+  const size_t modulo = source.find(
+      "int64_t _pgen_normalized_rotation = (int64_t)", slots);
+  const size_t half_turn = source.find(
+      "_pgen_normalized_rotation > "
+      "(int64_t)(_pgen_rotation_slots / 2U)", modulo);
+  const size_t zero = source.find(" == 0) {", half_turn);
+  const size_t swk  = source.find("Swk(1,", zero);
+  const size_t order = source.find("Auto_order(", swk);
+  if (slots == std::string::npos || modulo == std::string::npos ||
+      half_turn == std::string::npos || zero == std::string::npos ||
+      swk == std::string::npos || order == std::string::npos ||
+      !(slots < modulo && modulo < half_turn && half_turn < zero &&
+        zero < swk && swk < order)) {
+    std::cerr << "generated ANT rotate helper does not normalize before "
+                 "zero/key/automorphism use"
+              << std::endl;
+    return 1;
+  }
+
+  std::ofstream of("test_rotate_04.inc");
+  of << source;
   Gen_expected(of);
   std::cout << "Output: test_rotate_04.inc" << std::endl;
   return 0;
