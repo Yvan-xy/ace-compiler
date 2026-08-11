@@ -3097,6 +3097,21 @@ phase environment_bootstrap bootstrap
 export PATH="/opt/ace-runpod-venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 if jq -e '
   .schema_version ==
+    "ace.phantom.native-bts-correctness-payload/1.0.0"
+' "${INPUT}/payload.json" >/dev/null; then
+  [[ "${MODE}" != "freeze-host" ]]
+  phase source_audit_and_extraction extract_sources
+  CURRENT_PHASE=qualification_environment
+  configure_qualification_environment
+  CURRENT_PHASE=""
+  phase native_bts_correctness_pipeline \
+    bash "${INPUT}/native_bts_pipeline.sh" "${MODE}" "${INPUT}" \
+      "${WORK}" "${RESULT_DIR}"
+  PIPELINE_EXIT=0
+  exit 0
+fi
+if jq -e '
+  .schema_version ==
     "ace.phantom.generated-bootstrap-correctness-payload/1.0.0"
 ' "${INPUT}/payload.json" >/dev/null; then
   [[ "${MODE}" != "freeze-host" ]]

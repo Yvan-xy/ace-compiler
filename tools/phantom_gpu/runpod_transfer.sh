@@ -55,9 +55,10 @@ import sys
 
 root = Path(sys.argv[1])
 payload_path = root / "payload.json"
-correctness_schema = (
-    "ace.phantom.generated-bootstrap-correctness-payload/1.0.0"
-)
+correctness_schemas = {
+    "ace.phantom.generated-bootstrap-correctness-payload/1.0.0",
+    "ace.phantom.native-bts-correctness-payload/1.0.0",
+}
 if not payload_path.is_file():
     print("")
     raise SystemExit(0)
@@ -79,16 +80,15 @@ try:
     )
 except (OSError, UnicodeError, ValueError) as error:
     try:
-        mentions_correctness = correctness_schema in payload_path.read_text(
-            encoding="utf-8"
-        )
+        text = payload_path.read_text(encoding="utf-8")
+        mentions_correctness = any(schema in text for schema in correctness_schemas)
     except (OSError, UnicodeError):
         mentions_correctness = False
     if mentions_correctness:
         raise SystemExit("correctness payload JSON is invalid") from error
     print("")
     raise SystemExit(0)
-if not isinstance(payload, dict) or payload.get("schema_version") != correctness_schema:
+if not isinstance(payload, dict) or payload.get("schema_version") not in correctness_schemas:
     print("")
     raise SystemExit(0)
 
@@ -122,10 +122,16 @@ for path in root.iterdir():
     actual[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
 if listed != actual:
     raise SystemExit("correctness payload checksum closure is invalid")
-if set(payload) != {
+generated_schema = "ace.phantom.generated-bootstrap-correctness-payload/1.0.0"
+expected_keys = {
     "schema_version", "status", "ace_commit", "phantom_commit",
-    "source_snapshots", "host_oracles_replayed", "files",
-}:
+    "source_snapshots", "files",
+}
+if payload["schema_version"] == generated_schema:
+    expected_keys.add("host_oracles_replayed")
+else:
+    expected_keys.update({"closed_m6", "compatibility_sha256"})
+if set(payload) != expected_keys:
     raise SystemExit("correctness payload schema is invalid")
 source_snapshots = payload["source_snapshots"]
 files = payload["files"]
@@ -136,7 +142,8 @@ expected_files = {
 }
 if (
     payload["status"] != "pass"
-    or payload["host_oracles_replayed"] is not True
+    or (payload["schema_version"] == generated_schema
+        and payload["host_oracles_replayed"] is not True)
     or not isinstance(payload["ace_commit"], str)
     or re.fullmatch(r"[0-9a-f]{40}", payload["ace_commit"]) is None
     or not isinstance(payload["phantom_commit"], str)
