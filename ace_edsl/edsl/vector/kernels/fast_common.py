@@ -35,10 +35,6 @@ def _vector_value(node, container, air_type):
     )
 
 
-def _local_vector(container, name, air_type):
-    return _vector_value(container.new_ldid(name), container, air_type)
-
-
 def _preg_vector(container, name, air_type):
     return _vector_value(container.new_ldp(name), container, air_type)
 
@@ -106,10 +102,7 @@ def _duplicate_packed_input(
                 _core_i32(shift, packed_input.container, i32_type),
                 candidates=(shift,),
             )
-    container = packed_input.container
-    container.new_local(local_name, packed_input.air_type)
-    container.new_stid(local_name, duplicated.value)
-    return _local_vector(container, local_name, packed_input.air_type)
+    return duplicated.materialize(local_name)
 
 
 def _blocking_inputs(packed_input, prepared, constants):
@@ -239,24 +232,18 @@ def reduce_add_intra(value, reduction, rotation, i32_type, local_name):
         value, reduction, rotation
     )
 
-    container = value.container
-    container.new_local(local_name, value.air_type)
-    container.new_stid(local_name, value.value)
+    result = value.materialize(local_name)
     if reduction.kind == "power-of-two":
         for iv in range_dynamic(0, len(candidates), 1):
             shift = 1 << iv
             if const_expr(stride != 1):
                 shift = shift * stride
-            current = _local_vector(container, local_name, value.air_type)
-            updated = current + current.roll(shift, candidates=candidates)
-            container.new_stid(local_name, updated.value)
+            result = result + result.roll(shift, candidates=candidates)
     else:
         for iv in range_dynamic(1, reduction.factor, 1):
             shift = iv * stride
-            current = _local_vector(container, local_name, value.air_type)
-            updated = current + value.roll(shift, candidates=candidates)
-            container.new_stid(local_name, updated.value)
-    return _local_vector(container, local_name, value.air_type)
+            result = result + value.roll(shift, candidates=candidates)
+    return result
 
 
 @vector_kernel
@@ -266,10 +253,7 @@ def clear_valid_data(value, prepared, constants, local_name):
     result = value
     if prepared.mask.policy != "none":
         mask = _ranked_constant(prepared, constants, "mask")
-        container = value.container
-        container.new_local(local_name, value.air_type)
-        container.new_stid(local_name, (value * mask).value)
-        result = _local_vector(container, local_name, value.air_type)
+        result = (value * mask).materialize(local_name)
     return result
 
 

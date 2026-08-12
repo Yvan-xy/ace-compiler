@@ -15,16 +15,6 @@ from ace_edsl.edsl.vector.kernels.fast_common import (
 from ace_edsl.edsl.vector.lowering import PreparedFastConvPlan
 
 
-def _local_vector(container, name, air_type):
-    return VectorValue(
-        None,
-        container,
-        shape=tuple(air_type.shape()),
-        temp_name=name,
-        air_type=air_type,
-    )
-
-
 def _validate_loop(loop, role, lower, upper, depth):
     if (
         loop.role != role
@@ -555,9 +545,7 @@ def _emit_fast_conv(
 
     result_name = "__conv_result"
     grid_name = "__grid_result"
-    container.new_local(result_name, result_type)
-    container.new_stid(result_name, container.new_zero(result_type))
-    container.new_local(grid_name, result_type)
+    result = VectorValue.zero(container, result_type).materialize(result_name)
 
     grid_loop = prepared.loop("grid")
     capacity_loop = prepared.loop("capacity-block")
@@ -568,7 +556,9 @@ def _emit_fast_conv(
     for grid_iv in range_dynamic(
         grid_loop.lower, grid_loop.upper, grid_loop.step
     ):
-        container.new_stid(grid_name, container.new_zero(result_type))
+        grid_result = VectorValue.zero(container, result_type).materialize(
+            grid_name
+        )
         for block_iv in range_dynamic(
             capacity_loop.lower,
             capacity_loop.upper,
@@ -583,14 +573,8 @@ def _emit_fast_conv(
             contribution = blocked.load(block_iv) * weight.slice(
                 slice_index, weight_slice.width
             )
-            grid_result = _local_vector(
-                container, grid_name, result_type
-            )
-            container.new_stid(
-                grid_name, (grid_result + contribution).value
-            )
+            grid_result = grid_result + contribution
 
-        grid_result = _local_vector(container, grid_name, result_type)
         if const_expr(prepared.cyclic_roll):
             aligned = roll_cyclic(
                 grid_result, grid_iv, prepared, constants, i32_type
@@ -600,10 +584,8 @@ def _emit_fast_conv(
             aligned = grid_result.roll(
                 shift, candidates=grid_rotation.candidates
             )
-        result = _local_vector(container, result_name, result_type)
-        container.new_stid(result_name, (result + aligned).value)
+        result = result + aligned
 
-    result = _local_vector(container, result_name, result_type)
     if const_expr(bool(prepared.reductions)):
         result = collective_reduce(
             result,
@@ -612,10 +594,8 @@ def _emit_fast_conv(
             i32_type,
             "__collective_result",
         )
-    container.new_stid(result_name, (result + bias).value)
-    return _local_vector(
-        container, result_name, result_type
-    ).with_slot(prepared.slot.value)
+    result = (result + bias).store_local(result_name)
+    return result.with_slot(prepared.slot.value)
 
 
 @vector_kernel

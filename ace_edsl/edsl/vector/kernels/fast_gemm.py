@@ -15,16 +15,6 @@ from ace_edsl.edsl.vector.lowering import (
 )
 
 
-def _local_vector(container, name, air_type):
-    return VectorValue(
-        None,
-        container,
-        shape=tuple(air_type.shape()),
-        temp_name=name,
-        air_type=air_type,
-    )
-
-
 def _expected_reduction(factor, block_width, padding):
     stride = block_width + padding
     if factor <= 1 or stride <= 0:
@@ -180,9 +170,7 @@ def fast_gemm_vector_kernel(
 
     result_name = "__gemm_result"
     block_name = "__block_result"
-    container.new_local(result_name, result_type)
-    container.new_stid(result_name, container.new_zero(result_type))
-    container.new_local(block_name, result_type)
+    result = VectorValue.zero(container, result_type).materialize(result_name)
 
     grid_loop = prepared.loop("grid")
     block_loop = prepared.loop("block")
@@ -191,25 +179,22 @@ def fast_gemm_vector_kernel(
 
     container.new_comment(f"IMRA Metakernel: gs={prepared.grid_size}")
     for grid_iv in range_dynamic(grid_loop.lower, grid_loop.upper, grid_loop.step):
-        container.new_stid(block_name, container.new_zero(result_type))
+        block_result = VectorValue.zero(container, result_type).materialize(
+            block_name
+        )
         for block_iv in range_dynamic(
             block_loop.lower, block_loop.upper, block_loop.step
         ):
-            slice_index = block_iv + grid_iv * prepared.block_size
-            contribution = blocked.load(block_iv) * weight.slice(
-                slice_index, weight_slice.width
+            block_result = block_result + blocked.load(block_iv) * weight.slice(
+                block_iv + grid_iv * prepared.block_size,
+                weight_slice.width,
             )
-            block_result = _local_vector(container, block_name, result_type)
-            container.new_stid(block_name, (block_result + contribution).value)
-
-        block_result = _local_vector(container, block_name, result_type)
-        shift = grid_iv * prepared.block_size
-        rolled = block_result.roll(shift, candidates=grid_rotation.candidates)
-        result = _local_vector(container, result_name, result_type)
-        container.new_stid(result_name, (result + rolled).value)
+        result = result + block_result.roll(
+            grid_iv * prepared.block_size,
+            candidates=grid_rotation.candidates,
+        )
 
     active_name = result_name
-    result = _local_vector(container, active_name, result_type)
     container.new_comment(f"gemm result reduce->Ps={prepared.packed_partitions}")
     if prepared.packed_partitions > 1:
         active_name = "__packed_partition_result"
@@ -236,8 +221,7 @@ def fast_gemm_vector_kernel(
         )
 
     container.new_comment("gemm add bias")
-    container.new_stid(active_name, (result + bias).value)
-    result = _local_vector(container, active_name, result_type)
+    result = (result + bias).store_local(active_name)
     if prepared.mask.policy != "none":
         result = clear_valid_data(result, prepared, constants, active_name)
     return result.with_slot(prepared.slot.value)
