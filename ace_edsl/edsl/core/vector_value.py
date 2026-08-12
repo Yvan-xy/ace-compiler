@@ -13,7 +13,46 @@ class VectorValue(AIRValue):
     and AIR emission remain owned by ``vector_ops``.
     """
 
-    NON_MUTATING_RECEIVER_METHODS = frozenset({"roll", "slice"})
+    NON_MUTATING_RECEIVER_METHODS = frozenset(
+        {"materialize", "roll", "slice", "store_local"}
+    )
+
+    @classmethod
+    def zero(cls, container: Any, air_type: Any) -> "VectorValue":
+        """Create a zero Vector value with an explicit ranked AIR type."""
+        if air_type is None or not air_type.is_array():
+            raise TypeError("VectorValue.zero requires a ranked Vector AIR type")
+        return cls(
+            container.new_zero(air_type),
+            container,
+            shape=tuple(air_type.shape()),
+            air_type=air_type,
+        )
+
+    def materialize(self, name: str) -> "VectorValue":
+        """Create a named Vector local initialized from this value."""
+        if not isinstance(name, str) or not name:
+            raise TypeError("Vector local name must be a non-empty string")
+        if self.air_type is None:
+            raise TypeError("Vector materialization requires AIR type metadata")
+        self.container.new_local(name, self.air_type)
+        return self.store_local(name)
+
+    def store_local(self, name: str) -> "VectorValue":
+        """Store into an existing named Vector local and return its value."""
+        if not isinstance(name, str) or not name:
+            raise TypeError("Vector local name must be a non-empty string")
+        if self.air_type is None:
+            raise TypeError("Vector local storage requires AIR type metadata")
+        self.container.new_stid(name, self._value_without_vector_slot())
+        return type(self)(
+            None,
+            self.container,
+            shape=self.shape,
+            temp_name=name,
+            air_type=self.air_type,
+            vector_slot=self._vector_slot,
+        )
 
     def __init__(
         self,

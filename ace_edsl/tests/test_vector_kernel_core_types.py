@@ -332,9 +332,26 @@ def test_vector_wrappers_reject_invalid_domains_types_owners_and_metadata():
     )
 
     assert isinstance(vector.view("nn::vector"), VectorValue)
+    zero = VectorValue.zero(container, vector4)
+    assert isinstance(zero, VectorValue)
+    assert zero.air_type == vector4
+    assert zero.shape == (4,)
+    assert zero.value.opcode_name() == "air::core::ZERO"
+    stored_zero = zero.materialize("stored_zero")
+    assert stored_zero.value.opcode_name() == "air::core::LDID"
+    assert stored_zero.air_type == vector4
+    stored_sum = (vector + vector).store_local("stored_zero")
+    assert stored_sum.value.opcode_name() == "air::core::LDID"
+    assert stored_sum.air_type == vector4
     assert isinstance(vector.zero_like(), VectorValue)
     assert isinstance(vector.with_slot(4), VectorValue)
     assert isinstance(vector.cast(vector4), VectorValue)
+    with pytest.raises(TypeError, match="ranked Vector AIR type"):
+        VectorValue.zero(container, i32)
+    with pytest.raises(TypeError, match="non-empty string"):
+        zero.materialize("")
+    with pytest.raises(TypeError, match="non-empty string"):
+        zero.store_local("")
     with pytest.raises(TypeError, match="ranked Vector AIR type"):
         VectorValue(index_param, container, air_type=i32)
     with pytest.raises(NotImplementedError, match="Vector subtraction"):
