@@ -63,6 +63,7 @@ class BootstrapConfig:
     eval_sin_upper_bound_k: int
     chebyshev_coefficients: Tuple[float, ...]
     double_angle_scalars: Tuple[float, ...]
+    clear_imag: bool = False
 
     def __post_init__(self):
         object.__setattr__(
@@ -95,6 +96,13 @@ class BootstrapConfig:
             raise ValueError("BootstrapConfig.eval_sin_upper_bound_k must be positive")
         if not self.chebyshev_coefficients:
             raise ValueError("BootstrapConfig.chebyshev_coefficients must not be empty")
+        if not isinstance(self.clear_imag, bool):
+            raise ValueError("BootstrapConfig.clear_imag must be a bool")
+        if self.clear_imag and self.post_scale_degree < 1:
+            raise ValueError(
+                "BootstrapConfig.clear_imag requires first_prime_bits "
+                "> scaling_factor_bits"
+            )
 
     @property
     def slots(self) -> int:

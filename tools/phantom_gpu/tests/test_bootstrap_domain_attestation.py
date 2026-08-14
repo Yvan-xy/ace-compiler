@@ -99,6 +99,159 @@ def test_current_emitted_map_has_a_directed_conservative_domain() -> None:
         "provider_value_oracle": False,
         "may_supply_expected_case_values": False,
     }
+    assert "output_projection" not in supported
+    assert "output_projection" not in attestation
+    assert (
+        "output_projection"
+        not in attestation["normalization"]["raw_air_topology"]
+    )
+
+
+def test_real_output_projection_is_explicit_and_replay_closed() -> None:
+    common = {
+        "poly_degree": 32,
+        "mul_level": 7,
+        "first_prime_bits": 45,
+        "scaling_factor_bits": 41,
+        "hamming_weight": 64,
+        "q_parts": 2,
+        "enc_budget": 2,
+        "dec_budget": 3,
+        "ct_encode": False,
+    }
+    complex_config = build_bootstrap_trace_config(**common)
+    real_config = build_bootstrap_trace_config(**common, clear_imag=True)
+    complex_transform, complex_constants, complex_air = transform_authorities(
+        complex_config
+    )
+    transform, constants, raw_air = transform_authorities(real_config)
+    scalar_manifest = build_bootstrap_evalmod_scalar_manifest(real_config)
+    supported, attestation = domain_attestation.derive_supported_identity_domain(
+        coefficients=real_config.chebyshev_coefficients,
+        scalars=real_config.double_angle_scalars,
+        overflow_bound=real_config.eval_sin_upper_bound_k,
+        restoration_factor=real_config.post_scale,
+        evalmod_lower=-1.0,
+        evalmod_upper=1.0,
+        provider_clear_threshold=1.0e-2,
+        artifact_bindings=ARTIFACT_BINDINGS,
+        polynomial_degree=real_config.poly_degree,
+        logical_slots=real_config.slots,
+        transform_payload_manifest=transform,
+        constant_manifest=constants,
+        evalmod_scalar_manifest=scalar_manifest,
+        raw_air=raw_air,
+        clear_imag=True,
+    )
+
+    projection = {
+        "kind": "conjugate-real-projection",
+        "caller_proof_required": True,
+        "semantic_input_requirement": "real-valued",
+    }
+    assert supported["kind"] == (
+        "centered-evalmod-real-projection-error-bounded"
+    )
+    assert supported["components"] == ["real"]
+    assert supported["output_projection"] == projection
+    assert attestation["output_projection"] == projection
+    assert supported["evidence"]["attestation_sha256"] == (
+        domain_attestation._sha256_bytes(
+            domain_attestation._canonical_bytes(attestation)
+        )
+    )
+    topology = attestation["normalization"]["raw_air_topology"]
+    assert topology["conjugate_count"] == 2
+    assert topology["output_projection"] == {
+        "kind": "terminal-conjugate-real-projection",
+        "caller_proof_required": True,
+    }
+    terminal = attestation["normalization"]["transform_stage_dataflow"][-1][
+        "terminal_restoration"
+    ]
+    assert terminal["self_add_count"] == real_config.post_scale_degree - 1
+    assert terminal["self_add_chain"] == ["_restored_0", "_restored_1", "_restored_2"]
+    assert terminal["return_source"] == "_restored_2"
+    assert terminal["real_projection"] == {
+        "kind": "terminal-conjugate-real-projection",
+        "source": terminal["rescale"],
+        "conjugate": "_real_conjugate",
+        "destination": "_real_projected",
+        "semantic_divisor": 2,
+        "projected_component": "real",
+        "caller_proof_required": True,
+    }
+
+    domain_attestation.validate_supported_identity_domain(
+        supported,
+        attestation,
+        provider_clear_threshold=1.0e-2,
+        artifact_bindings=ARTIFACT_BINDINGS,
+        constant_manifest=constants,
+        evalmod_scalar_manifest=scalar_manifest,
+        raw_air=raw_air,
+        clear_imag=True,
+    )
+    assert domain_attestation.validate_evalmod_air_polynomial(
+        air=raw_air,
+        air_label="real-output AIR",
+        scalar_manifest=scalar_manifest,
+    ) == domain_attestation.validate_evalmod_air_polynomial(
+        air=complex_air,
+        air_label="complex-output AIR",
+        scalar_manifest=build_bootstrap_evalmod_scalar_manifest(complex_config),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="invalid restoration chain|dual-EvalMod routing",
+    ):
+        domain_attestation.validate_supported_identity_domain(
+            supported,
+            attestation,
+            provider_clear_threshold=1.0e-2,
+            artifact_bindings=ARTIFACT_BINDINGS,
+            constant_manifest=constants,
+            evalmod_scalar_manifest=scalar_manifest,
+            raw_air=raw_air,
+        )
+    with pytest.raises(
+        ValueError,
+        match="invalid real projection|dual-EvalMod routing",
+    ):
+        domain_attestation._attest_normalization(
+            polynomial_degree=complex_config.poly_degree,
+            logical_slots=complex_config.slots,
+            overflow_bound=complex_config.eval_sin_upper_bound_k,
+            restoration_factor=complex_config.post_scale,
+            transform_payload_manifest=complex_transform,
+            constant_manifest=complex_constants,
+            raw_air=complex_air,
+            clear_imag=True,
+        )
+    terminal_conjugate = raw_air.rfind("CKKS.conjugate")
+    assert terminal_conjugate > 0
+    broken_air = (
+        raw_air[:terminal_conjugate]
+        + raw_air[terminal_conjugate:].replace(
+            "CKKS.conjugate", "CKKS.rotate", 1
+        )
+    )
+    with pytest.raises(
+        ValueError,
+        match="invalid real projection|dual-EvalMod routing",
+    ):
+        domain_attestation.validate_transform_air_semantics(
+            polynomial_degree=real_config.poly_degree,
+            logical_slots=real_config.slots,
+            overflow_bound=real_config.eval_sin_upper_bound_k,
+            restoration_factor=real_config.post_scale,
+            transform_payload_manifest=transform,
+            constant_manifest=constants,
+            air=broken_air,
+            air_label="tampered real-output AIR",
+            clear_imag=True,
+        )
 
 
 def test_proof_is_independent_of_the_ambient_decimal_context() -> None:

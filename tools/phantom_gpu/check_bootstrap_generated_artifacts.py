@@ -18,13 +18,13 @@ EXAMPLES = REPOSITORY / "ace_edsl" / "examples"
 sys.path.insert(0, str(REPOSITORY))
 sys.path.insert(0, str(EXAMPLES))
 
-from check_primitive_codegen import compare_context, extract_context
-from bootstrap_full import build_bootstrap_trace_config
-from ace_edsl.edsl.core.bootstrap_decomposition import (
+from check_primitive_codegen import compare_context, extract_context  # noqa: E402
+from bootstrap_full import build_bootstrap_trace_config  # noqa: E402
+from ace_edsl.edsl.core.bootstrap_decomposition import (  # noqa: E402
     build_bootstrap_evalmod_scalar_manifest,
     build_bootstrap_transform_payload_manifest,
 )
-from bootstrap_domain_attestation import (
+from bootstrap_domain_attestation import (  # noqa: E402
     CLEAR_MAP_BUDGET_FRACTION,
     validate_evalmod_air_polynomial,
     validate_supported_identity_domain,
@@ -39,7 +39,7 @@ SCHEMA = "ace.phantom.bootstrap-generated-artifact-audit/2.0.0"
 V4_SCHEMA = "ace.phantom.bootstrap-generated-artifact-audit/4.0.0"
 RAW_SCALE_COORDINATE_TOLERANCE = 1.0e-4
 
-INVOCATION_OPTION_KEYS = {
+LEGACY_INVOCATION_OPTION_KEYS = {
     "ciphertext_constant_encoding",
     "decode_transform_budget",
     "encode_transform_budget",
@@ -58,6 +58,7 @@ INVOCATION_OPTION_KEYS = {
     "security_level",
     "vector_capacity",
 }
+INVOCATION_OPTION_KEYS = LEGACY_INVOCATION_OPTION_KEYS | {"clear_imag"}
 
 REQUIRED_AIR_OPCODES = (
     "ckks.conjugate",
@@ -1638,7 +1639,14 @@ def verify_v4_closure(
     options = invocation["options"]
     if not isinstance(options, dict):
         raise AuditError("compiler invocation options must be an object")
-    _require_exact_keys(options, INVOCATION_OPTION_KEYS, "compiler invocation options")
+    if frozenset(options) not in {
+        frozenset(LEGACY_INVOCATION_OPTION_KEYS),
+        frozenset(INVOCATION_OPTION_KEYS),
+    }:
+        raise AuditError("compiler invocation options keys differ from schema")
+    clear_imag = options.get("clear_imag", False)
+    if not isinstance(clear_imag, bool):
+        raise AuditError("compiler invocation clear_imag must be a boolean")
     expected_argv = [
         invocation["tool"],
         "--poly-degree", str(options["poly_degree"]),
@@ -1661,6 +1669,8 @@ def verify_v4_closure(
         str(options["post_multiply_scale_degree"]),
         "--post-rotation-step", str(options["post_rotation_step"]),
     ]
+    if clear_imag:
+        expected_argv.append("--clear-imag")
     if invocation["normalized_argv"] != expected_argv:
         raise AuditError("normalized compiler argv differs from typed options")
     expected_context_options = {
@@ -1750,6 +1760,7 @@ def verify_v4_closure(
             ct_encode=(
                 options["ciphertext_constant_encoding"] == "enabled"
             ),
+            clear_imag=clear_imag,
         )
         expected_transform_payload_manifest = (
             build_bootstrap_transform_payload_manifest(
@@ -1829,6 +1840,7 @@ def verify_v4_closure(
             constant_manifest=constant_manifest,
             evalmod_scalar_manifest=expected_scalar_manifest,
             raw_air=raw_air_path.read_text(encoding="utf-8"),
+            clear_imag=clear_imag,
         )
     except ValueError as error:
         raise AuditError(str(error)) from error
@@ -1842,6 +1854,7 @@ def verify_v4_closure(
             constant_manifest=constant_manifest,
             air=post_air,
             air_label="post-CKKS AIR",
+            clear_imag=clear_imag,
         )
         post_evalmod_polynomial = validate_evalmod_air_polynomial(
             air=post_air,
@@ -1920,6 +1933,7 @@ def verify_v4_closure(
         }
         or expanded.get("ciphertext_constant_encoding")
         != options["ciphertext_constant_encoding"]
+        or expanded.get("clear_imag", False) != clear_imag
         or expanded.get("coefficient_family", {}).get("coefficient_count")
         != len(coefficients)
         or expanded.get("coefficient_family", {}).get(

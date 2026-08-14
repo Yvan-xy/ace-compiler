@@ -258,8 +258,14 @@ def build_bootstrap_trace_config(
     enc_budget: int,
     dec_budget: int,
     ct_encode: bool,
+    clear_imag: bool = False,
 ) -> BootstrapConfig:
-    """Build a trace config without reading process-global configuration."""
+    """Build a trace config without reading process-global configuration.
+
+    ``clear_imag`` is only valid when the caller has proved that the semantic
+    result is real-valued.  It selects the conjugate projection already used
+    by the full-packed primitive; the default preserves complex semantics.
+    """
     if hamming_weight > UNIFORM_COEFFICIENT_HAMMING_WEIGHT_MAX:
         raise ValueError(
             "the expanded uniform coefficient family supports hamming weight "
@@ -278,6 +284,7 @@ def build_bootstrap_trace_config(
         eval_sin_upper_bound_k=EVAL_SIN_UPPER_BOUND_K,
         chebyshev_coefficients=tuple(G_COEFFICIENTS_UNIFORM_HW_192),
         double_angle_scalars=tuple(get_double_angle_scalars(NUM_DOUBLE_ANGLE)),
+        clear_imag=clear_imag,
     )
 
 
@@ -488,6 +495,7 @@ def bootstrap_full(
     return fullpacked_bootstrap_primitive(
         x_in,
         config=bootstrap_config,
+        clear_imag=bootstrap_config.clear_imag,
     )
 
 

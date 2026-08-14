@@ -71,6 +71,16 @@ def test_normalized_invocation_is_typed_and_destination_independent() -> None:
     assert "another-destination" not in json.dumps(first)
     assert "identity_error_threshold" not in first["options"]
     assert "--identity-error-threshold" not in first["normalized_argv"]
+    assert first["options"]["clear_imag"] is False
+    assert "--clear-imag" not in first["normalized_argv"]
+
+
+def test_clear_imag_is_explicitly_identity_bound_when_enabled() -> None:
+    value = generator.parse_arguments([*command(), "--clear-imag"])
+    generator.validate_arguments(value)
+    invocation = generator.build_invocation_record(value)
+    assert invocation["options"]["clear_imag"] is True
+    assert invocation["normalized_argv"][-1] == "--clear-imag"
 
 
 def test_rotation_normalization_preserves_even_capacity_half_turn() -> None:
@@ -174,6 +184,48 @@ def test_terminal_restoration_is_derived_from_air_chain() -> None:
     broken = air.replace('ld "_double" VAR[2]', 'ld "_other" VAR[2]', 1)
     with pytest.raises(SystemExit, match="self-add count"):
         generator.attest_terminal_restoration(broken, config)
+
+
+def test_clear_imag_terminal_projection_and_restoration_are_attested() -> None:
+    source_attributes = "level=5,rescale_level=3,scale=1"
+    output_attributes = "level=1,rescale_level=3,scale=1"
+    air = f"""
+      ld "_pre_source" VAR[0] ATTR[{source_attributes}]
+  st "_source" VAR[1] ATTR[{source_attributes}]
+      ld "_source" VAR[1] ATTR[{source_attributes}]
+    CKKS.conjugate ATTR[{source_attributes}] RTYPE[1](CIPHERTEXT)
+  st "_conjugate" VAR[2] ATTR[{output_attributes}]
+      ld "_source" VAR[1] ATTR[{output_attributes}]
+      ld "_conjugate" VAR[2] ATTR[{output_attributes}]
+    CKKS.add ATTR[{output_attributes}] RTYPE[1](CIPHERTEXT)
+  st "_projection" VAR[3] ATTR[{output_attributes}]
+      ld "_projection" VAR[3] ATTR[{output_attributes}]
+      ld "_projection" VAR[3] ATTR[{output_attributes}]
+    CKKS.add ATTR[{output_attributes}] RTYPE[1](CIPHERTEXT)
+  st "_restored" VAR[4] ATTR[{output_attributes}]
+    ld "_restored" VAR[4] ATTR[{output_attributes}]
+  st "__ret_tmp_0" VAR[5] ATTR[{output_attributes}]
+    ld "__ret_tmp_0" VAR[5] ATTR[{output_attributes}]
+  retv ID(6)
+"""
+    config = SimpleNamespace(
+        clear_imag=True,
+        post_scale_degree=2,
+        post_scale=4.0,
+    )
+    attestation = generator.attest_terminal_restoration(air, config)
+    restoration = attestation["restoration"]
+    assert restoration["self_add_count"] == 1
+    assert restoration["restored_factor"] == 4
+    assert restoration["real_projection"] == {
+        "kind": "terminal-conjugate-real-projection",
+        "source": "_source",
+        "conjugate": "_conjugate",
+        "destination": "_projection",
+        "semantic_divisor": 2,
+        "projected_component": "real",
+        "caller_proof_required": True,
+    }
 
 
 def test_post_operation_air_transitions_are_checked() -> None:

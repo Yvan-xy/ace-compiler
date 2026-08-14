@@ -96,6 +96,15 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         choices=("enabled", "disabled"),
     )
+    parser.add_argument(
+        "--clear-imag",
+        action="store_true",
+        default=False,
+        help=(
+            "project the bootstrap output onto the real subspace; valid only "
+            "when the caller proves that the semantic output is real-valued"
+        ),
+    )
     parser.add_argument("--packing", required=True, choices=("full",))
     parser.add_argument("--post-multiply-real", required=True, type=float)
     parser.add_argument("--post-multiply-imag", required=True, type=float)
@@ -215,6 +224,7 @@ def reject_ambient_controls() -> None:
 def typed_options(arguments: argparse.Namespace) -> dict[str, Any]:
     return {
         "ciphertext_constant_encoding": arguments.ciphertext_constant_encoding,
+        "clear_imag": arguments.clear_imag,
         "decode_transform_budget": arguments.decode_transform_budget,
         "encode_transform_budget": arguments.encode_transform_budget,
         "first_prime_bits": arguments.first_prime_bits,
@@ -235,7 +245,7 @@ def typed_options(arguments: argparse.Namespace) -> dict[str, Any]:
 
 
 def normalized_argv(arguments: argparse.Namespace) -> list[str]:
-    return [
+    argv = [
         GENERATOR_TOOL,
         "--poly-degree", str(arguments.poly_degree),
         "--vector-capacity", str(arguments.vector_capacity),
@@ -256,6 +266,9 @@ def normalized_argv(arguments: argparse.Namespace) -> list[str]:
         "--post-multiply-scale-degree", str(arguments.post_multiply_scale_degree),
         "--post-rotation-step", str(arguments.post_rotation_step),
     ]
+    if arguments.clear_imag:
+        argv.append("--clear-imag")
+    return argv
 
 
 def build_invocation_record(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -283,6 +296,7 @@ def build_config(arguments: argparse.Namespace):
             enc_budget=arguments.encode_transform_budget,
             dec_budget=arguments.decode_transform_budget,
             ct_encode=arguments.ciphertext_constant_encoding == "enabled",
+            clear_imag=arguments.clear_imag,
         )
     except ValueError as error:
         raise SystemExit(str(error)) from error
@@ -585,6 +599,23 @@ SELF_ADD = re.compile(
     r'\s*st "(?P<destination>[^"]+)"[^\n]*ATTR\[(?P<store_attributes>[^\]]+)\]',
     re.MULTILINE,
 )
+CONJUGATE_STORE = re.compile(
+    r'^\s*ld "(?P<source>[^"]+)"[^\n]*\n'
+    r'\s*CKKS\.conjugate ATTR\[(?P<operation_attributes>[^\]]+)\][^\n]*\n'
+    r'\s*st "(?P<destination>[^"]+)"[^\n]*ATTR\[(?P<store_attributes>[^\]]+)\]',
+    re.MULTILINE,
+)
+BINARY_ADD = re.compile(
+    r'^\s*ld "(?P<left>[^"]+)"[^\n]*\n'
+    r'\s*ld "(?P<right>[^"]+)"[^\n]*\n'
+    r'\s*CKKS\.add ATTR\[(?P<operation_attributes>[^\]]+)\][^\n]*\n'
+    r'\s*st "(?P<destination>[^"]+)"[^\n]*ATTR\[(?P<store_attributes>[^\]]+)\]',
+    re.MULTILINE,
+)
+STORE_ATTRIBUTES = re.compile(
+    r'^\s*st "(?P<destination>[^"]+)"[^\n]*ATTR\[(?P<attributes>[^\]]+)\]',
+    re.MULTILINE,
+)
 RETURN_STORE = re.compile(
     r'^\s*ld "(?P<source>[^"]+)"[^\n]*\n'
     r'\s*st "(?P<return_name>__ret_tmp_[^"]+)"[^\n]*'
@@ -623,19 +654,78 @@ def attest_terminal_restoration(post_air: str, config) -> dict[str, Any]:
         chain_reversed.append(link)
         cursor = link["source"]
     chain = list(reversed(chain_reversed))
-    expected_count = config.post_scale_degree
+    clear_imag = getattr(config, "clear_imag", False)
+    expected_count = config.post_scale_degree - (1 if clear_imag else 0)
     if len(chain) != expected_count:
         raise SystemExit(
             "terminal restoration self-add count disagrees with expanded post scale: "
             f"expected {expected_count}, observed {len(chain)}"
         )
-    restored_factor = 2 ** len(chain)
+    projection = None
+    if clear_imag:
+        conjugates = {
+            match.group("destination"): match
+            for match in CONJUGATE_STORE.finditer(post_air)
+        }
+        projection_adds = [
+            match
+            for match in BINARY_ADD.finditer(post_air)
+            if match.group("destination") == cursor
+        ]
+        if len(projection_adds) != 1:
+            raise SystemExit(
+                "clear-imag terminal AIR must contain exactly one projection add"
+            )
+        projection_add = projection_adds[0]
+        left = projection_add.group("left")
+        right = projection_add.group("right")
+        conjugate_name = right if right in conjugates else left
+        source_name = left if conjugate_name == right else right
+        conjugate = conjugates.get(conjugate_name)
+        if conjugate is None or conjugate.group("source") != source_name:
+            raise SystemExit(
+                "clear-imag terminal add operands are not a value/conjugate pair"
+            )
+        source_stores = {
+            match.group("destination"): match.group("attributes")
+            for match in STORE_ATTRIBUTES.finditer(post_air)
+        }
+        source_attribute_text = source_stores.get(source_name)
+        if source_attribute_text is None:
+            raise SystemExit("clear-imag projection source has no AIR store metadata")
+        source_attributes = parse_air_attributes(source_attribute_text)
+        if parse_air_attributes(conjugate.group("operation_attributes")) != source_attributes:
+            raise SystemExit("clear-imag conjugate operation changes source metadata")
+        output_metadata_values = (
+            conjugate.group("store_attributes"),
+            projection_add.group("operation_attributes"),
+            projection_add.group("store_attributes"),
+        )
+        if any(
+            parse_air_attributes(value) != output_attributes
+            for value in output_metadata_values
+        ):
+            raise SystemExit("clear-imag terminal projection changes output metadata")
+        projection = {
+            "kind": "terminal-conjugate-real-projection",
+            "source": source_name,
+            "conjugate": conjugate_name,
+            "destination": cursor,
+            "semantic_divisor": 2,
+            "projected_component": "real",
+            "caller_proof_required": True,
+        }
+    restored_factor = 2 ** (len(chain) + (1 if projection else 0))
     if not math.isclose(restored_factor, config.post_scale, rel_tol=0.0, abs_tol=0.0):
         raise SystemExit("terminal restoration factor disagrees with expanded semantics")
-    return {
+    result = {
         "output_attributes": output_attributes,
         "restoration": {
-            "kind": "terminal-ciphertext-self-add-chain",
+            "kind": (
+                "terminal-real-projection-and-ciphertext-self-add-chain"
+                if projection
+                else "terminal-ciphertext-self-add-chain"
+            ),
             "self_add_count": len(chain),
             "self_add_chain": [
                 {"source": link["source"], "destination": link["destination"]}
@@ -645,6 +735,9 @@ def attest_terminal_restoration(post_air: str, config) -> dict[str, Any]:
             "expanded_post_scale_matches": True,
         },
     }
+    if projection:
+        result["restoration"]["real_projection"] = projection
+    return result
 
 
 def float_sequence_sha256(values: Sequence[float]) -> str:
@@ -731,6 +824,7 @@ def build_semantics_record(
             ),
             evalmod_scalar_manifest=evalmod_scalar_manifest,
             raw_air=raw_air_path.read_text(encoding="utf-8"),
+            clear_imag=arguments.clear_imag,
         )
     )
     return {
@@ -745,6 +839,7 @@ def build_semantics_record(
                 "decode": config.dec_budget,
             },
             "ciphertext_constant_encoding": arguments.ciphertext_constant_encoding,
+            "clear_imag": arguments.clear_imag,
             "coefficient_family": {
                 "kind": "ant-uniform-hamming-weight-at-most-threshold",
                 "hamming_weight_max": UNIFORM_COEFFICIENT_HAMMING_WEIGHT_MAX,
@@ -958,6 +1053,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "enc_budget": config.enc_budget,
             "dec_budget": config.dec_budget,
             "ct_encode": config.ct_encode,
+            "clear_imag": config.clear_imag,
         },
         "identity_domain_policy": {
             "provider_clear_maximum_absolute": (

@@ -821,15 +821,20 @@ def _attest_evalmod_polynomial(
     stores = _air_top_level_stores(air, air_label=air_label)
     records = {record["symbol"]: record for record in stores}
     indexes = {record["symbol"]: index for index, record in enumerate(stores)}
-    conjugates = [
-        record for record in stores if record["operation"] == "CKKS.conjugate"
-    ]
     monomials = [
         record for record in stores if record["operation"] == "CKKS.mul_mono"
     ]
-    if len(conjugates) != 1 or len(monomials) != 2:
+    if len(monomials) != 2:
         raise ValueError(f"{air_label} EvalMod routing shape is invalid")
-    conjugate = conjugates[0]
+    first_monomial_index = indexes[monomials[0]["symbol"]]
+    split_conjugates = [
+        record
+        for record in stores[:first_monomial_index]
+        if record["operation"] == "CKKS.conjugate"
+    ]
+    if len(split_conjugates) != 1:
+        raise ValueError(f"{air_label} EvalMod routing shape is invalid")
+    conjugate = split_conjugates[0]
     conjugate_index = indexes[conjugate["symbol"]]
     split_candidates = [
         record
@@ -1019,6 +1024,7 @@ def _attest_transform_group_dataflow(
     expected_roles: list[dict[str, Any]],
     actual_constants: list[dict[str, Any]],
     stage_batch_symbols: dict[tuple[str, int], str],
+    clear_imag: bool = False,
 ) -> list[dict[str, Any]]:
     """Bind baby/giant transform groups to the emitted AIR store graph."""
     stores = _air_top_level_stores(air, air_label=air_label)
@@ -1303,26 +1309,29 @@ def _attest_transform_group_dataflow(
         ),
         None,
     )
-    conjugates = [
-        record for record in stores if record["operation"] == "CKKS.conjugate"
-    ]
-    if (
-        final_encoding is None
-        or len(conjugates) != 1
-        or len(conjugates[0]["dependencies"]) != 1
-    ):
-        raise ValueError(f"{air_label} encoding-to-EvalMod boundary is invalid")
-    require_connector_path(
-        conjugates[0]["dependencies"][0],
-        final_encoding["final_accumulator"],
-        label="encoding-to-EvalMod boundary",
-    )
-
     monomials = [
         record for record in stores if record["operation"] == "CKKS.mul_mono"
     ]
     if len(monomials) != 2:
         raise ValueError(f"{air_label} EvalMod-to-decoding boundary is invalid")
+    first_monomial_index = indexes[monomials[0]["symbol"]]
+    split_conjugates = [
+        record
+        for record in stores[:first_monomial_index]
+        if record["operation"] == "CKKS.conjugate"
+    ]
+    if (
+        final_encoding is None
+        or len(split_conjugates) != 1
+        or len(split_conjugates[0]["dependencies"]) != 1
+    ):
+        raise ValueError(f"{air_label} encoding-to-EvalMod boundary is invalid")
+    require_connector_path(
+        split_conjugates[0]["dependencies"][0],
+        final_encoding["final_accumulator"],
+        label="encoding-to-EvalMod boundary",
+    )
+
     second_monomial = monomials[1]
     second_monomial_index = indexes[second_monomial["symbol"]]
     recombinations = [
@@ -1379,6 +1388,12 @@ def _attest_transform_group_dataflow(
     if restoration_integer & (restoration_integer - 1):
         raise ValueError(f"{air_label} restoration factor is not a power of two")
     restoration_count = restoration_integer.bit_length() - 1
+    if clear_imag:
+        if restoration_count < 1:
+            raise ValueError(
+                f"{air_label} real projection requires a compensating restoration"
+            )
+        restoration_count -= 1
     cursor = return_source
     restoration_chain = []
     for _ in range(restoration_count):
@@ -1396,6 +1411,55 @@ def _attest_transform_group_dataflow(
             )
         restoration_chain.append(link["symbol"])
         cursor = link["dependencies"][0]
+    real_projection = None
+    if clear_imag:
+        projection = records.get(cursor)
+        if (
+            projection is None
+            or projection["operation"] != "CKKS.add"
+            or len(projection["dependencies"]) != 2
+            or projection["dependencies"][0] == projection["dependencies"][1]
+            or projection["constant_ids"]
+            or projection["operations"] != ["CKKS.add"]
+        ):
+            raise ValueError(
+                f"{air_label} final decode result has an invalid real projection"
+            )
+        dependency_records = [
+            records.get(dependency) for dependency in projection["dependencies"]
+        ]
+        conjugate_indexes = [
+            index
+            for index, record in enumerate(dependency_records)
+            if record is not None and record["operation"] == "CKKS.conjugate"
+        ]
+        if len(conjugate_indexes) != 1:
+            raise ValueError(
+                f"{air_label} final decode result has an invalid real projection"
+            )
+        conjugate_index = conjugate_indexes[0]
+        source_index = 1 - conjugate_index
+        conjugate = dependency_records[conjugate_index]
+        source = projection["dependencies"][source_index]
+        if (
+            conjugate is None
+            or conjugate["dependencies"] != [source]
+            or conjugate["constant_ids"]
+            or conjugate["operations"] != ["CKKS.conjugate"]
+        ):
+            raise ValueError(
+                f"{air_label} final decode result has an invalid real projection"
+            )
+        real_projection = {
+            "kind": "terminal-conjugate-real-projection",
+            "source": source,
+            "conjugate": conjugate["symbol"],
+            "destination": projection["symbol"],
+            "semantic_divisor": 2,
+            "projected_component": "real",
+            "caller_proof_required": True,
+        }
+        cursor = source
     final_decode = stage_bindings[-1]
     if final_decode["direction"] != "slots-to-coefficients":
         raise ValueError(f"{air_label} final transform direction is invalid")
@@ -1411,18 +1475,21 @@ def _attest_transform_group_dataflow(
             f"{air_label} final decode accumulator does not feed restoration"
         )
     stage_bindings[0]["primary_input"] = formals[0]
-    final_encoding["evalmod_input"] = conjugates[0]["symbol"]
+    final_encoding["evalmod_input"] = split_conjugates[0]["symbol"]
     next(
         record
         for record in stage_bindings
         if record["direction"] == "slots-to-coefficients"
     )["evalmod_recombination"] = recombinations[0]["symbol"]
-    stage_bindings[-1]["terminal_restoration"] = {
+    terminal_restoration = {
         "rescale": rescale["symbol"],
         "self_add_count": restoration_count,
         "self_add_chain": list(reversed(restoration_chain)),
         "return_source": return_source,
     }
+    if real_projection is not None:
+        terminal_restoration["real_projection"] = real_projection
+    stage_bindings[-1]["terminal_restoration"] = terminal_restoration
     return stage_bindings
 
 
@@ -1436,7 +1503,10 @@ def _attest_normalization(
     constant_manifest: dict[str, Any],
     raw_air: str,
     air_label: str = "raw AIR",
+    clear_imag: bool = False,
 ) -> dict[str, Any]:
+    if not isinstance(clear_imag, bool):
+        raise ValueError("clear_imag must be a bool")
     if polynomial_degree <= 0 or logical_slots * 2 != polynomial_degree:
         raise ValueError("clear EvalMod normalization is not full-packed")
     expected_configured_factor = (
@@ -1728,16 +1798,27 @@ def _attest_normalization(
         expected_roles=expected_roles,
         actual_constants=actual_constants,
         stage_batch_symbols=stage_batch_symbols,
+        clear_imag=clear_imag,
     )
     conjugates = [match.start() for match in re.finditer(r"\bCKKS\.conjugate\b", raw_air)]
     monomial_matches = list(_MONOMIAL_OPERATION.finditer(raw_air))
     monomial_powers = [int(match.group(1), 0) for match in monomial_matches]
-    if len(conjugates) != 1 or monomial_powers != [3 * logical_slots, logical_slots]:
+    expected_conjugate_count = 2 if clear_imag else 1
+    if (
+        len(conjugates) != expected_conjugate_count
+        or monomial_powers != [3 * logical_slots, logical_slots]
+    ):
         raise ValueError(
             f"{air_label} does not contain the full-packed dual-EvalMod routing"
         )
-    conjugate = conjugates[0]
     first_monomial = monomial_matches[0].start()
+    split_conjugates = [value for value in conjugates if value < first_monomial]
+    terminal_conjugates = [value for value in conjugates if value > monomial_matches[1].end()]
+    if len(split_conjugates) != 1 or len(terminal_conjugates) != int(clear_imag):
+        raise ValueError(
+            f"{air_label} does not contain the full-packed dual-EvalMod routing"
+        )
+    conjugate = split_conjugates[0]
     split_region = raw_air[conjugate:first_monomial]
     add_position = split_region.find("CKKS.add")
     subtract_position = split_region.find("CKKS.sub")
@@ -1807,6 +1888,14 @@ def _attest_normalization(
             "split_operation_order": ["conjugate", "add", "subtract"],
             "monomial_routing_powers": monomial_powers,
             "transform_placement": "before-split-and-after-recombine",
+            **(
+                {"output_projection": {
+                    "kind": "terminal-conjugate-real-projection",
+                    "caller_proof_required": True,
+                }}
+                if clear_imag
+                else {}
+            ),
         },
         "matrix_constant_authority": (
             "compiler-emitted-source-and-constant-manifest-artifact-bindings"
@@ -1824,6 +1913,7 @@ def validate_transform_air_semantics(
     constant_manifest: dict[str, Any],
     air: str,
     air_label: str,
+    clear_imag: bool = False,
 ) -> dict[str, Any]:
     """Replay transform-role and stage dataflow against an emitted AIR form."""
     return _attest_normalization(
@@ -1835,6 +1925,7 @@ def validate_transform_air_semantics(
         constant_manifest=constant_manifest,
         raw_air=air,
         air_label=air_label,
+        clear_imag=clear_imag,
     )
 
 
@@ -1854,7 +1945,10 @@ def derive_supported_identity_domain(
     constant_manifest: dict[str, Any],
     evalmod_scalar_manifest: dict[str, Any],
     raw_air: str,
+    clear_imag: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(clear_imag, bool):
+        raise ValueError("clear_imag must be a bool")
     if not math.isfinite(provider_clear_threshold) or provider_clear_threshold <= 0:
         raise ValueError("provider clear threshold must be finite and positive")
     if (evalmod_lower, evalmod_upper) != (-1.0, 1.0):
@@ -1879,6 +1973,7 @@ def derive_supported_identity_domain(
         transform_payload_manifest=transform_payload_manifest,
         constant_manifest=constant_manifest,
         raw_air=raw_air,
+        clear_imag=clear_imag,
     )
     executed_polynomial, emitted_polynomial_record = _attest_evalmod_polynomial(
         air=raw_air,
@@ -1965,10 +2060,21 @@ def derive_supported_identity_domain(
         "error_contract": error_contract,
         "proof": proof,
     }
+    output_projection = {
+        "kind": "conjugate-real-projection",
+        "caller_proof_required": True,
+        "semantic_input_requirement": "real-valued",
+    }
+    if clear_imag:
+        attestation["output_projection"] = output_projection
     attestation_sha256 = _sha256_bytes(_canonical_bytes(attestation))
     domain = {
-        "kind": "centered-evalmod-complex-error-bounded",
-        "components": ["real", "imaginary"],
+        "kind": (
+            "centered-evalmod-real-projection-error-bounded"
+            if clear_imag
+            else "centered-evalmod-complex-error-bounded"
+        ),
+        "components": ["real"] if clear_imag else ["real", "imaginary"],
         "lower_exclusive": -radius,
         "upper_exclusive": radius,
         "period": restoration_factor,
@@ -1982,6 +2088,8 @@ def derive_supported_identity_domain(
             ),
         },
     }
+    if clear_imag:
+        domain["output_projection"] = output_projection
     return domain, attestation
 
 
@@ -1994,6 +2102,7 @@ def validate_supported_identity_domain(
     constant_manifest: dict[str, Any],
     evalmod_scalar_manifest: dict[str, Any],
     raw_air: str,
+    clear_imag: bool = False,
 ) -> None:
     try:
         expression = attestation["expanded_clear_component_map"]
@@ -2030,6 +2139,7 @@ def validate_supported_identity_domain(
         constant_manifest=constant_manifest,
         evalmod_scalar_manifest=evalmod_scalar_manifest,
         raw_air=raw_air,
+        clear_imag=clear_imag,
     )
     if attestation != expected_attestation or domain != expected_domain:
         raise ValueError("clear EvalMod identity-domain attestation differs on replay")

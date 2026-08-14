@@ -308,9 +308,33 @@ def transform_authorities(config: Any) -> tuple[dict[str, Any], dict[str, Any], 
     decoding, decoding_output = transform_air(
         "slots_to_coefficients", "_recombined"
     )
-    restoration = []
+    projection = ""
     restored = decoding_output
-    for index in range(config.post_scale_degree):
+    restoration_count = config.post_scale_degree
+    if config.clear_imag:
+        projection = "".join(
+            (
+                store(
+                    f'''\
+          ld "{decoding_output}" VAR[1] RTYPE[1](CIPHERTEXT)
+        CKKS.conjugate RTYPE[1](CIPHERTEXT)
+''',
+                    "_real_conjugate",
+                ),
+                store(
+                    f'''\
+          ld "{decoding_output}" VAR[1] RTYPE[1](CIPHERTEXT)
+          ld "_real_conjugate" VAR[1] RTYPE[1](CIPHERTEXT)
+        CKKS.add RTYPE[1](CIPHERTEXT)
+''',
+                    "_real_projected",
+                ),
+            )
+        )
+        restored = "_real_projected"
+        restoration_count -= 1
+    restoration = []
+    for index in range(restoration_count):
         destination = f"_restored_{index}"
         restoration.append(
             store(
@@ -332,7 +356,7 @@ def transform_authorities(config: Any) -> tuple[dict[str, Any], dict[str, Any], 
           intconst #{config.mul_level:#x} RTYPE[1](uint32_t)
         CKKS.raise_mod RTYPE[1](CIPHERTEXT)
       st "{raised_input}" VAR[1] ID(1)
-{encoding}{evalmod_split}{''.join(evalmod_operations)}{evalmod_recombine}{decoding}{''.join(restoration)}        ld "{restored}" VAR[1] RTYPE[1](CIPHERTEXT)
+{encoding}{evalmod_split}{''.join(evalmod_operations)}{evalmod_recombine}{decoding}{projection}{''.join(restoration)}        ld "{restored}" VAR[1] RTYPE[1](CIPHERTEXT)
       st "__ret_tmp_0" VAR[1] ID(1)
         ld "__ret_tmp_0" VAR[1] RTYPE[1](CIPHERTEXT)
       retv ID(1)
