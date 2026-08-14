@@ -34,6 +34,14 @@ void Phantom_encode_manifest_constant(PLAIN plain, uint32_t entry_id);
 void Phantom_load_cached_constant(PLAIN plain, uint32_t entry_id);
 PHANTOM_SETUP_METRICS Phantom_get_setup_metrics();
 
+//! @brief Borrow the singleton's provider objects for provider-pure native code.
+//!
+//! The returned pointers remain owned by the runtime and are valid strictly
+//! between Prepare_context() and Finalize_context().  This is intended for
+//! native Phantom code that must evaluate the same ciphertexts with the same
+//! context and keyset as compiler-generated ordinary CKKS code.
+PHANTOM_BORROWED_RUNTIME Phantom_borrow_runtime();
+
 void Phantom_encode_float_cst_lvl(PLAIN plain, float* input, size_t len,
                                   SCALE_T scale, int level);
 void Phantom_encode_float_mask(PLAIN plain, float input, size_t len,

@@ -18,6 +18,13 @@
 //! @brief Forward declaration of phantom types
 namespace phantom {}  // namespace phantom
 
+class PhantomContext;
+class PhantomCKKSEncoder;
+class PhantomSecretKey;
+class PhantomPublicKey;
+class PhantomRelinKey;
+class PhantomGaloisKey;
+
 //! @brief Define CIPHERTEXT/CIPHER/PLAINTEXT/PLAIN for rt APIs
 typedef PhantomCiphertext  CIPHERTEXT;
 typedef PhantomCiphertext  CIPHERTEXT3;
@@ -25,6 +32,21 @@ typedef PhantomCiphertext* CIPHER;
 typedef PhantomCiphertext* CIPHER3;
 typedef PhantomPlaintext   PLAINTEXT;
 typedef PhantomPlaintext*  PLAIN;
+
+//! @brief Non-owning view of the provider objects backing ordinary CKKS.
+//!
+//! Every pointer is owned by the singleton initialized by Prepare_context().
+//! The view is valid only until Finalize_context(); callers must not delete,
+//! replace, or retain any pointer beyond that lifetime.  Optional evaluation
+//! keys are null when their resource was not declared by the program manifest.
+typedef struct {
+  PhantomContext*     _context;
+  PhantomCKKSEncoder* _encoder;
+  PhantomSecretKey*   _secret_key;
+  PhantomPublicKey*   _public_key;
+  PhantomRelinKey*    _relin_key;
+  PhantomGaloisKey*   _galois_key;
+} PHANTOM_BORROWED_RUNTIME;
 
 // NOLINTEND (readability-identifier-naming)
 

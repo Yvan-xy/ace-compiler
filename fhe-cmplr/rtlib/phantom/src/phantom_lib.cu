@@ -390,6 +390,11 @@ public:
 
   PHANTOM_SETUP_METRICS SetupMetrics() const { return _setup_metrics; }
 
+  PHANTOM_BORROWED_RUNTIME BorrowRuntime() const {
+    return {_context.get(), _encoder.get(), _secret_key.get(),
+            _public_key.get(), _relin_key.get(), _galois_key.get()};
+  }
+
   template <typename T>
   void EncodeMask(Plaintext* plain, T value, size_t len, SCALE_T degree,
                   LEVEL_T level, const char* diagnostic) {
@@ -2105,6 +2110,10 @@ void Phantom_load_cached_constant(PLAIN plain, uint32_t entry_id) {
 
 PHANTOM_SETUP_METRICS Phantom_get_setup_metrics() {
   return PHANTOM_CONTEXT::Context()->SetupMetrics();
+}
+
+PHANTOM_BORROWED_RUNTIME Phantom_borrow_runtime() {
+  return PHANTOM_CONTEXT::Context()->BorrowRuntime();
 }
 
 void Phantom_encode_float_cst_lvl(PLAIN plain, float* input, size_t len,
