@@ -56,6 +56,15 @@ def fail(message: str) -> None:
     raise ComparisonError(message)
 
 
+def requested_prime_size(prime: int) -> int:
+    """Return ANT's nearest-power-of-two modulus-size convention."""
+    integer(prime, "prime", 2)
+    floor_log2 = prime.bit_length() - 1
+    lower = 1 << floor_log2
+    upper = lower << 1
+    return floor_log2 if prime - lower <= upper - prime else floor_log2 + 1
+
+
 def expect_keys(value: Any, expected: set[str], context: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         fail(f"{context} must be an object")
@@ -1447,7 +1456,8 @@ def compare_exact(
             isinstance(modulus, bool)
             or not isinstance(modulus, int)
             or modulus < 3
-            or modulus.bit_length() != resolved["data_q_bit_sizes"][index]
+            or requested_prime_size(modulus)
+            != resolved["data_q_bit_sizes"][index]
         ):
             fail(f"exact runtime modulus {index} disagrees with the context manifest")
     observed_data = load_binary(

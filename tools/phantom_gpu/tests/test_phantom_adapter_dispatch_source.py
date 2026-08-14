@@ -56,9 +56,37 @@ def test_single_element_mask_preserves_scalar_broadcast_semantics() -> None:
     )
     vector_construction = body.index("std::vector<double> values(encoded_len")
     provider_encoding = body.index("EncodeVector(plain, values")
+    scalar_provenance = body.index("RememberBroadcastScalar(plain")
 
-    assert length_selection < vector_construction < provider_encoding
+    assert (
+        length_selection
+        < vector_construction
+        < provider_encoding
+        < scalar_provenance
+    )
+    assert body.index("if (len == 1)") < scalar_provenance
     assert "std::vector<double> values(len" not in body
+
+
+def _assert_broadcast_plain_is_aligned_to_cipher_scale(
+    body: str, operation: str
+) -> None:
+    provenance_lookup = body.index("FindBroadcastScalar(right, &broadcast_scalar)")
+    reencode = body.index("EncodeBroadcast(&aligned_plain, broadcast_scalar")
+    provider_selection = body.index("provider_plain = &aligned_plain")
+    provider = body.index(f'ProviderCall("{operation}_PLAIN_PROVIDER"')
+
+    assert provenance_lookup < reencode < provider_selection < provider
+    assert re.search(
+        r"EncodeBroadcast\(&aligned_plain,\s*broadcast_scalar,\s*"
+        r"left->chain_index\(\),\s*left->scale\(\)",
+        body,
+    )
+    assert "Plaintext* provider_plain = right" in body
+    assert (
+        f"{operation.lower()}_plain_inplace(*_context, *result, *provider_plain)"
+        in body
+    )
 
 
 def test_provider_outputs_are_live_before_metadata_validation() -> None:
@@ -122,13 +150,15 @@ def test_add_sub_uses_logical_scale_degree_and_normalizes_destinations() -> None
     assert "right->set_scale(" not in sub_cipher
 
     add_plain = _function_body(source, "AddPlain")
+    _assert_broadcast_plain_is_aligned_to_cipher_scale(add_plain, "ADD")
     assert add_plain.index('ProviderCall("ADD_PLAIN_PROVIDER"') < (
         add_plain.index("result->scale() = output_scale")
     )
 
     sub_plain = _function_body(source, "SubPlain")
+    _assert_broadcast_plain_is_aligned_to_cipher_scale(sub_plain, "SUB")
     provider = sub_plain.index('ProviderCall("SUB_PLAIN_PROVIDER"')
-    normalize = sub_plain.index("result->scale() = right->scale()")
+    normalize = sub_plain.index("result->scale() = provider_plain->scale()")
     provider_call = sub_plain.index("sub_plain_inplace(")
     restore = sub_plain.index("result->scale() = output_scale")
     assert provider < normalize < provider_call < restore

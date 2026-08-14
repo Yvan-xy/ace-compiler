@@ -1107,7 +1107,10 @@ def test_runtime_exact_oracle_recomputes_from_observed_sources(tmp_path: Path) -
         "normalized_compiler_command_sha256": "2" * 64,
         "post_ckks_air_sha256": "3" * 64,
     }
-    moduli = [17, 19, 23]
+    # Keep these toy RNS moduli in the manifest's requested-size-5 bucket.
+    # Requested prime sizes follow ANT's nearest-power convention, under which
+    # 17 belongs to bucket 4 even though its ordinary binary bit length is 5.
+    moduli = [29, 31, 37]
     degree = context["polynomial_degree"]
     binary = bytearray(fixture_tool.EXACT_MAGIC)
     records = []

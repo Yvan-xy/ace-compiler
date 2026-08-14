@@ -98,6 +98,130 @@ void ProviderCall(const char* diagnostic, FN&& fn) {
   }
 }
 
+// ACE's modulus-size manifest uses the ANT convention: the requested size is
+// the exponent of the nearest power of two.  In particular, an NTT prime just
+// above 2^56 is still a 56-bit scaling prime for compiler purposes even though
+// its ordinary binary bit count is 57.
+uint32_t RequestedPrimeSize(uint64_t prime) {
+  if (prime < 2) Fail("CONTEXT_MODULI", "modulus must be at least two");
+  const uint64_t original = prime;
+  uint32_t floor_log2 = 0;
+  while (prime > 1) {
+    ++floor_log2;
+    prime >>= 1;
+  }
+  if (floor_log2 >= 63) {
+    Fail("CONTEXT_MODULI", "modulus exceeds the supported size");
+  }
+  const uint64_t lower = uint64_t{1} << floor_log2;
+  const uint64_t upper = lower << 1;
+  return original - lower <= upper - original ? floor_log2 : floor_log2 + 1;
+}
+
+bool IsPrime(uint64_t candidate) {
+  return phantom::arith::Modulus(candidate).is_prime();
+}
+
+uint64_t AntFirstPrime(uint32_t ring_degree, uint32_t requested_size) {
+  const uint64_t order = uint64_t{2} * ring_degree;
+  uint64_t candidate = (uint64_t{1} << requested_size) + order + 1;
+  while (!IsPrime(candidate)) {
+    if (candidate > std::numeric_limits<uint64_t>::max() - order) {
+      Fail("CONTEXT_MODULI", "first-prime search overflowed");
+    }
+    candidate += order;
+  }
+  return candidate;
+}
+
+uint64_t AntPreviousPrime(uint64_t prime, uint64_t order) {
+  uint64_t candidate = prime;
+  do {
+    if (candidate <= order) {
+      Fail("CONTEXT_MODULI", "previous-prime search underflowed");
+    }
+    candidate -= order;
+  } while (!IsPrime(candidate));
+  return candidate;
+}
+
+uint64_t AntNextPrime(uint64_t prime, uint64_t order) {
+  // Match ANT's Gen_next_prime exactly.  It initializes to prime + order and
+  // increments once more before testing, so prime + 2*order is the first
+  // candidate considered.
+  if (prime > std::numeric_limits<uint64_t>::max() - order) {
+    Fail("CONTEXT_MODULI", "next-prime search overflowed");
+  }
+  uint64_t candidate = prime + order;
+  do {
+    if (candidate > std::numeric_limits<uint64_t>::max() - order) {
+      Fail("CONTEXT_MODULI", "next-prime search overflowed");
+    }
+    candidate += order;
+  } while (!IsPrime(candidate));
+  return candidate;
+}
+
+std::vector<phantom::arith::Modulus> BuildAntCompatibleCoefficientModuli(
+    const PHANTOM_CONTEXT_MANIFEST& manifest) {
+  const uint32_t ring_degree = manifest._poly_degree;
+  const uint64_t order = uint64_t{2} * ring_degree;
+  std::vector<uint64_t> data_q(manifest._data_q_count);
+
+  uint64_t lower =
+      AntFirstPrime(ring_degree, manifest._scaling_modulus_bits);
+  uint64_t upper = lower;
+  data_q.back() = lower;
+  for (size_t offset = 0; offset + 2 < data_q.size(); ++offset) {
+    const size_t index = data_q.size() - 2 - offset;
+    data_q[index] = (offset & 1U) == 0
+                        ? (lower = AntPreviousPrime(lower, order))
+                        : (upper = AntNextPrime(upper, order));
+  }
+  data_q.front() =
+      manifest._first_modulus_bits == manifest._scaling_modulus_bits
+          ? AntPreviousPrime(lower, order)
+          : AntPreviousPrime(
+                AntFirstPrime(ring_degree, manifest._first_modulus_bits),
+                order);
+
+  std::set<uint64_t> used;
+  std::vector<phantom::arith::Modulus> moduli;
+  moduli.reserve(manifest._data_q_count + manifest._special_p_count);
+  for (size_t index = 0; index < data_q.size(); ++index) {
+    const uint64_t prime = data_q[index];
+    if (phantom::arith::Modulus(prime).bit_count() >
+            USER_MOD_BIT_COUNT_MAX ||
+        !used.insert(prime).second || prime % order != 1 || !IsPrime(prime) ||
+        RequestedPrimeSize(prime) != manifest._data_q_bit_sizes[index]) {
+      Fail("CONTEXT_Q_PRIME",
+           "generated data-Q modulus %zu violates the compiler prime policy",
+           index);
+    }
+    moduli.emplace_back(prime);
+  }
+
+  uint64_t special_cursor =
+      AntFirstPrime(ring_degree, manifest._special_p_bit_sizes[0]);
+  for (size_t index = 0; index < manifest._special_p_count; ++index) {
+    do {
+      special_cursor = AntPreviousPrime(special_cursor, order);
+    } while (used.count(special_cursor) != 0);
+    if (phantom::arith::Modulus(special_cursor).bit_count() >
+            USER_MOD_BIT_COUNT_MAX ||
+        !used.insert(special_cursor).second || special_cursor % order != 1 ||
+        !IsPrime(special_cursor) ||
+        RequestedPrimeSize(special_cursor) !=
+            manifest._special_p_bit_sizes[index]) {
+      Fail("CONTEXT_P_PRIME",
+           "generated special-P modulus %zu violates the compiler prime policy",
+           index);
+    }
+    moduli.emplace_back(special_cursor);
+  }
+  return moduli;
+}
+
 std::int64_t CheckedScaleDegree(SCALE_T degree, const char* diagnostic) {
   if (!std::isfinite(degree) || degree < 0.0 ||
       degree != std::nearbyint(degree)) {
@@ -241,6 +365,7 @@ public:
 
   void EncodeManifestConstant(Plaintext* plain, uint32_t entry_id) {
     RequireWritablePlain(plain, "ENCODE_MANIFEST_CONSTANT");
+    ForgetBroadcastScalar(plain);
     const PHANTOM_CONSTANT_ENTRY& entry = FindConstantEntry(entry_id);
     const ConstantCacheKey key = ConstantKey(entry, "ENCODE_MANIFEST_CONSTANT");
     EncodeConstantPayload(plain, entry, "ENCODE_MANIFEST_CONSTANT");
@@ -250,6 +375,7 @@ public:
 
   void LoadCachedConstant(Plaintext* plain, uint32_t entry_id) {
     RequireWritablePlain(plain, "LOAD_CACHED_CONSTANT");
+    ForgetBroadcastScalar(plain);
     const PHANTOM_CONSTANT_ENTRY& entry = FindConstantEntry(entry_id);
     const ConstantCacheKey key = ConstantKey(entry, "LOAD_CACHED_CONSTANT");
     const auto cached = _constant_cache.find(key);
@@ -275,6 +401,9 @@ public:
     const size_t encoded_len = len == 1 ? _logical_slots : len;
     std::vector<double> values(encoded_len, static_cast<double>(value));
     EncodeVector(plain, values, degree, level, diagnostic);
+    if (len == 1) {
+      RememberBroadcastScalar(plain, static_cast<double>(value));
+    }
   }
 
   void AddCipher(Ciphertext* result, Ciphertext* left, Ciphertext* right) {
@@ -332,9 +461,21 @@ public:
     RequireWritableCipher(result, "ADD_PLAIN_DESTINATION");
     const double output_scale = left->scale();
     const size_t output_scale_degree = left->GetNoiseScaleDeg();
+    Plaintext aligned_plain;
+    Plaintext* provider_plain = right;
+    double broadcast_scalar = 0.0;
+    if (FindBroadcastScalar(right, &broadcast_scalar)) {
+      // A broadcast scalar is an additive value, not a fixed-point payload.
+      // Re-encode it at the ciphertext's exact post-rescale scale, matching
+      // Phantom's native add_const semantics and preventing coefficient-domain
+      // addition from silently changing the scalar's decoded magnitude.
+      EncodeBroadcast(&aligned_plain, broadcast_scalar, left->chain_index(),
+                      left->scale(), "ADD_PLAIN_ALIGN_SCALAR");
+      provider_plain = &aligned_plain;
+    }
     ProviderCall("ADD_PLAIN_PROVIDER", [&] {
       if (result != left) *result = *left;
-      add_plain_inplace(*_context, *result, *right);
+      add_plain_inplace(*_context, *result, *provider_plain);
     });
     result->scale() = output_scale;
     result->SetNoiseScaleDeg(output_scale_degree);
@@ -346,10 +487,18 @@ public:
     RequireWritableCipher(result, "SUB_PLAIN_DESTINATION");
     const double output_scale = left->scale();
     const size_t output_scale_degree = left->GetNoiseScaleDeg();
+    Plaintext aligned_plain;
+    Plaintext* provider_plain = right;
+    double broadcast_scalar = 0.0;
+    if (FindBroadcastScalar(right, &broadcast_scalar)) {
+      EncodeBroadcast(&aligned_plain, broadcast_scalar, left->chain_index(),
+                      left->scale(), "SUB_PLAIN_ALIGN_SCALAR");
+      provider_plain = &aligned_plain;
+    }
     ProviderCall("SUB_PLAIN_PROVIDER", [&] {
       if (result != left) *result = *left;
-      result->scale() = right->scale();
-      sub_plain_inplace(*_context, *result, *right);
+      result->scale() = provider_plain->scale();
+      sub_plain_inplace(*_context, *result, *provider_plain);
     });
     result->scale() = output_scale;
     result->SetNoiseScaleDeg(output_scale_degree);
@@ -784,6 +933,7 @@ public:
     }
     ValidatePlain(plain, "FREE_PLAIN");
     plain->release();
+    ForgetBroadcastScalar(plain);
     MarkPlain(plain, ObjectState::kFreed);
   }
 
@@ -821,6 +971,7 @@ public:
       Fail("REGISTER_PLAIN_NULL", "plaintext pointer is null");
     }
     std::lock_guard<std::mutex> lock(_state_mutex);
+    _broadcast_scalars.erase(plain);
     _plain_states[plain] =
         plain->poly_modulus_degree() == 0 ? ObjectState::kUninitialized
                                           : ObjectState::kLive;
@@ -981,20 +1132,17 @@ private:
 
     phantom::EncryptionParameters parameters(phantom::scheme_type::ckks);
     parameters.set_poly_modulus_degree(_manifest->_poly_degree);
-    std::vector<int> modulus_bits;
-    modulus_bits.reserve(_manifest->_data_q_count +
-                         _manifest->_special_p_count);
-    for (size_t index = 0; index < _manifest->_data_q_count; ++index) {
-      modulus_bits.push_back(
-          static_cast<int>(_manifest->_data_q_bit_sizes[index]));
+    // The AIR parameter sizes have ANT semantics, so reproduce ANT's balanced
+    // prime chain explicitly.  Phantom's generic Create() searches only below
+    // 2^bits; using it here makes every exact rescale drift in the same
+    // direction and materially changes deep generated EvalMod arithmetic.
+    const std::vector<phantom::arith::Modulus> coefficient_moduli =
+        BuildAntCompatibleCoefficientModuli(*_manifest);
+    _ordered_coefficient_moduli.reserve(coefficient_moduli.size());
+    for (const auto& modulus : coefficient_moduli) {
+      _ordered_coefficient_moduli.push_back(modulus.value());
     }
-    for (size_t index = 0; index < _manifest->_special_p_count; ++index) {
-      modulus_bits.push_back(
-          static_cast<int>(_manifest->_special_p_bit_sizes[index]));
-    }
-    parameters.set_coeff_modulus(
-        phantom::arith::CoeffModulus::Create(_manifest->_poly_degree,
-                                             modulus_bits));
+    parameters.set_coeff_modulus(coefficient_moduli);
     parameters.set_special_modulus_size(_manifest->_special_p_count);
     parameters.set_secret_key_hamming_weight(_manifest->_hamming_weight);
     parameters.set_sparse_slots(_logical_slots);
@@ -1378,6 +1526,10 @@ private:
       if (bits == 0 || bits > 60) {
         Fail("CONTEXT_P_BITS", "special-P bit size %zu is invalid", index);
       }
+      if (bits != _manifest->_special_p_bit_sizes[0]) {
+        Fail("CONTEXT_P_BITS",
+             "ANT-compatible special-P sizes must be uniform");
+      }
     }
     if (_manifest->_input_level == 0 ||
         _manifest->_input_level > _manifest->_data_q_count ||
@@ -1520,20 +1672,31 @@ private:
            key_moduli.size(),
            _manifest->_data_q_count + _manifest->_special_p_count);
     }
+    if (key_moduli.size() != _ordered_coefficient_moduli.size()) {
+      Fail("CONTEXT_MODULI", "constructed modulus identity count changed");
+    }
+    for (size_t index = 0; index < key_moduli.size(); ++index) {
+      if (key_moduli[index].value() != _ordered_coefficient_moduli[index]) {
+        Fail("CONTEXT_MODULI",
+             "constructed modulus %zu changed value or Q/P order", index);
+      }
+    }
     for (size_t index = 0; index < _manifest->_data_q_count; ++index) {
-      if (key_moduli[index].bit_count() !=
+      if (RequestedPrimeSize(key_moduli[index].value()) !=
           _manifest->_data_q_bit_sizes[index]) {
-        Fail("CONTEXT_Q_BITS", "data-Q modulus %zu has %d bits, expected %d",
-             index, key_moduli[index].bit_count(),
+        Fail("CONTEXT_Q_BITS",
+             "data-Q modulus %zu has requested size %u, expected %u", index,
+             RequestedPrimeSize(key_moduli[index].value()),
              _manifest->_data_q_bit_sizes[index]);
       }
     }
     for (size_t index = 0; index < _manifest->_special_p_count; ++index) {
       const size_t key_index = _manifest->_data_q_count + index;
-      if (key_moduli[key_index].bit_count() !=
+      if (RequestedPrimeSize(key_moduli[key_index].value()) !=
           _manifest->_special_p_bit_sizes[index]) {
-        Fail("CONTEXT_P_BITS", "special-P modulus %zu has %d bits, expected %d",
-             index, key_moduli[key_index].bit_count(),
+        Fail("CONTEXT_P_BITS",
+             "special-P modulus %zu has requested size %u, expected %u", index,
+             RequestedPrimeSize(key_moduli[key_index].value()),
              _manifest->_special_p_bit_sizes[index]);
       }
     }
@@ -1546,8 +1709,7 @@ private:
       bool matches = true;
       for (size_t index = 0; index < moduli.size(); ++index) {
         matches = matches &&
-                  moduli[index].bit_count() ==
-                      _manifest->_data_q_bit_sizes[index];
+                  moduli[index].value() == _ordered_coefficient_moduli[index];
       }
       if (matches) {
         if (_first_data_chain_index != std::numeric_limits<size_t>::max()) {
@@ -1570,8 +1732,7 @@ private:
              level, chain, moduli.size());
       }
       for (size_t index = 0; index < moduli.size(); ++index) {
-        if (moduli[index].bit_count() !=
-            _manifest->_data_q_bit_sizes[index]) {
+        if (moduli[index].value() != _ordered_coefficient_moduli[index]) {
           Fail("CONTEXT_LEVEL_MAP",
                "chain %zu data-Q modulus %zu disagrees with the manifest",
                chain, index);
@@ -1595,6 +1756,7 @@ private:
   void EncodeVector(Plaintext* plain, const std::vector<T>& values,
                     SCALE_T degree, LEVEL_T level,
                     const char* diagnostic) {
+    ForgetBroadcastScalar(plain);
     const std::int64_t integral_degree = CheckedScaleDegree(degree, diagnostic);
     size_t chain = 0;
     double scale = 0.0;
@@ -1683,6 +1845,24 @@ private:
   void MarkPlain(Plaintext* plain, ObjectState state) {
     std::lock_guard<std::mutex> lock(_state_mutex);
     _plain_states[plain] = state;
+  }
+
+  void RememberBroadcastScalar(Plaintext* plain, double value) {
+    std::lock_guard<std::mutex> lock(_state_mutex);
+    _broadcast_scalars[plain] = value;
+  }
+
+  void ForgetBroadcastScalar(Plaintext* plain) {
+    std::lock_guard<std::mutex> lock(_state_mutex);
+    _broadcast_scalars.erase(plain);
+  }
+
+  bool FindBroadcastScalar(Plaintext* plain, double* value) {
+    std::lock_guard<std::mutex> lock(_state_mutex);
+    const auto found = _broadcast_scalars.find(plain);
+    if (found == _broadcast_scalars.end()) return false;
+    *value = found->second;
+    return true;
   }
 
   void RequireWritableCipher(Ciphertext* cipher, const char* diagnostic) {
@@ -1850,6 +2030,7 @@ private:
   std::unique_ptr<PhantomRelinKey> _relin_key;
   std::unique_ptr<PhantomGaloisKey> _galois_key;
   std::set<int> _rotation_steps;
+  std::vector<uint64_t> _ordered_coefficient_moduli;
   std::map<ConstantCacheKey, Plaintext> _constant_cache;
   std::unordered_map<uint32_t, const PHANTOM_CONSTANT_ENTRY*>
       _constant_entries;
@@ -1859,6 +2040,7 @@ private:
   std::mutex _state_mutex;
   std::unordered_map<const void*, ObjectState> _cipher_states;
   std::unordered_map<const void*, ObjectState> _plain_states;
+  std::unordered_map<const void*, double> _broadcast_scalars;
 
   static PHANTOM_CONTEXT* _instance;
 };

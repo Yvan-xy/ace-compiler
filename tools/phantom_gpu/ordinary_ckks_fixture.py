@@ -50,6 +50,16 @@ def fail(message: str) -> None:
     raise OrdinaryCkksError(message)
 
 
+def requested_prime_size(prime: int) -> int:
+    """Return ANT's nearest-power-of-two modulus-size convention."""
+    if isinstance(prime, bool) or not isinstance(prime, int) or prime < 2:
+        fail("prime must be an integer at least two")
+    floor_log2 = prime.bit_length() - 1
+    lower = 1 << floor_log2
+    upper = lower << 1
+    return floor_log2 if prime - lower <= upper - prime else floor_log2 + 1
+
+
 def _object_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -1830,10 +1840,11 @@ def validate_observed_metadata(
             )
         else:
             dropped = _integer(observed.get("dropped_modulus"), "observed metadata.dropped_modulus", 2)
-            if dropped.bit_length() != scale_bits:
+            dropped_size = requested_prime_size(dropped)
+            if dropped_size != scale_bits:
                 errors.append(
                     "dropped_modulus: expected "
-                    f"{scale_bits} bits, got {dropped.bit_length()}"
+                    f"requested size {scale_bits}, got {dropped_size}"
                 )
             expected_scale = math.ldexp(
                 1.0, raw_rule["numerator_scale_degree"] * scale_bits
