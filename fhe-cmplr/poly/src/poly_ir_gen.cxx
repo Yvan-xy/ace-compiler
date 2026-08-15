@@ -388,7 +388,9 @@ STMT_PTR POLY_IR_GEN::New_init_ciph(CONST_VAR v_parent, NODE_PTR node) {
       }
       case fhe::ckks::CKKS_OPERATOR::RELIN:
       case fhe::ckks::CKKS_OPERATOR::ROTATE:
-      case fhe::ckks::CKKS_OPERATOR::MODSWITCH: {
+      case fhe::ckks::CKKS_OPERATOR::MODSWITCH:
+      case fhe::ckks::CKKS_OPERATOR::RAISE_MOD:
+      {
         AIR_ASSERT(Has_node_var(node->Child(0)));
         CONST_VAR& v_opnd0 = Node_var(node->Child(0));
         if (v_res != v_opnd0) {
@@ -402,6 +404,21 @@ STMT_PTR POLY_IR_GEN::New_init_ciph(CONST_VAR v_parent, NODE_PTR node) {
         }
         break;
       }
+      case fhe::ckks::CKKS_OPERATOR::LINEAR_TRANSFORM: {
+        AIR_ASSERT(Has_node_var(node->Child(0)));
+        CONST_VAR& v_opnd0 = Node_var(node->Child(0));
+        if (v_res != v_opnd0) {
+          NODE_PTR n_res   = New_var_load(v_res, spos);
+          NODE_PTR n_opnd0 = New_var_load(v_opnd0, spos);
+          // LINEAR_TRANSFORM multiplies a degree-1 ciphertext by encoded
+          // plaintext rows.  Its result therefore has scale degree 2; the
+          // explicit CKKS.rescale immediately following the semantic op
+          // consumes that extra degree.
+          return New_init_ciph_up_scale(
+              n_res, n_opnd0, Container()->Clone_node_tree(n_opnd0), spos);
+        }
+        break;
+      }
       case fhe::ckks::CKKS_OPERATOR::RESCALE: {
         AIR_ASSERT(Has_node_var(node->Child(0)));
         CONST_VAR& v_opnd0 = Node_var(node->Child(0));
@@ -410,7 +427,8 @@ STMT_PTR POLY_IR_GEN::New_init_ciph(CONST_VAR v_parent, NODE_PTR node) {
         return New_init_ciph_down_scale(n_res, n_opnd0, spos);
       }
       default:
-        CMPLR_ASSERT(false, "not supported operator");
+        CMPLR_ASSERT(false, "not supported CKKS operator %u in New_init_ciph",
+                     static_cast<uint32_t>(node->Operator()));
     }
   } else if (node->Opcode() == air::core::OPC_LD ||
              node->Opcode() == air::core::OPC_LDP) {
@@ -519,6 +537,15 @@ STMT_PTR POLY_IR_GEN::New_free_poly(CONST_VAR v_poly, const SPOS& spos) {
   NODE_PTR n_poly = New_var_load(v_poly, spos);
   STMT_PTR s_free = New_poly_stmt(FREE, spos);
   s_free->Node()->Set_child(0, n_poly);
+  return s_free;
+}
+
+STMT_PTR POLY_IR_GEN::New_free_polys(CONST_VAR v_polys, const SPOS& spos) {
+  CMPLR_ASSERT(v_polys.Type() == Get_type(POLY_PTR, spos), "invalid type");
+
+  NODE_PTR n_polys = New_var_load(v_polys, spos);
+  STMT_PTR s_free  = New_poly_stmt(FREE, spos);
+  s_free->Node()->Set_child(0, n_polys);
   return s_free;
 }
 
@@ -751,6 +778,15 @@ NODE_PTR POLY_IR_GEN::New_mod_down(NODE_PTR node, const SPOS& spos) {
                "node is not polynonmial");
 
   NODE_PTR n_res = New_poly_node(MOD_DOWN, node->Rtype(), spos);
+  n_res->Set_child(0, node);
+  return n_res;
+}
+
+NODE_PTR POLY_IR_GEN::New_extend(NODE_PTR node, const SPOS& spos) {
+  CMPLR_ASSERT(node->Rtype() == Get_type(POLY, spos),
+               "node is not polynomial");
+
+  NODE_PTR n_res = New_poly_node(EXTEND, node->Rtype(), spos);
   n_res->Set_child(0, node);
   return n_res;
 }

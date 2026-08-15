@@ -54,8 +54,23 @@ void H2LPOLY::Call_rns_func(POLY_LOWER_CTX& ctx, air::base::NODE_PTR node,
     case OPC_ADD:
       fhe_func_id = is_ext ? core::RNS_ADD_EXT : core::RNS_ADD;
       break;
+    case OPC_ADD_EXT:
+      AIR_ASSERT(is_ext);
+      fhe_func_id = core::RNS_ADD_EXT;
+      break;
+    case OPC_SUB:
+      fhe_func_id = is_ext ? core::RNS_SUB_EXT : core::RNS_SUB;
+      break;
+    case OPC_SUB_EXT:
+      AIR_ASSERT(is_ext);
+      fhe_func_id = core::RNS_SUB_EXT;
+      break;
     case OPC_MUL:
       fhe_func_id = is_ext ? core::RNS_MUL_EXT : core::RNS_MUL;
+      break;
+    case OPC_MUL_EXT:
+      AIR_ASSERT(is_ext);
+      fhe_func_id = core::RNS_MUL_EXT;
       break;
     case OPC_ROTATE:
       fhe_func_id = is_ext ? core::RNS_ROTATE_EXT : core::RNS_ROTATE;
@@ -115,12 +130,20 @@ air::base::STMT_PTR H2LPOLY::Gen_rns_binary_op(
   AIR_ASSERT(op.Domain() == fhe::poly::POLYNOMIAL_DID);
 
   switch (op) {
-    case OPC_ADD: {
+    case OPC_ADD:
+    case OPC_ADD_EXT: {
       air::base::NODE_PTR n2_at_l =
           pgen.New_poly_load_at_level(opnd2, v_rns_idx);
       n_op = pgen.New_hw_modadd(n1_at_l, n2_at_l, n_modulus, spos);
     } break;
-    case OPC_MUL: {
+    case OPC_SUB:
+    case OPC_SUB_EXT: {
+      air::base::NODE_PTR n2_at_l =
+          pgen.New_poly_load_at_level(opnd2, v_rns_idx);
+      n_op = pgen.New_hw_modsub(n1_at_l, n2_at_l, n_modulus, spos);
+    } break;
+    case OPC_MUL:
+    case OPC_MUL_EXT: {
       air::base::NODE_PTR n2_at_l =
           pgen.New_poly_load_at_level(opnd2, v_rns_idx);
       n_op = pgen.New_hw_modmul(n1_at_l, n2_at_l, n_modulus, spos);
@@ -149,6 +172,12 @@ bool H2LPOLY::Has_ext_attr(POLY_LOWER_CTX& ctx, air::base::NODE_PTR node) {
   const uint32_t* is_ext_ptr =
       node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::EXTENDED);
   if (is_ext_ptr != nullptr && *is_ext_ptr != 0) {
+    is_ext = true;
+  }
+  // Attribute propagation represents the actual RNS basis with NUM_P.
+  // ROTATE has no separate *_EXT opcode, so relying only on the legacy
+  // EXTENDED marker silently omits the P-prime loop for QP operands.
+  if (!is_ext && ctx.Poly_gen().Get_num_p(node) != 0) {
     is_ext = true;
   }
   return is_ext;

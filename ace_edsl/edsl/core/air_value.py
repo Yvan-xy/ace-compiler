@@ -789,6 +789,41 @@ class AIRValue:
             domain=self._domain,
             temp_name=temp_name,
         )
+
+    def _linear_transform(
+        self,
+        coefficients: Sequence[complex],
+        *,
+        rot_in: list[int],
+        rot_out: list[int],
+        slots: int,
+        term_count: int,
+        scale_degree: int = 1,
+        plain_level: int = 0,
+        num_p: int = 0,
+        encode_cache: bool = True,
+        schema_version: int = 1,
+    ) -> 'AIRValue':
+        """Emit the internal compiler-only CKKS linear-transform descriptor."""
+        self._set_loc()
+        if not hasattr(self._container, "new_ckks_linear_transform"):
+            raise NotImplementedError(
+                "Container does not support CKKS linear_transform"
+            )
+        result_node = self._container.new_ckks_linear_transform(
+            self.value,
+            list(coefficients),
+            list(rot_in),
+            list(rot_out),
+            int(slots),
+            int(term_count),
+            int(scale_degree),
+            int(plain_level),
+            int(num_p),
+            bool(encode_cache),
+            int(schema_version),
+        )
+        return self._flatten_result(result_node)
     
     def rescale(self) -> 'AIRValue':
         """

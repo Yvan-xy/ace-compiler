@@ -9,6 +9,8 @@
 #ifndef FHE_POLY_IR2C_HANDLER_H
 #define FHE_POLY_IR2C_HANDLER_H
 
+#include <string>
+
 #include "air/base/container.h"
 #include "air/core/opcode.h"
 #include "fhe/poly/invalid_handler.h"
@@ -22,6 +24,42 @@ namespace poly {
 //! @brief Handler to convert polynomial IR to C
 class IR2C_HANDLER : public INVALID_HANDLER {
 public:
+  //! @brief Begin an OpenMP parallel-sections region.  The region markers are
+  //! explicit POLY statements so all enclosed arithmetic remains analyzable.
+  template <typename RETV, typename VISITOR>
+  void Handle_parallel_sections_begin(VISITOR* visitor,
+                                      air::base::NODE_PTR node) {
+    IR2C_CTX& ctx = visitor->Context();
+    ctx << "#pragma omp parallel sections\n"
+        << std::string(ctx.Level() * 2, ' ') << "{\n";
+    ++ctx.Level();
+  }
+
+  template <typename RETV, typename VISITOR>
+  void Handle_parallel_section_begin(VISITOR* visitor,
+                                     air::base::NODE_PTR node) {
+    IR2C_CTX& ctx = visitor->Context();
+    ctx << "#pragma omp section\n"
+        << std::string(ctx.Level() * 2, ' ') << "{\n";
+    ++ctx.Level();
+  }
+
+  template <typename RETV, typename VISITOR>
+  void Handle_parallel_section_end(VISITOR* visitor,
+                                   air::base::NODE_PTR node) {
+    IR2C_CTX& ctx = visitor->Context();
+    --ctx.Level();
+    ctx << "}\n";
+  }
+
+  template <typename RETV, typename VISITOR>
+  void Handle_parallel_sections_end(VISITOR* visitor,
+                                    air::base::NODE_PTR node) {
+    IR2C_CTX& ctx = visitor->Context();
+    --ctx.Level();
+    ctx << "}\n";
+  }
+
   //! @brief Emit C code for polynomial ADD
   //! @tparam RETV Return Type
   //! @tparam VISITOR Visitor Type
@@ -73,7 +111,8 @@ public:
     }
     if (elem_cnt > 0) {
       ctx << "Free_ciph_poly(";
-    } else if (ctx.Is_poly_ptr_ptr(node->Child(0)->Rtype())) {
+    } else if (ctx.Is_poly_ptr(node->Child(0)->Rtype()) ||
+               ctx.Is_poly_ptr_ptr(node->Child(0)->Rtype())) {
       ctx << "Free_polys(";
     } else {
       AIR_ASSERT(ctx.Is_rns_poly_type(node->Child(0)->Rtype_id()));

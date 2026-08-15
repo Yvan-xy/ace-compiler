@@ -90,6 +90,7 @@ double CKKS_STATS::Op_cost(OP_KIND kind, const core::CTX_PARAM& param,
     case RESCALE:
     case MODSWITCH:
     case BOOTSTRAP:
+    case LINEAR_TRANSFORM:
     case CALL:
       break;
     case ADD_CP:

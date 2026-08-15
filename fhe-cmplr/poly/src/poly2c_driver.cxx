@@ -67,8 +67,9 @@ GLOB_SCOPE* POLY2C_DRIVER::Flatten(GLOB_SCOPE* glob) {
 }
 
 void POLY2C_DRIVER::Emit_get_context_params() {
-  const core::CTX_PARAM&   param    = _ctx.Lower_ctx().Get_ctx_param();
-  const std::set<int32_t>& rot_keys = param.Get_rotate_index();
+  const core::CTX_PARAM& param = _ctx.Lower_ctx().Get_ctx_param();
+  const std::set<int32_t> rot_keys =
+      param.Get_legacy_runtime_rotate_index();
   // CKKS_PARAMS Get_context_params()
   _ctx << "CKKS_PARAMS* ";
   _ctx.Emit_identifier(_ctx.Function_name_prefix());

@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <vector>
 
@@ -141,6 +142,24 @@ public:
 
   void                     Clear_rotate_index() { _rotate_index.clear(); }
   const std::set<int32_t>& Get_rotate_index() const { return _rotate_index; }
+  //! Rotation resources for the legacy CKKS_PARAMS runtime ABI.  ANT models
+  //! conjugation as automorphism index 2N-1 in the same key list used for
+  //! ordinary logical rotations.
+  std::set<int32_t> Get_legacy_runtime_rotate_index() const {
+    std::set<int32_t> indices = _rotate_index;
+    if (_conjugation_key_required) {
+      CMPLR_ASSERT(_poly_degree != 0,
+                   "conjugation key requires a polynomial degree");
+      const uint64_t conjugation_index =
+          static_cast<uint64_t>(_poly_degree) * 2U - 1U;
+      CMPLR_ASSERT(conjugation_index <=
+                       static_cast<uint64_t>(
+                           std::numeric_limits<int32_t>::max()),
+                   "conjugation automorphism index exceeds CKKS_PARAMS ABI");
+      indices.insert(static_cast<int32_t>(conjugation_index));
+    }
+    return indices;
+  }
   void                     Print(std::ostream& out = std::cout);
   uint32_t                 Mul_depth_of_bootstrap();
   uint32_t                 Get_modulus_bit_num() const;

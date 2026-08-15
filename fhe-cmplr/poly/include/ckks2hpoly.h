@@ -75,7 +75,44 @@ public:
   template <typename RETV, typename VISITOR>
   POLY_LOWER_RETV Handle_raise_mod(VISITOR* visitor, air::base::NODE_PTR node);
 
+  //! @brief Lower a compiler-only BSGS diagonal linear transform to HPOLY.
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_linear_transform(VISITOR* visitor,
+                                          air::base::NODE_PTR node);
+
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_parallel_sections_begin(
+      VISITOR* visitor, air::base::NODE_PTR node) {
+    return Lower_parallel_marker(visitor, node,
+                                 OPC_PARALLEL_SECTIONS_BEGIN);
+  }
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_parallel_section_begin(
+      VISITOR* visitor, air::base::NODE_PTR node) {
+    return Lower_parallel_marker(visitor, node,
+                                 OPC_PARALLEL_SECTION_BEGIN);
+  }
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_parallel_section_end(
+      VISITOR* visitor, air::base::NODE_PTR node) {
+    return Lower_parallel_marker(visitor, node, OPC_PARALLEL_SECTION_END);
+  }
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_parallel_sections_end(
+      VISITOR* visitor, air::base::NODE_PTR node) {
+    return Lower_parallel_marker(visitor, node, OPC_PARALLEL_SECTIONS_END);
+  }
+
 private:
+  template <typename VISITOR>
+  POLY_LOWER_RETV Lower_parallel_marker(VISITOR* visitor,
+                                        air::base::NODE_PTR node,
+                                        air::base::OPCODE opcode) {
+    POLY_LOWER_CTX& ctx = visitor->Context();
+    ctx.Prepend(ctx.Container()->New_cust_stmt(opcode, node->Spos()));
+    return POLY_LOWER_RETV(RETV_KIND::RK_BLOCK, air::base::Null_ptr);
+  }
+
   //! @brief Handle binary arithmetic operations for CKKS_OPERATOR::ADD/SUB/MUL:
   //! cc_op_handler: handle operations between ciphertexts.
   //! cp_op_handler: handle operations between ciphertext and plaintext.
@@ -163,6 +200,10 @@ private:
                                 air::base::NODE_PTR    n_c1,
                                 air::base::NODE_PTR    n_opnd1,
                                 const air::base::SPOS& spos);
+
+  POLY_LOWER_RETV Expand_linear_transform(POLY_LOWER_CTX&     ctx,
+                                          air::base::NODE_PTR node,
+                                          POLY_LOWER_RETV     input_pair);
 
   // expand relinearize sub options
   POLY_LOWER_RETV Expand_relin(POLY_LOWER_CTX& ctx, air::base::NODE_PTR node,
@@ -264,6 +305,9 @@ POLY_LOWER_RETV CKKS2HPOLY::Handle_bin_arith(VISITOR*            visitor,
 template <typename RETV, typename VISITOR>
 POLY_LOWER_RETV CKKS2HPOLY::Handle_add(VISITOR*            visitor,
                                        air::base::NODE_PTR node) {
+  if (visitor->Context().Config().Linear_transform_only())
+    return visitor->Context()
+        .template Handle_node<POLY_LOWER_RETV>(visitor, node);
   return Handle_bin_arith<RETV>(visitor, node, &CKKS2HPOLY::Handle_add_ciph,
                                 &CKKS2HPOLY::Handle_add_plain,
                                 &CKKS2HPOLY::Handle_add_float);
@@ -272,6 +316,9 @@ POLY_LOWER_RETV CKKS2HPOLY::Handle_add(VISITOR*            visitor,
 template <typename RETV, typename VISITOR>
 POLY_LOWER_RETV CKKS2HPOLY::Handle_sub(VISITOR*            visitor,
                                        air::base::NODE_PTR node) {
+  if (visitor->Context().Config().Linear_transform_only())
+    return visitor->Context()
+        .template Handle_node<POLY_LOWER_RETV>(visitor, node);
   return Handle_bin_arith<RETV>(visitor, node, &CKKS2HPOLY::Handle_sub_ciph,
                                 &CKKS2HPOLY::Handle_sub_plain,
                                 &CKKS2HPOLY::Handle_sub_float);
@@ -280,6 +327,9 @@ POLY_LOWER_RETV CKKS2HPOLY::Handle_sub(VISITOR*            visitor,
 template <typename RETV, typename VISITOR>
 POLY_LOWER_RETV CKKS2HPOLY::Handle_mul(VISITOR*            visitor,
                                        air::base::NODE_PTR node) {
+  if (visitor->Context().Config().Linear_transform_only())
+    return visitor->Context()
+        .template Handle_node<POLY_LOWER_RETV>(visitor, node);
   POLY_LOWER_CTX&       ctx       = visitor->Context();
   fhe::core::LOWER_CTX* lower_ctx = ctx.Lower_ctx();
   air::base::NODE_PTR   opnd0     = node->Child(0);
@@ -294,6 +344,9 @@ POLY_LOWER_RETV CKKS2HPOLY::Handle_mul(VISITOR*            visitor,
 template <typename RETV, typename VISITOR>
 POLY_LOWER_RETV CKKS2HPOLY::Handle_relin(VISITOR*            visitor,
                                          air::base::NODE_PTR node) {
+  if (visitor->Context().Config().Linear_transform_only())
+    return visitor->Context()
+        .template Handle_node<POLY_LOWER_RETV>(visitor, node);
   POLY_LOWER_CTX&       ctx  = visitor->Context();
   air::base::CONTAINER* cntr = ctx.Container();
   air::base::SPOS       spos = node->Spos();
@@ -319,6 +372,9 @@ POLY_LOWER_RETV CKKS2HPOLY::Handle_relin(VISITOR*            visitor,
 template <typename RETV, typename VISITOR>
 POLY_LOWER_RETV CKKS2HPOLY::Handle_rotate(VISITOR*            visitor,
                                           air::base::NODE_PTR node) {
+  if (visitor->Context().Config().Linear_transform_only())
+    return visitor->Context()
+        .template Handle_node<POLY_LOWER_RETV>(visitor, node);
   POLY_LOWER_CTX&       ctx  = visitor->Context();
   air::base::CONTAINER* cntr = ctx.Container();
   air::base::SPOS       spos = node->Spos();
@@ -344,8 +400,24 @@ POLY_LOWER_RETV CKKS2HPOLY::Handle_rotate(VISITOR*            visitor,
 }
 
 template <typename RETV, typename VISITOR>
+POLY_LOWER_RETV CKKS2HPOLY::Handle_linear_transform(
+    VISITOR* visitor, air::base::NODE_PTR node) {
+  CMPLR_ASSERT(node->Num_child() == 2,
+               "linear_transform requires two operands");
+  POLY_LOWER_RETV input_pair =
+      visitor->template Visit<RETV>(node->Child(0));
+  CMPLR_ASSERT(input_pair.Kind() == RETV_KIND::RK_CIPH_POLY &&
+                   !input_pair.Is_null(),
+               "linear_transform input is not a ciphertext polynomial pair");
+  return Expand_linear_transform(visitor->Context(), node, input_pair);
+}
+
+template <typename RETV, typename VISITOR>
 POLY_LOWER_RETV CKKS2HPOLY::Handle_rescale(VISITOR*            visitor,
                                            air::base::NODE_PTR node) {
+  if (visitor->Context().Config().Linear_transform_only())
+    return visitor->Context()
+        .template Handle_node<POLY_LOWER_RETV>(visitor, node);
   POLY_LOWER_CTX&       ctx       = visitor->Context();
   fhe::core::LOWER_CTX* lower_ctx = ctx.Lower_ctx();
   air::base::NODE_PTR   opnd0     = node->Child(0);
@@ -380,6 +452,9 @@ POLY_LOWER_RETV CKKS2HPOLY::Handle_rescale(VISITOR*            visitor,
 template <typename RETV, typename VISITOR>
 POLY_LOWER_RETV CKKS2HPOLY::Handle_modswitch(VISITOR*            visitor,
                                              air::base::NODE_PTR node) {
+  if (visitor->Context().Config().Linear_transform_only())
+    return visitor->Context()
+        .template Handle_node<POLY_LOWER_RETV>(visitor, node);
   POLY_LOWER_CTX&       ctx       = visitor->Context();
   fhe::core::LOWER_CTX* lower_ctx = ctx.Lower_ctx();
   POLY_IR_GEN&          pgen      = ctx.Poly_gen();
@@ -422,6 +497,9 @@ POLY_LOWER_RETV CKKS2HPOLY::Handle_modswitch(VISITOR*            visitor,
 template <typename RETV, typename VISITOR>
 POLY_LOWER_RETV CKKS2HPOLY::Handle_raise_mod(VISITOR*            visitor,
                                              air::base::NODE_PTR node) {
+  if (visitor->Context().Config().Linear_transform_only())
+    return visitor->Context()
+        .template Handle_node<POLY_LOWER_RETV>(visitor, node);
   POLY_LOWER_CTX&       ctx       = visitor->Context();
   fhe::core::LOWER_CTX* lower_ctx = ctx.Lower_ctx();
   air::base::NODE_PTR   opnd0     = node->Child(0);

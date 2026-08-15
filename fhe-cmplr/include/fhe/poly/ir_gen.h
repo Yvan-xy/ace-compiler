@@ -244,7 +244,10 @@ public:
         _tmp_var(),
         _ty_table(VAR_TYPE_KIND::LAST_TYPE),
         _node2var_map(),
-        _var_map() {}
+        _var_map(),
+        _parallel_scope(0),
+        _parallel_scope_counter(0),
+        _parallel_scope_stack() {}
 
   air::base::CONTAINER* Container() { return _container; }
 
@@ -298,6 +301,21 @@ public:
   //! @param spos source position
   //! @return VAR Local Symbol
   CONST_VAR& Get_var(POLY_PREDEF_VAR id, const air::base::SPOS& spos);
+
+  //! Give cached compiler scratch variables section-local identities.  AIR
+  //! symbols remain function scoped, but independent OpenMP sections must not
+  //! share loop indices, modulus cursors, or key-switch work buffers.
+  void Enter_parallel_section() {
+    _parallel_scope_stack.push_back(_parallel_scope);
+    _parallel_scope = ++_parallel_scope_counter;
+  }
+
+  void Leave_parallel_section() {
+    AIR_ASSERT_MSG(!_parallel_scope_stack.empty(),
+                   "unbalanced POLY parallel section markers");
+    _parallel_scope = _parallel_scope_stack.back();
+    _parallel_scope_stack.pop_back();
+  }
 
   //! @brief Generate a uniq temporary name
   //! @return NAME_PTR
@@ -548,6 +566,9 @@ private:
   std::vector<air::base::TYPE_ID>   _ty_table;
   std::map<air::base::NODE_ID, VAR> _node2var_map;
   std::map<VAR, VAR_ARR>            _var_map;
+  uint32_t                          _parallel_scope;
+  uint32_t                          _parallel_scope_counter;
+  std::vector<uint32_t>             _parallel_scope_stack;
   POLY_MEM_POOL*                    _pool;
 };
 

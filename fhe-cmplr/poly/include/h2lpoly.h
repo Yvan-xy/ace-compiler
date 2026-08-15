@@ -34,13 +34,37 @@ public:
   template <typename RETV, typename VISITOR>
   POLY_LOWER_RETV Handle_add(VISITOR* visitor, air::base::NODE_PTR node);
 
+  //! @brief Handle HPOLY_OPERATOR::ADD_EXT
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_add_ext(VISITOR* visitor,
+                                 air::base::NODE_PTR node);
+
   //! @brief Handle HPOLY_OPERATOR::SUB
   template <typename RETV, typename VISITOR>
   POLY_LOWER_RETV Handle_sub(VISITOR* visitor, air::base::NODE_PTR node);
 
+  //! @brief Handle HPOLY_OPERATOR::SUB_EXT
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_sub_ext(VISITOR* visitor,
+                                 air::base::NODE_PTR node);
+
   //! @brief Handle HPOLY_OPERATOR::MUL
   template <typename RETV, typename VISITOR>
   POLY_LOWER_RETV Handle_mul(VISITOR* visitor, air::base::NODE_PTR node);
+
+  //! @brief Handle HPOLY_OPERATOR::MUL_EXT
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_mul_ext(VISITOR* visitor,
+                                 air::base::NODE_PTR node);
+
+  //! @brief Handle HPOLY_OPERATOR::MAC
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_mac(VISITOR* visitor, air::base::NODE_PTR node);
+
+  //! @brief Handle HPOLY_OPERATOR::MAC_EXT
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_mac_ext(VISITOR* visitor,
+                                 air::base::NODE_PTR node);
 
   //! @brief Handle HPOLY_OPERATOR::ROTATE
   template <typename RETV, typename VISITOR>
@@ -50,10 +74,33 @@ public:
   template <typename RETV, typename VISITOR>
   POLY_LOWER_RETV Handle_extend(VISITOR* visitor, air::base::NODE_PTR node);
 
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_parallel_section_begin(
+      VISITOR* visitor, air::base::NODE_PTR node) {
+    visitor->Context().Poly_gen().Enter_parallel_section();
+    return visitor->Context().template Handle_node<POLY_LOWER_RETV>(visitor,
+                                                                    node);
+  }
+
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_parallel_section_end(
+      VISITOR* visitor, air::base::NODE_PTR node) {
+    POLY_LOWER_RETV retv =
+        visitor->Context().template Handle_node<POLY_LOWER_RETV>(visitor,
+                                                                 node);
+    visitor->Context().Poly_gen().Leave_parallel_section();
+    return retv;
+  }
+
 private:
   // Genernal function that process binary operations
   template <typename RETV, typename VISITOR>
   POLY_LOWER_RETV Handle_binary_op(VISITOR* visitor, air::base::NODE_PTR node);
+
+  // Preserve a three-input multiply-accumulate at the whole-QP runtime
+  // boundary used by semantic LINEAR_TRANSFORM.
+  template <typename RETV, typename VISITOR>
+  POLY_LOWER_RETV Handle_mac_op(VISITOR* visitor, air::base::NODE_PTR node);
 
   // Generate binary op for rns expanded polynomial
   air::base::STMT_PTR Gen_rns_binary_op(
@@ -108,8 +155,20 @@ POLY_LOWER_RETV H2LPOLY::Handle_add(VISITOR*            visitor,
 }
 
 template <typename RETV, typename VISITOR>
+POLY_LOWER_RETV H2LPOLY::Handle_add_ext(VISITOR*            visitor,
+                                        air::base::NODE_PTR node) {
+  return Handle_binary_op<RETV>(visitor, node);
+}
+
+template <typename RETV, typename VISITOR>
 POLY_LOWER_RETV H2LPOLY::Handle_sub(VISITOR*            visitor,
                                     air::base::NODE_PTR node) {
+  return Handle_binary_op<RETV>(visitor, node);
+}
+
+template <typename RETV, typename VISITOR>
+POLY_LOWER_RETV H2LPOLY::Handle_sub_ext(VISITOR*            visitor,
+                                        air::base::NODE_PTR node) {
   return Handle_binary_op<RETV>(visitor, node);
 }
 
@@ -117,6 +176,58 @@ template <typename RETV, typename VISITOR>
 POLY_LOWER_RETV H2LPOLY::Handle_mul(VISITOR*            visitor,
                                     air::base::NODE_PTR node) {
   return Handle_binary_op<RETV>(visitor, node);
+}
+
+template <typename RETV, typename VISITOR>
+POLY_LOWER_RETV H2LPOLY::Handle_mul_ext(VISITOR*            visitor,
+                                        air::base::NODE_PTR node) {
+  return Handle_binary_op<RETV>(visitor, node);
+}
+
+template <typename RETV, typename VISITOR>
+POLY_LOWER_RETV H2LPOLY::Handle_mac(VISITOR*            visitor,
+                                    air::base::NODE_PTR node) {
+  return Handle_mac_op<RETV>(visitor, node);
+}
+
+template <typename RETV, typename VISITOR>
+POLY_LOWER_RETV H2LPOLY::Handle_mac_ext(VISITOR*            visitor,
+                                        air::base::NODE_PTR node) {
+  return Handle_mac_op<RETV>(visitor, node);
+}
+
+template <typename RETV, typename VISITOR>
+POLY_LOWER_RETV H2LPOLY::Handle_mac_op(VISITOR*            visitor,
+                                       air::base::NODE_PTR node) {
+  POLY_LOWER_CTX& ctx = visitor->Context();
+  if (!ctx.Config().Linear_transform_only()) {
+    if (node->Opcode() == OPC_MAC) {
+      return fhe::poly::DEFAULT_HANDLER::template Handle_mac<RETV, VISITOR>(
+          visitor, node);
+    }
+    return fhe::poly::DEFAULT_HANDLER::template Handle_mac_ext<RETV, VISITOR>(
+        visitor, node);
+  }
+
+  CMPLR_ASSERT(node->Num_child() == 3, "invalid mac op node");
+  POLY_IR_GEN&          pgen = ctx.Poly_gen();
+  air::base::CONTAINER* cntr = pgen.Container();
+  POLY_LOWER_RETV       children[3];
+  for (uint32_t index = 0; index < 3; ++index) {
+    children[index] =
+        visitor->template Visit<RETV>(node->Child(index));
+    CMPLR_ASSERT(!children[index].Is_null(), "null mac operand");
+  }
+
+  CONST_VAR& v_node = pgen.Node_var(node);
+  ctx.Prepend(pgen.New_init_poly_by_opnd(
+      v_node, node, node->Opcode() == OPC_MAC_EXT || Has_ext_attr(ctx, node),
+      node->Spos()));
+  air::base::NODE_PTR preserved = cntr->Clone_node(node);
+  for (uint32_t index = 0; index < 3; ++index) {
+    preserved->Set_child(index, children[index].Node());
+  }
+  return POLY_LOWER_RETV(preserved);
 }
 
 template <typename RETV, typename VISITOR>
@@ -156,10 +267,27 @@ POLY_LOWER_RETV H2LPOLY::Handle_binary_op(VISITOR*            visitor,
   CONST_VAR& v_node = pgen.Node_var(node);
 
   // Add init poly
-  bool                is_ext = Has_ext_attr(ctx, node);
+  const bool is_ext_opcode =
+      node->Opcode() == OPC_ADD_EXT || node->Opcode() == OPC_SUB_EXT ||
+      node->Opcode() == OPC_MUL_EXT;
+  bool is_ext = is_ext_opcode || Has_ext_attr(ctx, node);
   air::base::STMT_PTR s_init =
       pgen.New_init_poly_by_opnd(v_node, node, is_ext, node->Spos());
   ctx.Prepend(s_init);
+
+  // LINEAR_TRANSFORM deliberately keeps QP scheduling visible at POLY, but
+  // the final CPU boundary should use ANT's contiguous whole-polynomial
+  // kernels.  Expanding these operations into one Hw_* call per RNS limb
+  // creates thousands of tiny calls and is substantially slower than RTL.
+  // Run_flatten has already materialized each operation as a store RHS, so it
+  // is safe to preserve this one node for POLY IR2C.
+  if (ctx.Config().Linear_transform_only() &&
+      (is_ext || node->Opcode() == OPC_ROTATE)) {
+    air::base::NODE_PTR preserved = cntr->Clone_node(node);
+    preserved->Set_child(0, n0_retv.Node());
+    preserved->Set_child(1, n1_retv.Node());
+    return POLY_LOWER_RETV(preserved);
+  }
 
   if (ctx.Config().Inline_rns()) {
     air::base::STMT_LIST sl = air::base::STMT_LIST::Enclosing_list(s_init);

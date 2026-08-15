@@ -1059,6 +1059,8 @@ public:
   RETV Handle_rotate(VISITOR* visitor, NODE_PTR node);
   template <typename RETV, typename VISITOR>
   RETV Handle_rotate_batch(VISITOR* visitor, NODE_PTR node);
+  template <typename RETV, typename VISITOR>
+  RETV Handle_linear_transform(VISITOR* visitor, NODE_PTR node);
 
   template <typename RETV, typename VISITOR>
   RETV Handle_relin(VISITOR* visitor, NODE_PTR node);
@@ -1089,6 +1091,23 @@ public:
   RETV Handle_bootstrap_eval_mod(VISITOR* visitor, NODE_PTR node);
   template <typename RETV, typename VISITOR>
   RETV Handle_bootstrap_slots_to_coeffs(VISITOR* visitor, NODE_PTR node);
+
+  template <typename RETV, typename VISITOR>
+  RETV Handle_parallel_sections_begin(VISITOR* visitor, NODE_PTR node) {
+    return RETV(node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_parallel_section_begin(VISITOR* visitor, NODE_PTR node) {
+    return RETV(node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_parallel_section_end(VISITOR* visitor, NODE_PTR node) {
+    return RETV(node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_parallel_sections_end(VISITOR* visitor, NODE_PTR node) {
+    return RETV(node);
+  }
 
 private:
   //! handle encode as 2nd child of CKKS.mul/add/sub
@@ -1320,6 +1339,27 @@ RETV CKKS_SCALE_MANAGER::Handle_rotate_batch(VISITOR* visitor, NODE_PTR node) {
   SCALE_INFO     si    = retv0.Scale_info();
   ctx.Set_node_scale_info(node, si);
   return RETV{si, node};
+}
+
+template <typename RETV, typename VISITOR>
+RETV CKKS_SCALE_MANAGER::Handle_linear_transform(VISITOR* visitor,
+                                                  NODE_PTR node) {
+  AIR_ASSERT_MSG(node->Num_child() == 2 &&
+                     node->Child(0) != air::base::Null_ptr &&
+                     node->Child(1) != air::base::Null_ptr,
+                 "linear_transform requires ciphertext and coefficient operands");
+  SCALE_MNG_CTX& ctx   = visitor->Context();
+  RETV           input = visitor->template Visit<RETV>(node->Child(0));
+  (void)visitor->template Visit<RETV>(node->Child(1));
+
+  const uint32_t* plain_scale = node->Attr<uint32_t>(
+      core::FHE_ATTR_KIND::LT_SCALE_DEGREE);
+  AIR_ASSERT_MSG(plain_scale != nullptr && *plain_scale > 0,
+                 "linear_transform requires a positive plaintext scale degree");
+  SCALE_INFO result(input.Scale_info().Scale_deg() + *plain_scale,
+                    input.Scale_info().Rescale_level());
+  ctx.Set_node_scale_info(node, result);
+  return RETV{result, node};
 }
 
 template <typename RETV, typename VISITOR>

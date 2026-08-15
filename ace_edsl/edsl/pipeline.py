@@ -52,6 +52,13 @@ def _pass_pipeline_config(config):
     return config
 
 
+class PolyLowering(str, Enum):
+    """Compiler lowering strategy used by the CKKS-to-POLY driver."""
+
+    SPOLY = "spoly"
+    LINEAR_TRANSFORM = "linear_transform"
+
+
 @dataclass
 class FHEConfig:
     """FHE parameter configuration for CKKS/Poly lowering."""
@@ -75,6 +82,7 @@ class FHEConfig:
     provider: str = "ant"
     codegen_ir: Optional[str] = None
     enable_poly: Optional[bool] = None
+    poly_lowering: str | PolyLowering = PolyLowering.SPOLY
     function_name_prefix: str = ""
     constant_name_prefix: str = ""
     pt_from_msg_name: str = "Pt_from_msg"
@@ -104,6 +112,25 @@ class FHEConfig:
 
         self.codegen_ir = selected
         self.enable_poly = selected == "poly"
+
+        poly_lowering = self.poly_lowering
+        if isinstance(poly_lowering, PolyLowering):
+            poly_lowering = poly_lowering.value
+        elif isinstance(poly_lowering, str):
+            poly_lowering = poly_lowering.strip().lower()
+        else:
+            raise TypeError("poly_lowering must be a PolyLowering or string")
+        supported_poly_lowerings = {mode.value for mode in PolyLowering}
+        if poly_lowering not in supported_poly_lowerings:
+            raise ValueError(
+                "poly_lowering must be 'spoly' or 'linear_transform'"
+            )
+        if (poly_lowering == PolyLowering.LINEAR_TRANSFORM.value and
+                selected != "poly"):
+            raise ValueError(
+                "poly_lowering='linear_transform' requires codegen_ir='poly'"
+            )
+        self.poly_lowering = poly_lowering
 
 
 @dataclass(frozen=True)
@@ -225,6 +252,7 @@ class AcePipeline:
         provider: str = "ant",
         codegen_ir: Optional[str] = None,
         enable_poly: Optional[bool] = None,
+        poly_lowering: str | PolyLowering = PolyLowering.SPOLY,
         function_name_prefix: str = "",
         constant_name_prefix: str = "",
         pt_from_msg_name: str = "Pt_from_msg",
@@ -248,6 +276,8 @@ class AcePipeline:
             ct_encode: Enable ciphertext encoding
             free_poly: Free polynomial after use
             enable_poly: Enable poly lowering (False = CKKS-level C for debugging)
+            poly_lowering: CKKS-to-POLY strategy (`spoly` or experimental
+                `linear_transform`)
             function_name_prefix: Prefix for generated C function symbols
             constant_name_prefix: Prefix for generated C constant symbols
             pt_from_msg_name: Plaintext data loader function name
@@ -273,6 +303,7 @@ class AcePipeline:
             provider=provider,
             codegen_ir=codegen_ir,
             enable_poly=enable_poly,
+            poly_lowering=poly_lowering,
             function_name_prefix=function_name_prefix,
             constant_name_prefix=constant_name_prefix,
             pt_from_msg_name=pt_from_msg_name,
@@ -440,7 +471,9 @@ class AcePipeline:
             return {"success": False, "message": "No AIR module"}
         
         air_builder = self._get_air_builder()
-        return air_builder.run_poly_driver(self.glob_scope)
+        return air_builder.run_poly_driver(
+            self.glob_scope, self.fhe_config.poly_lowering
+        )
     
     def run_poly2c(self) -> Optional[str]:
         """
@@ -903,6 +936,7 @@ class Pipeline:
         provider: str = "ant",
         codegen_ir: Optional[str] = None,
         enable_poly: Optional[bool] = None,
+        poly_lowering: str | PolyLowering = PolyLowering.SPOLY,
         context_manifest_file: str = "",
         resource_manifest_file: str = "",
         constant_manifest_file: str = "",
@@ -924,6 +958,8 @@ class Pipeline:
             ct_encode: Enable ciphertext encoding
             free_poly: Free polynomials after use
             enable_poly: Enable poly lowering (False = CKKS-level C for debugging)
+            poly_lowering: CKKS-to-POLY strategy (`spoly` or experimental
+                `linear_transform`)
             
         Returns:
             self for chaining
@@ -944,6 +980,7 @@ class Pipeline:
             provider=provider,
             codegen_ir=codegen_ir,
             enable_poly=enable_poly,
+            poly_lowering=poly_lowering,
             context_manifest_file=context_manifest_file,
             resource_manifest_file=resource_manifest_file,
             constant_manifest_file=constant_manifest_file,
@@ -1119,7 +1156,9 @@ class Pipeline:
         elif phase == "poly_driver":
             if self.config.codegen_ir != "poly":
                 raise RuntimeError("poly_driver is not selected by codegen_ir")
-            result = air_builder.run_poly_driver(self.glob)
+            result = air_builder.run_poly_driver(
+                self.glob, self.config.poly_lowering
+            )
             return result.get("success", False)
         
         elif phase == "poly2c":

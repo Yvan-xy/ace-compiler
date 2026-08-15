@@ -153,6 +153,11 @@ public:
     return false;
   }
 
+  bool Is_poly_ptr(air::base::TYPE_PTR type) {
+    return type->Is_ptr() && Lower_ctx().Is_rns_poly_type(
+                                 type->Cast_to_ptr()->Domain_type_id());
+  }
+
 private:
   void Emit_get_input_data(air::base::ADDR_DATUM_PTR var) {
     if (var->Type()->Is_array()) {

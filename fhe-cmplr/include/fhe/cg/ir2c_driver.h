@@ -123,8 +123,9 @@ public:
 private:
   void Emit_get_context_params() {
     const core::CTX_PARAM& param = _ctx.Lower_ctx().Get_ctx_param();
-    const std::set<int32_t>& rot_keys = param.Get_rotate_index();
     if (!_ctx.Emit_provider_context_manifest()) {
+      const std::set<int32_t> rot_keys =
+          param.Get_legacy_runtime_rotate_index();
       _ctx << "CKKS_PARAMS* ";
       _ctx.Emit_identifier(_ctx.Function_name_prefix());
       _ctx << "Get_context_params() {\n";

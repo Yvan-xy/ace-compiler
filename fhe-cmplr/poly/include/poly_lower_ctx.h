@@ -158,6 +158,10 @@ public:
       return false;
     }
     if (parent->Domain() == fhe::ckks::CKKS_DOMAIN::ID) {
+      if (Config().Linear_transform_only()) {
+        return parent->Operator() ==
+               fhe::ckks::CKKS_OPERATOR::LINEAR_TRANSFORM;
+      }
       switch (parent->Operator()) {
         case fhe::ckks::CKKS_OPERATOR::ADD:
         case fhe::ckks::CKKS_OPERATOR::SUB:
@@ -167,6 +171,7 @@ public:
         case fhe::ckks::CKKS_OPERATOR::RELIN:
         case fhe::ckks::CKKS_OPERATOR::MODSWITCH:
         case fhe::ckks::CKKS_OPERATOR::RAISE_MOD:
+        case fhe::ckks::CKKS_OPERATOR::LINEAR_TRANSFORM:
           return true;
         default:
           return false;
@@ -203,6 +208,11 @@ public:
         case fhe::poly::ADD:
         case fhe::poly::SUB:
         case fhe::poly::MUL:
+        case fhe::poly::ADD_EXT:
+        case fhe::poly::SUB_EXT:
+        case fhe::poly::MUL_EXT:
+        case fhe::poly::MAC:
+        case fhe::poly::MAC_EXT:
         case fhe::poly::ROTATE:
         case fhe::poly::EXTEND:
         case fhe::poly::MODSWITCH:

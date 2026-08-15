@@ -734,6 +734,11 @@ bool Verify_ckks_node(NODE_PTR node, NODE_PTR parent,
                       core::PROVIDER provider,
                       std::string* diagnostic) {
   CKKS_OPERATOR op = static_cast<CKKS_OPERATOR>(node->Operator());
+  if (op == CKKS_OPERATOR::LINEAR_TRANSFORM) {
+    return Fail(
+        "CKKS2C rejects unlowered compiler-only CKKS.linear_transform",
+        diagnostic);
+  }
   if (provider == core::PROVIDER::PHANTOM) {
     switch (op) {
       case CKKS_OPERATOR::BOOTSTRAP:

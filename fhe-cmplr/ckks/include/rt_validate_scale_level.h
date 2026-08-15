@@ -9,6 +9,7 @@
 #ifndef FHE_CKKS_RT_VAL_SCL_LVL_H
 #define FHE_CKKS_RT_VAL_SCL_LVL_H
 #include <algorithm>
+#include <vector>
 
 #include "air/base/analyze_ctx.h"
 #include "air/base/container.h"
@@ -86,6 +87,32 @@ public:
         node->Set_attr(nn::core::ATTR::RNUM, &default_rot, 1);
         _fhe_ctx->Get_ctx_param().Add_rotate_index(default_rot);
         Trace(TD_RT_VAL, "RT_VALIDATE_SCL_LVL reset rotate_batch to default\n");
+        break;
+      }
+      case OPC_LINEAR_TRANSFORM: {
+        auto reset_rotations = [&](const char* attr_name) -> bool {
+          uint32_t   count = 0;
+          const int* values = node->Attr<int>(attr_name, &count);
+          if (values == nullptr || count == 0) return false;
+          std::vector<int32_t> replacements(values, values + count);
+          bool                 replaced = false;
+          for (int32_t& value : replacements) {
+            if (value != 0) {
+              value    = DEFAULT_ROT_IDX;
+              replaced = true;
+            }
+          }
+          node->Set_attr(attr_name, replacements.data(), replacements.size());
+          return replaced;
+        };
+        const bool has_rotation =
+            reset_rotations(core::FHE_ATTR_KIND::LT_ROT_IN) |
+            reset_rotations(core::FHE_ATTR_KIND::LT_ROT_OUT);
+        if (has_rotation) {
+          _fhe_ctx->Get_ctx_param().Add_rotate_index(DEFAULT_ROT_IDX);
+        }
+        Trace(TD_RT_VAL,
+              "RT_VALIDATE_SCL_LVL reset linear_transform rotations to default\n");
         break;
       }
       case OPC_MUL:

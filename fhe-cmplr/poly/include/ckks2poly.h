@@ -21,6 +21,8 @@
 #include "fhe/core/lower_ctx.h"
 #include "fhe/core/rt_timing.h"
 #include "fhe/poly/config.h"
+#include "fhe/poly/default_handler.h"
+#include "fhe/poly/handler.h"
 #include "poly_ir_gen.h"
 #include "poly_lower_ctx.h"
 
@@ -31,9 +33,11 @@ namespace poly {
 class CKKS2POLY;
 class CORE2POLY;
 class CKKS2POLY_CTX;
+class POLY2SPOLY;
 using CKKS2POLY_VISITOR =
     air::base::VISITOR<CKKS2POLY_CTX, air::core::HANDLER<CORE2POLY>,
-                       fhe::ckks::HANDLER<CKKS2POLY>>;
+                       fhe::ckks::HANDLER<CKKS2POLY>,
+                       fhe::poly::HANDLER<POLY2SPOLY>>;
 
 //! @brief CKKS2POLY handler context
 class CKKS2POLY_CTX : public air::base::TRANSFORM_CTX {
@@ -199,6 +203,27 @@ private:
   POLY_IR_GEN           _poly_gen;
   std::stack<NODE_PAIR> _rns_blk;  // stack maintains the RNS loop block
                                    // pair <outer_block, body_block>
+};
+
+//! Preserve HPOLY regions during the hybrid SPOLY pass while carrying the
+//! structured parallel-section state into SPOLY scratch allocation.
+class POLY2SPOLY : public fhe::poly::DEFAULT_HANDLER {
+public:
+  template <typename RETV, typename VISITOR>
+  RETV Handle_parallel_section_begin(VISITOR* visitor,
+                                     air::base::NODE_PTR node) {
+    visitor->Context().Poly_gen().Enter_parallel_section();
+    return visitor->Context().template Handle_node<RETV>(visitor, node);
+  }
+
+  template <typename RETV, typename VISITOR>
+  RETV Handle_parallel_section_end(VISITOR* visitor,
+                                   air::base::NODE_PTR node) {
+    RETV retv =
+        visitor->Context().template Handle_node<RETV>(visitor, node);
+    visitor->Context().Poly_gen().Leave_parallel_section();
+    return retv;
+  }
 };
 
 //! @brief Lower CKKS IR to Poly IR

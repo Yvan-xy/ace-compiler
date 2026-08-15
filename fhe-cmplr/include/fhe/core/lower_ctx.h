@@ -96,6 +96,16 @@ public:
       "explicit_scale_coordinate";
   // bool, emit CKKS.raise_mod level via configured runtime helper in IR2C
   static constexpr const char* RUNTIME_RAISE_LEVEL = "runtime_raise_level";
+  // CKKS.linear_transform descriptor schema and BSGS schedule attributes.
+  static constexpr const char* LT_SCHEMA_VERSION = "lt_schema_version";
+  static constexpr const char* LT_SLOTS          = "lt_slots";
+  static constexpr const char* LT_TERM_COUNT     = "lt_term_count";
+  static constexpr const char* LT_ROT_IN         = "lt_rot_in";
+  static constexpr const char* LT_ROT_OUT        = "lt_rot_out";
+  static constexpr const char* LT_SCALE_DEGREE   = "lt_scale_degree";
+  static constexpr const char* LT_PLAIN_LEVEL    = "lt_plain_level";
+  static constexpr const char* LT_NUM_P          = "lt_num_p";
+  static constexpr const char* LT_ENCODE_CACHE   = "lt_encode_cache";
 };
 
 //! info of function gen in FHE phase

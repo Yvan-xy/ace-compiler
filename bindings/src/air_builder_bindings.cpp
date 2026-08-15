@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -1841,6 +1842,162 @@ public:
         auto node = wrap_node(n, "fhe::ckks::ROTATE_BATCH");
         node->add_child(ct);
         return node;
+    }
+
+    // Compiler-only CKKS diagonal linear-transform descriptor.  Coefficients
+    // are stored row-major as one interleaved-f64 constant and are not lowered
+    // to a runtime library call at this layer.
+    std::shared_ptr<Node> new_ckks_linear_transform(
+        std::shared_ptr<Node> ct, py::list coefficients, py::list rot_in,
+        py::list rot_out, uint32_t slots, uint32_t term_count,
+        uint32_t scale_degree = 1, uint32_t plain_level = 0,
+        uint32_t num_p = 0, bool encode_cache = true,
+        uint32_t schema_version = 1) {
+        require_not_expired();
+        if (!(container && glob && ct && ct->has_node &&
+              ct->node != air::base::Null_ptr)) {
+            throw std::runtime_error(
+                "new_ckks_linear_transform requires a real ciphertext operand");
+        }
+        if (slots == 0 || term_count == 0 || scale_degree == 0 ||
+            schema_version == 0) {
+            throw std::runtime_error(
+                "new_ckks_linear_transform requires positive slots, term_count, "
+                "scale_degree, and schema_version");
+        }
+        if (rot_in.empty() || rot_out.empty()) {
+            throw std::runtime_error(
+                "new_ckks_linear_transform requires non-empty rotation lists");
+        }
+
+        std::vector<int32_t> input_rotations;
+        std::vector<int32_t> output_rotations;
+        input_rotations.reserve(rot_in.size());
+        output_rotations.reserve(rot_out.size());
+        for (py::handle item : rot_in) {
+            input_rotations.push_back(item.cast<int32_t>());
+        }
+        for (py::handle item : rot_out) {
+            output_rotations.push_back(item.cast<int32_t>());
+        }
+        if (output_rotations.front() != 0) {
+            throw std::runtime_error(
+                "new_ckks_linear_transform requires rot_out to start with zero");
+        }
+        const uint64_t schedule_capacity =
+            static_cast<uint64_t>(input_rotations.size()) *
+            static_cast<uint64_t>(output_rotations.size());
+        if (term_count > schedule_capacity) {
+            throw std::runtime_error(
+                "new_ckks_linear_transform term_count exceeds BSGS schedule capacity");
+        }
+        const uint64_t expected_coefficients =
+            static_cast<uint64_t>(term_count) * static_cast<uint64_t>(slots);
+        if (expected_coefficients > std::numeric_limits<size_t>::max() ||
+            expected_coefficients >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / 2 ||
+            coefficients.size() != static_cast<size_t>(expected_coefficients)) {
+            throw std::runtime_error(
+                "new_ckks_linear_transform coefficient count must equal "
+                "term_count * slots");
+        }
+
+        std::vector<double> coefficient_buffer;
+        coefficient_buffer.reserve(coefficients.size() * 2);
+        for (py::handle item : coefficients) {
+            double real = 0.0;
+            double imag = 0.0;
+            if (PyComplex_Check(item.ptr())) {
+                std::complex<double> value = item.cast<std::complex<double>>();
+                real                       = value.real();
+                imag                       = value.imag();
+            } else if (py::isinstance<py::list>(item) ||
+                       py::isinstance<py::tuple>(item)) {
+                py::sequence pair = item.cast<py::sequence>();
+                if (pair.size() != 2) {
+                    throw std::runtime_error(
+                        "new_ckks_linear_transform complex pairs require two elements");
+                }
+                real = pair[0].cast<double>();
+                imag = pair[1].cast<double>();
+            } else {
+                real = item.cast<double>();
+            }
+            coefficient_buffer.push_back(real);
+            coefficient_buffer.push_back(imag);
+        }
+
+        SPOS spos = get_spos();
+        TYPE_PTR f64_type =
+            glob->Prim_type(air::base::PRIMITIVE_TYPE::FLOAT_64);
+        std::vector<int64_t> dimensions = {
+            static_cast<int64_t>(coefficient_buffer.size())};
+        TYPE_PTR coefficient_type = glob->New_arr_type(
+            glob->New_str("linear_transform_coefficients"), f64_type,
+            dimensions, spos);
+        CONSTANT_PTR coefficient_constant = glob->New_const(
+            CONSTANT_KIND::ARRAY, coefficient_type, coefficient_buffer.data(),
+            coefficient_buffer.size() * sizeof(double));
+        NODE_PTR coefficient_node =
+            container->New_ldc(coefficient_constant, spos);
+
+        NODE_PTR linear_transform = container->New_cust_node(
+            fhe::ckks::OPC_LINEAR_TRANSFORM,
+            get_compatible_type(ct->node->Rtype()), spos);
+        linear_transform->Set_child(0, ct->node);
+        linear_transform->Set_child(1, coefficient_node);
+        linear_transform->Set_attr(
+            fhe::core::FHE_ATTR_KIND::LT_SCHEMA_VERSION, &schema_version, 1);
+        linear_transform->Set_attr(fhe::core::FHE_ATTR_KIND::LT_SLOTS, &slots,
+                                   1);
+        linear_transform->Set_attr(fhe::core::FHE_ATTR_KIND::LT_TERM_COUNT,
+                                   &term_count, 1);
+        linear_transform->Set_attr(fhe::core::FHE_ATTR_KIND::LT_ROT_IN,
+                                   input_rotations.data(),
+                                   input_rotations.size());
+        linear_transform->Set_attr(fhe::core::FHE_ATTR_KIND::LT_ROT_OUT,
+                                   output_rotations.data(),
+                                   output_rotations.size());
+        linear_transform->Set_attr(
+            fhe::core::FHE_ATTR_KIND::LT_SCALE_DEGREE, &scale_degree, 1);
+        linear_transform->Set_attr(fhe::core::FHE_ATTR_KIND::LT_PLAIN_LEVEL,
+                                   &plain_level, 1);
+        linear_transform->Set_attr(fhe::core::FHE_ATTR_KIND::LT_NUM_P, &num_p,
+                                   1);
+        const uint32_t cache_flag = encode_cache ? 1U : 0U;
+        linear_transform->Set_attr(
+            fhe::core::FHE_ATTR_KIND::LT_ENCODE_CACHE, &cache_flag, 1);
+
+        auto wrapped = wrap_node(linear_transform,
+                                 "fhe::ckks::LINEAR_TRANSFORM");
+        wrapped->add_child(ct);
+        return wrapped;
+    }
+
+    void new_ckks_parallel_sections_begin() {
+        append_ckks_parallel_marker(
+            fhe::ckks::OPC_PARALLEL_SECTIONS_BEGIN);
+    }
+
+    void new_ckks_parallel_section_begin() {
+        append_ckks_parallel_marker(fhe::ckks::OPC_PARALLEL_SECTION_BEGIN);
+    }
+
+    void new_ckks_parallel_section_end() {
+        append_ckks_parallel_marker(fhe::ckks::OPC_PARALLEL_SECTION_END);
+    }
+
+    void new_ckks_parallel_sections_end() {
+        append_ckks_parallel_marker(fhe::ckks::OPC_PARALLEL_SECTIONS_END);
+    }
+
+    void append_ckks_parallel_marker(air::base::OPCODE opcode) {
+        require_not_expired();
+        if (!container) {
+            throw std::runtime_error(
+                "CKKS parallel marker requires a real AIR container");
+        }
+        append_stmt(container->New_cust_stmt(opcode, get_spos()));
     }
     
     // CKKS encode - encode scalar/constant into plaintext polynomial
@@ -7440,16 +7597,20 @@ private:
         }
 
         if (!fhe_types_registered) {
-            // Set up CTX_PARAM with reasonable FHE/CKKS defaults
+            // Type registration must not overwrite invocation-owned FHE
+            // parameters that run_ckks_driver already installed.  In
+            // particular, resetting the scaling factor here changes the
+            // derived P-prime count while POLY lowering is in progress.
             auto& ctx_param = lower_ctx->Get_ctx_param();
-            ctx_param.Set_poly_degree(16384, false);               // N = 2^14
-            // Type registration must not choose the ciphertext-chain length.
-            // The CKKS driver establishes it later from configure_fhe_params()
-            // (the compiler invocation authority) or from its default path.
-            ctx_param.Set_security_level(128);              // 128-bit security
-            ctx_param.Set_first_prime_bit_num(60);          // First prime bits
-            ctx_param.Set_scaling_factor_bit_num(40);       // Scale factor bits
-            ctx_param.Set_hamming_weight(192);              // Hamming weight
+            if (!fhe_config_set) {
+                ctx_param.Set_poly_degree(16384, false);     // N = 2^14
+                // Type registration must not choose the ciphertext-chain
+                // length.  The CKKS driver establishes it later.
+                ctx_param.Set_security_level(128);
+                ctx_param.Set_first_prime_bit_num(60);
+                ctx_param.Set_scaling_factor_bit_num(40);
+                ctx_param.Set_hamming_weight(192);
+            }
             
             if (found_existing_cipher) {
                 // Use existing types instead of creating new ones
@@ -10563,7 +10724,42 @@ py::dict load_onnx_model(const std::string& onnx_path) {
 
 // Standalone wrapper for fhe::poly::POLY_DRIVER
 // This allows direct Python access to the Poly lowering driver (CKKS -> Poly)
-py::dict run_poly_driver(std::shared_ptr<GlobScope> glob) {
+static bool contains_ckks_linear_transform(GLOB_SCOPE& glob) {
+    for (GLOB_SCOPE::FUNC_SCOPE_ITER iter = glob.Begin_func_scope();
+         iter != glob.End_func_scope(); ++iter) {
+        FUNC_SCOPE& function = *iter;
+        std::unordered_set<uint64_t> visited;
+        std::function<bool(NODE_PTR)> scan;
+        scan = [&](NODE_PTR node) -> bool {
+            if (node == air::base::Null_ptr) return false;
+            const uint64_t node_id = node->Id().Value();
+            if (node_id != 0 && !visited.insert(node_id).second) return false;
+            if (node->Opcode() == fhe::ckks::OPC_LINEAR_TRANSFORM) return true;
+            if (node->Is_block()) {
+                STMT_LIST statements(node);
+                for (STMT_PTR statement = statements.Begin_stmt();
+                     statement != statements.End_stmt();
+                     statement = statement->Next()) {
+                    if (statement != air::base::Null_ptr &&
+                        scan(statement->Node())) {
+                        return true;
+                    }
+                }
+            }
+            for (uint32_t index = 0; index < node->Num_child(); ++index) {
+                if (scan(node->Child(index))) return true;
+            }
+            return false;
+        };
+
+        STMT_PTR entry = function.Container().Entry_stmt();
+        if (entry != air::base::Null_ptr && scan(entry->Node())) return true;
+    }
+    return false;
+}
+
+py::dict run_poly_driver(std::shared_ptr<GlobScope> glob,
+                         std::string poly_lowering = "spoly") {
     py::dict result;
     result["success"] = false;
     result["message"] = "";
@@ -10573,6 +10769,26 @@ py::dict run_poly_driver(std::shared_ptr<GlobScope> glob) {
         return result;
     }
     glob->require_no_air_pass_transaction("Poly lowering");
+
+    std::transform(poly_lowering.begin(), poly_lowering.end(),
+                   poly_lowering.begin(), [](unsigned char value) {
+                       return static_cast<char>(std::tolower(value));
+                   });
+    if (poly_lowering != "spoly" && poly_lowering != "linear_transform") {
+        result["message"] =
+            "Unknown poly lowering mode; expected 'spoly' or "
+            "'linear_transform'";
+        return result;
+    }
+    const bool has_linear_transform =
+        contains_ckks_linear_transform(*glob->glob);
+    if (has_linear_transform && poly_lowering == "spoly") {
+        result["message"] =
+            "Poly lowering mode 'spoly' cannot lower "
+            "CKKS.linear_transform; select "
+            "poly_lowering='linear_transform'";
+        return result;
+    }
     
     glob->prep_fhe_types();
     fhe::core::LOWER_CTX* lower_ctx = glob->get_lower_ctx();
@@ -10583,6 +10799,15 @@ py::dict run_poly_driver(std::shared_ptr<GlobScope> glob) {
     
     try {
         fhe::poly::POLY_CONFIG config;
+        if (poly_lowering == "linear_transform") {
+            config._lower_to_hpoly  = true;
+            config._lower_to_hpoly2 = false;
+            config._lower_to_lpoly  = true;
+            config._prop_attr       = true;
+            config._inline_rotate   = true;
+            config._inline_relin    = true;
+            config._linear_transform_only = true;
+        }
         const auto saved_rotate_keys = lower_ctx->Get_ctx_param().Get_rotate_index();
         // Default SPOLY path: ckks2poly lowering with poly2c flatten.
         // The flatten fix in poly2c_driver.cxx prevents HW_* ops from
@@ -10758,6 +10983,21 @@ PYBIND11_MODULE(air_builder, m) {
         .def("new_ckks_rotate_batch", &Container::new_ckks_rotate_batch,
              py::arg("ct"), py::arg("rotations"),
              "CKKS grouped rotation batch: rotate one ciphertext by many amounts")
+        .def("new_ckks_linear_transform", &Container::new_ckks_linear_transform,
+             py::arg("ct"), py::arg("coefficients"), py::arg("rot_in"),
+             py::arg("rot_out"), py::arg("slots"), py::arg("term_count"),
+             py::arg("scale_degree") = 1, py::arg("plain_level") = 0,
+             py::arg("num_p") = 0, py::arg("encode_cache") = true,
+             py::arg("schema_version") = 1,
+             "Create a compiler-only CKKS BSGS linear-transform descriptor")
+        .def("new_ckks_parallel_sections_begin",
+             &Container::new_ckks_parallel_sections_begin)
+        .def("new_ckks_parallel_section_begin",
+             &Container::new_ckks_parallel_section_begin)
+        .def("new_ckks_parallel_section_end",
+             &Container::new_ckks_parallel_section_end)
+        .def("new_ckks_parallel_sections_end",
+             &Container::new_ckks_parallel_sections_end)
         .def("new_ckks_encode", &Container::new_ckks_encode,
              py::arg("data"),
              py::arg("encode_len") = -1,
@@ -11320,6 +11560,7 @@ PYBIND11_MODULE(air_builder, m) {
     
     m.def("run_poly_driver", &run_poly_driver,
           py::arg("glob_scope"),
+          py::arg("poly_lowering") = "spoly",
           "Run the Poly driver directly on CKKS-level IR. Returns dict with success, message, and ir_dump.");
     
     m.def("load_onnx_model", &load_onnx_model,

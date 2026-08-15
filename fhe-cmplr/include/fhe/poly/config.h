@@ -40,8 +40,15 @@ struct POLY_CONFIG : public fhe::poly::POLY_OPTION_CONFIG {
 public:
   POLY_CONFIG(void) {}
 
+  bool Linear_transform_only() const { return _linear_transform_only; }
+
   void Update_options();
   void Pre_process_options();
+
+  // Preserve ordinary CKKS runtime operations and lower only semantic
+  // LINEAR_TRANSFORM regions through HPOLY/LPOLY.  This is intentionally not
+  // a command-line option; it is selected by the EDSL compiler contract.
+  bool _linear_transform_only = false;
 };
 
 }  // namespace poly

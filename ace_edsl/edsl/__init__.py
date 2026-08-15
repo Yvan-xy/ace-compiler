@@ -70,6 +70,7 @@ from . import domain_ast_decorators  # noqa: F401
 from .pipeline import (
     AcePipeline, 
     FHEConfig, 
+    PolyLowering,
     PipelineResult, 
     compile_to_c,
     Pipeline,
@@ -184,6 +185,7 @@ __all__ = [
     'fast_conv_vector_kernel',
     'configure_fast_conv_dsl',
     'FHEConfig',
+    'PolyLowering',
     'PipelineResult',
     'HookExecutionResult',
     'PassInstrumentation',

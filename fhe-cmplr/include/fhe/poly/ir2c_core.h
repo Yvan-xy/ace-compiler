@@ -28,6 +28,54 @@ namespace poly {
 //! @brief Special IR2C handler for CORE operators
 class IR2C_CORE : public fhe::ckks::IR2C_CORE {
 public:
+  //! @brief Emit a retained QP operation through the whole-polynomial runtime
+  //! kernel.  H2LPOLY may deliberately retain these operations after it has
+  //! materialized their result in any of CORE's four direct store forms.
+  template <typename RETV, typename VISITOR>
+  bool Handle_whole_poly_store(VISITOR*            visitor,
+                               air::base::NODE_PTR node) {
+    IR2C_CTX&           ctx = visitor->Context();
+    air::base::NODE_PTR val = node->Child(0);
+    if (val->Opcode() == fhe::poly::OPC_ADD_EXT ||
+        val->Opcode() == fhe::poly::OPC_SUB_EXT ||
+        val->Opcode() == fhe::poly::OPC_MUL_EXT) {
+      const char* function = val->Opcode() == fhe::poly::OPC_ADD_EXT
+                                 ? "Add_poly"
+                             : val->Opcode() == fhe::poly::OPC_SUB_EXT
+                                 ? "Sub_poly"
+                                 : "Mul_poly";
+      ctx << function << "(&";
+      ctx.Emit_st_var(node);
+      ctx << ", ";
+      visitor->template Visit<RETV>(val->Child(0));
+      ctx << ", ";
+      visitor->template Visit<RETV>(val->Child(1));
+      ctx << ")";
+      return true;
+    }
+    if (val->Opcode() == fhe::poly::OPC_MAC_EXT) {
+      ctx << "Mac_poly(&";
+      ctx.Emit_st_var(node);
+      for (uint32_t index = 0; index < 3; ++index) {
+        ctx << ", ";
+        visitor->template Visit<RETV>(val->Child(index));
+      }
+      ctx << ")";
+      return true;
+    }
+    if (val->Opcode() == fhe::poly::OPC_ROTATE) {
+      ctx << "Rotate_poly_with_cached_rotation_idx(&";
+      ctx.Emit_st_var(node);
+      ctx << ", ";
+      visitor->template Visit<RETV>(val->Child(0));
+      ctx << ", ";
+      visitor->template Visit<RETV>(val->Child(1));
+      ctx << ")";
+      return true;
+    }
+    return false;
+  }
+
   //! @brief Special handling for CORE LD operator
   template <typename RETV, typename VISITOR>
   void Handle_ld(VISITOR* visitor, air::base::NODE_PTR node) {
@@ -146,6 +194,9 @@ public:
   void Handle_st(VISITOR* visitor, air::base::NODE_PTR node) {
     IR2C_CTX&           ctx = visitor->Context();
     air::base::NODE_PTR val = node->Child(0);
+    if (Handle_whole_poly_store<RETV>(visitor, node)) {
+      return;
+    }
     if (val->Opcode() ==
         air::base::OPCODE(fhe::poly::POLYNOMIAL_DID, fhe::poly::DECOMP)) {
       ctx << "Decomp(&";
@@ -329,6 +380,9 @@ public:
   void Handle_stp(VISITOR* visitor, air::base::NODE_PTR node) {
     IR2C_CTX&           ctx = visitor->Context();
     air::base::NODE_PTR val = node->Child(0);
+    if (Handle_whole_poly_store<RETV>(visitor, node)) {
+      return;
+    }
     if (ctx.Is_cipher_type(val->Rtype_id())) {
       if (val->Opcode() == fhe::ckks::OPC_BOOTSTRAP) {
         const uint32_t* mul_lev =
@@ -463,6 +517,9 @@ public:
   void Handle_stf(VISITOR* visitor, air::base::NODE_PTR node) {
     IR2C_CTX&           ctx = visitor->Context();
     air::base::NODE_PTR val = node->Child(0);
+    if (Handle_whole_poly_store<RETV>(visitor, node)) {
+      return;
+    }
     air::base::OPCODE   opc = val->Opcode();
     if (ctx.Is_rns_poly_type(val->Rtype_id())) {
       switch (opc) {
@@ -517,6 +574,9 @@ public:
   void Handle_stpf(VISITOR* visitor, air::base::NODE_PTR node) {
     IR2C_CTX&           ctx = visitor->Context();
     air::base::NODE_PTR val = node->Child(0);
+    if (Handle_whole_poly_store<RETV>(visitor, node)) {
+      return;
+    }
     air::base::OPCODE   opc = val->Opcode();
     if (ctx.Is_rns_poly_type(val->Rtype_id())) {
       switch (opc) {

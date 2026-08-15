@@ -250,6 +250,10 @@ public:
   //! @return air::base::STMT_PTR
   air::base::STMT_PTR New_free_poly(CONST_VAR              v_poly,
                                     const air::base::SPOS& spos);
+  //! @brief Free an array of RNS polynomials allocated for key-switch
+  //! precomputation.
+  air::base::STMT_PTR New_free_polys(CONST_VAR              v_polys,
+                                     const air::base::SPOS& spos);
 
   //! @brief Create node to get ring degree
   //! @param spos source position
@@ -357,6 +361,10 @@ public:
   //! @return air::base::NODE_PTR
   air::base::NODE_PTR New_mod_down(air::base::NODE_PTR    node,
                                    const air::base::SPOS& spos);
+
+  //! @brief Extend a Q-basis polynomial to the configured QP basis.
+  air::base::NODE_PTR New_extend(air::base::NODE_PTR    node,
+                                 const air::base::SPOS& spos);
 
   //! @brief Create DECOMP_MODUP node
   //! @param node Source node

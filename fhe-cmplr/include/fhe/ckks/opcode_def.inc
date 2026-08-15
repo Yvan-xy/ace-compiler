@@ -41,7 +41,24 @@ CKKS_OPCODE(BOOTSTRAP_EVAL_MOD, bootstrap_eval_mod, 1, 0,
 CKKS_OPCODE(BOOTSTRAP_SLOTS_TO_COEFFS, bootstrap_slots_to_coeffs, 1, 0,
             PROP_EXPR | PROP_TYPE | PROP_ATTR | PROP_LIB_CALL)
 
+// Compiler-only semantic description of one BSGS diagonal linear transform.
+// This operation must be lowered to POLY primitives before code generation.
+CKKS_OPCODE(LINEAR_TRANSFORM, linear_transform, 2, 0,
+            PROP_EXPR | PROP_TYPE | PROP_ATTR)
+
 // free opcode to free ciphertext
 CKKS_OPCODE(FREE,       free,       1, 0, PROP_STMT | PROP_TYPE | PROP_LIB_CALL)
+
+// Compiler-only structured scheduling markers.  They delimit independent
+// statement regions while keeping every CKKS/POLY operation visible to the
+// normal lowering and optimization passes.
+CKKS_OPCODE(PARALLEL_SECTIONS_BEGIN, parallel_sections_begin, 0, 0,
+            PROP_SCF | PROP_STMT)
+CKKS_OPCODE(PARALLEL_SECTION_BEGIN, parallel_section_begin, 0, 0,
+            PROP_SCF | PROP_STMT)
+CKKS_OPCODE(PARALLEL_SECTION_END, parallel_section_end, 0, 0,
+            PROP_SCF | PROP_STMT)
+CKKS_OPCODE(PARALLEL_SECTIONS_END, parallel_sections_end, 0, 0,
+            PROP_SCF | PROP_STMT)
 
 #undef CKKS_OPCODE

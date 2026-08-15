@@ -147,7 +147,9 @@ public:
   }
 
   void Set_attr_info(air::base::NODE_PTR node, const ATTR_INFO& attr_info) {
-    AIR_ASSERT(attr_info.Is_valid());
+    AIR_ASSERT_MSG(attr_info.Is_valid(),
+                   "invalid propagated attributes for node %s",
+                   node->Name());
     _irgen.Set_num_q(node, attr_info.Num_q());
 
     if (attr_info.Num_p() > 0) {
@@ -247,24 +249,112 @@ public:
   //! to capture any unresolved IR
   template <typename RETV, typename VISITOR>
   RETV Handle_encode(VISITOR* visitor, air::base::NODE_PTR node) {
-    IR_GEN&            irgen = visitor->Context().Irgen();
+    ATTR_PROP_CTX&      ctx   = visitor->Context();
+    // In the hybrid path ordinary CKKS remains for the subsequent SPOLY
+    // pass.  Do not freeze a dynamic CKKS.level child into the logical level
+    // inferred by the CKKS analysis (for bootstrap EvalMod that logical level
+    // is relative to the refreshed chain, not the runtime Q level).  The
+    // LINEAR_TRANSFORM row encodes are already POLY.ENCODE nodes here and are
+    // still handled by HPOLY_ATTR_PROP below.
+    if (ctx.Config().Linear_transform_only()) return ATTR_INFO();
+    IR_GEN&             irgen = ctx.Irgen();
     air::base::TYPE_ID ty    = node->Rtype_id();
     AIR_ASSERT(irgen.Is_fhe_type(ty));
-    // treat encode as leaf node, assume CKKS layer already annoate attribute
-    ATTR_INFO ret(irgen.Get_num_q(node), irgen.Get_num_p(node),
-                  irgen.Get_sbase(node));
+    const uint32_t* level =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
+    uint32_t  num_q  = level == nullptr ? 0 : *level;
+    uint32_t  sf_deg = irgen.Get_sf_deg(node);
+    ATTR_INFO source;
+    air::base::NODE_PTR level_expr = node->Child(3);
+    if (num_q == 0 &&
+        level_expr->Opcode() == fhe::ckks::OPC_LEVEL) {
+      source = visitor->template Visit<RETV>(level_expr->Child(0));
+      AIR_ASSERT(source.Is_valid());
+      num_q = source.Num_q();
+    } else if (num_q == 0 &&
+               level_expr->Opcode() == air::core::OPC_INTCONST) {
+      num_q = level_expr->Intconst();
+    }
+    air::base::NODE_PTR scale_expr = node->Child(2);
+    if (scale_expr->Opcode() == fhe::ckks::OPC_SCALE) {
+      if (!source.Is_valid()) {
+        source = visitor->template Visit<RETV>(scale_expr->Child(0));
+      }
+      AIR_ASSERT(source.Is_valid());
+      sf_deg = source.Sf_deg();
+    }
+    // A zero-level encode remains dynamically level-bound in the surrounding
+    // opaque CKKS path.  LINEAR_TRANSFORM row encodes always carry an explicit
+    // nonzero level and therefore still receive fully static POLY metadata.
+    ATTR_INFO ret(num_q, irgen.Get_num_p(node), irgen.Get_sbase(node), sf_deg);
+    ctx.Set_attr_info(node, ret);
     return ret;
   }
 
   template <typename RETV, typename VISITOR>
   RETV Handle_bootstrap(VISITOR* visitor, air::base::NODE_PTR node) {
-    IR_GEN&            irgen = visitor->Context().Irgen();
+    ATTR_PROP_CTX&      ctx   = visitor->Context();
+    // These CKKS nodes are deliberately opaque until the hybrid SPOLY pass;
+    // preserving their original attributes and dynamic operands is part of
+    // that pass's runtime-level contract.
+    if (ctx.Config().Linear_transform_only()) return ATTR_INFO();
+    IR_GEN&             irgen = ctx.Irgen();
     air::base::TYPE_ID ty    = node->Rtype_id();
     AIR_ASSERT(irgen.Is_fhe_type(ty));
-    // treat bootstrap as leaf node, assume CKKS layer already annoate attribute
-    ATTR_INFO ret(irgen.Get_num_q(node), irgen.Get_num_p(node),
-                  irgen.Get_sbase(node));
+    const uint32_t* level =
+        node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
+    // A zero/missing CKKS level is legal in the existing dynamic runtime path.
+    // Mixed LINEAR_TRANSFORM lowering needs authoritative static metadata only
+    // at the transform boundaries, whose nodes always carry nonzero levels.
+    ATTR_INFO ret(level == nullptr ? 0 : *level, irgen.Get_num_p(node),
+                  irgen.Get_sbase(node), irgen.Get_sf_deg(node));
+    ctx.Set_attr_info(node, ret);
     return ret;
+  }
+
+  template <typename RETV, typename VISITOR>
+  RETV Handle_rotate(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_rotate_batch(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_add(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_sub(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_mul(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_neg(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_rescale(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_upscale(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_modswitch(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_relin(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
+  }
+  template <typename RETV, typename VISITOR>
+  RETV Handle_raise_mod(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
   }
 
   template <typename RETV, typename VISITOR>
@@ -283,6 +373,19 @@ public:
                                         air::base::NODE_PTR node) {
     return Handle_bootstrap<RETV>(visitor, node);
   }
+
+  // These whole-cipher runtime operations deliberately remain at CKKS while
+  // LINEAR_TRANSFORM and ordinary arithmetic are lowered around them.  Their
+  // CKKS analysis attributes are authoritative at this boundary.
+  template <typename RETV, typename VISITOR>
+  RETV Handle_conjugate(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
+  }
+
+  template <typename RETV, typename VISITOR>
+  RETV Handle_mul_mono(VISITOR* visitor, air::base::NODE_PTR node) {
+    return Handle_bootstrap<RETV>(visitor, node);
+  }
 };
 
 class HPOLY_ATTR_PROP : public fhe::poly::DEFAULT_HANDLER {
@@ -290,12 +393,70 @@ public:
   //! @brief Construct a new HPOLY_ATTR_PROP object
   HPOLY_ATTR_PROP() {}
 
+  // Cipher initialization statements write runtime metadata into child 0.
+  // That destination is intentionally read before its first SSA definition,
+  // so attribute propagation must inspect only the initialized operands.
+  template <typename RETV, typename VISITOR>
+  RETV Handle_init_ciph_same_scale(VISITOR* visitor,
+                                   air::base::NODE_PTR node) {
+    return RETV();
+  }
+
+  template <typename RETV, typename VISITOR>
+  RETV Handle_init_ciph_up_scale(VISITOR* visitor,
+                                 air::base::NODE_PTR node) {
+    return Handle_init_ciph_same_scale<RETV>(visitor, node);
+  }
+
+  template <typename RETV, typename VISITOR>
+  RETV Handle_init_ciph_down_scale(VISITOR* visitor,
+                                   air::base::NODE_PTR node) {
+    return RETV();
+  }
+
   template <typename RETV, typename VISITOR>
   RETV Handle_rescale(VISITOR* visitor, air::base::NODE_PTR node) {
     air::base::NODE_PTR n_ch0 = node->Child(0);
     ATTR_INFO           info  = visitor->template Visit<RETV>(n_ch0);
-    AIR_ASSERT(info.Num_q() > 1);
+    const char* child_value =
+        n_ch0->Has_sym() ? n_ch0->Addr_datum()->Name()->Char_str() : "-";
+    AIR_ASSERT_MSG(info.Num_q() > 1,
+                   "cannot rescale num_q=%u child=%s value=%s node=%u",
+                   info.Num_q(), n_ch0->Name(), child_value,
+                   n_ch0->Id().Value());
     ATTR_INFO ret(info.Num_q() - 1, info.Num_p(), info.Sbase());
+    visitor->Context().Set_attr_info(node, ret);
+    return ret;
+  }
+
+  template <typename RETV, typename VISITOR>
+  RETV Handle_modswitch(VISITOR* visitor, air::base::NODE_PTR node) {
+    air::base::NODE_PTR n_ch0 = node->Child(0);
+    ATTR_INFO           info  = visitor->template Visit<RETV>(n_ch0);
+    AIR_ASSERT(info.Is_valid() && info.Num_q() > 1 && info.Num_p() == 0);
+    ATTR_INFO ret(info.Num_q() - 1, 0, info.Sbase(), info.Sf_deg());
+    visitor->Context().Set_attr_info(node, ret);
+    return ret;
+  }
+
+  template <typename RETV, typename VISITOR>
+  RETV Handle_raise_mod(VISITOR* visitor, air::base::NODE_PTR node) {
+    air::base::NODE_PTR n_ch0 = node->Child(0);
+    air::base::NODE_PTR n_ch1 = node->Child(1);
+    ATTR_INFO           info  = visitor->template Visit<RETV>(n_ch0);
+    AIR_ASSERT(info.Is_valid() && info.Num_p() == 0 &&
+               n_ch1->Opcode() == air::core::OPC_INTCONST);
+    uint32_t target_level = n_ch1->Intconst();
+    if (target_level == 0) {
+      target_level =
+          visitor->Context().Lower_ctx()->Get_ctx_param().Get_mul_level();
+    }
+    AIR_ASSERT(target_level >= info.Num_q() &&
+               target_level <= visitor->Context()
+                                   .Lower_ctx()
+                                   ->Get_ctx_param()
+                                   .Get_mul_level());
+    ATTR_INFO ret(target_level, 0, 0, info.Sf_deg());
     visitor->Context().Set_attr_info(node, ret);
     return ret;
   }
@@ -390,6 +551,20 @@ public:
     ATTR_INFO           info  = visitor->template Visit<RETV>(n_ch0);
     ATTR_INFO           ret(info.Num_q(), 0, 0);
     visitor->Context().Set_attr_info(node, ret);
+    return ret;
+  }
+
+  template <typename RETV, typename VISITOR>
+  RETV Handle_extend(VISITOR* visitor, air::base::NODE_PTR node) {
+    ATTR_PROP_CTX&      ctx   = visitor->Context();
+    IR_GEN&             irgen = ctx.Irgen();
+    air::base::NODE_PTR child = node->Child(0);
+    ATTR_INFO           info  = visitor->template Visit<RETV>(child);
+    AIR_ASSERT(info.Is_valid() && info.Num_p() == 0);
+    ATTR_INFO ret(info.Num_q(),
+                  irgen.Lower_ctx()->Get_ctx_param().Get_p_prime_num(),
+                  info.Sbase(), info.Sf_deg());
+    ctx.Set_attr_info(node, ret);
     return ret;
   }
 
@@ -674,6 +849,35 @@ public:
     IR_GEN& irgen = ctx.Irgen();
     if (irgen.Is_fhe_type(node->Rtype_id())) {
       air::opt::SSA_VER_PTR ssa_ver   = ctx.Ssa_cntr()->Node_ver(node->Id());
+      const char* value_name =
+          node->Has_sym() ? node->Addr_datum()->Name()->Char_str() : "preg";
+      const char* value_kind =
+          irgen.Is_type_of(node->Rtype_id(), CIPH)       ? "ciph"
+          : irgen.Is_type_of(node->Rtype_id(), CIPH3)    ? "ciph3"
+          : irgen.Is_type_of(node->Rtype_id(), PLAIN)    ? "plain"
+          : irgen.Is_type_of(node->Rtype_id(), POLY)     ? "poly"
+          : irgen.Is_type_of(node->Rtype_id(), POLY_PTR) ? "poly_ptr"
+                                                         : "unknown";
+      if (!ctx.Has_attr_info(ssa_ver->Id())) {
+        // CKKS level management may already have attached authoritative
+        // metadata to a load whose defining whole-cipher operation is opaque
+        // to HPOLY (for example Conjugate or Mul_mono).  Preserve that
+        // boundary information instead of inventing it from a POLY use.
+        const uint32_t* level =
+            node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
+        if (level != nullptr) {
+          ATTR_INFO direct(*level, irgen.Get_num_p(node),
+                           irgen.Get_sbase(node), irgen.Get_sf_deg(node));
+          ctx.Set_attr_info(ssa_ver->Id(), direct);
+          ctx.Set_attr_info(node, direct);
+          return direct;
+        }
+      }
+      AIR_ASSERT_MSG(ctx.Has_attr_info(ssa_ver->Id()),
+                     "ssa attributes not set for %s %s kind=%s node=%u "
+                     "version=%u",
+                     node->Name(), value_name, value_kind,
+                     node->Id().Value(), ssa_ver->Id().Value());
       const ATTR_INFO&      attr_info = ctx.Attr_info(ssa_ver->Id());
       ctx.Set_attr_info(node, attr_info);
       return attr_info;
@@ -687,6 +891,36 @@ public:
     air::base::TYPE_ID ty =
         node->Has_fld() ? node->Field()->Type_id() : node->Access_type_id();
     if (irgen.Is_fhe_type(ty)) {
+      // ALLOC initializes backing storage for a POLY_PTR before PRECOMP writes
+      // the first value carrying RNS metadata.  There is no Q/P basis to
+      // propagate from that allocation statement itself.
+      if (!rhs_attr.Is_valid() && irgen.Is_type_of(ty, POLY_PTR)) {
+        return ATTR_INFO();
+      }
+      // Hybrid lowering intentionally leaves ordinary whole-cipher CKKS
+      // definitions for SPOLY.  Their logical CKKS levels must not be turned
+      // into static runtime Q levels on the CKKS expression itself.  A
+      // transform boundary still needs the defining variable's SSA metadata
+      // so the generated component loads receive the correct Q basis.
+      if (!rhs_attr.Is_valid() && ctx.Config().Linear_transform_only() &&
+          node->Child(0)->Domain() == fhe::ckks::CKKS_DOMAIN::ID) {
+        const uint32_t* level = node->Child(0)->Attr<uint32_t>(
+            fhe::core::FHE_ATTR_KIND::LEVEL);
+        if (level != nullptr && *level != 0) {
+          ATTR_INFO boundary(*level, irgen.Get_num_p(node->Child(0)),
+                             irgen.Get_sbase(node->Child(0)),
+                             irgen.Get_sf_deg(node->Child(0)));
+          air::opt::SSA_VER_PTR ssa_ver =
+              ctx.Ssa_cntr()->Node_ver(node->Id());
+          ctx.Set_attr_info(ssa_ver->Id(), boundary);
+          ctx.Set_attr_info(node, boundary);
+          ctx.Prop_chi_list(node, boundary);
+        }
+        return ATTR_INFO();
+      }
+      AIR_ASSERT_MSG(rhs_attr.Is_valid(),
+                     "invalid attributes for store RHS node %s",
+                     node->Child(0)->Name());
       air::opt::SSA_VER_PTR ssa_ver = ctx.Ssa_cntr()->Node_ver(node->Id());
       ctx.Set_attr_info(ssa_ver->Id(), rhs_attr);
       ctx.Set_attr_info(node, rhs_attr);

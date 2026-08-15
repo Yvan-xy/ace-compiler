@@ -204,9 +204,11 @@ double Operation_cost(air::base::OPCODE opc, uint32_t level,
                       uint32_t poly_deg) {
   AIR_ASSERT_MSG(opc.Domain() == CKKS_DOMAIN::ID,
                  "currently only support cost of CKKS operation");
-  const CKKS_OP_COST* opc_cost = (poly_deg >= 131072)
-                                     ? Fhe_op_cost_deg131072[opc.Operator()]
-                                     : Fhe_op_cost_deg65536[opc.Operator()];
+  const auto& cost_table = (poly_deg >= 131072) ? Fhe_op_cost_deg131072
+                                                : Fhe_op_cost_deg65536;
+  AIR_ASSERT_MSG(opc.Operator() < cost_table.size(),
+                 "no CKKS cost model entry for opcode");
+  const CKKS_OP_COST* opc_cost = cost_table[opc.Operator()];
   AIR_ASSERT_MSG(opc_cost->Opcode() == opc,
                  "opcode inconsistent with CKKS_OP_COST");
   return opc_cost->Cost(level);

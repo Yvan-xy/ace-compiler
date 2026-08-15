@@ -890,6 +890,8 @@ public:
   template <typename RETV, typename VISITOR>
   RETV Handle_rotate_batch(VISITOR* visitor, NODE_PTR rot_node);
   template <typename RETV, typename VISITOR>
+  RETV Handle_linear_transform(VISITOR* visitor, NODE_PTR transform_node);
+  template <typename RETV, typename VISITOR>
   RETV Handle_mul_mono(VISITOR* visitor, NODE_PTR mul_mono_node);
   template <typename RETV, typename VISITOR>
   RETV Handle_conjugate(VISITOR* visitor, NODE_PTR conjugate_node);
@@ -1054,6 +1056,61 @@ RETV CKKS_ANA_IMPL::Handle_rotate_batch(VISITOR* visitor, NODE_PTR rot_node) {
     if (normalized != 0) ana_ctx.Add_rotate_index(normalized);
   }
 
+  return child0_res;
+}
+
+template <typename RETV, typename VISITOR>
+RETV CKKS_ANA_IMPL::Handle_linear_transform(VISITOR* visitor,
+                                             NODE_PTR transform_node) {
+  if (transform_node->Num_child() != 2 ||
+      transform_node->Child(0) == air::base::Null_ptr ||
+      transform_node->Child(1) == air::base::Null_ptr) {
+    return RETV{false, 0};
+  }
+
+  CTX_PARAM_ANA_CTX& ana_ctx   = visitor->Context();
+  // The descriptor constant is interleaved complex data.  Propagate that
+  // requirement even when a particular transform happens to have zero
+  // imaginary components.
+  ana_ctx.Require_complex_plaintext();
+  uint32_t           mul_level = ana_ctx.Top_mul_level();
+  const uint32_t preserved_q =
+      ana_ctx.Preserved_active_q_count(transform_node,
+                                       transform_node->Child(0));
+  if (preserved_q != CTX_PARAM_ANA_CTX::INVALID_LVL) {
+    mul_level = preserved_q;
+  }
+  ana_ctx.Set_node_mul_level(transform_node, mul_level);
+
+  ana_ctx.Push_mul_level(mul_level);
+  RETV child0_res =
+      visitor->template Visit<RETV>(transform_node->Child(0));
+  (void)visitor->template Visit<RETV>(transform_node->Child(1));
+  AIR_ASSERT_MSG(mul_level == ana_ctx.Top_mul_level(),
+                 "mul level inconsistent");
+  ana_ctx.Pop_mul_level();
+
+  const uint32_t* slots = transform_node->Attr<uint32_t>(
+      core::FHE_ATTR_KIND::LT_SLOTS);
+  if (slots == nullptr || *slots == 0) return child0_res;
+  const uint32_t poly_degree =
+      ana_ctx.Lower_ctx()->Get_ctx_param().Get_poly_degree();
+  AIR_ASSERT_MSG(poly_degree >= 2 && (poly_degree % 2) == 0 &&
+                     *slots <= poly_degree / 2,
+                 "linear_transform slots exceed the CKKS slot capacity");
+
+  auto record_rotations = [&](const char* attr_name) {
+    uint32_t   count = 0;
+    const int* steps = transform_node->Attr<int>(attr_name, &count);
+    if (steps == nullptr) return;
+    for (uint32_t index = 0; index < count; ++index) {
+      const int32_t normalized =
+          Normalize_scalar_rotation_index(steps[index], *slots);
+      if (normalized != 0) ana_ctx.Add_rotate_index(normalized);
+    }
+  };
+  record_rotations(core::FHE_ATTR_KIND::LT_ROT_IN);
+  record_rotations(core::FHE_ATTR_KIND::LT_ROT_OUT);
   return child0_res;
 }
 

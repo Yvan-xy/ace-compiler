@@ -59,7 +59,7 @@ DEF_OPCODE(HW_MODADD, hw_modadd, 3, 0, PROP_EXPR | PROP_LIB_CALL)
 DEF_OPCODE(HW_MODSUB, hw_modsub, 3, 0, PROP_EXPR | PROP_LIB_CALL)
 DEF_OPCODE(HW_MODMUL, hw_modmul, 3, 0, PROP_EXPR | PROP_LIB_CALL)
 DEF_OPCODE(HW_ROTATE, hw_rotate, 3, 0, PROP_EXPR | PROP_LIB_CALL)
-DEF_OPCODE(MODSWITCH, modswitch, 1, 0, PROP_EXPR | PROP_LIB_CALL)
+DEF_OPCODE(MODSWITCH, modswitch, 1, 0, PROP_EXPR | PROP_LIB_CALL | PROP_ATTR)
 
 DEF_OPCODE(INIT_POLY, init_poly, 3, 0, PROP_STMT)
 DEF_OPCODE(INIT_POLY_BY_OPND, init_poly_by_opnd, 4, 0, PROP_STMT)
@@ -82,3 +82,14 @@ DEF_OPCODE(BSWITCH, bswitch, 4, 0, PROP_EXPR|PROP_ATTR)
 DEF_OPCODE(RAISE_MOD, raise_mod, 2, 0, PROP_EXPR|PROP_ATTR)
 
 DEF_OPCODE(ALLOC_N, alloc_n, 4, 0, PROP_EXPR)
+
+// Structured parallel scheduling markers.  These remain statements so the
+// operations inside each section stay visible to POLY transformations.
+DEF_OPCODE(PARALLEL_SECTIONS_BEGIN, parallel_sections_begin, 0, 0,
+           PROP_SCF | PROP_STMT)
+DEF_OPCODE(PARALLEL_SECTION_BEGIN, parallel_section_begin, 0, 0,
+           PROP_SCF | PROP_STMT)
+DEF_OPCODE(PARALLEL_SECTION_END, parallel_section_end, 0, 0,
+           PROP_SCF | PROP_STMT)
+DEF_OPCODE(PARALLEL_SECTIONS_END, parallel_sections_end, 0, 0,
+           PROP_SCF | PROP_STMT)

@@ -69,6 +69,11 @@ static const POLY_FUNC_INFO Builtin_func_info[] = {
      {POLY, POLY, POLY},
      {"res", "p0", "p1"},
      "Rns_add"                                                                       },
+    {core::RNS_SUB,
+     3,                       POLY,
+     {POLY, POLY, POLY},
+     {"res", "p0", "p1"},
+     "Rns_sub"                                                                       },
     {core::RNS_MUL,
      3,                       POLY,
      {POLY, POLY, POLY},
@@ -84,6 +89,11 @@ static const POLY_FUNC_INFO Builtin_func_info[] = {
      {POLY, POLY, POLY},
      {"res", "p0", "p1"},
      "Rns_add_ext"                                                                   },
+    {core::RNS_SUB_EXT,
+     3,                       POLY,
+     {POLY, POLY, POLY},
+     {"res", "p0", "p1"},
+     "Rns_sub_ext"                                                                   },
     {core::RNS_MUL_EXT,
      3,                       POLY,
      {POLY, POLY, POLY},
@@ -229,7 +239,12 @@ CONST_VAR& IR_GEN::Get_var(POLY_PREDEF_VAR id, const SPOS& spos) {
   FUNC_SCOPE*              fs         = Container()->Parent_func_scope();
   std::map<uint64_t, VAR>& predef_var = Predef_var();
 
-  uint64_t idx = id + ((uint64_t)(fs->Id().Value()) << 32);
+  AIR_ASSERT_MSG(id < 256, "predefined POLY variable id exceeds cache key");
+  AIR_ASSERT_MSG(_parallel_scope < (1U << 24),
+                 "too many parallel POLY sections in one function");
+  uint64_t idx = static_cast<uint64_t>(id) |
+                 (static_cast<uint64_t>(_parallel_scope) << 8) |
+                 (static_cast<uint64_t>(fs->Id().Value()) << 32);
   if (predef_var.find(idx) != predef_var.end()) {
     CMPLR_ASSERT(predef_var[idx].Func_scope() == fs, "invalid predef var map");
     return predef_var[idx];
@@ -256,6 +271,9 @@ void IR_GEN::Enter_func(FUNC_SCOPE* fscope) {
   _func_scope = fscope;
   _glob_scope = &(fscope->Glob_scope());
   _container  = &(fscope->Container());
+  _parallel_scope = 0;
+  _parallel_scope_counter = 0;
+  _parallel_scope_stack.clear();
 }
 
 TYPE_PTR IR_GEN::Poly_type() {
@@ -534,7 +552,8 @@ uint32_t IR_GEN::Get_num_q(NODE_PTR node) {
   uint32_t        num_q = 0;
   const uint32_t* num_q_attr =
       node->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL);
-  AIR_ASSERT_MSG(num_q_attr, "missing level attribute");
+  AIR_ASSERT_MSG(num_q_attr, "missing level attribute on node %s (id=%lu)",
+                 node->Name(), node->Id().Value());
   num_q = *num_q_attr;
   AIR_ASSERT_MSG(num_q <= Lower_ctx()->Get_ctx_param().Get_mul_level(),
                  "invalid level");

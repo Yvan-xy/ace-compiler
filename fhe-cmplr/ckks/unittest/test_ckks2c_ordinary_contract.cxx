@@ -96,6 +96,21 @@ TEST(CKKS2COrdinaryContract, TracksRelinearizationRequirementSeparately) {
   EXPECT_TRUE(param.Relin_key_required());
 }
 
+TEST(CKKS2COrdinaryContract,
+     LegacyRuntimeRotationKeysIncludeConjugationAutomorphism) {
+  fhe::core::CTX_PARAM parameters;
+  SetValidContextParameters(parameters);
+  parameters.Add_rotate_index(-1);
+  EXPECT_EQ(parameters.Get_legacy_runtime_rotate_index(),
+            (std::set<int32_t>{-1}));
+
+  parameters.Require_conjugation_key();
+  EXPECT_EQ(parameters.Get_legacy_runtime_rotate_index(),
+            (std::set<int32_t>{-1, 63}));
+  // Keep the compiler's logical rotation resources provider-neutral.
+  EXPECT_EQ(parameters.Get_rotate_index(), (std::set<int32_t>{-1}));
+}
+
 TEST(CKKS2COrdinaryContract, SeparatesRetainedResourceRequirements) {
   fhe::core::CTX_PARAM parameters;
   SetValidContextParameters(parameters);
@@ -1267,6 +1282,18 @@ TEST_F(CKKS2COrdinaryAirVerifier, RejectsMismatchedRotationAttribute) {
       diagnostic,
       "Phantom CKKS2C rotate requires one RNUM entry matching its constant "
       "step");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier, RejectsUnloweredLinearTransform) {
+  NODE_PTR transform = _container->New_cust_node(
+      fhe::ckks::OPC_LINEAR_TRANSFORM, _cipher, _spos);
+  transform->Set_child(0, Cipher_load(2, 1, 0));
+  transform->Set_child(1, Float_constant());
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(transform, &diagnostic));
+  EXPECT_EQ(
+      diagnostic,
+      "CKKS2C rejects unlowered compiler-only CKKS.linear_transform");
 }
 
 TEST_F(CKKS2COrdinaryAirVerifier, CodegenDoesNotRepairMissingKeyResources) {

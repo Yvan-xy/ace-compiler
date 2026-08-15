@@ -37,14 +37,15 @@ public:
     RESCALE,
     MODSWITCH,
     BOOTSTRAP,
+    LINEAR_TRANSFORM,
     CALL,
     OP_MAX
   };
 
   static inline const char* Kind_name(OP_KIND kind) {
-    static const char* name[OP_MAX] = {"add_cc",  "add_cp",    "mul_cc",
-                                       "mul_cp",  "rotate",    "relin",
-                                       "rescale", "modswitch", "bootstrap"};
+    static const char* name[OP_MAX] = {
+        "add_cc", "add_cp", "mul_cc", "mul_cp", "rotate", "relin",
+        "rescale", "modswitch", "bootstrap", "linear_transform", "call"};
     AIR_ASSERT(kind >= ADD_CC && kind < OP_MAX);
     return name[kind];
   }
@@ -92,6 +93,9 @@ public:
       case OPC_BOOTSTRAP:
         kind = BOOTSTRAP;
         break;
+      case OPC_LINEAR_TRANSFORM:
+        kind = LINEAR_TRANSFORM;
+        break;
       case air::core::OPC_PRAGMA:
         if (_per_op_stats) {
           if (node->Pragma_id() == nn::core::PRAGMA_OP_START) {
@@ -128,6 +132,27 @@ public:
       Update_rot_map(_func_stat->_rot_stats, rot_idx, rot_cnt, level, est_freq);
       if (_op_stat != nullptr) {
         Update_rot_map(_op_stat->_rot_stats, rot_idx, rot_cnt, level, est_freq);
+      }
+    } else if (kind == LINEAR_TRANSFORM) {
+      auto update_rotations = [&](ROT_COUNTER& stats, const char* attr_name) {
+        uint32_t   count = 0;
+        const int* rotations = node->Attr<int>(attr_name, &count);
+        AIR_ASSERT(rotations != nullptr && count > 0);
+        for (uint32_t index = 0; index < count; ++index) {
+          if (rotations[index] != 0) {
+            Update_rot_map(stats, rotations + index, 1, level, est_freq);
+          }
+        }
+      };
+      update_rotations(_func_stat->_rot_stats,
+                       core::FHE_ATTR_KIND::LT_ROT_IN);
+      update_rotations(_func_stat->_rot_stats,
+                       core::FHE_ATTR_KIND::LT_ROT_OUT);
+      if (_op_stat != nullptr) {
+        update_rotations(_op_stat->_rot_stats,
+                         core::FHE_ATTR_KIND::LT_ROT_IN);
+        update_rotations(_op_stat->_rot_stats,
+                         core::FHE_ATTR_KIND::LT_ROT_OUT);
       }
     }
   }

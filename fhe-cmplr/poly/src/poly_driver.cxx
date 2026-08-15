@@ -75,6 +75,14 @@ GLOB_SCOPE* POLY_DRIVER::Run(POLY_CONFIG& config, GLOB_SCOPE* glob,
     new_glob = Lower_to_poly(config, new_glob, driver_ctx, lower_ctx, HPOLY_P2);
   }
 
+  // The semantic transform mode is deliberately hybrid: only
+  // CKKS.LINEAR_TRANSFORM uses the QP HPOLY schedule.  Lower all surrounding
+  // CKKS operations with the established SPOLY implementation so generated C
+  // retains its existing runtime contracts.
+  if (config.Linear_transform_only()) {
+    new_glob = Lower_to_poly(config, new_glob, driver_ctx, lower_ctx, SPOLY);
+  }
+
   // lower HPOLY to LPOLY
   if (config.Lower_to_lpoly()) {
     new_glob = Lower_to_poly(config, new_glob, driver_ctx, lower_ctx, LPOLY);
@@ -198,6 +206,7 @@ GLOB_SCOPE* POLY_DRIVER::Run_flatten(GLOB_SCOPE* glob, POLY_LAYER tgt_layer) {
             opcode == fhe::ckks::OPC_BOOTSTRAP_SLOTS_TO_COEFFS) {
           return true;
         }
+        if (opcode == fhe::ckks::OPC_LINEAR_TRANSFORM) return true;
         return false;
       }
       // flatten iload to make sure the there is an preg generated
