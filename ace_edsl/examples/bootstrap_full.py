@@ -120,6 +120,11 @@ def _bootstrap_mul_level() -> int:
     return _env_int("ACE_BOOTSTRAP_MUL_LEVEL", 26)
 
 
+def _bootstrap_context_mul_level() -> int:
+    """Return the full runtime Q-chain length used to derive the P basis."""
+    return _env_int("ACE_BOOTSTRAP_CONTEXT_MUL_LEVEL", 0, min_value=0)
+
+
 def _bootstrap_input_level() -> int:
     """Return the configured CKKS input ciphertext level for the demo."""
     # Bootstrap should consume a low-level ciphertext by default.
@@ -158,6 +163,21 @@ def _bootstrap_enc_budget() -> int:
 
 def _bootstrap_dec_budget() -> int:
     return _env_int("ACE_BOOTSTRAP_DEC_BUDGET", _bootstrap_transform_level_budget())
+
+
+def _bootstrap_transform_giant_step() -> int:
+    """Optional BSGS override for controlled transform-lowering experiments."""
+    return _env_int("ACE_BOOTSTRAP_BSGS_GIANT_STEP", 0, min_value=0)
+
+
+def _bootstrap_linear_transform_enabled() -> bool:
+    """Whether collapsed FFT stages emit semantic CKKS linear transforms."""
+    return _env_flag("ACE_BOOTSTRAP_LINEAR_TRANSFORM")
+
+
+def _bootstrap_parallel_eval_mod_enabled() -> bool:
+    """Enable the experimental dual-EvalMod parallel scheduling contract."""
+    return _env_flag("ACE_BOOTSTRAP_PARALLEL_EVAL_MOD")
 
 
 def _bootstrap_ct_encode() -> bool:
@@ -258,7 +278,11 @@ def build_bootstrap_trace_config(
     enc_budget: int,
     dec_budget: int,
     ct_encode: bool,
+    transform_giant_step: int = 0,
     clear_imag: bool = False,
+    emit_linear_transform: bool = False,
+    context_mul_level: int = 0,
+    parallel_eval_mod: bool = False,
 ) -> BootstrapConfig:
     """Build a trace config without reading process-global configuration.
 
@@ -284,7 +308,11 @@ def build_bootstrap_trace_config(
         eval_sin_upper_bound_k=EVAL_SIN_UPPER_BOUND_K,
         chebyshev_coefficients=tuple(G_COEFFICIENTS_UNIFORM_HW_192),
         double_angle_scalars=tuple(get_double_angle_scalars(NUM_DOUBLE_ANGLE)),
+        transform_giant_step=transform_giant_step,
         clear_imag=clear_imag,
+        emit_linear_transform=emit_linear_transform,
+        context_mul_level=context_mul_level,
+        parallel_eval_mod=parallel_eval_mod,
     )
 
 
@@ -315,7 +343,16 @@ def _bootstrap_trace_config() -> BootstrapConfig:
         enc_budget=_bootstrap_enc_budget(),
         dec_budget=_bootstrap_dec_budget(),
         ct_encode=_bootstrap_ct_encode(),
+        transform_giant_step=_bootstrap_transform_giant_step(),
+        emit_linear_transform=_bootstrap_linear_transform_enabled(),
+        context_mul_level=_bootstrap_context_mul_level(),
+        parallel_eval_mod=_bootstrap_parallel_eval_mod_enabled(),
     )
+
+
+def _bootstrap_poly_lowering(config: BootstrapConfig) -> str:
+    """Select the only POLY path that understands the emitted CKKS contract."""
+    return "linear_transform" if config.emit_linear_transform else "spoly"
 
 
 def bootstrap_full_python_reference(values):
@@ -601,7 +638,9 @@ Key Difference from acepy:
     pipeline = AcePipeline(glob)
     pipeline.configure_fhe(
         poly_degree=bootstrap_config.poly_degree,
-        mul_level=bootstrap_config.mul_level,
+        mul_level=(
+            bootstrap_config.context_mul_level or bootstrap_config.mul_level
+        ),
         input_level=_bootstrap_input_level(),
         security_level=0,  # 0 = skip validation (mul_depth=23 exceeds 128-bit limit at N=16384/32768)
         scaling_factor_bits=bootstrap_config.scaling_factor_bits,
@@ -610,6 +649,7 @@ Key Difference from acepy:
         data_file=data_file_path,
         ct_encode=bootstrap_config.ct_encode,
         enable_poly=True,   # Poly-level C (Hw_modadd, Rotate, etc.) for ANT rtlib; scale handled in pipeline
+        poly_lowering=_bootstrap_poly_lowering(bootstrap_config),
         function_name_prefix=_bootstrap_function_name_prefix(),
         constant_name_prefix=_bootstrap_constant_name_prefix(),
         pt_from_msg_name=_bootstrap_pt_from_msg_name(),

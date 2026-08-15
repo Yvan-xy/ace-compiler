@@ -231,14 +231,41 @@ class TestBootstrapFull(unittest.TestCase):
         with open(BOOTSTRAP_C_FILE, "r") as f:
             gen_c = f.read()
         original_c = gen_c
+        ctx_pat = re.compile(
+            r"(static\s+CKKS_PARAMS\s+parm\s*=\s*\{\s*"
+            r"LIB_ANT\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*"
+            r"\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*)"
+            r"\d+\s*,\s*\n\s*\{\s*([^}]*)\s*\}",
+            re.S,
+        )
         # Derive required rot idxs from generated Rotate calls instead of hardcoding.
         rot_idxs = set()
+        # Preserve the context analyzer's normalized rotation keys.  Runtime
+        # Rotate_batch_ciph normalizes offsets (for example, 7944 -> -248 for
+        # 8192 slots), so reconstructing the list from call operands alone is
+        # not equivalent to the generated context.
+        ctx_match = ctx_pat.search(gen_c)
+        if ctx_match:
+            rot_idxs.update(
+                int(value)
+                for value in re.findall(r"-?\d+", ctx_match.group(2))
+            )
         for pattern in (
             r"\bRotate\s*\([^,]+,\s*(-?\d+)\s*\)",
             r"\bRotate_ciph\s*\([^,]+,\s*[^,]+,\s*(-?\d+)\s*\)",
         ):
             for m in re.finditer(pattern, gen_c):
                 rot_idxs.add(int(m.group(1)))
+        # Rotate_batch_ciph carries its rotations in a generated static array.
+        # If this helper rewrites the context from scalar call sites alone, it
+        # discards the otherwise-correct batch keys and fails during keygen.
+        for batch in re.finditer(
+            r"\b_rot_batch_\d+\s*\[\s*\]\s*=\s*\{([^}]*)\}", gen_c
+        ):
+            rot_idxs.update(
+                int(value)
+                for value in re.findall(r"-?\d+", batch.group(1))
+            )
         # Conjugation needs auto-index m-1.
         if "Conjugate_ciph(" in gen_c:
             deg_match = re.search(
@@ -251,13 +278,6 @@ class TestBootstrapFull(unittest.TestCase):
                 rot_idxs.add(2 * ring_degree - 1)
         rot_vals = sorted(v for v in rot_idxs if v != 0)
         if rot_vals:
-            ctx_pat = re.compile(
-                r"(static\s+CKKS_PARAMS\s+parm\s*=\s*\{\s*"
-                r"LIB_ANT\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*"
-                r"\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*)"
-                r"\d+\s*,\s*\n\s*\{\s*[^}]*\s*\}",
-                re.S,
-            )
             rot_list = ", ".join(str(v) for v in rot_vals)
             gen_c = ctx_pat.sub(
                 lambda m: f"{m.group(1)}{len(rot_vals)}, \n    {{ {rot_list} }}",
@@ -685,6 +705,7 @@ finally:
             "ckks.bootstrap_coeffs_to_slots",
             "ckks.bootstrap_eval_mod",
             "ckks.bootstrap_slots_to_coeffs",
+            "ckks.linear_transform",
         )
         retained = (
             "ckks.conjugate",

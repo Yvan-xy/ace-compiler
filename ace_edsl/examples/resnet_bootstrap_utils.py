@@ -15,6 +15,13 @@ def _script_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _non_negative_int(raw: str) -> int:
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return value
+
+
 def _bootstrap_module():
     script_dir = _script_dir()
     if str(script_dir) not in sys.path:
@@ -46,6 +53,7 @@ def generate_demo(args: argparse.Namespace) -> int:
         ACE_BOOTSTRAP_IMPL=args.impl,
         ACE_BOOTSTRAP_POLY_DEGREE=args.poly_degree,
         ACE_BOOTSTRAP_MUL_LEVEL=args.mul_level,
+        ACE_BOOTSTRAP_BSGS_GIANT_STEP=args.bsgs_giant_step,
         ACE_BOOTSTRAP_FUNCTION_NAME_PREFIX=args.function_name_prefix,
         ACE_BOOTSTRAP_CONSTANT_NAME_PREFIX=args.const_prefix,
         ACE_BOOTSTRAP_PT_FROM_MSG_NAME=args.pt_from_msg_name,
@@ -70,6 +78,16 @@ def emit_body(args: argparse.Namespace) -> int:
 
 def emit_shim(args: argparse.Namespace) -> int:
     dst_path = Path(args.output)
+    target_level_setter_name = getattr(args, "target_level_setter_name", "")
+    target_level_setter = ""
+    if target_level_setter_name:
+        target_level_setter = textwrap.dedent(
+            f"""\
+            void {target_level_setter_name}(uint32_t target_level) {{
+              g_dsl_bts_target_level_after_bts = target_level;
+            }}
+            """
+        )
     source = textwrap.dedent(
         f"""\
         #include <stdlib.h>
@@ -97,6 +115,8 @@ def emit_shim(args: argparse.Namespace) -> int:
 
         static unsigned long g_dsl_bts_call_counter = 0;
         static __thread uint32_t g_dsl_bts_target_level_after_bts = 0;
+
+        {target_level_setter}
 
         CKKS_PARAMS* Get_extra_context_params(void) {{
           return {args.ctxparams_name}();
@@ -160,6 +180,14 @@ def emit_shim(args: argparse.Namespace) -> int:
             dsl_bts_stage_probe_mark("post_scale");
           }}
           memset(&g_dsl_bts_stage_probe, 0, sizeof(g_dsl_bts_stage_probe));
+        }}
+
+        void ace_cpu_bootstrap_stage_probe_begin(void) {{
+          dsl_bts_stage_probe_begin();
+        }}
+
+        void ace_cpu_bootstrap_stage_probe_finish(void) {{
+          dsl_bts_stage_probe_finish();
         }}
 
         CIPHER dsl_bts_probe_Conjugate_ciph(CIPHER res, CIPHER ciph) {{
@@ -421,6 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--impl", default="primitive")
     generate.add_argument("--poly-degree", type=int, required=True)
     generate.add_argument("--mul-level", type=int, required=True)
+    generate.add_argument("--bsgs-giant-step", type=_non_negative_int, default=0)
     generate.add_argument("--function-name-prefix", default="dsl_bts_")
     generate.add_argument("--const-prefix", default="dsl_bts")
     generate.add_argument("--pt-from-msg-name", default="dsl_bts_Pt_from_msg")
@@ -452,6 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
     shim.add_argument("--rtdata-name", default="dsl_bts_Get_rt_data_info")
     shim.add_argument("--pt-from-msg-name", default="dsl_bts_Pt_from_msg")
     shim.add_argument("--raise-level-name", default="dsl_bts_raise_level")
+    shim.add_argument("--target-level-setter-name", default="")
     shim.add_argument("--bootstrap-depth", type=int, default=15)
     shim.add_argument("--bootstrap-call-name", default="Eval_bootstrap_ciph_dsl")
     shim.add_argument("--log-prefix", default="dsl_bts")

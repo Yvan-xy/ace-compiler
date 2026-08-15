@@ -65,6 +65,57 @@ def test_bootstrap_scalar_constants_request_dynamic_encode_level(monkeypatch):
     assert encoded == [(-1.0, 1, 0), (0.5, 1, 0)]
 
 
+def test_bootstrap_linear_wsum_defers_term_rescales(monkeypatch):
+    from ace_edsl.edsl.core import bootstrap_decomposition
+
+    events = []
+
+    class Cipher:
+        container = object()
+
+        def __init__(self, name):
+            self.name = name
+
+        def __add__(self, rhs):
+            events.append(("add", self.name, rhs.name))
+            return Cipher("sum")
+
+        def rescale(self):
+            events.append(("rescale", self.name))
+            return Cipher("rescaled")
+
+    def capture_encode(x, value, *, scale_degree, level):
+        events.append(("encode", x.name, value, scale_degree, level))
+        return f"plain-{value}"
+
+    def capture_lazy_mul(ct, plain):
+        events.append(("lazy-mul", ct.name, plain))
+        return Cipher(f"term-{ct.name}")
+
+    monkeypatch.setattr(
+        bootstrap_decomposition, "_encode_scalar_like", capture_encode
+    )
+    monkeypatch.setattr(
+        bootstrap_decomposition, "_mul_plain_lazy_rescale", capture_lazy_mul
+    )
+
+    result = bootstrap_decomposition._eval_linear_wsum(
+        [Cipher("t1"), Cipher("t2"), Cipher("t3")],
+        [2.0, 0.0, -3.0],
+        type("Config", (), {"emit_linear_transform": True})(),
+    )
+
+    assert result.name == "rescaled"
+    assert events == [
+        ("encode", "t1", 2.0, 1, 0),
+        ("lazy-mul", "t1", "plain-2.0"),
+        ("encode", "t3", -3.0, 1, 0),
+        ("lazy-mul", "t3", "plain--3.0"),
+        ("add", "term-t1", "term-t3"),
+        ("rescale", "sum"),
+    ]
+
+
 def test_phantom_add_mul_rotate_uses_only_dedicated_ckks2c():
     result = _run_isolated(
         r'''

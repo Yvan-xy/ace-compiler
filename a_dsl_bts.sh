@@ -26,6 +26,12 @@ END_IDX="${ACE_DSL_BTS_END_IDX:-}"
 IMAGE_PARALLELISM="${ACE_DSL_BTS_IMAGE_PARALLELISM:-}"
 BOOTSTRAP_CT_ENCODE="${ACE_BOOTSTRAP_CT_ENCODE:-1}"
 BOOTSTRAP_CT_ENCODE_DEPTH="${ACE_CT_ENCODE_DEPTH:-30}"
+BOOTSTRAP_CONTEXT_MUL_LEVEL="${ACE_BOOTSTRAP_CONTEXT_MUL_LEVEL:-30}"
+case "${ACE_BOOTSTRAP_LINEAR_TRANSFORM:-0}" in
+  1 | true | TRUE | on | ON | yes | YES)
+    BOOTSTRAP_CONTEXT_MUL_LEVEL="${ACE_BOOTSTRAP_CONTEXT_MUL_LEVEL:-31}"
+    ;;
+esac
 
 mkdir -p "${WORK_DIR}"
 exec > >(tee "${LOG_FILE}") 2>&1
@@ -61,6 +67,7 @@ fi
 PYTHONPATH="${ACE_EDSL_DIR}:${APP_ROOT}" \
 ACE_BOOTSTRAP_CT_ENCODE="${BOOTSTRAP_CT_ENCODE}" \
 ACE_CT_ENCODE_DEPTH="${BOOTSTRAP_CT_ENCODE_DEPTH}" \
+ACE_BOOTSTRAP_CONTEXT_MUL_LEVEL="${BOOTSTRAP_CONTEXT_MUL_LEVEL}" \
 python3 "${BOOTSTRAP_UTILS_PY}" generate-demo \
   --impl primitive \
   --poly-degree 65536 \
@@ -95,6 +102,19 @@ if [[ "${BOOTSTRAP_CT_ENCODE}" != "0" ]] &&
   echo "bootstrap_full.c still performs lazy dcmplx encoding; expected ct-encoded plaintext data" >&2
   exit 1
 fi
+
+case "${ACE_BOOTSTRAP_LINEAR_TRANSFORM:-0}" in
+  1 | true | TRUE | on | ON | yes | YES)
+    ALLOC_POLYS_COUNT=$(grep -F -c 'Alloc_polys(' "${BOOTSTRAP_GEN_C}" || true)
+    FREE_POLYS_COUNT=$(grep -F -c 'Free_polys(' "${BOOTSTRAP_GEN_C}" || true)
+    if [[ "${ALLOC_POLYS_COUNT}" -eq 0 ]] ||
+       [[ "${ALLOC_POLYS_COUNT}" -ne "${FREE_POLYS_COUNT}" ]]; then
+      echo "bootstrap_full.c has unbalanced linear-transform precompute ownership: " \
+           "Alloc_polys=${ALLOC_POLYS_COUNT}, Free_polys=${FREE_POLYS_COUNT}" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 if [[ -f "${RESNET_DATASET_INC}" ]]; then
   cp "${RESNET_DATASET_INC}" "${BACKUP_RESNET_INC}"

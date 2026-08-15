@@ -64,6 +64,10 @@ class BootstrapConfig:
     chebyshev_coefficients: Tuple[float, ...]
     double_angle_scalars: Tuple[float, ...]
     clear_imag: bool = False
+    transform_giant_step: int = 0
+    emit_linear_transform: bool = False
+    context_mul_level: int = 0
+    parallel_eval_mod: bool = False
 
     def __post_init__(self):
         object.__setattr__(
@@ -92,6 +96,47 @@ class BootstrapConfig:
             raise ValueError("BootstrapConfig.q_parts must be positive")
         if self.enc_budget <= 0 or self.dec_budget <= 0:
             raise ValueError("BootstrapConfig transform budgets must be positive")
+        if (
+            not isinstance(self.transform_giant_step, int)
+            or isinstance(self.transform_giant_step, bool)
+            or self.transform_giant_step < 0
+        ):
+            raise ValueError(
+                "BootstrapConfig.transform_giant_step must be a non-negative integer"
+            )
+        if self.transform_giant_step > self.slots:
+            raise ValueError(
+                "BootstrapConfig.transform_giant_step must not exceed slots"
+            )
+        if self.transform_giant_step and (
+            self.transform_giant_step & (self.transform_giant_step - 1)
+        ):
+            raise ValueError(
+                "BootstrapConfig.transform_giant_step must be a power of two"
+            )
+        if not isinstance(self.emit_linear_transform, bool):
+            raise ValueError(
+                "BootstrapConfig.emit_linear_transform must be a bool"
+            )
+        if not isinstance(self.parallel_eval_mod, bool):
+            raise ValueError("BootstrapConfig.parallel_eval_mod must be a bool")
+        if self.parallel_eval_mod and not self.emit_linear_transform:
+            raise ValueError(
+                "BootstrapConfig.parallel_eval_mod requires emit_linear_transform"
+            )
+        if (
+            not isinstance(self.context_mul_level, int)
+            or isinstance(self.context_mul_level, bool)
+            or self.context_mul_level < 0
+            or (
+                self.context_mul_level != 0
+                and self.context_mul_level < self.mul_level
+            )
+        ):
+            raise ValueError(
+                "BootstrapConfig.context_mul_level must be zero or at least "
+                "mul_level"
+            )
         if self.eval_sin_upper_bound_k <= 0:
             raise ValueError("BootstrapConfig.eval_sin_upper_bound_k must be positive")
         if not self.chebyshev_coefficients:
@@ -143,7 +188,14 @@ class BootstrapConfig:
 
     @property
     def num_p(self) -> int:
-        num_per_part = math.ceil(float(self.mul_level) / float(self.q_parts))
+        # Key switching uses the P basis of the complete runtime context, not
+        # merely the active Q level to which bootstrap raises its operand.
+        # They differ for the first ResNet bootstrap (31 context Q primes,
+        # active transform level 30).
+        context_mul_level = self.context_mul_level or self.mul_level
+        num_per_part = math.ceil(
+            float(context_mul_level) / float(self.q_parts)
+        )
         bit_num = self.first_prime_bits + (num_per_part - 1) * self.scaling_factor_bits
         return int(math.ceil(float(bit_num) / 60.0))
 
@@ -425,22 +477,35 @@ def _inner_eval_chebyshev_ps(coeffs, k, m, t_list, t2_list, y, in_recursion,
 def _eval_linear_wsum(t_list, weights, config: Optional[BootstrapConfig] = None):
     """Weighted sum: sum weights[i] * t_list[i] (mul_const + accumulate).
 
-    Note (P0a): The rtlib rescales the accumulated result here
-    (chebyshev_impl.c:309). We leave the rescale placement to the CKKS
-    scale manager because forcing an explicit rescale here conflicts with
-    the current compiler pass ordering.
+    In the semantic linear-transform pipeline, match
+    ``Eval_linear_wsum_mutable`` in the rtlib: keep every scalar multiply at
+    scale degree two, accumulate the terms, and rescale the sum exactly once.
+    Legacy SPOLY retains its established per-term scale-manager behavior.
     """
+    grouped_rescale = bool(
+        config is not None
+        and getattr(config, "emit_linear_transform", False)
+    )
     result = None
     for i, w in enumerate(weights):
         if w == 0.0:
             continue
         if i >= len(t_list) or t_list[i] is None:
             continue
-        term = _mul_const_like(t_list[i], w, config)
+        if grouped_rescale and hasattr(t_list[i], "container"):
+            _require_bootstrap_config(config, "_eval_linear_wsum")
+            plain = _encode_scalar_like(
+                t_list[i], w, scale_degree=1, level=0
+            )
+            term = _mul_plain_lazy_rescale(t_list[i], plain)
+        else:
+            term = _mul_const_like(t_list[i], w, config)
         if result is None:
             result = term
         else:
             result = result + term
+    if grouped_rescale and result is not None and hasattr(result, "container"):
+        result = result.rescale()
     return result
 
 
@@ -729,7 +794,13 @@ def _select_layers(log_slots: int, budget: int):
     return (layers, rows, rem)
 
 
-def _get_colls_fft_params(slots: int, level_budget: int = 3, dim1: int = 0):
+def _get_colls_fft_params(
+    slots: int,
+    level_budget: int = 3,
+    dim1: int = 0,
+    *,
+    prefer_hoisted: bool = False,
+):
     """Python port of rtlib Get_colls_fft_params."""
     log_slots = int(math.log2(slots))
     layers_coll, _, rem_coll = _select_layers(log_slots, level_budget)
@@ -767,12 +838,26 @@ def _get_colls_fft_params(slots: int, level_budget: int = 3, dim1: int = 0):
             g <<= 1
         return best_g
 
-    if dim1 == 0 or dim1 > num_rot:
+    if dim1 == 0:
         if num_rot > 7:
-            g = choose_dsl_g(num_rot, 1 << (layers_coll // 2 + 2))
+            default_g = 1 << (layers_coll // 2 + 2)
         else:
-            g = choose_dsl_g(num_rot, 1 << (layers_coll // 2 + 1))
+            default_g = 1 << (layers_coll // 2 + 1)
+        # Once the transform is lowered as one QP region, an input rotation
+        # reuses the stage precompute while an outer rotation needs its own
+        # ModDown/precompute/key switch.  ANT's larger default giant step is
+        # therefore a better cost point than minimizing high-level rotate
+        # count, which remains the right proxy for the primitive DSL path.
+        g = (
+            default_g
+            if prefer_hoisted
+            else choose_dsl_g(num_rot, default_g)
+        )
     else:
+        if dim1 > num_rot:
+            raise ValueError(
+                f"transform giant step {dim1} exceeds stage rotation count {num_rot}"
+            )
         g = dim1
     b = (num_rot + 1 + g - 1) // g
 
@@ -780,9 +865,14 @@ def _get_colls_fft_params(slots: int, level_budget: int = 3, dim1: int = 0):
     g_rem = 0
     if flag_rem:
         if num_rot_rem > 7:
-            g_rem = choose_dsl_g(num_rot_rem, 1 << (rem_coll // 2 + 2))
+            default_g_rem = 1 << (rem_coll // 2 + 2)
         else:
-            g_rem = choose_dsl_g(num_rot_rem, 1 << (rem_coll // 2 + 1))
+            default_g_rem = 1 << (rem_coll // 2 + 1)
+        g_rem = (
+            default_g_rem
+            if prefer_hoisted
+            else choose_dsl_g(num_rot_rem, default_g_rem)
+        )
         b_rem = (num_rot_rem + 1 + g_rem - 1) // g_rem
 
     return {
@@ -925,7 +1015,12 @@ def _collapsed_fft_stage_plan(config: BootstrapConfig, encoding: bool):
     """Return direct stage plans equivalent to rtlib Rotate_precomp for full-packed mode."""
     slots = config.slots
     level_budget = config.enc_budget if encoding else config.dec_budget
-    params = _get_colls_fft_params(slots, level_budget)
+    params = _get_colls_fft_params(
+        slots,
+        level_budget,
+        config.transform_giant_step,
+        prefer_hoisted=config.emit_linear_transform,
+    )
     coeff = _coeff_collapse(slots, level_budget, encoding)
     enc_level, dec_level = _primitive_transform_levels(config)
 
@@ -1050,6 +1145,114 @@ def _rotate_plain_vector(values, rotation: int):
     if rot == 0:
         return list(values)
     return [values[(idx + rot) % length] for idx in range(length)]
+
+
+def _signed_rotation(index: int, slots: int) -> int:
+    """Return the canonical signed representative of a logical rotation."""
+    rotation = _reduce_rotation(index, slots)
+    if rotation > slots // 2:
+        rotation -= slots
+    return rotation
+
+
+def _collapsed_fft_linear_transform_descriptor(
+    coeff,
+    stage,
+    slots: int,
+    config: BootstrapConfig,
+):
+    """Build the versioned payload for one semantic linear-transform stage.
+
+    Coefficients are flat row-major complex values. ``AIRValue._linear_transform``
+    owns the ABI conversion to an interleaved-f64 constant; keeping that boundary
+    here makes the descriptor independently testable without requiring the new
+    CKKS opcode to be present in the Python bindings.
+    """
+    num_rot = stage["num_rot"]
+    baby_step = stage["baby_step"]
+    giant_step = stage["giant_step"]
+    shift = stage["shift"]
+    diag_scale = stage["diag_scale"]
+
+    rot_in = [
+        _signed_rotation(
+            (j - ((num_rot + 1) // 2) + 1) * shift,
+            slots,
+        )
+        for j in range(giant_step)
+    ]
+    compact_terms = _compact_grouped_stage_terms(coeff, stage, slots, config)
+    if compact_terms is None:
+        term_count = num_rot
+        stage_giant_step = giant_step
+    else:
+        term_count = len(compact_terms)
+        stage_giant_step = max(
+            1, (term_count + baby_step - 1) // baby_step
+        )
+        rot_in = [
+            _signed_rotation(j * shift, slots)
+            for j in range(min(stage_giant_step, term_count))
+        ]
+
+    active_baby_steps = (term_count + len(rot_in) - 1) // len(rot_in)
+    rot_out = [
+        _signed_rotation(stage_giant_step * i * shift, slots)
+        for i in range(active_baby_steps)
+    ]
+    coefficients = []
+    for term in range(term_count):
+        baby_index, _ = divmod(term, len(rot_in))
+        giant = stage_giant_step * baby_index
+        if compact_terms is None:
+            diag = coeff[stage["s"]][term]
+        else:
+            _, diag = compact_terms[term]
+        if diag_scale != 1.0:
+            diag = [value * diag_scale for value in diag]
+        diag_rotation = _reduce_rotation(-giant * shift, slots)
+        if diag_rotation != 0:
+            diag = _rotate_plain_vector(diag, diag_rotation)
+        coefficients.extend(complex(value) for value in diag)
+
+    if len(coefficients) != term_count * slots:
+        raise ValueError(
+            "linear-transform descriptor coefficient size does not match "
+            "term_count * slots"
+        )
+    return {
+        "coefficients": tuple(coefficients),
+        "rot_in": tuple(rot_in),
+        "rot_out": tuple(rot_out),
+        "slots": int(slots),
+        "term_count": int(term_count),
+        "scale_degree": 1,
+        "plain_level": int(stage["plain_level"]),
+        "num_p": int(config.num_p),
+        "encode_cache": bool(config.ct_encode),
+        "schema_version": 1,
+    }
+
+
+def _emit_collapsed_fft_linear_transform_stage(
+    x,
+    coeff,
+    stage,
+    slots: int,
+    config: BootstrapConfig,
+):
+    """Emit one CKKS.LINEAR_TRANSFORM through the internal AIRValue seam."""
+    emit = getattr(x, "_linear_transform", None)
+    if emit is None:
+        raise NotImplementedError(
+            "linear-transform bootstrap emission requires "
+            "AIRValue._linear_transform"
+        )
+    descriptor = _collapsed_fft_linear_transform_descriptor(
+        coeff, stage, slots, config
+    )
+    coefficients = descriptor.pop("coefficients")
+    return emit(coefficients, **descriptor)
 
 
 def _complex_vector_sha256(values) -> str:
@@ -1238,6 +1441,12 @@ def _apply_collapsed_fft_transform(
 
     result = x
     for stage in stages:
+        if config.emit_linear_transform:
+            result = _emit_collapsed_fft_linear_transform_stage(
+                result, coeff, stage, slots, config
+            ).rescale()
+            continue
+
         s = stage["s"]
         num_rot = stage["num_rot"]
         baby_step = stage["baby_step"]
@@ -1572,9 +1781,31 @@ def fullpacked_bootstrap_primitive(ct, m_by_4: Optional[int] = None,
     imag_part = enc - conj          # 2i * Im(enc)
     imag_part = imag_part.mul_mono(three_m_by_4)
 
-    # Step 3: Dual EvalMod
-    real_evmod = eval_approx_mod(real_part, config=cfg)
-    imag_evmod = eval_approx_mod(imag_part, config=cfg)
+    # Step 3: Dual EvalMod.  The two branches are independent after the
+    # conjugate split.  In the compiler-visible LT path, retain that fact as
+    # structured scheduling markers so POLY codegen can match the rtlib's two
+    # OpenMP EvalMod tasks without hiding either branch in a runtime call.
+    parallel_marker_names = (
+        "new_ckks_parallel_sections_begin",
+        "new_ckks_parallel_section_begin",
+        "new_ckks_parallel_section_end",
+        "new_ckks_parallel_sections_end",
+    )
+    parallel_eval_mod = cfg.parallel_eval_mod and all(
+        hasattr(ct.container, name) for name in parallel_marker_names
+    )
+    if parallel_eval_mod:
+        ct.container.new_ckks_parallel_sections_begin()
+        ct.container.new_ckks_parallel_section_begin()
+        real_evmod = eval_approx_mod(real_part, config=cfg)
+        ct.container.new_ckks_parallel_section_end()
+        ct.container.new_ckks_parallel_section_begin()
+        imag_evmod = eval_approx_mod(imag_part, config=cfg)
+        ct.container.new_ckks_parallel_section_end()
+        ct.container.new_ckks_parallel_sections_end()
+    else:
+        real_evmod = eval_approx_mod(real_part, config=cfg)
+        imag_evmod = eval_approx_mod(imag_part, config=cfg)
 
     # Step 4: Recombine
     imag_evmod = imag_evmod.mul_mono(m_by_4)
