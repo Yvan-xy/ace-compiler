@@ -15,6 +15,33 @@ The optimization target is the generated primitive bootstrap used by:
 - [bootstrap_full.py](/home/dyf/code/ace-compiler/ace_edsl/examples/bootstrap_full.py)
 - [a_dsl_bts.sh](/home/dyf/code/ace-compiler/a_dsl_bts.sh)
 
+## 2026-08-15 Current Result
+
+The compiler-visible `CKKS.LINEAR_TRANSFORM` work has closed the gap described
+in the historical snapshots below.  In a strict full one-image ResNet20 A/B,
+with both executables freshly built against the same installed ANT runtime:
+
+- generated DSL LT: `FHE_BOOTSTRAP=431.671949s` for 21 calls and
+  `MAIN_GRAPH=620.658973s`;
+- current native RTL: `FHE_BOOTSTRAP=502.078130s` for 21 calls and
+  `MAIN_GRAPH=692.307532s`;
+- both paths passed classification for the same image;
+- both paths emitted 1166 instrumented `FHE_ROTATE` wrappers.
+
+The generated path is therefore 14.0% faster in aggregate bootstrap time and
+10.3% faster over the main graph for this workload.  Runtime instrumentation
+reports 56.1% fewer `PRECOMP`, 34.0% fewer `DOT_PROD`, and 28.0% fewer `MULP`
+events.  Those wrapper counters are path-sensitive because generated HPOLY can
+inline equivalent low-level work; they are not exact counts of eliminated
+mathematical operations.  Generated LT ownership is explicit: its 24
+precompute allocations have 24 matching releases, and last-use releases for
+QP intermediates keep RSS stable across all 21 calls.
+
+See [dsl_bts_linear_transform.md](dsl_bts_linear_transform.md) for the
+commands, counters, lifetime findings, standalone measurements, and caveats.
+The dated sections below remain as the evidence trail explaining why this
+architecture was chosen.
+
 ## 2026-06-05 Current Snapshot
 
 This section supersedes the older "current" sections below for active tuning.
@@ -221,6 +248,392 @@ Regression guardrails for the current path:
   likely regression
 - treat full one-image bootstrap average above about `50.7s/call` as a likely
   current-path regression
+
+## 2026-07-06 FFT-Stage Experiment Lesson
+
+The `dsl-bts-stage-op-transform` branch added an experimental
+`CKKS.bootstrap_fft_stage` operator and lowered it directly to the ANT runtime
+helper:
+
+- `CKKS.bootstrap_fft_stage`
+- `Eval_bootstrap_fft_stage_ciph(...)`
+- `Bootstrap_fft_stage(...)`
+- `Rotate_iteration(...)`
+
+The experiment was useful because it validated the bottleneck hypothesis. The
+runtime result improved materially:
+
+- prior DSL primitive:
+  - `FHE_BOOTSTRAP`: about `980.959s` across `21` calls
+  - average bootstrap: about `46.710s/call`
+  - `FHE_ROTATE`: `2048` calls, about `335.575s`
+- experimental FFT-stage operator path:
+  - `FHE_BOOTSTRAP`: about `757.656s` across `21` calls
+  - average bootstrap: about `36.079s/call`
+  - `FHE_ROTATE`: `1166` calls, about `71.875s`
+- rtlib baseline:
+  - `BS_EVAL`: about `712.991s` across `21` calls
+  - average bootstrap: about `33.952s/call`
+  - `FHE_ROTATE`: `1166` calls, about `72.385s`
+
+This tells us the old DSL path was slower mainly because the collapsed FFT
+transform still emitted extra scalar moved rotations. The FFT-stage experiment
+removed those extra rotations and made the runtime rotation count match rtlib.
+
+However, this is not the right mainline architecture for the DSL compiler. The
+new operator imports a runtime implementation strategy into CKKS IR. In
+particular, `Bootstrap_fft_stage(...)` calls `Rotate_iteration(...)`, and
+`Rotate_iteration(...)` performs work that belongs below CKKS level:
+
+- keyswitch precomputation / digit decomposition
+- `Fast_rotate_ext(...)`
+- `Switch_key_ext(...)`
+- plaintext multiply and accumulation
+- automorphism
+- `Mod_down(...)`
+
+Once that work is hidden inside an opaque runtime helper call, POLY/HPOLY
+compiler passes cannot see it. That blocks compiler-owned optimizations such as
+mod-down hoisting, mod-up hoisting, op fusion, and loop-level restructuring.
+
+Conclusion:
+
+- keep the FFT-stage result as bottleneck evidence
+- do not treat `CKKS.bootstrap_fft_stage` as the final DSL design
+- return to `dsl-bts-performance-tuning`
+- keep the CKKS DSL expressed in CKKS-level primitive operations
+- move the optimization into CKKS-to-POLY / HPOLY lowering, where the compiler
+  can see the rotate, keyswitch, multiply, accumulation, and mod-down structure
+- use the rtlib `Rotate_iteration(...)` behavior as a reference schedule, not as
+  an opaque CKKS operator
+
+The next target should therefore be compiler-visible collapsed FFT transform
+lowering: recognize or construct the transform schedule from CKKS DSL
+primitives, lower it to POLY/HPOLY IR, and apply hoisting/fusion there.
+
+## 2026-04-08 Current Snapshot
+
+This section supersedes the older "current" numbers below. The rest of this
+document is still useful as history, but the numbers in this section are the
+latest baseline for planning.
+
+### Main-Graph Comparison
+
+Using:
+
+- DSL integrated run:
+  - [1.log](/home/dyf/code/ace-compiler/1.log)
+- rtlib integrated baseline:
+  - [origin.log](/home/dyf/code/ace-compiler/origin.log)
+
+Observed timings:
+
+- rtlib:
+  - `PREPARE_CONTEXT`: `24.340701s`
+  - `MAIN_GRAPH`: `899.852733s`
+  - `BS_EVAL`: `712.991312s` across `21` bootstraps
+  - average bootstrap eval: about `33.952s/call`
+- DSL:
+  - `PREPARE_CONTEXT`: `19.293506s`
+  - `MAIN_GRAPH`: `1458.887598s`
+  - explicit DSL bootstrap calls: `21`
+  - summed bootstrap call time: `1275.737s`
+  - average bootstrap call: about `60.749s/call`
+
+Direct implication:
+
+- the `MAIN_GRAPH` gap is about `559.035s`
+- almost all of that gap is inside bootstrap itself
+- the non-bootstrap residual is effectively the same:
+  - DSL residual: about `183.151s`
+  - rtlib residual: about `186.861s`
+
+So the next optimization pass should ignore the rest of resnet and focus only
+on the primitive bootstrap body.
+
+### Current DSL Stage-Probe Breakdown
+
+I added an optional stage probe in the DSL integration path, gated by:
+
+- `ACE_BOOTSTRAP_STAGE_PROBE=1`
+
+Measured with:
+
+- `ACE_STOP_AFTER_FIRST_BTS=1 ACE_BOOTSTRAP_CT_ENCODE=1 ACE_BOOTSTRAP_STAGE_PROBE=1 bash a_dsl_bts.sh`
+
+Observed first-bootstrap breakdown:
+
+- `coeff_to_slots`: `25.263s`
+- `split`: `0.430s`
+- `dual_evalmod`: `23.151s`
+- `recombine`: `0.028s`
+- `slots_to_coeffs`: `13.531s`
+- `post_scale`: `0.011s`
+- total bootstrap call: `62.416s`
+
+Interpretation:
+
+- transform dominates:
+  - `coeff_to_slots + slots_to_coeffs = 38.794s`
+  - about `62%` of the bootstrap call
+- `dual_evalmod` is also very large:
+  - `23.151s`
+  - about `37%` of the bootstrap call
+- split / recombine / post-scale are negligible
+
+### Stage Gap Against rtlib
+
+From the rtlib baseline in [origin.log](/home/dyf/code/ace-compiler/origin.log):
+
+- `BS_COEFF_TO_SLOT`: `272.542386s / 21` → about `12.978s/call`
+- `BS_APPROX_MOD`: `268.898589s / 21` → about `12.805s/call`
+- `BS_SLOT_TO_COEFF`: `157.318718s / 21` → about `7.491s/call`
+
+Compared with the current DSL stage probe:
+
+- `CoeffToSlot`:
+  - DSL `25.263s`
+  - rtlib `12.978s`
+  - DSL is about `1.95x`
+- `ApproxMod`:
+  - DSL `23.151s`
+  - rtlib `12.805s`
+  - DSL is about `1.81x`
+- `SlotToCoeff`:
+  - DSL `13.531s`
+  - rtlib `7.491s`
+  - DSL is about `1.81x`
+
+So the DSL path is slower in all three major bootstrap stages, not just one.
+
+### Current Helper-Level Profile
+
+The latest `gprofng` first-bootstrap profiles still show the hottest helper
+ordering inside `dsl_bootstrap_full` as:
+
+- `dsl_bts_Rotate`: about `2.302s` inclusive
+- `dsl_bts_Relinearize`: about `1.011s`
+- `Rescale`: about `1.061s`
+- `Pt_from_msg`: negligible
+
+This remains useful because it says the transform path is still helper-heavy,
+but by itself it is too coarse. The stage probe is the better guide for the
+next pass.
+
+### Important Comparison Caveat
+
+`MAIN_GRAPH` is still the right top-level comparison, but the setup placement is
+not identical:
+
+- rtlib baseline does `Bootstrap_precom(...)` in `Prepare_context()`
+  outside `MAIN_GRAPH`
+- DSL path disables that precompute and instead does its bootstrap plaintext
+  materialization lazily on first use inside the graph
+
+That caveat matters for fairness, but the measured residuals above already show
+it is not the dominant issue. The dominant gap is still the bootstrap body
+itself.
+
+## 2026-04-08 Optimization Plan
+
+The order below reflects the measured stage costs, not guesswork.
+
+### 1. Make The DSL Bootstrap Raise Target-Level-Aware
+
+Current mismatch:
+
+- DSL always raises to the full configured tower in
+  [bootstrap_full.py](/home/dyf/code/ace-compiler/ace_edsl/examples/bootstrap_full.py)
+- rtlib raises only to `level_after_bts + bts_depth` in
+  [bootstrap.c](/home/dyf/code/ace-compiler/fhe-cmplr/rtlib/ant/ckks/src/bootstrap.c)
+
+Why this is first:
+
+- it is a semantic mismatch with rtlib
+- it can reduce work in all downstream stages at once
+- it may also allow an early-copy / no-bootstrap fast path analogous to rtlib
+
+Expected impact:
+
+- high
+
+Status update:
+
+- implemented for the `dsl-bts` integration path
+- kept the generic DSL bootstrap body unchanged
+- made the emitted bootstrap body call a shim helper for `Raise_mod(...)`
+  level selection at runtime
+- the shim now derives the active Q-chain size from the main program
+  `Get_context_params()` and computes:
+  - `raise_level = level_after_bts + bts_depth`
+  - or `q_cnt` when `level_after_bts == 0`
+
+Important implementation detail:
+
+- using the bootstrap module's `Get_extra_context_params()` is incorrect for
+  this purpose because that extra context currently exists to contribute rotate
+  metadata, not to define the active resnet Q chain
+- the integrated dynamic raise helper must use the main program
+  `Get_context_params()` first
+
+Validated result on the integrated `ct_encode` path:
+
+- helper tests:
+  - `python3 -m pytest -q ace_edsl/tests/test_resnet_bootstrap_utils.py`
+    → `4 passed`
+- first-bootstrap-only probe:
+  - before: about `62.766s`
+  - after: about `59.461s`
+  - improvement: about `3.305s`
+- full one-image integrated run:
+  - before:
+    - summed bootstrap calls: about `1275.737s`
+    - average bootstrap call: about `60.749s`
+    - wall time: `24m40.078s`
+  - after:
+    - summed bootstrap calls: about `1102.668s`
+    - average bootstrap call: about `52.508s`
+    - wall time: `21m48.061s`
+
+Observed per-target effect:
+
+- `level_after_bts = 16` calls remain close to the old cost because they still
+  require the maximum raise level
+- lower target levels now benefit materially:
+  - `15`: about `59.461s`
+  - `14`: about `52`–`54s`
+  - `13`: about `50`–`51s`
+  - `6`: about `31s`
+
+Interpretation:
+
+- the target-aware raise change is a real integrated win
+- it does not close the gap to rtlib by itself
+- but it is worth keeping and should be treated as the new working baseline for
+  the next optimization phases
+
+### 2. Optimize The Transform Path Next
+
+Why this is second:
+
+- it is the largest measured cost bucket
+- transform cost is about `38.794s` out of `62.416s`
+- helper profile still points to `dsl_bts_Rotate` first
+
+What to target:
+
+- bootstrap-local hoisted rotate lowering that is closer to rtlib
+  `Rotate_iteration(...)`
+- avoid touching shared rtlib/global rotate helpers directly
+- reduce emitted bootstrap-local `Rotate`, `Relinearize`, and associated
+  modulus plumbing in:
+  - `coeffs_to_slots`
+  - `slots_to_coeffs`
+
+Expected impact:
+
+- very high
+
+Status update:
+
+- implemented one transform-only change in
+  [_apply_collapsed_fft_transform](/home/dyf/code/ace-compiler/ace_edsl/edsl/core/bootstrap_decomposition.py)
+- changed the DSL transform from:
+  - one `rescale()` per baby-step inner sum
+  to:
+  - one `rescale()` per collapsed-FFT stage
+
+Why this is closer to rtlib:
+
+- rtlib `Rotate_iteration(...)` accumulates work across the whole stage and
+  rescales at stage boundaries
+- the previous DSL path was still paying extra scale-management work inside
+  each stage
+
+Validated result on top of the target-aware raise baseline:
+
+- helper tests:
+  - `python3 -m pytest -q ace_edsl/tests/test_resnet_bootstrap_utils.py`
+    → `4 passed`
+- first-bootstrap stage probe:
+  - before:
+    - `coeff_to_slots`: `25.263s`
+    - `dual_evalmod`: `23.151s`
+    - `slots_to_coeffs`: `13.531s`
+    - total: `62.416s`
+  - after:
+    - `coeff_to_slots`: `22.972s`
+    - `dual_evalmod`: `22.114s`
+    - `slots_to_coeffs`: `12.067s`
+    - total: `57.606s`
+- first-bootstrap-only integrated probe:
+  - before step 2: about `59.461s`
+  - after step 2: about `59.204s`
+- full one-image integrated run:
+  - before step 2:
+    - bootstrap-call sum: about `1102.668s`
+    - bootstrap-call average: about `52.508s`
+    - wall time: `21m48.061s`
+  - after step 2:
+    - bootstrap-call sum: about `1078.293s`
+    - bootstrap-call average: about `51.347s`
+    - wall time: `21m24.185s`
+
+Interpretation:
+
+- this is a real but smaller win than step 1
+- the transform is still the right target
+- but the remaining gap is now more clearly concentrated in:
+  - bootstrap-local rotate cost
+  - residual heavy work in `dual_evalmod`
+
+### 3. Optimize Dual EvalMod After That
+
+Why this is third:
+
+- `dual_evalmod` is still `23.151s`
+- that is the second-largest stage after the transforms
+
+Recommended first step:
+
+- parallelize the full-packed real/imag `EvalMod` branches so the DSL matches
+  the rtlib OpenMP task structure
+
+Recommended second step:
+
+- after branch parallelism, inspect intra-branch `Relinearize` / `Rescale`
+  pressure and PS schedule details
+
+Expected impact:
+
+- high
+
+### 4. Do Not Spend Time On Split / Recombine / Post-Scale
+
+Measured cost:
+
+- `split`: `0.430s`
+- `recombine`: `0.028s`
+- `post_scale`: `0.011s`
+
+These are not meaningful optimization targets for the current gap.
+
+### 5. Keep The Stage Probe As A Diagnostic Tool Only
+
+Current probe support:
+
+- `ACE_BOOTSTRAP_STAGE_PROBE=1`
+
+Use it for:
+
+- first-bootstrap diagnosis
+- before/after optimization comparisons at the stage level
+
+Do not use it for:
+
+- final headline performance claims
+
+because it is instrumentation, not the production path.
 
 ## Current Performance Snapshot
 
@@ -1046,12 +1459,76 @@ These must remain true throughout optimization:
 
 ## Recommended Next Optimization
 
-Start with **Phase 1: cache encoded diagonal plaintexts**.
+Start with a **framework/codegen-level grouped rotate batch** for the
+collapsed-FFT transform.
 
 Reason:
 
-- it is the clearest difference from rtlib
-- it targets one of the largest visible costs (`Encode_dcmplx_ext(...)`)
-- it should improve both runtime and code size
+- recent real-path ablations showed the current planner differences are helping,
+  not hurting:
+  - forcing rtlib default BSGS regressed the first bootstrap from about
+    `56.14s` to about `62.43s`
+  - disabling stage compaction regressed it further to about `63.02s`
+- direct helper substitution is also not enough:
+  - swapping generated rotate/relin helpers for runtime `Rotate_ciph` / `Relin`
+    regressed the first bootstrap to about `58.09s`
+  - runtime `Relin` alone still regressed to about `57.44s`
+- the remaining gap is stage-level reuse:
+  - DSL still executes many independent rotate helpers on the same source
+    ciphertext
+  - rtlib's `Rotate_iteration(...)` hoists that work once per stage
 
-After that, do **Phase 2: hoist rotations inside each collapsed-FFT stage**.
+So the next defensible optimization is:
+
+1. identify a grouped rotate batch in `_apply_collapsed_fft_transform()`
+2. lower that batch through a generic framework/codegen path
+3. share one stage-local rotate/decomp/precompute setup across the batch
+
+Status update:
+
+- done for the `fast_rot` construction
+- implemented as a first-class `CKKS.rotate_batch` op returning an
+  array-of-ciphertexts
+- runtime helper `Rotate_batch_ciph(...)` shares one precompute across the
+  whole batch
+
+Measured result on the real integrated path:
+
+- first-bootstrap stage probe:
+  - `coeff_to_slots`: `22.450s -> 20.274s`
+  - `dual_evalmod`: `21.390s -> 21.792s`
+  - `slots_to_coeffs`: `11.862s -> 9.398s`
+  - total: `56.140s -> 53.334s`
+- early integrated call timings also improved:
+  - call 1 (`15`): `55.308s`
+  - call 2 (`14`): `48.368s`
+  - call 3 (`16`): `53.658s`
+  - call 6 (`13`): `46.163s`
+  - call 7 (`6`): `29.153s`
+
+Next recommendation:
+
+- keep the grouped `fast_rot` batch
+- next try the same stage-local grouping idea on the later moved rotates in
+  `_apply_collapsed_fft_transform()`
+- if that stalls, switch focus to `dual_evalmod`
+
+Multi-image note:
+
+- the grouped `rotate_batch` path also exposed a real ownership bug in
+  `poly2c_mfree`: extracted batch outputs from
+  `st x = ild(array(batch, i))` were being marked as already freed, so the
+  generated bootstrap body missed the `Free_data(...)` calls for those moved
+  ciphertext temporaries
+- fixing that in `fhe-cmplr/include/fhe/poly/poly2c_mfree.h` restores normal
+  last-use frees for the extracted ciphertext values while still suppressing
+  container frees on the backing batch array
+- that fix removes the missing-frees bug, but it is not enough to make
+  `0..9` multi-image `dsl-bts` safe by itself: direct runtime sampling shows
+  one active `dsl-bts` image already reaches roughly `15 GB RSS` around
+  20 seconds into bootstrap and roughly `30 GB RSS` around 40 seconds, so the
+  old image-level `#pragma omp parallel for` in `resnet_cifar.main.inc` is
+  fundamentally too aggressive for DSL bootstrap runs
+- the clean runtime fix is to make image-level parallelism configurable through
+  `ACE_IMAGE_PARALLELISM`; `a_dsl_bts.sh` now defaults multi-image runs to
+  `ACE_IMAGE_PARALLELISM=1` unless `ACE_DSL_BTS_IMAGE_PARALLELISM` is set
