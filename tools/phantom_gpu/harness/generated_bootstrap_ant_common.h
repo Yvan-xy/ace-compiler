@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <complex>
 #include <cstddef>
@@ -53,6 +54,64 @@ constexpr double kRequiredMaximumError = 1.0e-2;
 
 inline void Require(bool condition, const std::string& message) {
   if (!condition) Fail(message);
+}
+
+inline void AppendPythonCanonicalJson(const Json& value,
+                                      std::string& output) {
+  if (value.is_null()) {
+    output += "null";
+  } else if (value.is_boolean()) {
+    output += value.get<bool>() ? "true" : "false";
+  } else if (value.is_number_unsigned()) {
+    output += std::to_string(value.get<std::uint64_t>());
+  } else if (value.is_number_integer()) {
+    output += std::to_string(value.get<std::int64_t>());
+  } else if (value.is_number_float()) {
+    const double number = value.get<double>();
+    Require(std::isfinite(number),
+            "canonical JSON cannot contain a non-finite number");
+    std::array<char, 128> buffer{};
+    const auto conversion =
+        std::to_chars(buffer.data(), buffer.data() + buffer.size(), number);
+    Require(conversion.ec == std::errc(),
+            "cannot format canonical JSON number");
+    std::string encoded(buffer.data(), conversion.ptr);
+    if (encoded.find_first_of(".eE") == std::string::npos)
+      encoded += ".0";
+    output += encoded;
+  } else if (value.is_string()) {
+    output += Json(value.get_ref<const std::string&>()).dump(
+        -1, ' ', true, Json::error_handler_t::strict);
+  } else if (value.is_array()) {
+    output.push_back('[');
+    bool first = true;
+    for (const Json& element : value) {
+      if (!first) output.push_back(',');
+      first = false;
+      AppendPythonCanonicalJson(element, output);
+    }
+    output.push_back(']');
+  } else if (value.is_object()) {
+    output.push_back('{');
+    bool first = true;
+    for (auto item = value.begin(); item != value.end(); ++item) {
+      if (!first) output.push_back(',');
+      first = false;
+      output += Json(item.key()).dump(-1, ' ', true,
+                                      Json::error_handler_t::strict);
+      output.push_back(':');
+      AppendPythonCanonicalJson(item.value(), output);
+    }
+    output.push_back('}');
+  } else {
+    Fail("unsupported canonical JSON value type");
+  }
+}
+
+inline std::string PythonCanonicalJson(const Json& value) {
+  std::string output;
+  AppendPythonCanonicalJson(value, output);
+  return output;
 }
 
 inline std::uint32_t RotateRight(std::uint32_t value, std::uint32_t count) {
@@ -427,7 +486,7 @@ inline QualificationInputs LoadQualificationInputs(
   const Json& identity_attestation =
       result.semantics.at("identity_domain_attestation");
   const std::string canonical_identity_attestation =
-      identity_attestation.dump();
+      PythonCanonicalJson(identity_attestation);
   const std::string identity_attestation_sha256 = Sha256(
       reinterpret_cast<const std::uint8_t*>(
           canonical_identity_attestation.data()),

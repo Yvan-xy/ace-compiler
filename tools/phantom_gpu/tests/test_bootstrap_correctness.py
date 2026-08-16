@@ -481,6 +481,8 @@ def test_generated_phantom_harness_covers_full_correctness_lifecycle() -> None:
     assert 'metadata.dump() + " expected=" + observed_contract.dump()' in source
     assert "canonical_identity_attestation" in source
     assert "identity_attestation_sha256" in source
+    assert "PythonCanonicalJson(identity_attestation)" in source
+    assert "std::to_chars" in source
     assert (
         'domain_evidence.at("attestation_sha256") ==\n'
         "                  identity_attestation_sha256"

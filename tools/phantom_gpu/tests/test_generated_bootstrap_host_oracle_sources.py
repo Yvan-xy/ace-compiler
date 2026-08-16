@@ -57,6 +57,8 @@ def test_shared_contract_matches_the_canonical_fixture_and_value_file() -> None:
     assert "centered-evalmod-complex-error-bounded" in shared
     assert "canonical_identity_attestation" in shared
     assert "identity_attestation_sha256" in shared
+    assert "PythonCanonicalJson(identity_attestation)" in shared
+    assert "std::to_chars" in shared
     assert (
         'domain_evidence.at("attestation_sha256") ==\n'
         "              identity_attestation_sha256"
@@ -126,6 +128,15 @@ def test_shared_contract_matches_the_canonical_fixture_and_value_file() -> None:
     ):
         assert field in shared
     assert "independent-non-authoritative-for-gpu" in shared
+
+
+def test_generated_oracle_isolates_each_large_case_process() -> None:
+    generated = source(GENERATED)
+    compact = "".join(generated.split())
+    assert "RunIsolatedCase" in generated
+    assert "fork()" in generated
+    assert "waitpid(child, &child_status, 0)" in generated
+    assert "RunIsolatedCase(fixture_case,zero_values,inputs)" in compact
 
 
 def test_native_oracle_uses_explicit_budgets_and_requires_full_execution() -> None:

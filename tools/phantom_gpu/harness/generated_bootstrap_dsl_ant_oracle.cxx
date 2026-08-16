@@ -3,10 +3,14 @@
 #include "common/rt_api.h"
 
 #include <array>
+#include <cerrno>
 #include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 #ifndef ACE_POST_CKKS_AIR_SHA256
 #error "ACE_POST_CKKS_AIR_SHA256 must bind the linked generated program"
@@ -68,6 +72,86 @@ void VerifyLinkedProgram(const QualificationInputs& inputs) {
           "linked program does not use the fixture's canonical post-CKKS AIR");
 }
 
+std::vector<Complex> RunIsolatedCase(const FixtureCase& fixture_case,
+                                     const std::vector<Complex>& zero_values,
+                                     const QualificationInputs& inputs) {
+  std::array<int, 2> pipe_descriptors{};
+  Require(pipe(pipe_descriptors.data()) == 0,
+          "cannot create generated-case result pipe");
+  const pid_t child = fork();
+  if (child < 0) {
+    close(pipe_descriptors[0]);
+    close(pipe_descriptors[1]);
+    generated_bootstrap_ant::Fail("cannot fork generated-case oracle");
+  }
+  if (child == 0) {
+    close(pipe_descriptors[0]);
+    try {
+      CIPHER source =
+          EncryptComplex(fixture_case.clear, inputs.input_level);
+      CIPHER encrypted_zero =
+          EncryptComplex(zero_values, inputs.input_level);
+      CIPHERTEXT result = bootstrap_full(*source, *encrypted_zero);
+      const std::vector<Complex> values = Decode(&result, inputs.slots);
+      std::vector<double> encoded;
+      encoded.reserve(values.size() * 2U);
+      for (const Complex& value : values) {
+        encoded.push_back(value.real());
+        encoded.push_back(value.imag());
+      }
+      const std::uint8_t* cursor =
+          reinterpret_cast<const std::uint8_t*>(encoded.data());
+      std::size_t remaining = encoded.size() * sizeof(double);
+      while (remaining != 0U) {
+        const ssize_t written =
+            write(pipe_descriptors[1], cursor, remaining);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) throw std::runtime_error("result pipe write failed");
+        cursor += written;
+        remaining -= static_cast<std::size_t>(written);
+      }
+      Zero_ciph(&result);
+      Free_ciphertext(encrypted_zero);
+      Free_ciphertext(source);
+      close(pipe_descriptors[1]);
+      _exit(0);
+    } catch (const std::exception& error) {
+      std::cerr << "generated DSL/ANT isolated case failed: " << error.what()
+                << '\n';
+      close(pipe_descriptors[1]);
+      _exit(1);
+    }
+  }
+
+  close(pipe_descriptors[1]);
+  std::vector<double> encoded(inputs.slots * 2U);
+  std::uint8_t* cursor = reinterpret_cast<std::uint8_t*>(encoded.data());
+  const std::size_t expected_bytes = encoded.size() * sizeof(double);
+  std::size_t received_bytes = 0U;
+  while (received_bytes != expected_bytes) {
+    const ssize_t received =
+        read(pipe_descriptors[0], cursor + received_bytes,
+             expected_bytes - received_bytes);
+    if (received < 0 && errno == EINTR) continue;
+    if (received <= 0) break;
+    received_bytes += static_cast<std::size_t>(received);
+  }
+  close(pipe_descriptors[0]);
+  int child_status = 0;
+  while (waitpid(child, &child_status, 0) < 0) {
+    if (errno == EINTR) continue;
+    generated_bootstrap_ant::Fail("cannot wait for generated-case oracle");
+  }
+  Require(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0,
+          "generated-case oracle child did not exit successfully");
+  Require(received_bytes == expected_bytes,
+          "generated-case oracle returned a truncated result");
+  std::vector<Complex> values(inputs.slots);
+  for (std::size_t index = 0; index < values.size(); ++index)
+    values[index] = Complex(encoded[index * 2U], encoded[index * 2U + 1U]);
+  return values;
+}
+
 Json RunOracle(const QualificationInputs& inputs, const std::string& executable,
                const std::string& output_values,
                const Json& context_attestation) {
@@ -79,20 +163,15 @@ Json RunOracle(const QualificationInputs& inputs, const std::string& executable,
   std::uint64_t invocation_count = 0U;
   for (const FixtureCase& fixture_case : cases) {
     order.push_back(fixture_case.id);
-    CIPHER source = EncryptComplex(fixture_case.clear, inputs.input_level);
-    CIPHER encrypted_zero = EncryptComplex(zero_values, inputs.input_level);
-    CIPHERTEXT result = bootstrap_full(*source, *encrypted_zero);
+    const std::vector<Complex> values =
+        RunIsolatedCase(fixture_case, zero_values, inputs);
     ++invocation_count;
-    const std::vector<Complex> values = Decode(&result, inputs.slots);
     const Json metric =
         Metric(values, fixture_case.clear, inputs.maximum_error,
                std::string(kProvider) + ":" + fixture_case.id);
     records.push_back(AppendValues(
         payload, fixture_case.id, kProvider, values,
         {{"recipe", fixture_case.recipe}, {"metrics_vs_clear", metric}}));
-    Zero_ciph(&result);
-    Free_ciphertext(encrypted_zero);
-    Free_ciphertext(source);
   }
   const std::vector<std::uint8_t> value_file =
       FinalizeValueFile(payload, records, inputs);
