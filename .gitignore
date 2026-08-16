@@ -12,4 +12,13 @@ output/
 .worktree_docker/
 *.t
 *.zip
+*.tar.gz
+*.tgz
+*.json
+*.msg
 resnet20_cifar10_random
+model_and_main
+.agents/evidence/
+.env
+*.dot
+*.patch
