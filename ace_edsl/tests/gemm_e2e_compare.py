@@ -28,6 +28,7 @@ MODEL_SLOTS = {
 }
 IMPLEMENTATIONS = ("native", "dsl")
 THREE_WAY_IMPLEMENTATIONS = ("dsl-fast", "cpp-baseline", "metakernel-fast")
+FAST_PAIR_IMPLEMENTATIONS = ("dsl-fast", "metakernel-fast")
 FOUR_WAY_IMPLEMENTATIONS = THREE_WAY_IMPLEMENTATIONS + ("python-dsl-fast",)
 ALL_IMPLEMENTATIONS = IMPLEMENTATIONS + FOUR_WAY_IMPLEMENTATIONS
 SCALING_FACTOR_BITS = 56
@@ -325,6 +326,8 @@ def _generate_one(
     implementation: str,
     output_dir: Path,
     model_dir: Path,
+    max_slots: int | None = None,
+    poly_degree: int | None = None,
 ) -> None:
     from ace_edsl.edsl.pipeline import Pipeline, PipelineTarget
     from ace_edsl.edsl.vector.kernels.baseline_gemm import (
@@ -340,6 +343,16 @@ def _generate_one(
         if phase in ("tensor2vector", "vector_kernel_inline"):
             phase_irs[phase] = ir
 
+    fhe_options: dict[str, object] = {
+        "scaling_factor_bits": SCALING_FACTOR_BITS,
+        "first_prime_bits": FIRST_PRIME_BITS,
+        "hamming_weight": HAMMING_WEIGHT,
+        "data_file": f"{model}.weight",
+        "free_poly": FREE_POLY,
+    }
+    if poly_degree is not None:
+        fhe_options["poly_degree"] = poly_degree
+
     pipeline = (
         Pipeline(
             f"{model}_{implementation}",
@@ -349,15 +362,9 @@ def _generate_one(
             on_phase_complete=capture_phase,
         )
         .load_onnx(str(model_dir / f"{model}.onnx"))
-        .configure_fhe(
-            scaling_factor_bits=SCALING_FACTOR_BITS,
-            first_prime_bits=FIRST_PRIME_BITS,
-            hamming_weight=HAMMING_WEIGHT,
-            data_file=f"{model}.weight",
-            free_poly=FREE_POLY,
-        )
+        .configure_fhe(**fhe_options)
     )
-    slots = MODEL_SLOTS[model]
+    slots = MODEL_SLOTS[model] if max_slots is None else max_slots
     prepared_plans: list[object] = []
     if implementation in ("native", "cpp-baseline"):
         pipeline.configure_vector_kernel_lowering(
@@ -459,6 +466,7 @@ def _generate_one(
         "model": model,
         "implementation": implementation,
         "max_slots": slots,
+        "poly_degree": poly_degree if poly_degree is not None else "auto",
         "stages": result.stages_completed,
         "generation_seconds": elapsed,
         "phase_seconds": pipeline.timings,
@@ -485,19 +493,26 @@ def _generate_subprocess(
     output_dir: Path,
     timeout: int,
     model_dir: Path,
+    max_slots: int | None = None,
+    poly_degree: int | None = None,
 ) -> dict[str, object]:
     print(f"[generate] {model} {implementation}", flush=True)
-    result = _run(
-        [
-            sys.executable,
-            "-u",
-            str(script),
+    command = [sys.executable, "-u", str(script)]
+    if max_slots is not None:
+        command.extend(("--max-slots", str(max_slots)))
+    if poly_degree is not None:
+        command.extend(("--poly-degree", str(poly_degree)))
+    command.extend(
+        (
             "--internal-generate",
             model,
             implementation,
             str(output_dir),
             str(model_dir),
-        ],
+        )
+    )
+    result = _run(
+        command,
         cwd=REPO_ROOT,
         timeout=timeout,
     )
@@ -784,7 +799,10 @@ def _benchmark_model(
     cross_tolerance: float,
     model_dir: Path,
     implementations: tuple[str, ...] = IMPLEMENTATIONS,
+    max_slots: int | None = None,
+    poly_degree: int | None = None,
 ) -> dict[str, object]:
+    effective_max_slots = MODEL_SLOTS[model] if max_slots is None else max_slots
     model_root = root / model
     generation = {}
     compilation = {}
@@ -793,7 +811,14 @@ def _benchmark_model(
         output_dir = model_root / implementation
         output_dir.mkdir(parents=True, exist_ok=True)
         generation[implementation] = _generate_subprocess(
-            script, model, implementation, output_dir, timeout, model_dir
+            script,
+            model,
+            implementation,
+            output_dir,
+            timeout,
+            model_dir,
+            effective_max_slots,
+            poly_degree,
         )
         executable, compile_metadata = _compile_runner(
             model, output_dir, timeout, model_dir
@@ -894,7 +919,8 @@ def _benchmark_model(
     performance = _summarize_timings(timings)
     summary = {
         "model": model,
-        "max_slots": MODEL_SLOTS[model],
+        "max_slots": effective_max_slots,
+        "poly_degree": poly_degree if poly_degree is not None else "auto",
         "implementations": list(implementations),
         "generation": generation,
         "compilation": compilation,
@@ -951,6 +977,16 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument("--cross-tolerance", type=float, default=0.0002)
     parser.add_argument(
+        "--max-slots",
+        type=int,
+        help="override the vector slot cap for every selected model",
+    )
+    parser.add_argument(
+        "--poly-degree",
+        type=int,
+        help="compile every selected model with this CKKS polynomial degree",
+    )
+    parser.add_argument(
         "--internal-generate",
         nargs=4,
         metavar=("MODEL", "IMPLEMENTATION", "OUTPUT_DIR", "MODEL_DIR"),
@@ -962,18 +998,32 @@ def _parse_arguments() -> argparse.Namespace:
     selected = tuple(arguments.implementations)
     if (
         selected != IMPLEMENTATIONS
+        and set(selected) != set(FAST_PAIR_IMPLEMENTATIONS)
         and set(selected) != set(THREE_WAY_IMPLEMENTATIONS)
         and set(selected) != set(FOUR_WAY_IMPLEMENTATIONS)
     ):
         parser.error(
-            "--implementations must select the default native/DSL pair or "
-            "all three C++ fast-comparison paths, optionally with "
-            "python-dsl-fast"
+            "--implementations must select the default native/DSL pair, the "
+            "DSL-fast/metakernel-fast pair, or all three C++ fast-comparison "
+            "paths, optionally with python-dsl-fast"
         )
     if arguments.warmups < 0 or arguments.runs < 1:
         parser.error("--warmups must be nonnegative and --runs must be positive")
     if arguments.timeout < 1:
         parser.error("--timeout must be positive")
+    if arguments.max_slots is not None and arguments.max_slots < 1:
+        parser.error("--max-slots must be positive")
+    if arguments.poly_degree is not None and (
+        arguments.poly_degree < 2
+        or arguments.poly_degree & (arguments.poly_degree - 1)
+    ):
+        parser.error("--poly-degree must be a power of two greater than one")
+    if (
+        arguments.max_slots is not None
+        and arguments.poly_degree is not None
+        and arguments.max_slots > arguments.poly_degree // 2
+    ):
+        parser.error("--max-slots cannot exceed half of --poly-degree")
     if not math.isfinite(arguments.cross_tolerance) or arguments.cross_tolerance < 0.0:
         parser.error("--cross-tolerance must be finite and nonnegative")
     return arguments
@@ -992,6 +1042,8 @@ def main() -> int:
             implementation,
             Path(output_dir).resolve(),
             resolved_model_dir,
+            arguments.max_slots,
+            arguments.poly_degree,
         )
         return 0
 
@@ -1013,6 +1065,8 @@ def main() -> int:
                 arguments.cross_tolerance,
                 model_dir,
                 tuple(arguments.implementations),
+                arguments.max_slots,
+                arguments.poly_degree,
             )
         )
     plan_providers = {
@@ -1030,6 +1084,22 @@ def main() -> int:
             "timeout_seconds": arguments.timeout,
             "cross_tolerance": arguments.cross_tolerance,
             "compiler_settings": {
+                "poly_degree": {
+                    model: (
+                        arguments.poly_degree
+                        if arguments.poly_degree is not None
+                        else "auto"
+                    )
+                    for model in arguments.models
+                },
+                "max_slots": {
+                    model: (
+                        arguments.max_slots
+                        if arguments.max_slots is not None
+                        else MODEL_SLOTS[model]
+                    )
+                    for model in arguments.models
+                },
                 "scaling_factor_bits": SCALING_FACTOR_BITS,
                 "first_prime_bits": FIRST_PRIME_BITS,
                 "hamming_weight": HAMMING_WEIGHT,

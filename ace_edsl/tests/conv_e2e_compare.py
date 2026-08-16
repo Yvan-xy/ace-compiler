@@ -34,6 +34,7 @@ THREE_WAY_IMPLEMENTATIONS = (
     "cpp-baseline",
     "metakernel-fast",
 )
+FAST_PAIR_IMPLEMENTATIONS = ("dsl-fast", "metakernel-fast")
 FOUR_WAY_IMPLEMENTATIONS = THREE_WAY_IMPLEMENTATIONS + ("python-dsl-fast",)
 ALL_IMPLEMENTATIONS = IMPLEMENTATIONS + FOUR_WAY_IMPLEMENTATIONS
 INLINER_IMPLEMENTATION = "tentative-binding-transition"
@@ -417,6 +418,8 @@ def _generate_one(
     implementation: str,
     output_dir: Path,
     model_dir: Path,
+    max_slots: int | None = None,
+    poly_degree: int | None = None,
 ) -> None:
     from ace_edsl.edsl.vector.kernels.baseline_conv import (
         configure_baseline_conv_dsl,
@@ -442,7 +445,11 @@ def _generate_one(
         )
         .load_onnx(str(model_dir / f"{model}.onnx"))
         .configure_fhe(
-            poly_degree=MODEL_POLY_DEGREES[model],
+            poly_degree=(
+                MODEL_POLY_DEGREES[model]
+                if poly_degree is None
+                else poly_degree
+            ),
             scaling_factor_bits=_shared.SCALING_FACTOR_BITS,
             first_prime_bits=_shared.FIRST_PRIME_BITS,
             hamming_weight=_shared.HAMMING_WEIGHT,
@@ -450,7 +457,7 @@ def _generate_one(
             free_poly=_shared.FREE_POLY,
         )
     )
-    slots = MODEL_SLOTS[model]
+    slots = MODEL_SLOTS[model] if max_slots is None else max_slots
     prepared_plans: list[object] = []
     if implementation in ("native", "cpp-baseline"):
         pipeline.configure_vector_kernel_lowering(
@@ -563,7 +570,11 @@ def _generate_one(
             INLINER_IMPLEMENTATION if uses_inliner else None
         ),
         "max_slots": slots,
-        "poly_degree": MODEL_POLY_DEGREES[model],
+        "poly_degree": (
+            MODEL_POLY_DEGREES[model]
+            if poly_degree is None
+            else poly_degree
+        ),
         "stages": result.stages_completed,
         "generation_seconds": elapsed,
         "phase_seconds": pipeline.timings,
@@ -631,6 +642,16 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=14400)
     parser.add_argument("--cross-tolerance", type=float, default=0.0002)
     parser.add_argument(
+        "--max-slots",
+        type=int,
+        help="override the vector slot cap for every selected model",
+    )
+    parser.add_argument(
+        "--poly-degree",
+        type=int,
+        help="compile every selected model with this CKKS polynomial degree",
+    )
+    parser.add_argument(
         "--internal-generate",
         nargs=4,
         metavar=("MODEL", "IMPLEMENTATION", "OUTPUT_DIR", "MODEL_DIR"),
@@ -642,18 +663,32 @@ def _parse_arguments() -> argparse.Namespace:
     selected = tuple(arguments.implementations)
     if (
         selected != IMPLEMENTATIONS
+        and set(selected) != set(FAST_PAIR_IMPLEMENTATIONS)
         and set(selected) != set(THREE_WAY_IMPLEMENTATIONS)
         and set(selected) != set(FOUR_WAY_IMPLEMENTATIONS)
     ):
         parser.error(
-            "--implementations must select the default native/DSL pair or "
-            "all three C++ fast-comparison paths, optionally with "
-            "python-dsl-fast"
+            "--implementations must select the default native/DSL pair, the "
+            "DSL-fast/metakernel-fast pair, or all three C++ fast-comparison "
+            "paths, optionally with python-dsl-fast"
         )
     if arguments.warmups < 0 or arguments.runs < 1:
         parser.error("--warmups must be nonnegative and --runs must be positive")
     if arguments.timeout < 1:
         parser.error("--timeout must be positive")
+    if arguments.max_slots is not None and arguments.max_slots < 1:
+        parser.error("--max-slots must be positive")
+    if arguments.poly_degree is not None and (
+        arguments.poly_degree < 2
+        or arguments.poly_degree & (arguments.poly_degree - 1)
+    ):
+        parser.error("--poly-degree must be a power of two greater than one")
+    if (
+        arguments.max_slots is not None
+        and arguments.poly_degree is not None
+        and arguments.max_slots > arguments.poly_degree // 2
+    ):
+        parser.error("--max-slots cannot exceed half of --poly-degree")
     if (
         not math.isfinite(arguments.cross_tolerance)
         or arguments.cross_tolerance < 0.0
@@ -676,6 +711,8 @@ def main() -> int:
             implementation,
             Path(output_dir).resolve(),
             resolved_model_dir,
+            arguments.max_slots,
+            arguments.poly_degree,
         )
         return 0
 
@@ -703,6 +740,12 @@ def main() -> int:
                 arguments.cross_tolerance,
                 model_dir,
                 tuple(arguments.implementations),
+                arguments.max_slots,
+                (
+                    arguments.poly_degree
+                    if arguments.poly_degree is not None
+                    else MODEL_POLY_DEGREES[model]
+                ),
             )
         )
     aggregate = {
@@ -716,11 +759,20 @@ def main() -> int:
             "cross_tolerance": arguments.cross_tolerance,
             "compiler_settings": {
                 "poly_degree": {
-                    model: MODEL_POLY_DEGREES[model]
+                    model: (
+                        arguments.poly_degree
+                        if arguments.poly_degree is not None
+                        else MODEL_POLY_DEGREES[model]
+                    )
                     for model in arguments.models
                 },
                 "max_slots": {
-                    model: MODEL_SLOTS[model] for model in arguments.models
+                    model: (
+                        arguments.max_slots
+                        if arguments.max_slots is not None
+                        else MODEL_SLOTS[model]
+                    )
+                    for model in arguments.models
                 },
                 "scaling_factor_bits": _shared.SCALING_FACTOR_BITS,
                 "first_prime_bits": _shared.FIRST_PRIME_BITS,

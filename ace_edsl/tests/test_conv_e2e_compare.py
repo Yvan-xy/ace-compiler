@@ -101,6 +101,18 @@ def test_comparison_cli_requires_complete_distinct_path_set(monkeypatch):
         [
             "conv_e2e_compare.py",
             "--implementations",
+            *conv.FAST_PAIR_IMPLEMENTATIONS,
+        ],
+    )
+    arguments = conv._parse_arguments()
+    assert tuple(arguments.implementations) == conv.FAST_PAIR_IMPLEMENTATIONS
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "conv_e2e_compare.py",
+            "--implementations",
             "python-dsl-fast",
             "metakernel-fast",
             "dsl-fast",
@@ -113,7 +125,7 @@ def test_comparison_cli_requires_complete_distinct_path_set(monkeypatch):
     )
 
     invalid_selections = (
-        ("dsl-fast", "cpp-baseline"),
+        ("cpp-baseline", "metakernel-fast"),
         ("dsl-fast", "cpp-baseline", "python-dsl-fast"),
         ("dsl-fast", "dsl-fast", "metakernel-fast"),
         ("native", "dsl-fast", "cpp-baseline", "metakernel-fast"),
@@ -127,6 +139,25 @@ def test_comparison_cli_requires_complete_distinct_path_set(monkeypatch):
         )
         with pytest.raises(SystemExit):
             conv._parse_arguments()
+
+
+def test_context_cli_accepts_resnet_slot_and_ring_settings(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "conv_e2e_compare.py",
+            "--max-slots",
+            "32768",
+            "--poly-degree",
+            "65536",
+        ],
+    )
+
+    selected = conv._parse_arguments()
+
+    assert selected.max_slots == 32768
+    assert selected.poly_degree == 65536
 
 
 def test_generated_helper_ir_excludes_caller_rotations():

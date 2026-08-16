@@ -11,6 +11,7 @@ import sys
 import pytest
 
 from ace_edsl.tests.gemm_e2e_compare import (
+    FAST_PAIR_IMPLEMENTATIONS,
     FOUR_WAY_IMPLEMENTATIONS,
     IMPLEMENTATIONS,
     MODEL_SLOTS,
@@ -265,6 +266,14 @@ def test_implementation_cli_preserves_default_and_accepts_exact_three_way(
     selected = _parse_arguments()
     assert tuple(selected.implementations) == THREE_WAY_IMPLEMENTATIONS
 
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gemm_e2e_compare.py", "--implementations", *FAST_PAIR_IMPLEMENTATIONS],
+    )
+    selected = _parse_arguments()
+    assert tuple(selected.implementations) == FAST_PAIR_IMPLEMENTATIONS
+
 
 def test_implementation_cli_accepts_exact_four_way(monkeypatch):
     monkeypatch.setattr(
@@ -287,6 +296,25 @@ def test_new_4096_by_10_model_cli_uses_4096_slots(monkeypatch):
 
     assert selected.models == ["gemmh10w4096"]
     assert MODEL_SLOTS["gemmh10w4096"] == 4096
+
+
+def test_context_cli_accepts_resnet_slot_and_ring_settings(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gemm_e2e_compare.py",
+            "--max-slots",
+            "32768",
+            "--poly-degree",
+            "65536",
+        ],
+    )
+
+    selected = _parse_arguments()
+
+    assert selected.max_slots == 32768
+    assert selected.poly_degree == 65536
 
 
 @pytest.mark.parametrize(
