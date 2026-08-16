@@ -668,8 +668,10 @@ bool CKKS2POLY::Is_gen_rns_loop(CKKS2POLY_CTX& ctx, NODE_PTR parent,
   if (node->Domain() != fhe::ckks::CKKS_DOMAIN::ID) return false;
 
   // for add/sub/mul, if parent node is root
-  // statement(st/call)/rotate/rescale/relin, generate a new rns loop to perform
-  // coefficient operations
+  // statement(st/call) or an operation that consumes a complete polynomial,
+  // generate a new RNS loop to perform coefficient operations.  In
+  // particular, MODSWITCH must not read an operand whose coefficient writes
+  // have been fused into an enclosing loop.
   switch (node->Operator()) {
     case fhe::ckks::CKKS_OPERATOR::ADD:
     case fhe::ckks::CKKS_OPERATOR::SUB:
@@ -686,6 +688,8 @@ bool CKKS2POLY::Is_gen_rns_loop(CKKS2POLY_CTX& ctx, NODE_PTR parent,
                                         fhe::ckks::CKKS_OPERATOR::ROTATE) ||
           p_opcode == air::base::OPCODE(fhe::ckks::CKKS_DOMAIN::ID,
                                         fhe::ckks::CKKS_OPERATOR::RESCALE) ||
+          p_opcode == air::base::OPCODE(fhe::ckks::CKKS_DOMAIN::ID,
+                                        fhe::ckks::CKKS_OPERATOR::MODSWITCH) ||
           p_opcode == air::base::OPCODE(fhe::ckks::CKKS_DOMAIN::ID,
                                         fhe::ckks::CKKS_OPERATOR::RELIN) ||
           parent->Is_root()) {

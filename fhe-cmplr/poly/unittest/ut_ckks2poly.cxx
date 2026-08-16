@@ -22,6 +22,28 @@ extern const POLY_FUNC_INFO* Poly_func_info(FHE_FUNC func_id);
 namespace fhe {
 namespace poly {
 namespace test {
+
+namespace {
+
+uint32_t Count_opcode(NODE_PTR node, air::base::OPCODE opcode) {
+  if (node == Null_ptr) return 0;
+  uint32_t count = node->Opcode() == opcode ? 1 : 0;
+  if (node->Is_block()) {
+    STMT_LIST statements(node);
+    for (STMT_PTR statement = statements.Begin_stmt();
+         statement != statements.End_stmt(); statement = statement->Next()) {
+      count += Count_opcode(statement->Node(), opcode);
+    }
+    return count;
+  }
+  for (uint32_t child = 0; child < node->Num_child(); ++child) {
+    count += Count_opcode(node->Child(child), opcode);
+  }
+  return count;
+}
+
+}  // namespace
+
 class TEST_CKKS2POLY : public TEST_LOWER_CKKS<TEST_CONFIG> {};
 
 TEST_P(TEST_CKKS2POLY, Handle_add_ciph) {
@@ -99,6 +121,24 @@ TEST_P(TEST_CKKS2POLY, Handle_rotate_func_preg) {
 TEST_P(TEST_CKKS2POLY, Handle_rescale) {
   STMT_PTR stmt = Ckks_ir_gen().Gen_rescale(Container(), Var_z(), Var_x());
   Lower();
+}
+
+TEST_P(TEST_CKKS2POLY, Modswitch_operand_ends_fused_rns_loop) {
+  NODE_PTR mul = Ckks_ir_gen().Gen_mul_node(Container(), Var_y(), Var_p());
+  NODE_PTR modswitch = Container()->New_cust_node(
+      fhe::ckks::OPC_MODSWITCH, Ciph_ty(), Spos());
+  modswitch->Set_child(0, mul);
+
+  NODE_PTR add = Container()->New_bin_arith(
+      fhe::ckks::OPC_ADD, Ciph_ty(), Container()->New_ld(Var_x(), Spos()),
+      modswitch, Spos());
+  Container()->Stmt_list().Append(Container()->New_st(add, Var_z(), Spos()));
+
+  NODE_PTR lowered = Lower()->Entry_node();
+  // The MUL must complete in its own RNS loop before the component-wise
+  // MODSWITCH calls.  The outer ADD then has a second loop.
+  EXPECT_EQ(Count_opcode(lowered, air::core::OPC_DO_LOOP), 2U);
+  EXPECT_EQ(Count_opcode(lowered, fhe::poly::OPC_MODSWITCH), 2U);
 }
 
 TEST_P(TEST_CKKS2POLY, Handle_bts) {
