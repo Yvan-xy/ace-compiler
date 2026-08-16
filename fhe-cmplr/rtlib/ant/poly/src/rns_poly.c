@@ -8,6 +8,7 @@
 
 #include "poly/rns_poly.h"
 
+#include "ckks/key.h"
 #include "common/error.h"
 #include "common/rt_config.h"
 #include "common/rtlib_timing.h"
@@ -946,8 +947,15 @@ POLY Mul_poly(POLY res, POLY poly1, POLY poly2) {
   if (!Is_ntt(poly2)) {
     Conv_poly2ntt_inplace(poly2);
   }
-  FMT_ASSERT(Is_size_match(res, poly1) && Is_size_match(res, poly2),
-             "size not match");
+  // Multiplication is valid at the result's active Q level even when an
+  // operand was pre-encoded for a taller Q tower.  This is the same prefix-Q
+  // behavior used by compiler-generated per-limb multiplication and is
+  // required when cached bootstrap plaintexts retain one extra Q prime.
+  FMT_ASSERT(Get_rdgree(res) == Get_rdgree(poly1) &&
+                 Get_rdgree(res) == Get_rdgree(poly2) &&
+                 Poly_level(res) <= Poly_level(poly1) &&
+                 Poly_level(res) <= Poly_level(poly2),
+             "result level exceeds multiplication operand");
   int64_t* res_data   = Get_poly_coeffs(res);
   int64_t* poly1_data = Get_poly_coeffs(poly1);
   int64_t* poly2_data = Get_poly_coeffs(poly2);
@@ -972,6 +980,73 @@ POLY Mul_poly(POLY res, POLY poly1, POLY poly2) {
     for (size_t module_idx = 0; module_idx < p_cnt; module_idx++) {
       for (uint32_t idx = 0; idx < Get_rdgree(res); idx++) {
         *res_data = Mul_int64_mod_barret(*poly1_data, *poly2_data, p_modulus);
+        poly1_data++;
+        poly2_data++;
+        res_data++;
+      }
+      p_modulus++;
+    }
+  }
+  Set_is_ntt(res, TRUE);
+  RTLIB_TM_END(RTM_MULP, rtm);
+  return res;
+}
+
+POLY Mac_poly(POLY res, POLY addend, POLY poly1, POLY poly2) {
+  RTLIB_TM_START(RTM_MULP, rtm);
+  if (!Is_ntt(addend)) {
+    Conv_poly2ntt_inplace(addend);
+  }
+  if (!Is_ntt(poly1)) {
+    Conv_poly2ntt_inplace(poly1);
+  }
+  if (!Is_ntt(poly2)) {
+    Conv_poly2ntt_inplace(poly2);
+  }
+  FMT_ASSERT(Get_rdgree(res) == Get_rdgree(addend) &&
+                 Get_rdgree(res) == Get_rdgree(poly1) &&
+                 Get_rdgree(res) == Get_rdgree(poly2) &&
+                 Poly_level(res) <= Poly_level(addend) &&
+                 Poly_level(res) <= Poly_level(poly1) &&
+                 Poly_level(res) <= Poly_level(poly2),
+             "result level exceeds mac operand");
+
+  int64_t* res_data     = Get_poly_coeffs(res);
+  int64_t* addend_data  = Get_poly_coeffs(addend);
+  int64_t* poly1_data   = Get_poly_coeffs(poly1);
+  int64_t* poly2_data   = Get_poly_coeffs(poly2);
+  MODULUS* q_modulus    = Q_modulus();
+  for (size_t module_idx = 0; module_idx < Poly_level(res); module_idx++) {
+    int64_t modulus = Get_mod_val(q_modulus);
+    for (uint32_t idx = 0; idx < Get_rdgree(res); idx++) {
+      int64_t product =
+          Mul_int64_mod_barret(*poly1_data, *poly2_data, q_modulus);
+      *res_data = Add_int64_with_mod(*addend_data, product, modulus);
+      addend_data++;
+      poly1_data++;
+      poly2_data++;
+      res_data++;
+    }
+    q_modulus++;
+  }
+
+  size_t p_cnt = Num_p(res);
+  if (p_cnt) {
+    IS_TRUE(Is_p_cnt_match(res, addend) && Is_p_cnt_match(res, poly1) &&
+                Is_p_cnt_match(res, poly2),
+            "unmatched p primes cnt");
+    MODULUS* p_modulus = P_modulus();
+    addend_data        = Get_p_coeffs(addend);
+    poly1_data         = Get_p_coeffs(poly1);
+    poly2_data         = Get_p_coeffs(poly2);
+    res_data           = Get_p_coeffs(res);
+    for (size_t module_idx = 0; module_idx < p_cnt; module_idx++) {
+      int64_t modulus = Get_mod_val(p_modulus);
+      for (uint32_t idx = 0; idx < Get_rdgree(res); idx++) {
+        int64_t product =
+            Mul_int64_mod_barret(*poly1_data, *poly2_data, p_modulus);
+        *res_data = Add_int64_with_mod(*addend_data, product, modulus);
+        addend_data++;
         poly1_data++;
         poly2_data++;
         res_data++;
@@ -1087,6 +1162,15 @@ POLY Automorphism_transform(POLY res, POLY poly, VALUE_LIST* precomp) {
   }
   Set_is_ntt(res, Is_ntt(poly));
   return res;
+}
+
+void Rotate_poly_with_cached_rotation_idx(POLY res, POLY poly,
+                                          int32_t rotation) {
+  CKKS_KEY_GENERATOR* keygen = (CKKS_KEY_GENERATOR*)Keygen();
+  uint32_t            auto_idx = Auto_idx(rotation);
+  VALUE_LIST* order = Get_precomp_auto_order(keygen, auto_idx);
+  FMT_ASSERT(order, "cannot find cached automorphism order");
+  Automorphism_transform(res, poly, order);
 }
 
 void Transform_values_from_level0(POLY res, POLY poly) {

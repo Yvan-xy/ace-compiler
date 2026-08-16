@@ -245,6 +245,80 @@ TEST_F(TEST_POLYNOMIAL, add_poly_int) {
 
 TEST_F(TEST_POLYNOMIAL, Mul_poly) { Multiply_poly(false); }
 
+TEST_F(TEST_POLYNOMIAL, Mul_poly_accepts_taller_q_operand) {
+  size_t degree        = Get_degree();
+  size_t full_q_count  = Get_prime();
+  size_t active_q_count = full_q_count - 1;
+  size_t p_count       = Get_crt_num_p(Get_crt());
+
+  VALUE_LIST* val1 = Alloc_value_list(I64_TYPE, degree);
+  VALUE_LIST* val2 = Alloc_value_list(I64_TYPE, degree);
+  VALUE_LIST* got  = Alloc_value_list(BIGINT_TYPE, degree);
+  Init_i64_value_list(val1, degree, (int64_t*)Coeffs1);
+  Init_i64_value_list(val2, degree, (int64_t*)Coeffs2);
+
+  POLYNOMIAL active, taller, product;
+  Alloc_poly_data(&active, degree, active_q_count, p_count);
+  Alloc_poly_data(&taller, degree, full_q_count, p_count);
+  Alloc_poly_data(&product, degree, active_q_count, p_count);
+  Transform_value_to_rns_poly(&active, val1, true);
+  Transform_value_to_rns_poly(&taller, val2, true);
+
+  Mul_poly(&product, &active, &taller);
+  Conv_ntt2poly_inplace(&product);
+  Reconstruct_rns_poly_to_value(got, &product);
+
+  int64_t expected[Coeff_len] = {-29, -31, -9, 17};
+  CHECK_BIG_INT_COEFFS(Get_bint_values(got), degree, expected);
+
+  Free_poly_data(&active);
+  Free_poly_data(&taller);
+  Free_poly_data(&product);
+  Free_value_list(val1);
+  Free_value_list(val2);
+  Free_value_list(got);
+}
+
+TEST_F(TEST_POLYNOMIAL, Mac_poly_fuses_add_and_taller_q_multiply) {
+  size_t degree         = Get_degree();
+  size_t full_q_count   = Get_prime();
+  size_t active_q_count = full_q_count - 1;
+  size_t p_count        = Get_crt_num_p(Get_crt());
+
+  VALUE_LIST* add_values = Alloc_value_list(I64_TYPE, degree);
+  VALUE_LIST* lhs_values = Alloc_value_list(I64_TYPE, degree);
+  VALUE_LIST* rhs_values = Alloc_value_list(I64_TYPE, degree);
+  VALUE_LIST* got        = Alloc_value_list(BIGINT_TYPE, degree);
+  Init_i64_value_list(add_values, degree, (int64_t*)Coeffs1);
+  Init_i64_value_list(lhs_values, degree, (int64_t*)Coeffs1);
+  Init_i64_value_list(rhs_values, degree, (int64_t*)Coeffs2);
+
+  POLYNOMIAL addend, lhs, taller_rhs, result;
+  Alloc_poly_data(&addend, degree, active_q_count, p_count);
+  Alloc_poly_data(&lhs, degree, active_q_count, p_count);
+  Alloc_poly_data(&taller_rhs, degree, full_q_count, p_count);
+  Alloc_poly_data(&result, degree, active_q_count, p_count);
+  Transform_value_to_rns_poly(&addend, add_values, true);
+  Transform_value_to_rns_poly(&lhs, lhs_values, true);
+  Transform_value_to_rns_poly(&taller_rhs, rhs_values, true);
+
+  Mac_poly(&result, &addend, &lhs, &taller_rhs);
+  Conv_ntt2poly_inplace(&result);
+  Reconstruct_rns_poly_to_value(got, &result);
+
+  int64_t expected[Coeff_len] = {-29, -30, -5, 22};
+  CHECK_BIG_INT_COEFFS(Get_bint_values(got), degree, expected);
+
+  Free_poly_data(&addend);
+  Free_poly_data(&lhs);
+  Free_poly_data(&taller_rhs);
+  Free_poly_data(&result);
+  Free_value_list(add_values);
+  Free_value_list(lhs_values);
+  Free_value_list(rhs_values);
+  Free_value_list(got);
+}
+
 TEST_F(TEST_POLYNOMIAL, Mul_poly_fast) { Multiply_poly(true); }
 
 TEST_F(TEST_POLYNOMIAL, mod_small_poly) {

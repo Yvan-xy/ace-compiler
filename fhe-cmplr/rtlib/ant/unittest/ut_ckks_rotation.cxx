@@ -65,8 +65,8 @@ protected:
     Encrypt_msg(ciph, _encryptor, plain);
     Init_ciphertext_from_ciph(ciph_rot, ciph, Get_ciph_sfactor(ciph),
                               Get_ciph_sf_degree(ciph));
-    Rotate_poly_with_rotation_idx(Get_c0(ciph_rot), Get_c0(ciph), rot);
-    Rotate_poly_with_rotation_idx(Get_c1(ciph_rot), Get_c1(ciph), rot);
+    Rotate_poly_with_cached_rotation_idx(Get_c0(ciph_rot), Get_c0(ciph), rot);
+    Rotate_poly_with_cached_rotation_idx(Get_c1(ciph_rot), Get_c1(ciph), rot);
     Rotate_poly_with_rotation_idx(Get_sk_poly(rot_key),
                                   Get_sk_poly(Get_sk(_keygen)), rot);
     Conv_poly2ntt(Get_ntt_sk(rot_key), Get_sk_poly(rot_key));

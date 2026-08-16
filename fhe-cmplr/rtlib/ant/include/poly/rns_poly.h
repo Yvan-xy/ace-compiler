@@ -395,6 +395,11 @@ POLY Sub_poly(POLY poly_diff, POLY poly1, POLY poly2);
 //! @param poly2 input poly to be multiply
 POLY Mul_poly(POLY res, POLY poly1, POLY poly2);
 
+//! @brief Compute res = addend + poly1 * poly2 in one traversal of all active
+//! Q/P limbs.  Multiplication uses the result's active Q prefix, so a cached
+//! plaintext operand may retain a taller Q tower.
+POLY Mac_poly(POLY res, POLY addend, POLY poly1, POLY poly2);
+
 //! @brief Perform polynomial multiply with precomputation
 //! @param res result poly
 //! @param poly1 multipler polynomial
@@ -407,6 +412,16 @@ POLY Mul_poly_fast(POLY res, POLY poly1, POLY poly2, POLY poly2_prec);
 //! @param poly given polynomial
 //! @param precomp precomputed from Precompute_automorphism_order
 POLY Automorphism_transform(POLY res, POLY poly, VALUE_LIST* precomp);
+
+//! @brief Rotate a polynomial by a slot rotation index.  Unlike
+//! Automorphism_transform, this entry point derives the automorphism order
+//! from the signed rotation index and applies it to every active Q/P limb.
+void Rotate_poly_with_rotation_idx(POLY res, POLY poly, int32_t rotation);
+
+//! @brief Rotate using the automorphism order cached by the active CKKS key
+//! generator.  The rotation must be present in the generated context key set.
+void Rotate_poly_with_cached_rotation_idx(POLY res, POLY poly,
+                                          int32_t rotation);
 
 //! @brief Transform values(level 0 of poly) to rns polynomial
 void Transform_values_from_level0(POLY res, POLY poly);
