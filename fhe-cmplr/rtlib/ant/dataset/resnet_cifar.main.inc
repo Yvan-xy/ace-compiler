@@ -76,35 +76,70 @@ int main(int argc, char* argv[]) {
 
   Prepare_context();
 
+  uint32_t image_parallelism = 0;
+  if (const char* image_parallelism_str = getenv("ACE_IMAGE_PARALLELISM")) {
+    image_parallelism = atoi(image_parallelism_str);
+  }
+
   uint32_t pass_cnt = 0;
   uint32_t fail_cnt = 0;
-#pragma omp parallel for reduction(+:pass_cnt) reduction(+:fail_cnt)
-  for (uint32_t i = start_idx; i <= end_idx; ++i) {
-    int label;
-#pragma omp critical
-    {
-      TENSOR* input_data =
-          Alloc_tensor(1, cifar_reader.Channel(), cifar_reader.Height(),
-                       cifar_reader.Width(), NULL);
-      label = cifar_reader.Load(i, input_data->_vals);
-      AIR_ASSERT(label != -1);
-      Prepare_input(input_data, "input");
-      Free_tensor(input_data);
+  if (image_parallelism <= 1) {
+    for (uint32_t i = start_idx; i <= end_idx; ++i) {
+      int label;
+      {
+        TENSOR* input_data =
+            Alloc_tensor(1, cifar_reader.Channel(), cifar_reader.Height(),
+                         cifar_reader.Width(), NULL);
+        label = cifar_reader.Load(i, input_data->_vals);
+        AIR_ASSERT(label != -1);
+        Prepare_input(input_data, "input");
+        Free_tensor(input_data);
+      }
+
+      Run_main_graph();
+
+      {
+        double* result = Handle_output("output");
+        bool    res    = Validate_output_data(result, CIFAR_CLASS_COUNT, label);
+        free(result);
+        if (res) {
+          printf("[INFO] infer image %d success\n", i);
+          ++pass_cnt;
+        } else {
+          printf("[INFO] infer image %d failed\n", i);
+          ++fail_cnt;
+        }
+      }
     }
+  } else {
+#pragma omp parallel for num_threads(image_parallelism) reduction(+:pass_cnt) reduction(+:fail_cnt)
+    for (uint32_t i = start_idx; i <= end_idx; ++i) {
+      int label;
+#pragma omp critical
+      {
+        TENSOR* input_data =
+            Alloc_tensor(1, cifar_reader.Channel(), cifar_reader.Height(),
+                         cifar_reader.Width(), NULL);
+        label = cifar_reader.Load(i, input_data->_vals);
+        AIR_ASSERT(label != -1);
+        Prepare_input(input_data, "input");
+        Free_tensor(input_data);
+      }
 
-    Run_main_graph();
+      Run_main_graph();
 
 #pragma omp critical
-    {
-      double* result = Handle_output("output");
-      bool    res    = Validate_output_data(result, CIFAR_CLASS_COUNT, label);
-      free(result);
-      if (res) {
-        printf("[INFO] infer image %d success\n", i);
-        ++pass_cnt;
-      } else {
-        printf("[INFO] infer image %d failed\n", i);
-        ++fail_cnt;
+      {
+        double* result = Handle_output("output");
+        bool    res    = Validate_output_data(result, CIFAR_CLASS_COUNT, label);
+        free(result);
+        if (res) {
+          printf("[INFO] infer image %d success\n", i);
+          ++pass_cnt;
+        } else {
+          printf("[INFO] infer image %d failed\n", i);
+          ++fail_cnt;
+        }
       }
     }
   }
