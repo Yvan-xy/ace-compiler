@@ -138,6 +138,28 @@ GLOB_SCOPE* Ckks_driver(GLOB_SCOPE* glob, core::LOWER_CTX* lower_ctx,
     // management operations, like bootstrap/rescale/modswitch
     RESBM resbm(driver_ctx, config, new_glob, lower_ctx);
     resbm.Perform();
+
+    // RESBM has now materialized bootstrap result levels.  Establish the
+    // complete data-Q count and entry input level before forward scale
+    // management translates those result levels into physical Q coordinates.
+    // This preliminary analysis must leave generated ENCODE levels symbolic:
+    // scale management owns the forward level coordinate and may still insert
+    // rescale/modswitch nodes.  The final analysis below materializes levels
+    // from the rewritten graph.
+    for (GLOB_SCOPE::FUNC_SCOPE_ITER it = new_glob->Begin_func_scope();
+         it != new_glob->End_func_scope(); ++it) {
+      FUNC_SCOPE*              ckks_func = &(*it);
+      core::CTX_PARAM_ANA preliminary_ctx_param_ana(
+          ckks_func, lower_ctx, driver_ctx, config,
+          core::CTX_PARAM_ANA_MODE::PRESERVE_SYMBOLIC_ENCODE_LEVELS);
+      R_CODE analysis_result = preliminary_ctx_param_ana.Run();
+      if (analysis_result != R_CODE::NORMAL) {
+        if (result != nullptr) *result = analysis_result;
+        delete new_glob;
+        return nullptr;
+      }
+    }
+
     // 3. perform other function level pass
     for (GLOB_SCOPE::FUNC_SCOPE_ITER it = new_glob->Begin_func_scope();
          it != new_glob->End_func_scope(); ++it) {

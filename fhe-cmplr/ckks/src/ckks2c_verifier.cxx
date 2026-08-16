@@ -379,6 +379,27 @@ bool Verify_static_cipher_rescale_metadata(NODE_PTR node, CKKS_OPERATOR op,
   return true;
 }
 
+bool Verify_static_cipher_plain_level_metadata(NODE_PTR node,
+                                               CKKS_OPERATOR op,
+                                               std::string* diagnostic) {
+  uint32_t cipher_level = 0;
+  uint32_t plain_level  = 0;
+  if (!Known_metadata(node->Child(0), core::FHE_ATTR_KIND::LEVEL, 3,
+                      &cipher_level) ||
+      !Known_metadata(node->Child(1), core::FHE_ATTR_KIND::LEVEL, 3,
+                      &plain_level) ||
+      cipher_level == plain_level) {
+    return true;
+  }
+
+  std::ostringstream os;
+  os << "Phantom CKKS2C " << Operator_name(op)
+     << " requires matching ciphertext and plaintext logical levels when "
+        "statically known: ciphertext="
+     << cipher_level << ", plaintext=" << plain_level;
+  return Fail(os.str(), diagnostic);
+}
+
 bool Verify_phantom_binary(NODE_PTR node, CKKS_OPERATOR op,
                            std::string* diagnostic) {
   if (node->Num_child() != 2) {
@@ -422,6 +443,10 @@ bool Verify_phantom_binary(NODE_PTR node, CKKS_OPERATOR op,
   }
   if (Is_cipher_family(rhs_kind) &&
       !Verify_static_cipher_rescale_metadata(node, op, diagnostic)) {
+    return false;
+  }
+  if (op == CKKS_OPERATOR::MUL && rhs_kind == OPERAND_KIND::PLAIN &&
+      !Verify_static_cipher_plain_level_metadata(node, op, diagnostic)) {
     return false;
   }
   if ((op == CKKS_OPERATOR::ADD || op == CKKS_OPERATOR::SUB) &&

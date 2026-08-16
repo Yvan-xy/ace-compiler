@@ -976,6 +976,22 @@ RETV CORE_SCALE_MANAGER::Handle_call(VISITOR* visitor, NODE_PTR node) {
   AIR_ASSERT(mul_depth_ptr != nullptr);
   uint32_t retv_rescale_level = *mul_depth_ptr + max_rescale_level;
 
+  // A planned callee may bootstrap internally, so its result is not always
+  // the input coordinate plus MUL_DEPTH.  Preliminary context analysis records
+  // the active data-Q count required at the call result in LEVEL.  Prefer that
+  // physical result level when it is available; otherwise retain the legacy
+  // monotonic-depth convention used by scale-manager-only pipelines.
+  const uint32_t* result_level =
+      node->Attr<uint32_t>(FHE_ATTR_KIND::LEVEL);
+  if (result_level != nullptr) {
+    const uint32_t full_q_count =
+        lower_ctx->Get_ctx_param().Get_mul_level() + 1;
+    AIR_ASSERT_MSG(*result_level > 0 && *result_level <= full_q_count,
+                   "call result level %u exceeds the data-Q count %u",
+                   *result_level, full_q_count);
+    retv_rescale_level = full_q_count - *result_level;
+  }
+
   air::opt::SSA_CONTAINER* ssa_cntr = ctx.Ssa_cntr();
   air::opt::SSA_VER_PTR    retv     = ssa_cntr->Node_ver(node->Id());
   SCALE_INFO               retv_scale_info(1, retv_rescale_level);
@@ -1415,6 +1431,25 @@ RETV CKKS_SCALE_MANAGER::Handle_bootstrap(VISITOR* visitor, NODE_PTR node) {
     EXPR_RESCALE_INFO rs_info(node, 0, child, rs_cnt,
                               SCALE_INFO(1, rescale_lev));
     ctx.Add_expr_rescale_info(rs_info);
+  }
+
+  // A bootstrap starts a new physical data-Q chain.  RESCALE_LEVEL is a
+  // full-Q coordinate, so retaining the input's coordinate makes a later
+  // residual add interpret every level restored by bootstrap as another
+  // consumed level.  That can generate an impossible modulus-switch chain on
+  // the bypass operand.  RESBM bootstraps carry their active-Q result count in
+  // LEVEL; translate it back to the coordinate used by the scale manager.
+  const uint32_t* result_level =
+      node->Attr<uint32_t>(core::FHE_ATTR_KIND::LEVEL);
+  if (result_level != nullptr) {
+    const uint32_t full_q_count =
+        ctx.Lower_ctx()->Get_ctx_param().Get_mul_level() + 1;
+    AIR_ASSERT_MSG(*result_level > 0 && *result_level <= full_q_count,
+                   "bootstrap result level %u exceeds the data-Q count %u",
+                   *result_level, full_q_count);
+    SCALE_INFO result(1, full_q_count - *result_level);
+    ctx.Set_node_scale_info(node, result);
+    return RETV{result, node};
   }
 
   return RETV{SCALE_INFO(1, rescale_lev), node};

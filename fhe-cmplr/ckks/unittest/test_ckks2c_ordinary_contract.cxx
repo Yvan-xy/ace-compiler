@@ -902,6 +902,19 @@ TEST_F(CKKS2COrdinaryAirVerifier, AcceptsContextDerivedEncodeLimits) {
 }
 
 TEST_F(CKKS2COrdinaryAirVerifier,
+       RejectsMismatchedCiphertextAndPlaintextLevels) {
+  NODE_PTR encode = Encode(Float_constant(), 16, 1, 3);
+  NODE_PTR product = _container->New_bin_arith(
+      fhe::ckks::OPC_MUL, _cipher, Cipher_load(4, 1, 0), encode, _spos);
+  std::string diagnostic;
+  EXPECT_FALSE(Verify(product, &diagnostic));
+  EXPECT_EQ(
+      diagnostic,
+      "Phantom CKKS2C mul requires matching ciphertext and plaintext "
+      "logical levels when statically known: ciphertext=4, plaintext=3");
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier,
        AnalysisTracksComplexPlaintextRequirement) {
   NODE_PTR encode = Encode(Float_constant(), 16, 1, 4);
   const uint32_t complex_plaintext = 1;
@@ -924,6 +937,38 @@ TEST_F(CKKS2COrdinaryAirVerifier,
                                     &driver_context, &config);
   ASSERT_EQ(analysis.Run(), R_CODE::NORMAL);
   EXPECT_TRUE(_lower_ctx.Get_ctx_param().Complex_plaintext_required());
+}
+
+TEST_F(CKKS2COrdinaryAirVerifier,
+       PreliminaryAnalysisKeepsEncodeLevelSymbolic) {
+  TYPE_PTR level_type = _lower_ctx.Get_level_type(_glob);
+  NODE_PTR level = _container->New_cust_node(
+      fhe::ckks::OPC_LEVEL, level_type, _spos);
+  level->Set_child(0, _container->New_ld(_cipher_input, _spos));
+  TYPE_PTR u32 = _glob->Prim_type(PRIMITIVE_TYPE::INT_U32);
+  NODE_PTR encode = Encode(Float_constant(),
+                           _container->New_intconst(u32, 16, _spos),
+                           _container->New_intconst(u32, 1, _spos), level);
+  NODE_PTR product = Use_plain(encode);
+  ADDR_DATUM_PTR result =
+      _func_scope->New_var(product->Rtype(), "symbolic_encode", _spos);
+  _container->Stmt_list().Append(
+      _container->New_st(product, result, _spos));
+  _container->Stmt_list().Append(
+      _container->New_retv(_container->New_ld(result, _spos), _spos));
+
+  fhe::ckks::CKKS_CONFIG config;
+  config._poly_deg         = 32;
+  config._max_cipher_lvl   = 4;
+  config._input_cipher_lvl = 4;
+  air::driver::DRIVER_CTX driver_context;
+  fhe::core::CTX_PARAM_ANA analysis(
+      _func_scope, &_lower_ctx, &driver_context, &config,
+      fhe::core::CTX_PARAM_ANA_MODE::PRESERVE_SYMBOLIC_ENCODE_LEVELS);
+  ASSERT_EQ(analysis.Run(), R_CODE::NORMAL);
+
+  EXPECT_EQ(encode->Child(3)->Opcode(), fhe::ckks::OPC_LEVEL);
+  EXPECT_EQ(encode->Attr<uint32_t>(fhe::core::FHE_ATTR_KIND::LEVEL), nullptr);
 }
 
 TEST_F(CKKS2COrdinaryAirVerifier, RejectsEncodeLengthBeyondContextSlots) {

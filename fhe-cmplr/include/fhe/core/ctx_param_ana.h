@@ -129,6 +129,11 @@ private:
 };
 
 //! @brief context of CTX_PARAM analyzer.
+enum class CTX_PARAM_ANA_MODE : uint8_t {
+  MATERIALIZE_ENCODE_LEVELS,
+  PRESERVE_SYMBOLIC_ENCODE_LEVELS,
+};
+
 class CTX_PARAM_ANA_CTX : public ANALYZE_CTX {
 public:
   using ROTATE_IDX_SET = std::set<int32_t>;
@@ -143,12 +148,15 @@ public:
   CTX_PARAM_ANA_CTX(const air::driver::DRIVER_CTX* driver_ctx,
                     const ckks::CKKS_CONFIG* config, LOWER_CTX* ctx,
                     FUNC_SCOPE* func_scope, SSA_CONTAINER* ssa_cntr,
-                    uint32_t formal_mul_lev)
+                    uint32_t formal_mul_lev,
+                    CTX_PARAM_ANA_MODE mode =
+                        CTX_PARAM_ANA_MODE::MATERIALIZE_ENCODE_LEVELS)
       : _lower_ctx(ctx),
         _func_scope(func_scope),
         _ssa_cntr(ssa_cntr),
         _driver_ctx(driver_ctx),
-        _config(config) {}
+        _config(config),
+        _mode(mode) {}
   ~CTX_PARAM_ANA_CTX() {}
 
   uint32_t Get_mul_level_of_ssa_ver(SSA_VER_ID id);
@@ -195,6 +203,9 @@ public:
   void Require_complex_plaintext() { _complex_plaintext_required = true; }
   bool Complex_plaintext_required() const {
     return _complex_plaintext_required;
+  }
+  bool Materialize_encode_levels() const {
+    return _mode == CTX_PARAM_ANA_MODE::MATERIALIZE_ENCODE_LEVELS;
   }
   void Add_monomial_power(uint32_t power) { _monomial_powers.insert(power); }
   const std::set<uint32_t>& Get_monomial_powers() const {
@@ -298,6 +309,8 @@ private:
   bool     _rotate_batch_required = false;
   bool     _raise_mod_required = false;
   bool     _complex_plaintext_required = false;
+  CTX_PARAM_ANA_MODE _mode =
+      CTX_PARAM_ANA_MODE::MATERIALIZE_ENCODE_LEVELS;
   std::set<uint32_t> _rotate_batch_nodes;
   std::vector<std::vector<int32_t>> _rotate_batches;
   std::set<uint32_t> _monomial_powers;
@@ -1435,7 +1448,8 @@ RETV CKKS_ANA_IMPL::Handle_encode(VISITOR* visitor, NODE_PTR encode) {
 
   bool is_entry_func =
       ana_ctx.Func_scope()->Owning_func()->Entry_point()->Is_program_entry();
-  if (!ana_ctx.Enc_lvl_cst() || !is_entry_func) {
+  if (!ana_ctx.Materialize_encode_levels() || !ana_ctx.Enc_lvl_cst() ||
+      !is_entry_func) {
     return RETV{false, mul_level};
   }
   CONTAINER*  cntr     = encode->Container();
@@ -1469,13 +1483,15 @@ public:
   using DRIVER_CTX    = air::driver::DRIVER_CTX;
   using CKKS_CONFIG   = ckks::CKKS_CONFIG;
   CTX_PARAM_ANA(FUNC_SCOPE* func_scope, LOWER_CTX* ctx,
-                const DRIVER_CTX* driver_ctx, const CKKS_CONFIG* config)
+                const DRIVER_CTX* driver_ctx, const CKKS_CONFIG* config,
+                CTX_PARAM_ANA_MODE mode =
+                    CTX_PARAM_ANA_MODE::MATERIALIZE_ENCODE_LEVELS)
       : _func_scope(func_scope),
         _lower_ctx(ctx),
         _driver_ctx(driver_ctx),
         _config(config),
         _ssa_cntr(&func_scope->Container()),
-        _ana_ctx(driver_ctx, config, ctx, func_scope, &_ssa_cntr, 0) {}
+        _ana_ctx(driver_ctx, config, ctx, func_scope, &_ssa_cntr, 0, mode) {}
 
   ~CTX_PARAM_ANA() {}
 

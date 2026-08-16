@@ -361,6 +361,99 @@ TEST_F(BinaryLevelAlignmentTest, AlignsCipherProducerWithoutSourceMetadata) {
   EXPECT_TRUE(_glob->Verify_ir());
 }
 
+TEST_F(BinaryLevelAlignmentTest,
+       BootstrapResultLevelResetsPhysicalQCoordinate) {
+  FUNCTION_IR ir = New_function(SCALE_POLICY::REGION_ENTRY);
+
+  // Seven data-Q primes are configured.  The bootstrap consumes a bottom-Q
+  // input (coordinate 6) and restores four active primes (coordinate 3).
+  NODE_PTR input = Cipher_load(ir.Container, ir.Formal, 1, 6);
+  NODE_PTR bootstrap =
+      CKKS_GEN(ir.Container, &_lower_ctx).Gen_bootstrap(input, _spos);
+  const uint32_t bootstrap_level = 4;
+  bootstrap->Set_attr(FHE_ATTR_KIND::LEVEL, &bootstrap_level, 1);
+
+  NODE_PTR rhs = Cipher_load(ir.Container, ir.Formal, 1, 4);
+  NODE_PTR add =
+      ir.Container->New_bin_arith(OPC_ADD, _cipher, bootstrap, rhs, _spos);
+  ADDR_DATUM_PTR result = ir.Scope->New_var(_cipher, "result", _spos);
+  STMT_PTR store = ir.Container->New_st(add, result, _spos);
+  ir.Container->Stmt_list().Append(store);
+  NODE_PTR return_load = ir.Container->New_ld(result, _spos);
+  ir.Container->Stmt_list().Append(
+      ir.Container->New_retv(return_load, _spos));
+
+  air::driver::DRIVER_CTX driver_context;
+  CKKS_CONFIG             config;
+  Configure(config, SCALE_POLICY::REGION_ENTRY);
+  SCALE_MANAGER manager(&driver_context, &config, ir.Scope, &_lower_ctx);
+  manager.Run();
+
+  EXPECT_EQ(Attr(bootstrap, FHE_ATTR_KIND::SCALE), 1U);
+  EXPECT_EQ(Attr(bootstrap, FHE_ATTR_KIND::RESCALE_LEVEL), 3U);
+  NODE_PTR modswitch = add->Child(0);
+  ASSERT_EQ(modswitch->Opcode(), OPC_MODSWITCH);
+  EXPECT_EQ(modswitch->Child(0), bootstrap);
+  EXPECT_EQ(Count_opcode(add->Child(0), OPC_MODSWITCH), 1U);
+  EXPECT_EQ(Attr(modswitch, FHE_ATTR_KIND::RESCALE_LEVEL), 4U);
+  EXPECT_EQ(add->Child(1), rhs);
+  EXPECT_EQ(Attr(add, FHE_ATTR_KIND::RESCALE_LEVEL), 4U);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 4U);
+  EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::RESCALE_LEVEL), 4U);
+  EXPECT_TRUE(_glob->Verify_ir());
+}
+
+TEST_F(BinaryLevelAlignmentTest,
+       CallResultLevelOverridesMonotonicCalleeDepth) {
+  FUNCTION_IR callee = New_function(SCALE_POLICY::EVA_CALLEE);
+  callee.Container->Stmt_list().Append(callee.Container->New_retv(
+      callee.Container->New_ld(callee.Formal, _spos), _spos));
+
+  FUNCTION_IR caller = New_function(SCALE_POLICY::REGION_ENTRY);
+  NODE_PTR call_arg = Cipher_load(caller.Container, caller.Formal, 1, 0);
+  PREG_PTR call_result = caller.Scope->New_preg(_cipher);
+  STMT_PTR call = caller.Container->New_call(
+      callee.Scope->Owning_func()->Entry_point(), call_result, 1, _spos);
+  call->Node()->Set_child(0, call_arg);
+  const uint32_t callee_depth = 5;
+  call->Node()->Set_attr(FHE_ATTR_KIND::MUL_DEPTH, &callee_depth, 1);
+  // Seven data-Q primes are configured.  Model a callee whose internal
+  // bootstrap restores four active primes, independent of the input level.
+  const uint32_t result_level = 4;
+  call->Node()->Set_attr(FHE_ATTR_KIND::LEVEL, &result_level, 1);
+  caller.Container->Stmt_list().Append(call);
+
+  NODE_PTR call_load = caller.Container->New_ldp(call_result, _spos);
+  NODE_PTR rhs = Cipher_load(caller.Container, caller.Formal, 1, 4);
+  NODE_PTR add = caller.Container->New_bin_arith(
+      OPC_ADD, _cipher, call_load, rhs, _spos);
+  ADDR_DATUM_PTR result = caller.Scope->New_var(_cipher, "result", _spos);
+  STMT_PTR store = caller.Container->New_st(add, result, _spos);
+  caller.Container->Stmt_list().Append(store);
+  NODE_PTR return_load = caller.Container->New_ld(result, _spos);
+  caller.Container->Stmt_list().Append(
+      caller.Container->New_retv(return_load, _spos));
+
+  air::driver::DRIVER_CTX driver_context;
+  CKKS_CONFIG             config;
+  Configure(config, SCALE_POLICY::REGION_ENTRY);
+  SCALE_MANAGER manager(&driver_context, &config, caller.Scope, &_lower_ctx);
+  manager.Run();
+
+  NODE_PTR modswitch = add->Child(0);
+  ASSERT_EQ(modswitch->Opcode(), OPC_MODSWITCH);
+  EXPECT_EQ(modswitch->Child(0), call_load);
+  EXPECT_EQ(Attr(call_load, FHE_ATTR_KIND::SCALE), 1U);
+  EXPECT_EQ(Attr(call_load, FHE_ATTR_KIND::RESCALE_LEVEL), 3U);
+  EXPECT_EQ(Count_opcode(add->Child(0), OPC_MODSWITCH), 1U);
+  EXPECT_EQ(Attr(modswitch, FHE_ATTR_KIND::RESCALE_LEVEL), 4U);
+  EXPECT_EQ(add->Child(1), rhs);
+  EXPECT_EQ(Attr(add, FHE_ATTR_KIND::RESCALE_LEVEL), 4U);
+  EXPECT_EQ(Attr(store->Node(), FHE_ATTR_KIND::RESCALE_LEVEL), 4U);
+  EXPECT_EQ(Attr(return_load, FHE_ATTR_KIND::RESCALE_LEVEL), 4U);
+  EXPECT_TRUE(_glob->Verify_ir());
+}
+
 TEST_F(BinaryLevelAlignmentTest, LeavesSymbolicZeroUnwrapped) {
   FUNCTION_IR ir = New_function(SCALE_POLICY::ACE_ENTRY);
 
