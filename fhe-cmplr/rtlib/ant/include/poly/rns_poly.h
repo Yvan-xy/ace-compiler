@@ -300,6 +300,10 @@ POLY Mod_up(POLY res, POLY poly, uint32_t q_part_idx);
 //! @param poly input poly
 //! @param q_part_idx index of q part
 POLY Decomp_modup(POLY res, POLY poly, uint32_t q_part_idx);
+//! Experimental CPU entry: only the internal NTT batches use this budget.
+//! The decomposition and base-conversion loops keep their original ordering.
+POLY Decomp_modup_with_ntt_threads(POLY res, POLY poly, uint32_t q_part_idx,
+                                   uint32_t max_threads);
 
 //! @brief Reduce poly from P*Q to Q
 //! @param res result poly

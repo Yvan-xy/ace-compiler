@@ -27,8 +27,19 @@ void Init_rtlib_timing() {}
 
 void Append_rtlib_timing(uint32_t event, uint32_t id, uint64_t nsec,
                          uint64_t sub_nsec) {
+  // Workers have private timing stacks but share these aggregate counters.
+  // Reports are read after the caller has joined all parallel work.
+#ifdef _OPENMP
+#pragma omp atomic update
+#endif
   Rtlib_timing[event] += nsec;
+#ifdef _OPENMP
+#pragma omp atomic update
+#endif
   Rtlib_sub_timing[event] += sub_nsec;
+#ifdef _OPENMP
+#pragma omp atomic update
+#endif
   Rtlib_count[event]++;
 }
 

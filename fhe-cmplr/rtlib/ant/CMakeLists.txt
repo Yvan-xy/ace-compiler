@@ -85,6 +85,16 @@ endif()
 
 if(BUILD_UNITTEST AND NOT RTLIB_SEED_MODE STREQUAL "fixed")
   build_app_unittest(RTLIB_INSTALL_APP "${FHERT_ANT_LIB};${UT_LIBS}" "ut_fhert_ant")
+  if(RTLIB_ENABLE_LINUX AND BUILD_WITH_OPENMP AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_definitions(ut_fhert_ant PRIVATE ACE_NTT_TEST_WRAP)
+    target_link_options(ut_fhert_ant PRIVATE "-Wl,--wrap=Ftt_fwd" "-Wl,--wrap=Ftt_inv")
+  endif()
+  add_test(NAME ut_fhert_ant_ntt_threads
+    COMMAND ${CMAKE_BINARY_DIR}/unittest/ut_fhert_ant
+            --gtest_filter=TEST_NTT_THREADS.*)
+  add_test(NAME ut_fhert_ant_evalmod_exec
+    COMMAND ${CMAKE_BINARY_DIR}/unittest/ut_fhert_ant
+            --gtest_filter=TEST_EVALMOD_EXEC.*)
   add_test(
     NAME ut_fhert_ant_ckks_extended_ops
     COMMAND ${CMAKE_BINARY_DIR}/unittest/ut_fhert_ant

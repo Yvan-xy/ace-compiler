@@ -10,6 +10,83 @@
 
 #include "util/bignumber.h"
 
+#include <limits.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+// Views passed to this batch helper contain contiguous limbs and explicit
+// prime lists. In particular, a decomposition's last partition may use only
+// a prefix of its prime list. No polynomial metadata is written by workers.
+static void Ntt_limb(POLY res, POLY poly, VL_CRTPRIME* primes, size_t index,
+                     bool inverse) {
+  size_t degree = Get_rdgree(poly);
+  VALUE_LIST input, output;
+  Init_i64_value_list_no_copy(&input, degree, Get_poly_coeffs(poly) + index * degree);
+  Init_i64_value_list_no_copy(&output, degree, Get_poly_coeffs(res) + index * degree);
+  NTT_CONTEXT* ntt = Get_ntt(Get_vlprime_at(primes, index));
+  if (inverse) {
+    Ftt_inv(&output, ntt, &input);
+  } else {
+    Ftt_fwd(&output, ntt, &input);
+  }
+}
+
+static void Ntt_batch(POLY res, POLY poly, VL_CRTPRIME* primes, bool inverse,
+                      uint32_t max_threads) {
+  size_t count = Poly_level(poly);
+  IS_TRUE(Get_rdgree(res) == Get_rdgree(poly) && Poly_level(res) == count &&
+              LIST_LEN(primes) >= count,
+          "NTT batch shape/prime list mismatch");
+  int workers = 1;
+#ifdef _OPENMP
+  if (max_threads > 1 && count > 1 && !omp_in_parallel() &&
+      Num_p(res) == 0 && Num_p(poly) == 0 &&
+      Num_alloc(res) >= count && Num_alloc(poly) >= count &&
+      Get_rdgree(poly) > 0 &&
+      count <= SIZE_MAX / sizeof(int64_t) / Get_rdgree(poly)) {
+    size_t bytes = count * Get_rdgree(poly) * sizeof(int64_t);
+    uintptr_t dst = (uintptr_t)Get_poly_coeffs(res);
+    uintptr_t src = (uintptr_t)Get_poly_coeffs(poly);
+    // Exact in-place or non-overlapping ranges are safe. Preserve the legacy
+    // serial order for other alias relationships.
+    bool disjoint = dst < src ? src - dst >= bytes : dst - src >= bytes;
+    if (dst && src && (dst == src || disjoint)) {
+      size_t limit = max_threads;
+      if (limit > count) limit = count;
+      if (limit > (size_t)omp_get_max_threads()) limit = omp_get_max_threads();
+      if (limit > (size_t)omp_get_thread_limit()) limit = omp_get_thread_limit();
+      if (limit > INT_MAX) limit = INT_MAX;
+      workers = (int)limit;
+    }
+  }
+#else
+  (void)max_threads;
+#endif
+  if (workers == 1) {
+    for (size_t i = 0; i < count; ++i) Ntt_limb(res, poly, primes, i, inverse);
+  } else {
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(workers) schedule(static) default(none) \
+    shared(res, poly, primes) firstprivate(count, inverse)
+    for (size_t i = 0; i < count; ++i) Ntt_limb(res, poly, primes, i, inverse);
+#endif
+  }
+  Set_is_ntt(res, !inverse);
+}
+
+void Conv_poly2ntt_inplace_with_primes_threads(POLY poly, VL_CRTPRIME* primes,
+                                               uint32_t max_threads) {
+  FMT_ASSERT(!Is_ntt(poly), "already ntt form");
+  Ntt_batch(poly, poly, primes, false, max_threads);
+}
+
+void Conv_ntt2poly_with_primes_threads(POLY res, POLY poly, VL_CRTPRIME* primes,
+                                       uint32_t max_threads) {
+  FMT_ASSERT(Is_ntt(poly), "already coefficient form");
+  Ntt_batch(res, poly, primes, true, max_threads);
+}
+
 void Multiply_add(POLYNOMIAL* res, POLYNOMIAL* poly1, POLYNOMIAL* poly2) {
   IS_TRUE(Is_ntt(res) && Is_ntt(poly1) && Is_ntt(poly2), "opnd/res is not ntt");
   IS_TRUE(Is_size_match(res, poly1) && Is_size_match(res, poly2),

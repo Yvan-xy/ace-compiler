@@ -158,7 +158,8 @@ POLY Mod_up(POLY new_poly, POLY old_poly, uint32_t q_part_idx) {
   return new_poly;
 }
 
-POLY Decomp_modup(POLY res, POLY poly, uint32_t q_part_idx) {
+static POLY Decomp_modup_impl(POLY res, POLY poly, uint32_t q_part_idx,
+                              uint32_t ntt_threads) {
   RTLIB_TM_START(RTM_DECOMP_MODUP, rtm);
   CRT_CONTEXT* crt        = Get_crt_context();
   size_t       num_decomp = Num_decomp(poly);
@@ -198,7 +199,12 @@ POLY Decomp_modup(POLY res, POLY poly, uint32_t q_part_idx) {
   POLYNOMIAL* part2_poly_intt_ptr;
   if (Is_ntt(poly)) {
     Alloc_poly_data(&part2_poly_intt, degree, num_part2, 0);
-    Conv_ntt2poly_with_primes(&part2_poly_intt, &part2_poly, part2_primes);
+    if (ntt_threads == 0) {
+      Conv_ntt2poly_with_primes(&part2_poly_intt, &part2_poly, part2_primes);
+    } else {
+      Conv_ntt2poly_with_primes_threads(&part2_poly_intt, &part2_poly,
+                                        part2_primes, ntt_threads);
+    }
     part2_poly_intt_ptr = &part2_poly_intt;
   } else {
     part2_poly_intt_ptr = &part2_poly;
@@ -247,8 +253,13 @@ POLY Decomp_modup(POLY res, POLY poly, uint32_t q_part_idx) {
     Extract_poly(&part3_poly, res, part3_start_idx, num_part3);
     Set_is_ntt(&part1_poly, false);
     Set_is_ntt(&part3_poly, false);
-    Conv_poly2ntt_inplace_with_primes(&part1_poly, &part1_primes);
-    Conv_poly2ntt_inplace_with_primes(&part3_poly, &part3_primes);
+    if (ntt_threads == 0) {
+      Conv_poly2ntt_inplace_with_primes(&part1_poly, &part1_primes);
+      Conv_poly2ntt_inplace_with_primes(&part3_poly, &part3_primes);
+    } else {
+      Conv_poly2ntt_inplace_with_primes_threads(&part1_poly, &part1_primes, ntt_threads);
+      Conv_poly2ntt_inplace_with_primes_threads(&part3_poly, &part3_primes, ntt_threads);
+    }
     Set_is_ntt(res, true);
     Free_poly_data(&part2_poly_intt);
   } else {
@@ -256,6 +267,26 @@ POLY Decomp_modup(POLY res, POLY poly, uint32_t q_part_idx) {
   }
   RTLIB_TM_END(RTM_DECOMP_MODUP, rtm);
   return res;
+}
+
+POLY Decomp_modup(POLY res, POLY poly, uint32_t q_part_idx) {
+  return Decomp_modup_impl(res, poly, q_part_idx, 0);
+}
+
+POLY Decomp_modup_with_ntt_threads(POLY res, POLY poly, uint32_t q_part_idx,
+                                   uint32_t max_threads) {
+  // The existing operation's shape requirements still apply. Only its known
+  // disjoint, densely allocated QP output layout is eligible for parallel NTT.
+  size_t src_bytes = Get_poly_mem_size(poly);
+  size_t dst_bytes = Get_poly_mem_size(res);
+  uintptr_t src = (uintptr_t)Get_poly_coeffs(poly);
+  uintptr_t dst = (uintptr_t)Get_poly_coeffs(res);
+  bool disjoint = dst < src ? src - dst >= dst_bytes : dst - src >= src_bytes;
+  if (!src || !dst || !disjoint || Num_p(poly) != 0 ||
+      Num_alloc(res) != Get_num_pq(res)) {
+    return Decomp_modup(res, poly, q_part_idx);
+  }
+  return Decomp_modup_impl(res, poly, q_part_idx, max_threads ? max_threads : 1);
 }
 
 POLY Mod_down(POLY res, POLY poly) {

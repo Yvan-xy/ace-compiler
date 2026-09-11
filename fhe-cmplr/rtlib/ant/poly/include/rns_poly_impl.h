@@ -112,6 +112,12 @@ void Print_rns_poly(FILE* fp, POLYNOMIAL* poly);
 
 //! @brief Convert polynomial from coefficient form to NTT
 void Conv_poly2ntt_inplace_with_primes(POLYNOMIAL* poly, VL_CRTPRIME* primes);
+// Explicit-budget variants for contiguous, borrowed limb views. A zero/one
+// budget or an existing OpenMP team selects the serial implementation.
+void Conv_poly2ntt_inplace_with_primes_threads(POLY poly, VL_CRTPRIME* primes,
+                                               uint32_t max_threads);
+void Conv_ntt2poly_with_primes_threads(POLY res, POLY poly, VL_CRTPRIME* primes,
+                                       uint32_t max_threads);
 void Conv_poly2ntt_with_primes(POLYNOMIAL* res, POLYNOMIAL* poly,
                                VL_CRTPRIME* primes);
 
