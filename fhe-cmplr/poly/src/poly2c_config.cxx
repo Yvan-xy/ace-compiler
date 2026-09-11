@@ -18,6 +18,10 @@ static POLY2C_CONFIG Poly2c_config;
 
 static OPTION_DESC Poly2c_option[] = {
     DECLARE_COMMON_CONFIG(Poly2c_config),
+    {"evalmod_schedule", "", "Experimental CPU region policy: 0 legacy, 1 operator, 2 combined",
+     &Poly2c_config._evalmod_schedule, air::util::K_UINT64, 0, V_EQUAL},
+    {"ntt_threads", "", "CPU ANT decomposition NTT budget (0=legacy, 1=serial)",
+     &Poly2c_config._decomp_ntt_threads, air::util::K_UINT64, 0, V_EQUAL},
     {"lib", "",
                      "FHE library used by generated code: ant, seal, openfhe, phantom, "
      "hyperfhe",                                                                                &Poly2c_config._prov_str, air::util::K_STR,  0, V_EQUAL},

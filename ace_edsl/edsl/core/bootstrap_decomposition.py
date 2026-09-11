@@ -68,6 +68,7 @@ class BootstrapConfig:
     emit_linear_transform: bool = False
     context_mul_level: int = 0
     parallel_eval_mod: bool = False
+    cpu_evalmod_region: bool = False
 
     def __post_init__(self):
         object.__setattr__(
@@ -118,6 +119,8 @@ class BootstrapConfig:
             raise ValueError(
                 "BootstrapConfig.emit_linear_transform must be a bool"
             )
+        if not isinstance(self.cpu_evalmod_region, bool) or (self.cpu_evalmod_region and not self.parallel_eval_mod):
+            raise ValueError("cpu_evalmod_region requires independent parallel EvalMod branches")
         if not isinstance(self.parallel_eval_mod, bool):
             raise ValueError("BootstrapConfig.parallel_eval_mod must be a bool")
         if self.parallel_eval_mod and not self.emit_linear_transform:
@@ -1795,7 +1798,10 @@ def fullpacked_bootstrap_primitive(ct, m_by_4: Optional[int] = None,
         hasattr(ct.container, name) for name in parallel_marker_names
     )
     if parallel_eval_mod:
-        ct.container.new_ckks_parallel_sections_begin()
+        if cfg.cpu_evalmod_region:
+            ct.container.new_ckks_parallel_sections_begin(cpu_evalmod=True)
+        else:
+            ct.container.new_ckks_parallel_sections_begin()
         ct.container.new_ckks_parallel_section_begin()
         real_evmod = eval_approx_mod(real_part, config=cfg)
         ct.container.new_ckks_parallel_section_end()

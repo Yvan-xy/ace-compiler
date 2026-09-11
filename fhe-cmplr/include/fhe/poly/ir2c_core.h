@@ -210,10 +210,11 @@ public:
     }
     if (val->Opcode() ==
         air::base::OPCODE(fhe::poly::POLYNOMIAL_DID, fhe::poly::MOD_DOWN)) {
-      ctx << "Mod_down(&";
+      ctx << (ctx.In_evalmod() ? "Evalmod_mod_down(&" : "Mod_down(&");
       ctx.Emit_var(node);
       ctx << ", ";
       visitor->template Visit<RETV>(val->Child(0));
+      if (ctx.In_evalmod()) ctx << ", &__ace_evalmod_exec";
       ctx << ")";
       return;
     }
@@ -230,12 +231,18 @@ public:
     }
     if (val->Opcode() ==
         air::base::OPCODE(fhe::poly::POLYNOMIAL_DID, fhe::poly::DECOMP_MODUP)) {
-      ctx << "Decomp_modup(&";
+      ctx << (ctx.In_evalmod() ? "Evalmod_decomp(&" : ctx.Decomp_ntt_threads() ? "Decomp_modup_with_ntt_threads(&"
+                                      : "Decomp_modup(&");
       ctx.Emit_var(node);
       ctx << ", ";
       visitor->template Visit<RETV>(val->Child(0));
       ctx << ", ";
       visitor->template Visit<RETV>(val->Child(1));
+      if (ctx.In_evalmod()) {
+        ctx << ", &__ace_evalmod_exec";
+      } else if (ctx.Decomp_ntt_threads()) {
+        ctx << ", " << ctx.Decomp_ntt_threads();
+      }
       ctx << ")";
       return;
     }

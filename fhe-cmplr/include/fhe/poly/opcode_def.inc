@@ -86,7 +86,7 @@ DEF_OPCODE(ALLOC_N, alloc_n, 4, 0, PROP_EXPR)
 // Structured parallel scheduling markers.  These remain statements so the
 // operations inside each section stay visible to POLY transformations.
 DEF_OPCODE(PARALLEL_SECTIONS_BEGIN, parallel_sections_begin, 0, 0,
-           PROP_SCF | PROP_STMT)
+           PROP_SCF | PROP_STMT | PROP_ATTR)
 DEF_OPCODE(PARALLEL_SECTION_BEGIN, parallel_section_begin, 0, 0,
            PROP_SCF | PROP_STMT)
 DEF_OPCODE(PARALLEL_SECTION_END, parallel_section_end, 0, 0,

@@ -58,14 +58,21 @@ from ace_edsl.edsl import ckks_kernel, CkksCiphertext, CkksPlaintext
 
 # ANT bootstrap constants (shared by kernel/driver only; ant_bootstrap_ref stays stdlib-only)
 from bootstrap_ant_constants import (
+    G_COEFFICIENTS_OPENFHE_SPARSE,
     G_COEFFICIENTS_UNIFORM_HW_192,
     get_double_angle_scalars,
     BOOTSTRAP_POST_SCALE,
+    OPENFHE_SPARSE_COEFF_SIZE,
+    OPENFHE_SPARSE_UPPER_BOUND_K,
     UNIFORM_COEFF_SIZE_HW_192,
     R_UNIFORM_HW_192,
 )
 from ace_edsl.edsl.core.bootstrap_decomposition import BootstrapConfig
-from ace_edsl.edsl.core.bootstrap_math import EVAL_SIN_UPPER_BOUND_K
+from ace_edsl.edsl.core.bootstrap_math import (
+    EVAL_SIN_UPPER_BOUND_K,
+    compute_degree_ps,
+    get_degree_from_coeffs,
+)
 
 # ANT full bootstrap reference (Python port of Eval_bootstrap); see plan ant_full_bootstrap_python_port
 try:
@@ -84,6 +91,8 @@ CHEB_COEFF_COUNT = UNIFORM_COEFF_SIZE_HW_192  # 55
 UNIFORM_COEFFICIENT_HAMMING_WEIGHT_MAX = 192
 EVALMOD_COMPONENT_LOWER_BOUND = -1.0
 EVALMOD_COMPONENT_UPPER_BOUND = 1.0
+EVALMOD_PROFILE_ANT_UNIFORM_HW192 = "ant_uniform_hw192"
+EVALMOD_PROFILE_OPENFHE_SPARSE = "openfhe_sparse"
 
 
 _EXPLICIT_TRACE_CONFIG: ContextVar[Optional[BootstrapConfig]] = ContextVar(
@@ -177,7 +186,27 @@ def _bootstrap_linear_transform_enabled() -> bool:
 
 def _bootstrap_parallel_eval_mod_enabled() -> bool:
     """Enable the experimental dual-EvalMod parallel scheduling contract."""
-    return _env_flag("ACE_BOOTSTRAP_PARALLEL_EVAL_MOD")
+    mode = _bootstrap_evalmod_schedule()
+    if mode and _bootstrap_decomp_ntt_threads():
+        raise ValueError("full EvalMod strategy conflicts with partial NTT strategy")
+    return bool(mode) or (_bootstrap_decomp_ntt_threads() == 0 and
+                         _env_flag("ACE_BOOTSTRAP_PARALLEL_EVAL_MOD"))
+
+
+def _bootstrap_evalmod_schedule() -> int:
+    value = int(os.environ.get("ACE_BOOTSTRAP_EVALMOD_SCHEDULE", "0"))
+    if value not in (0, 1, 2):
+        raise ValueError("ACE_BOOTSTRAP_EVALMOD_SCHEDULE must be 0, 1 or 2")
+    return value
+
+
+def _bootstrap_decomp_ntt_threads() -> int:
+    """Explicit CPU experiment; keep the default two-branch mode available."""
+    raw = os.environ.get("ACE_BOOTSTRAP_DECOMP_NTT_THREADS", "0")
+    value = int(raw)
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise ValueError("ACE_BOOTSTRAP_DECOMP_NTT_THREADS must be uint32")
+    return value
 
 
 def _bootstrap_ct_encode() -> bool:
@@ -191,6 +220,55 @@ def _bootstrap_ct_encode() -> bool:
 def _env_flag(name: str) -> bool:
     raw = os.environ.get(name, "").strip().lower()
     return bool(raw) and raw not in ("0", "false", "off", "no")
+
+
+def _normalize_evalmod_profile(profile: str) -> str:
+    """Return the canonical EvalMod profile name or reject an unknown value."""
+    normalized = str(profile).strip().lower()
+    aliases = {
+        "": EVALMOD_PROFILE_ANT_UNIFORM_HW192,
+        "ant": EVALMOD_PROFILE_ANT_UNIFORM_HW192,
+        "ant_hw192": EVALMOD_PROFILE_ANT_UNIFORM_HW192,
+        EVALMOD_PROFILE_ANT_UNIFORM_HW192: EVALMOD_PROFILE_ANT_UNIFORM_HW192,
+        "openfhe": EVALMOD_PROFILE_OPENFHE_SPARSE,
+        EVALMOD_PROFILE_OPENFHE_SPARSE: EVALMOD_PROFILE_OPENFHE_SPARSE,
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(f"unsupported bootstrap EvalMod profile: {profile!r}") from exc
+
+
+def _bootstrap_evalmod_profile() -> str:
+    return _normalize_evalmod_profile(
+        os.environ.get(
+            "ACE_BOOTSTRAP_EVALMOD_PROFILE",
+            EVALMOD_PROFILE_ANT_UNIFORM_HW192,
+        )
+    )
+
+
+def _bootstrap_evalmod_parameters(profile: str, hamming_weight: int):
+    canonical = _normalize_evalmod_profile(profile)
+    if canonical == EVALMOD_PROFILE_OPENFHE_SPARSE:
+        if hamming_weight != 192:
+            raise ValueError(
+                "the OpenFHE sparse EvalMod profile requires hamming_weight=192"
+            )
+        if len(G_COEFFICIENTS_OPENFHE_SPARSE) != OPENFHE_SPARSE_COEFF_SIZE:
+            raise RuntimeError(
+                "the OpenFHE sparse EvalMod coefficient table has the wrong size"
+            )
+        return (
+            OPENFHE_SPARSE_UPPER_BOUND_K,
+            tuple(G_COEFFICIENTS_OPENFHE_SPARSE),
+            R_UNIFORM_HW_192,
+        )
+    return (
+        EVAL_SIN_UPPER_BOUND_K,
+        tuple(G_COEFFICIENTS_UNIFORM_HW_192),
+        R_UNIFORM_HW_192,
+    )
 
 
 def _bootstrap_runtime_raise_level() -> bool:
@@ -283,6 +361,8 @@ def build_bootstrap_trace_config(
     emit_linear_transform: bool = False,
     context_mul_level: int = 0,
     parallel_eval_mod: bool = False,
+    evalmod_profile: str = EVALMOD_PROFILE_ANT_UNIFORM_HW192,
+    cpu_evalmod_region: bool = False,
 ) -> BootstrapConfig:
     """Build a trace config without reading process-global configuration.
 
@@ -295,6 +375,9 @@ def build_bootstrap_trace_config(
             "the expanded uniform coefficient family supports hamming weight "
             f"at most {UNIFORM_COEFFICIENT_HAMMING_WEIGHT_MAX}"
         )
+    eval_sin_upper_bound_k, chebyshev_coefficients, double_angle_count = (
+        _bootstrap_evalmod_parameters(evalmod_profile, hamming_weight)
+    )
     return BootstrapConfig(
         poly_degree=poly_degree,
         mul_level=mul_level,
@@ -305,14 +388,15 @@ def build_bootstrap_trace_config(
         enc_budget=enc_budget,
         dec_budget=dec_budget,
         ct_encode=ct_encode,
-        eval_sin_upper_bound_k=EVAL_SIN_UPPER_BOUND_K,
-        chebyshev_coefficients=tuple(G_COEFFICIENTS_UNIFORM_HW_192),
-        double_angle_scalars=tuple(get_double_angle_scalars(NUM_DOUBLE_ANGLE)),
+        eval_sin_upper_bound_k=eval_sin_upper_bound_k,
+        chebyshev_coefficients=chebyshev_coefficients,
+        double_angle_scalars=tuple(get_double_angle_scalars(double_angle_count)),
         transform_giant_step=transform_giant_step,
         clear_imag=clear_imag,
         emit_linear_transform=emit_linear_transform,
         context_mul_level=context_mul_level,
         parallel_eval_mod=parallel_eval_mod,
+        cpu_evalmod_region=cpu_evalmod_region,
     )
 
 
@@ -347,6 +431,8 @@ def _bootstrap_trace_config() -> BootstrapConfig:
         emit_linear_transform=_bootstrap_linear_transform_enabled(),
         context_mul_level=_bootstrap_context_mul_level(),
         parallel_eval_mod=_bootstrap_parallel_eval_mod_enabled(),
+        evalmod_profile=_bootstrap_evalmod_profile(),
+        cpu_evalmod_region=bool(_bootstrap_evalmod_schedule()),
     )
 
 
@@ -546,6 +632,10 @@ def run_demo():
     print("=" * 70)
     print("Full CKKS Bootstrap Algorithm - ACE EDSL")
     print("=" * 70)
+    chebyshev_degree = get_degree_from_coeffs(
+        list(bootstrap_config.chebyshev_coefficients)
+    )
+    ps_k, ps_m = compute_degree_ps(chebyshev_degree)
     print("Implementation mode: primitive")
     
     print(f"""
@@ -554,7 +644,7 @@ Bootstrap Algorithm:
 │  primitive mode (full decomposition):                               │
 │    CoeffToSlot                 - U0hat diagonal linear transform     │
 │    Full-packed split           - conjugate + add/sub + mul_mono      │
-│    Dual EvalMod (PS)           - Chebyshev 55 (k=8,m=3) + {len(bootstrap_config.double_angle_scalars)} DA     │
+│    Dual EvalMod (PS)           - Chebyshev {len(bootstrap_config.chebyshev_coefficients)} (k={ps_k},m={ps_m}) + {len(bootstrap_config.double_angle_scalars)} DA     │
 │    Recombine                   - mul_mono + add                      │
 │    SlotToCoeff                 - U0 diagonal linear transform        │
 │    Post-scale                  - * {bootstrap_config.post_scale:g} (q0/sf ratio)                  │
@@ -654,6 +744,8 @@ Key Difference from acepy:
         constant_name_prefix=_bootstrap_constant_name_prefix(),
         pt_from_msg_name=_bootstrap_pt_from_msg_name(),
         raise_mod_level_func=_bootstrap_raise_level_name(),
+        decomp_ntt_threads=_bootstrap_decomp_ntt_threads(),
+        evalmod_schedule=_bootstrap_evalmod_schedule(),
     )
     # Keep CKKS extended-op semantics intact for staged bootstrap flow.
     # The current generic rewrite maps conjugate -> identity, which breaks
@@ -708,7 +800,7 @@ Key Difference from acepy:
         "Bootstrap Phases (full-packed decomposition):\n"
         "  ├─ CoeffToSlot:  U0hat diagonal linear transform\n"
         "  ├─ Conjugate:    split real/imag + mul_mono\n"
-        f"  ├─ Dual EvalMod: PS Chebyshev (k=8, m=3, deg=54) + {len(bootstrap_config.double_angle_scalars)} DA\n"
+        f"  ├─ Dual EvalMod: PS Chebyshev (k={ps_k}, m={ps_m}, deg={chebyshev_degree}) + {len(bootstrap_config.double_angle_scalars)} DA\n"
         "  ├─ Recombine:    mul_mono + add\n"
         "  ├─ SlotToCoeff:  U0 diagonal linear transform\n"
         f"  └─ Post-scale:   * {bootstrap_config.post_scale:g}"

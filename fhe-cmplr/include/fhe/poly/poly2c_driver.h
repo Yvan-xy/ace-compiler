@@ -136,6 +136,9 @@ void POLY2C_DRIVER::Run(air::base::GLOB_SCOPE* glob, VISITOR& visitor) {
 
   _ctx.Emit_need_bts();
   _ctx.Emit_global_constants(glob, false);
+  AIR_ASSERT_MSG(!_ctx.In_evalmod(), "unclosed CPU execution region");
+  AIR_ASSERT_MSG(!_ctx.Evalmod_schedule() || _ctx.Evalmod_regions(),
+                 "EvalMod policy requested without a marked region");
 }
 
 }  // namespace poly

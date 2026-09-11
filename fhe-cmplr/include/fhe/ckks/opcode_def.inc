@@ -53,7 +53,7 @@ CKKS_OPCODE(FREE,       free,       1, 0, PROP_STMT | PROP_TYPE | PROP_LIB_CALL)
 // statement regions while keeping every CKKS/POLY operation visible to the
 // normal lowering and optimization passes.
 CKKS_OPCODE(PARALLEL_SECTIONS_BEGIN, parallel_sections_begin, 0, 0,
-            PROP_SCF | PROP_STMT)
+            PROP_SCF | PROP_STMT | PROP_ATTR)
 CKKS_OPCODE(PARALLEL_SECTION_BEGIN, parallel_section_begin, 0, 0,
             PROP_SCF | PROP_STMT)
 CKKS_OPCODE(PARALLEL_SECTION_END, parallel_section_end, 0, 0,

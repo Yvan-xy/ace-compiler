@@ -90,6 +90,9 @@ class FHEConfig:
     context_manifest_file: str = ""
     resource_manifest_file: str = ""
     constant_manifest_file: str = ""
+    # CPU POLY codegen experiment: 0 legacy, 1 serial, >1 limb thread budget.
+    decomp_ntt_threads: int = 0
+    evalmod_schedule: int = 0
 
     def __post_init__(self):
         self.provider = self.provider.strip().lower()
@@ -131,6 +134,18 @@ class FHEConfig:
                 "poly_lowering='linear_transform' requires codegen_ir='poly'"
             )
         self.poly_lowering = poly_lowering
+        if (isinstance(self.decomp_ntt_threads, bool) or
+                not isinstance(self.decomp_ntt_threads, int) or
+                not 0 <= self.decomp_ntt_threads <= 0xFFFFFFFF):
+            raise ValueError("decomp_ntt_threads must be a uint32 integer")
+        if self.decomp_ntt_threads and (self.provider != "ant" or selected != "poly"):
+            raise ValueError("decomp_ntt_threads requires ANT POLY codegen")
+        if (isinstance(self.evalmod_schedule, bool) or not isinstance(self.evalmod_schedule, int)
+                or self.evalmod_schedule not in (0, 1, 2)):
+            raise ValueError("evalmod_schedule must be 0, 1 or 2")
+        if self.evalmod_schedule and (self.provider != "ant" or selected != "poly" or
+                self.poly_lowering != "linear_transform" or self.decomp_ntt_threads):
+            raise ValueError("evalmod_schedule requires ANT linear_transform and decomp_ntt_threads=0")
 
 
 @dataclass(frozen=True)
@@ -260,6 +275,8 @@ class AcePipeline:
         context_manifest_file: str = "",
         resource_manifest_file: str = "",
         constant_manifest_file: str = "",
+        decomp_ntt_threads: int = 0,
+        evalmod_schedule: int = 0,
     ) -> "AcePipeline":
         """
         Configure FHE parameters.
@@ -311,6 +328,8 @@ class AcePipeline:
             context_manifest_file=context_manifest_file,
             resource_manifest_file=resource_manifest_file,
             constant_manifest_file=constant_manifest_file,
+            decomp_ntt_threads=decomp_ntt_threads,
+            evalmod_schedule=evalmod_schedule,
         )
         return self
 
@@ -503,6 +522,9 @@ class AcePipeline:
             constant_name_prefix=self.fhe_config.constant_name_prefix,
             pt_from_msg_name=self.fhe_config.pt_from_msg_name,
             raise_mod_level_func=self.fhe_config.raise_mod_level_func,
+            **({"decomp_ntt_threads": self.fhe_config.decomp_ntt_threads}
+               if self.fhe_config.decomp_ntt_threads else {}),
+            **({"evalmod_schedule": self.fhe_config.evalmod_schedule} if self.fhe_config.evalmod_schedule else {}),
         )
         
         if ok and hasattr(self.glob_scope, "get_c_code"):
@@ -940,6 +962,8 @@ class Pipeline:
         context_manifest_file: str = "",
         resource_manifest_file: str = "",
         constant_manifest_file: str = "",
+        decomp_ntt_threads: int = 0,
+        evalmod_schedule: int = 0,
     ) -> "Pipeline":
         """
         Configure FHE parameters.
@@ -984,6 +1008,8 @@ class Pipeline:
             context_manifest_file=context_manifest_file,
             resource_manifest_file=resource_manifest_file,
             constant_manifest_file=constant_manifest_file,
+            decomp_ntt_threads=decomp_ntt_threads,
+            evalmod_schedule=evalmod_schedule,
         )
         return self
     
@@ -1168,6 +1194,9 @@ class Pipeline:
                     ct_encode=self.config.ct_encode,
                     free_poly=self.config.free_poly,
                     enable_poly=True,
+                    **({"decomp_ntt_threads": self.config.decomp_ntt_threads}
+                       if self.config.decomp_ntt_threads else {}),
+                    **({"evalmod_schedule": self.config.evalmod_schedule} if self.config.evalmod_schedule else {}),
                 )
             return False
 

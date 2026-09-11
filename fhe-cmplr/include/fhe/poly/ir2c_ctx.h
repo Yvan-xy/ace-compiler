@@ -19,15 +19,39 @@ namespace poly {
 
 //! @brief Context to convert polynomial IR to C
 class IR2C_CTX : public fhe::ckks::IR2C_CTX {
+private:
+  uint32_t _decomp_ntt_threads;
+  uint32_t _evalmod_schedule;
+  bool _in_evalmod = false;
+  uint32_t _evalmod_regions = 0;
+
 public:
   //! @brief Construct a new ir2c ctx object
   //! @param os Output stream
   IR2C_CTX(std::ostream& os, const fhe::core::LOWER_CTX& lower_ctx,
            const fhe::poly::POLY2C_CONFIG& cfg)
-      : fhe::ckks::IR2C_CTX(os, lower_ctx, cfg) {}
+      : fhe::ckks::IR2C_CTX(os, lower_ctx, cfg),
+        _decomp_ntt_threads(static_cast<uint32_t>(cfg.Decomp_ntt_threads())),
+        _evalmod_schedule(static_cast<uint32_t>(cfg.Evalmod_schedule())) {
+    AIR_ASSERT_MSG(cfg.Evalmod_schedule() <= 2, "invalid EvalMod policy");
+    AIR_ASSERT_MSG(!_evalmod_schedule || (!_decomp_ntt_threads && Provider() == core::PROVIDER::ANT),
+                   "EvalMod policy requires ANT and conflicts with the partial NTT experiment");
+    AIR_ASSERT_MSG(cfg.Decomp_ntt_threads() <= UINT32_MAX,
+                   "decomposition NTT thread budget exceeds uint32");
+    AIR_ASSERT_MSG(_decomp_ntt_threads == 0 || Provider() == core::PROVIDER::ANT,
+                   "decomposition NTT scheduling requires the ANT provider");
+  }
+
+  uint32_t Decomp_ntt_threads() const { return _decomp_ntt_threads; }
+  uint32_t Evalmod_schedule() const { return _evalmod_schedule; }
+  bool In_evalmod() const { return _in_evalmod; }
+  uint32_t Evalmod_regions() const { return _evalmod_regions; }
+  void Begin_evalmod() { AIR_ASSERT(!_in_evalmod); _in_evalmod = true; ++_evalmod_regions; }
+  void End_evalmod() { AIR_ASSERT(_in_evalmod); _in_evalmod = false; }
 
   //! @brief Include "rt_ant.h" in generated C file
   void Emit_global_include() {
+    if (_evalmod_schedule) _ir2c_util << "#include \"poly/evalmod_exec.h\"\n";
     _ir2c_util << "// external header files" << std::endl;
     _ir2c_util << "#include \"";
     _ir2c_util << fhe::core::Provider_header(Provider());

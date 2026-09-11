@@ -80,6 +80,44 @@ class TestBootstrapStagePlanning(unittest.TestCase):
         ):
             replace(_bootstrap_config(slots=8), parallel_eval_mod=True)
 
+    def test_openfhe_sparse_evalmod_profile_is_opt_in(self):
+        common = dict(
+            poly_degree=16,
+            mul_level=10,
+            first_prime_bits=60,
+            scaling_factor_bits=56,
+            hamming_weight=192,
+            q_parts=3,
+            enc_budget=3,
+            dec_budget=3,
+            ct_encode=True,
+        )
+        default = bootstrap_full.build_bootstrap_trace_config(**common)
+        sparse = bootstrap_full.build_bootstrap_trace_config(
+            **common, evalmod_profile="openfhe_sparse"
+        )
+        self.assertEqual(default.eval_sin_upper_bound_k, bootstrap_full.EVAL_SIN_UPPER_BOUND_K)
+        self.assertEqual(
+            len(default.chebyshev_coefficients),
+            bootstrap_full.UNIFORM_COEFF_SIZE_HW_192,
+        )
+        self.assertEqual(sparse.eval_sin_upper_bound_k, bootstrap_full.OPENFHE_SPARSE_UPPER_BOUND_K)
+        self.assertEqual(
+            len(sparse.chebyshev_coefficients),
+            bootstrap_full.OPENFHE_SPARSE_COEFF_SIZE,
+        )
+        self.assertEqual(
+            sparse.chebyshev_coefficients,
+            tuple(bootstrap_full.G_COEFFICIENTS_OPENFHE_SPARSE),
+        )
+        self.assertEqual(default.bootstrap_depth, sparse.bootstrap_depth)
+        with self.assertRaisesRegex(ValueError, "unsupported bootstrap EvalMod profile"):
+            bootstrap_full.build_bootstrap_trace_config(**common, evalmod_profile="bad")
+        with self.assertRaisesRegex(ValueError, "requires hamming_weight=192"):
+            bootstrap_full.build_bootstrap_trace_config(
+                **{**common, "hamming_weight": 191}, evalmod_profile="openfhe_sparse"
+            )
+
     def test_linear_transform_descriptor_emits_one_op_per_collapsed_stage(self):
         config = replace(
             _bootstrap_config(slots=8),

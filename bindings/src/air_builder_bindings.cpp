@@ -1974,9 +1974,15 @@ public:
         return wrapped;
     }
 
-    void new_ckks_parallel_sections_begin() {
-        append_ckks_parallel_marker(
-            fhe::ckks::OPC_PARALLEL_SECTIONS_BEGIN);
+    void new_ckks_parallel_sections_begin(bool cpu_evalmod = false) {
+        require_not_expired();
+        if (!container) throw std::runtime_error("parallel region requires an AIR container");
+        auto stmt = container->New_cust_stmt(fhe::ckks::OPC_PARALLEL_SECTIONS_BEGIN, get_spos());
+        if (cpu_evalmod) {
+            uint32_t value = 1;
+            stmt->Node()->Set_attr("cpu_evalmod", &value, 1);
+        }
+        append_stmt(stmt);
     }
 
     void new_ckks_parallel_section_begin() {
@@ -8225,7 +8231,13 @@ public:
         const std::string& function_name_prefix = "",
         const std::string& constant_name_prefix = "",
         const std::string& pt_from_msg_name = "Pt_from_msg",
-        const std::string& raise_mod_level_func = "") {
+        const std::string& raise_mod_level_func = "",
+        uint32_t decomp_ntt_threads = 0, uint32_t evalmod_schedule = 0) {
+        if (evalmod_schedule > 2 || (evalmod_schedule && (!enable_poly || decomp_ntt_threads)))
+            throw py::value_error("invalid/conflicting EvalMod policy");
+        if (!enable_poly && decomp_ntt_threads != 0) {
+            throw py::value_error("decomp_ntt_threads requires POLY codegen");
+        }
         if (!enable_poly) {
             return run_ckks2c_pass_with_config(
                 output_file, data_file, ct_encode, free_poly, "ant",
@@ -8262,6 +8274,8 @@ public:
             p2c_config._constant_name_prefix = constant_name_prefix;
             p2c_config._pt_from_msg_name = pt_from_msg_name;
             p2c_config._raise_mod_level_func = raise_mod_level_func;
+            p2c_config._decomp_ntt_threads = decomp_ntt_threads;
+            p2c_config._evalmod_schedule = evalmod_schedule;
             
             // Enable free_poly for memory management (matches native compiler)
             p2c_config._free_poly = free_poly;
@@ -10991,7 +11005,7 @@ PYBIND11_MODULE(air_builder, m) {
              py::arg("schema_version") = 1,
              "Create a compiler-only CKKS BSGS linear-transform descriptor")
         .def("new_ckks_parallel_sections_begin",
-             &Container::new_ckks_parallel_sections_begin)
+             &Container::new_ckks_parallel_sections_begin, py::arg("cpu_evalmod") = false)
         .def("new_ckks_parallel_section_begin",
              &Container::new_ckks_parallel_section_begin)
         .def("new_ckks_parallel_section_end",
@@ -11408,6 +11422,8 @@ PYBIND11_MODULE(air_builder, m) {
              py::arg("constant_name_prefix") = "",
              py::arg("pt_from_msg_name") = "Pt_from_msg",
              py::arg("raise_mod_level_func") = "",
+             py::arg("decomp_ntt_threads") = 0,
+             py::arg("evalmod_schedule") = 0,
              "Run poly2c pass with configuration.\n"
              "  output_file: if non-empty, write C code to this file\n"
              "  data_file: if non-empty, write constants to this file (makes C code MUCH smaller)\n"

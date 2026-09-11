@@ -127,6 +127,12 @@ pybind11_add_module(air_builder
     src/onnx_loader.cpp
     src/vector_kernel_plan_provider.cpp
 )
+# The static offline encoder can contain CPU OpenMP kernels. Propagate their
+# runtime dependency when building bindings independently of the main project.
+find_package(OpenMP QUIET)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(air_builder PRIVATE OpenMP::OpenMP_CXX)
+endif()
 target_include_directories(air_builder PRIVATE
     ${AIR_INFRA_DIR}/include
     ${ACE_INCLUDE_DIR}
@@ -147,6 +153,14 @@ endif()
 if(ACE_BINDINGS_ENABLED)
     target_compile_definitions(air_builder PRIVATE ACE_BINDINGS_ENABLED=1)
     target_link_directories(air_builder PRIVATE ${ACE_LIB_DIR} ${ACE_INSTALL_DIR}/rtlib/lib)
+    # Named -l inputs do not make changes to installed archives visible to
+    # CMake. Track the codegen/opcode and encoder archives to avoid loading a
+    # stale module after rebuilding the compiler or runtime.
+    set_property(TARGET air_builder APPEND PROPERTY LINK_DEPENDS
+        "${ACE_LIB_DIR}/libFHEckks.a"
+        "${ACE_LIB_DIR}/libFHEpoly.a"
+        "${ACE_INSTALL_DIR}/rtlib/lib/libFHErt_ant_encode.a"
+        "${ACE_INSTALL_DIR}/rtlib/lib/libFHErt_common.a")
     # Order matters for static libraries - dependent libs come first
     # Include NNonnx2air and NNonnx for ONNX model loading
     target_link_libraries(air_builder PRIVATE 

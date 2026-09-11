@@ -30,6 +30,16 @@ public:
   void Handle_parallel_sections_begin(VISITOR* visitor,
                                       air::base::NODE_PTR node) {
     IR2C_CTX& ctx = visitor->Context();
+    const uint32_t* region = node->Attr<uint32_t>("cpu_evalmod");
+    AIR_ASSERT_MSG(!ctx.In_evalmod(), "nested scheduling region is unsupported");
+    if (ctx.Evalmod_schedule() && region && *region) {
+      ctx.Begin_evalmod();
+      ctx << "{ EVALMOD_EXEC __ace_evalmod_exec; Evalmod_exec_init(&__ace_evalmod_exec);\n"
+             "#pragma omp parallel num_threads(__ace_evalmod_exec.threads) if(__ace_evalmod_exec.threads > 1)\n"
+             "{\n#pragma omp single\n{\n#pragma omp taskgroup\n{\n";
+      ctx.Level() += 4;
+      return;
+    }
     ctx << "#pragma omp parallel sections\n"
         << std::string(ctx.Level() * 2, ' ') << "{\n";
     ++ctx.Level();
@@ -39,6 +49,12 @@ public:
   void Handle_parallel_section_begin(VISITOR* visitor,
                                      air::base::NODE_PTR node) {
     IR2C_CTX& ctx = visitor->Context();
+    if (ctx.In_evalmod()) {
+      if (ctx.Evalmod_schedule() == 2) ctx << "#pragma omp task default(shared)\n";
+      ctx << "{\n";
+      ++ctx.Level();
+      return;
+    }
     ctx << "#pragma omp section\n"
         << std::string(ctx.Level() * 2, ' ') << "{\n";
     ++ctx.Level();
@@ -56,6 +72,12 @@ public:
   void Handle_parallel_sections_end(VISITOR* visitor,
                                     air::base::NODE_PTR node) {
     IR2C_CTX& ctx = visitor->Context();
+    if (ctx.In_evalmod()) {
+      ctx.Level() -= 4;
+      ctx << "}\n}\n}\nEvalmod_exec_report(&__ace_evalmod_exec);\n}\n";
+      ctx.End_evalmod();
+      return;
+    }
     --ctx.Level();
     ctx << "}\n";
   }
@@ -318,7 +340,7 @@ public:
   template <typename RETV, typename VISITOR>
   void Handle_mod_down(VISITOR* visitor, air::base::NODE_PTR node) {
     IR2C_CTX& ctx = visitor->Context();
-    ctx << "Mod_down(";
+    ctx << (ctx.In_evalmod() ? "Evalmod_mod_down(" : "Mod_down(");
     air::base::NODE_PTR parent = ctx.Parent(1);
     if (parent != air::base::Null_ptr) {
       ctx << "&";
@@ -326,6 +348,7 @@ public:
       ctx << ", ";
     }
     visitor->template Visit<RETV>(node->Child(0));
+    if (ctx.In_evalmod()) ctx << ", &__ace_evalmod_exec";
     ctx << ")";
   }
 
@@ -349,7 +372,7 @@ public:
     IR2C_CTX&           ctx    = visitor->Context();
     air::base::NODE_PTR parent = ctx.Parent(1);
     AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
-    ctx << "Hw_modadd(";
+    ctx << (ctx.In_evalmod() ? "Evalmod_hw_modadd(" : "Hw_modadd(");
     ctx.template Emit_st_var<RETV, VISITOR>(visitor, parent);
     ctx << ", ";
     visitor->template Visit<RETV>(node->Child(0));
@@ -357,7 +380,9 @@ public:
     visitor->template Visit<RETV>(node->Child(1));
     ctx << ", ";
     visitor->template Visit<RETV>(node->Child(2));
-    ctx << ", degree)";
+    ctx << ", degree";
+    if (ctx.In_evalmod()) ctx << ", &__ace_evalmod_exec";
+    ctx << ")";
   }
 
   //! @brief Emit a HW_MODMUL call to RTlib
@@ -366,7 +391,7 @@ public:
     IR2C_CTX&           ctx    = visitor->Context();
     air::base::NODE_PTR parent = ctx.Parent(1);
     AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
-    ctx << "Hw_modmul(";
+    ctx << (ctx.In_evalmod() ? "Evalmod_hw_modmul(" : "Hw_modmul(");
     ctx.template Emit_st_var<RETV, VISITOR>(visitor, parent);
     ctx << ", ";
     visitor->template Visit<RETV>(node->Child(0));
@@ -374,7 +399,9 @@ public:
     visitor->template Visit<RETV>(node->Child(1));
     ctx << ", ";
     visitor->template Visit<RETV>(node->Child(2));
-    ctx << ", degree)";
+    ctx << ", degree";
+    if (ctx.In_evalmod()) ctx << ", &__ace_evalmod_exec";
+    ctx << ")";
   }
 
   //! @brief Emit a HW_MODSUB call to RTlib
@@ -383,7 +410,7 @@ public:
     IR2C_CTX&           ctx    = visitor->Context();
     air::base::NODE_PTR parent = ctx.Parent(1);
     AIR_ASSERT(parent != air::base::Null_ptr && parent->Is_st());
-    ctx << "Hw_modsub(";
+    ctx << (ctx.In_evalmod() ? "Evalmod_hw_modsub(" : "Hw_modsub(");
     ctx.template Emit_st_var<RETV, VISITOR>(visitor, parent);
     ctx << ", ";
     visitor->template Visit<RETV>(node->Child(0));
@@ -391,7 +418,9 @@ public:
     visitor->template Visit<RETV>(node->Child(1));
     ctx << ", ";
     visitor->template Visit<RETV>(node->Child(2));
-    ctx << ", degree)";
+    ctx << ", degree";
+    if (ctx.In_evalmod()) ctx << ", &__ace_evalmod_exec";
+    ctx << ")";
   }
 
   //! @brief Emit a HW_ROTATE call to RTlib
@@ -507,7 +536,7 @@ public:
   template <typename RETV, typename VISITOR>
   void Handle_rescale(VISITOR* visitor, air::base::NODE_PTR node) {
     IR2C_CTX& ctx = visitor->Context();
-    ctx << "Rescale(";
+    ctx << (ctx.In_evalmod() ? "Evalmod_rescale(" : "Rescale(");
     air::base::NODE_PTR parent = ctx.Parent(1);
     if (parent != air::base::Null_ptr) {
       ctx << "&";
@@ -515,6 +544,7 @@ public:
       ctx << ", ";
     }
     visitor->template Visit<RETV>(node->Child(0));
+    if (ctx.In_evalmod()) ctx << ", &__ace_evalmod_exec";
     ctx << ")";
   }
 
@@ -596,12 +626,12 @@ public:
     IR2C_CTX&           ctx = visitor->Context();
     air::base::NODE_PTR val = node->Child(2);
     if (val->Opcode() == air::base::OPCODE(POLYNOMIAL_DID, OPCODE::HW_MODADD)) {
-      ctx << "Hw_modadd(";
+      ctx << (ctx.In_evalmod() ? "Evalmod_hw_modadd(" : "Hw_modadd(");
       Gen_hw_op_param(visitor, node, val);
       ctx << ")";
     } else if (val->Opcode() ==
                air::base::OPCODE(POLYNOMIAL_DID, OPCODE::HW_MODMUL)) {
-      ctx << "Hw_modmul(";
+      ctx << (ctx.In_evalmod() ? "Evalmod_hw_modmul(" : "Hw_modmul(");
       Gen_hw_op_param(visitor, node, val);
       ctx << ")";
     } else if (val->Opcode() ==
@@ -611,7 +641,7 @@ public:
       ctx << ")";
     } else if (val->Opcode() ==
                air::base::OPCODE(POLYNOMIAL_DID, OPCODE::HW_MODSUB)) {
-      ctx << "Hw_modsub(";
+      ctx << (ctx.In_evalmod() ? "Evalmod_hw_modsub(" : "Hw_modsub(");
       Gen_hw_op_param(visitor, node, val);
       ctx << ")";
     } else if (val->Opcode() ==
@@ -688,6 +718,8 @@ private:
     ctx << ", ";
     visitor->template Visit<void>(op->Child(2));
     ctx << ", degree";
+    if (ctx.In_evalmod() && (op->Opcode() == OPC_HW_MODADD || op->Opcode() == OPC_HW_MODMUL || op->Opcode() == OPC_HW_MODSUB))
+      ctx << ", &__ace_evalmod_exec";
   }
 
   // Emit param list for INIT_CIPH_xxx Operations

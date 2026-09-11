@@ -109,7 +109,9 @@ private:
                                         air::base::NODE_PTR node,
                                         air::base::OPCODE opcode) {
     POLY_LOWER_CTX& ctx = visitor->Context();
-    ctx.Prepend(ctx.Container()->New_cust_stmt(opcode, node->Spos()));
+    auto lowered = ctx.Container()->New_cust_stmt(opcode, node->Spos());
+    if (opcode == OPC_PARALLEL_SECTIONS_BEGIN) lowered->Node()->Copy_attr(node);
+    ctx.Prepend(lowered);
     return POLY_LOWER_RETV(RETV_KIND::RK_BLOCK, air::base::Null_ptr);
   }
 
