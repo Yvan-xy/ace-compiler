@@ -1,0 +1,105 @@
+Note: Google Test filter = TEST_EVALMOD_EXEC.*:TEST_NTT_THREADS.*:TEST_CKKS_EXTENDED_OPS.*
+[==========] Running 18 tests from 3 test suites.
+[----------] Global test environment set-up.
+[----------] 6 tests from TEST_EVALMOD_EXEC
+[ RUN      ] TEST_EVALMOD_EXEC.ExactDecompositionAllPartitions
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_EVALMOD_EXEC.ExactDecompositionAllPartitions (64 ms)
+[ RUN      ] TEST_EVALMOD_EXEC.ExactModDown
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_EVALMOD_EXEC.ExactModDown (64 ms)
+[ RUN      ] TEST_EVALMOD_EXEC.ExactRescaleInPlaceAndOutOfPlace
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_EVALMOD_EXEC.ExactRescaleInPlaceAndOutOfPlace (63 ms)
+[ RUN      ] TEST_EVALMOD_EXEC.PointwiseTasksAndAliasing
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_EVALMOD_EXEC.PointwiseTasksAndAliasing (64 ms)
+[ RUN      ] TEST_EVALMOD_EXEC.TwoBranchesShareTeamAndScratchIsPrivate
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_EVALMOD_EXEC.TwoBranchesShareTeamAndScratchIsPrivate (64 ms)
+[ RUN      ] TEST_EVALMOD_EXEC.CoefficientFallbackAndOutsideTeam
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_EVALMOD_EXEC.CoefficientFallbackAndOutsideTeam (63 ms)
+[----------] 6 tests from TEST_EVALMOD_EXEC (384 ms total)
+
+[----------] 8 tests from TEST_NTT_THREADS
+[ RUN      ] TEST_NTT_THREADS.ExactRoundTripAndRepeatedCalls
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_NTT_THREADS.ExactRoundTripAndRepeatedCalls (63 ms)
+[ RUN      ] TEST_NTT_THREADS.EmptyAndPrimeListPrefix
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_NTT_THREADS.EmptyAndPrimeListPrefix (63 ms)
+[ RUN      ] TEST_NTT_THREADS.DecompositionMatchesLegacyAllPartitions
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_NTT_THREADS.DecompositionMatchesLegacyAllPartitions (64 ms)
+[ RUN      ] TEST_NTT_THREADS.CoefficientInputKeepsSerialBaseConversion
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_NTT_THREADS.CoefficientInputKeepsSerialBaseConversion (63 ms)
+[ RUN      ] TEST_NTT_THREADS.TimingAggregationKeepsConcurrentCounts
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_NTT_THREADS.TimingAggregationKeepsConcurrentCounts (64 ms)
+[ RUN      ] TEST_NTT_THREADS.WorkersObeyBudgetAndAvoidNestedTeams
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_NTT_THREADS.WorkersObeyBudgetAndAvoidNestedTeams (63 ms)
+[ RUN      ] TEST_NTT_THREADS.DecompEntryReallyReachesParallelNtt
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_NTT_THREADS.DecompEntryReallyReachesParallelNtt (63 ms)
+[ RUN      ] TEST_NTT_THREADS.OverlappingViewsFallBackToLegacyOrder
+ckks_param: _provider = 0, _poly_degree = 64, mul_depth = 7, input_lev = 1, _first_mod_size = 50, _scaling_mod_size = 40, _num_q_parts = 3, _num_p = 3, _num_rot_idx = 0,_hamming_weight = 8
+Total memory size for keys: rot_key_cnt = 0, rot_key_size = 0 bytes, total_key_size = 53784 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_NTT_THREADS.OverlappingViewsFallBackToLegacyOrder (63 ms)
+[----------] 8 tests from TEST_NTT_THREADS (509 ms total)
+
+[----------] 4 tests from TEST_CKKS_EXTENDED_OPS
+[ RUN      ] TEST_CKKS_EXTENDED_OPS.CenteredRaiseIsExactAndOutOfPlace
+ckks_param: _provider = 0, _poly_degree = 32, mul_depth = 2, input_lev = 1, _first_mod_size = 33, _scaling_mod_size = 30, _num_q_parts = 2, _num_p = 2, _num_rot_idx = 3,_hamming_weight = 0
+Total memory size for keys: rot_key_cnt = 3, rot_key_size = 16080 bytes, total_key_size = 25728 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_CKKS_EXTENDED_OPS.CenteredRaiseIsExactAndOutOfPlace (56 ms)
+[ RUN      ] TEST_CKKS_EXTENDED_OPS.MonomialIsExactForCoefficientAndNttFormsAndNormalizesPower
+ckks_param: _provider = 0, _poly_degree = 32, mul_depth = 2, input_lev = 1, _first_mod_size = 33, _scaling_mod_size = 30, _num_q_parts = 2, _num_p = 2, _num_rot_idx = 3,_hamming_weight = 0
+Total memory size for keys: rot_key_cnt = 3, rot_key_size = 16080 bytes, total_key_size = 25728 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_CKKS_EXTENDED_OPS.MonomialIsExactForCoefficientAndNttFormsAndNormalizesPower (57 ms)
+[ RUN      ] TEST_CKKS_EXTENDED_OPS.MonomialIdentityNegationInverseAndInPlace
+ckks_param: _provider = 0, _poly_degree = 32, mul_depth = 2, input_lev = 1, _first_mod_size = 33, _scaling_mod_size = 30, _num_q_parts = 2, _num_p = 2, _num_rot_idx = 3,_hamming_weight = 0
+Total memory size for keys: rot_key_cnt = 3, rot_key_size = 16080 bytes, total_key_size = 25728 bytes
+Total memory size for weight plain: cnt = 0, size = 0 bytes
+[       OK ] TEST_CKKS_EXTENDED_OPS.MonomialIdentityNegationInverseAndInPlace (57 ms)
+[ RUN      ] TEST_CKKS_EXTENDED_OPS.ConjugateAndOrderedBatchMatchIndependentDecodedValues
+ckks_param: _provider = 0, _poly_degree = 32, mul_depth = 2, input_lev = 1, _first_mod_size = 33, _scaling_mod_size = 30, _num_q_parts = 2, _num_p = 2, _num_rot_idx = 3,_hamming_weight = 0
+Total memory size for keys: rot_key_cnt = 3, rot_key_size = 16080 bytes, total_key_size = 25728 bytes
+Total memory size for weight plain: cnt = 1, size = 328 bytes
+[       OK ] TEST_CKKS_EXTENDED_OPS.ConjugateAndOrderedBatchMatchIndependentDecodedValues (57 ms)
+[----------] 4 tests from TEST_CKKS_EXTENDED_OPS (228 ms total)
+
+[----------] Global test environment tear-down
+[==========] 18 tests from 3 test suites ran. (1123 ms total)
+[  PASSED  ] 18 tests.

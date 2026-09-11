@@ -1,0 +1,170 @@
+{
+  "0": {
+    "entry": {
+      "seconds": 1.652e-05,
+      "cpu_seconds": 1.6e-05,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    },
+    "modraise": {
+      "seconds": 0.075441015,
+      "cpu_seconds": 0.075445,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    },
+    "coeff_to_slots": {
+      "seconds": 8.84514334,
+      "cpu_seconds": 27.804735,
+      "system_seconds": 4.985273,
+      "minor_faults": 690138
+    },
+    "split": {
+      "seconds": 0.442556486,
+      "cpu_seconds": 0.442471,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    },
+    "evalmod": {
+      "seconds": 8.568812431,
+      "cpu_seconds": 17.056995,
+      "system_seconds": 0.405043,
+      "minor_faults": 195396
+    },
+    "recombine": {
+      "seconds": 0.031480879,
+      "cpu_seconds": 0.118005,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    },
+    "slots_to_coeffs": {
+      "seconds": 5.336507868,
+      "cpu_seconds": 16.914955,
+      "system_seconds": 3.039146,
+      "minor_faults": 425689
+    },
+    "postscale": {
+      "seconds": 0.012750969,
+      "cpu_seconds": 0.01275,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    },
+    "normalize": {
+      "seconds": 7.77e-06,
+      "cpu_seconds": 4e-06,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    }
+  },
+  "1": {
+    "entry": {
+      "seconds": 1.581e-05,
+      "cpu_seconds": 1.6e-05,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    },
+    "modraise": {
+      "seconds": 0.076476382,
+      "cpu_seconds": 0.07648,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    },
+    "coeff_to_slots": {
+      "seconds": 8.844584579,
+      "cpu_seconds": 27.793454,
+      "system_seconds": 4.979233,
+      "minor_faults": 672249
+    },
+    "split": {
+      "seconds": 0.442035076,
+      "cpu_seconds": 0.442038,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    },
+    "evalmod": {
+      "seconds": 6.063051123,
+      "cpu_seconds": 88.2637,
+      "system_seconds": 0.080418,
+      "minor_faults": 1172
+    },
+    "recombine": {
+      "seconds": 0.031050315,
+      "cpu_seconds": 0.11718,
+      "system_seconds": 0.000553,
+      "minor_faults": 0
+    },
+    "slots_to_coeffs": {
+      "seconds": 5.344968772,
+      "cpu_seconds": 16.498592,
+      "system_seconds": 2.739443,
+      "minor_faults": 347509
+    },
+    "postscale": {
+      "seconds": 0.013255735,
+      "cpu_seconds": 0.013137,
+      "system_seconds": 5e-06,
+      "minor_faults": 0
+    },
+    "normalize": {
+      "seconds": 7.96e-06,
+      "cpu_seconds": 4e-06,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    }
+  },
+  "2": {
+    "entry": {
+      "seconds": 2.1499e-05,
+      "cpu_seconds": 2.1e-05,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    },
+    "modraise": {
+      "seconds": 0.079110768,
+      "cpu_seconds": 0.079104,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    },
+    "coeff_to_slots": {
+      "seconds": 9.023701054,
+      "cpu_seconds": 28.164964,
+      "system_seconds": 4.841162,
+      "minor_faults": 734302
+    },
+    "split": {
+      "seconds": 0.451007543,
+      "cpu_seconds": 0.450903,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    },
+    "evalmod": {
+      "seconds": 4.195594677,
+      "cpu_seconds": 63.675408,
+      "system_seconds": 0.572215,
+      "minor_faults": 208425
+    },
+    "recombine": {
+      "seconds": 0.032655593,
+      "cpu_seconds": 0.123075,
+      "system_seconds": 0.000572,
+      "minor_faults": 0
+    },
+    "slots_to_coeffs": {
+      "seconds": 5.36886836,
+      "cpu_seconds": 17.317121,
+      "system_seconds": 3.437613,
+      "minor_faults": 477786
+    },
+    "postscale": {
+      "seconds": 0.012962364,
+      "cpu_seconds": 0.012963,
+      "system_seconds": 1.1e-05,
+      "minor_faults": 0
+    },
+    "normalize": {
+      "seconds": 7.23e-06,
+      "cpu_seconds": 4e-06,
+      "system_seconds": 0.0,
+      "minor_faults": 0
+    }
+  }
+}

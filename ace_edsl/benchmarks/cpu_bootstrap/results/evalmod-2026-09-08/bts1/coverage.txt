@@ -1,0 +1,9 @@
+ckks_param: _provider = 0, _poly_degree = 65536, mul_depth = 30, input_lev = 2, _first_mod_size = 60, _scaling_mod_size = 56, _num_q_parts = 3, _num_p = 11, _num_rot_idx = 48,_hamming_weight = 192
+EVALMOD_EXEC={"threads":16,"calls":[29002,90,64,92],"jobs":[116008,3660,1728,1472],"fallback":[0,0,0,0],"thread_mask":65535,"max_active_jobs":16}
+CPU_BTS_RESULT={"implementation":"dsl_cpu","sample":0,"timed":false,"seconds":23.188554519,"maximum_error":0.000446317774869,"ring_dimension":65536,"slots":32768,"context_q":31,"p_count":11,"raised_q":31,"input_q":2,"input_scale_degree":1,"output_q":14,"output_scale_degree":1,"output_scale":72057594037927936,"raw_output_q":16,"raw_output_scale_degree":1,"threads":16,"status":"pass"}
+CPU_BTS_RESOURCE={"sample":0,"cpu_seconds":135.477853000,"system_seconds":7.855940000,"minor_faults":1611576,"major_faults":0,"process_peak_rss_kib":13266488}
+EVALMOD_EXEC={"threads":16,"calls":[29002,90,64,92],"jobs":[116008,3660,1728,1472],"fallback":[0,0,0,0],"thread_mask":65535,"max_active_jobs":16}
+CPU_BTS_RESULT={"implementation":"dsl_cpu","sample":1,"timed":true,"seconds":22.257419375,"maximum_error":0.000446317774869,"ring_dimension":65536,"slots":32768,"context_q":31,"p_count":11,"raised_q":31,"input_q":2,"input_scale_degree":1,"output_q":14,"output_scale_degree":1,"output_scale":72057594037927936,"raw_output_q":16,"raw_output_scale_degree":1,"threads":16,"status":"pass"}
+CPU_BTS_RESOURCE={"sample":1,"cpu_seconds":138.731686000,"system_seconds":11.003173000,"minor_faults":1968604,"major_faults":0,"process_peak_rss_kib":14639708}
+Total memory size for keys: rot_key_cnt = 48, rot_key_size = 6341804160 bytes, total_key_size = 6550471320 bytes
+Total memory size for weight plain: cnt = 1, size = 1048648 bytes

@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.16)
+project(cpu_bootstrap_compare LANGUAGES CXX)
+find_package(OpenFHE 1.5.1 EXACT CONFIG REQUIRED)
+find_package(OpenMP REQUIRED)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenFHE_CXX_FLAGS}")
+add_executable(openfhe_bench openfhe_main.cxx)
+target_include_directories(openfhe_bench PRIVATE ${OpenFHE_INCLUDE}
+  ${OpenFHE_INCLUDE}/core ${OpenFHE_INCLUDE}/pke ${OpenFHE_INCLUDE}/binfhe)
+target_link_directories(openfhe_bench PRIVATE ${OpenFHE_LIBDIR})
+target_link_libraries(openfhe_bench PRIVATE ${OpenFHE_SHARED_LIBRARIES} OpenMP::OpenMP_CXX)
